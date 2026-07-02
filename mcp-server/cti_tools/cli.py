@@ -37,6 +37,7 @@ def main(argv: list[str] | None = None) -> int:
 
     pr = sub.add_parser("update-profile")
     pr.add_argument("name")
+    pr.add_argument("--description")
     pr.add_argument("--adversary")
     pr.add_argument("--capability")
     pr.add_argument("--infrastructure")
@@ -105,8 +106,9 @@ def main(argv: list[str] | None = None) -> int:
             aliases = args.aliases.split(",") if args.aliases is not None else None
             aliases = [a.strip() for a in aliases] if aliases else aliases
             _print(core.update_profile(
-                args.name, args.adversary, args.capability, args.infrastructure,
-                args.victim, aliases, args.confidence, args.first_seen, args.last_seen))
+                args.name, args.description, args.adversary, args.capability,
+                args.infrastructure, args.victim, aliases, args.confidence,
+                args.first_seen, args.last_seen))
         elif args.command == "update-ttp":
             _print(core.update_ttp(args.name, args.technique_id,
                                     args.technique_name, args.status, args.notes))

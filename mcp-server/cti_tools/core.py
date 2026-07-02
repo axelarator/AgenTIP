@@ -136,7 +136,8 @@ def get_cluster(name: str) -> dict[str, Any]:
     return load_cluster(name)
 
 
-def update_profile(name: str, adversary: str | None = None,
+def update_profile(name: str, description: str | None = None,
+                    adversary: str | None = None,
                     capability: str | None = None,
                     infrastructure: str | None = None,
                     victim: str | None = None,
@@ -148,6 +149,8 @@ def update_profile(name: str, adversary: str | None = None,
     Only provided fields are changed; everything else is left as-is."""
     data = load_cluster(name)
     d = data["diamond"]
+    if description is not None:
+        data["description"] = description
     if adversary is not None:
         d["adversary"] = adversary
     if capability is not None:

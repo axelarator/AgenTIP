@@ -39,7 +39,8 @@ def create_cluster(name: str, description: str = "") -> dict:
 
 
 @mcp.tool()
-def update_profile(name: str, adversary: str | None = None,
+def update_profile(name: str, description: str | None = None,
+                    adversary: str | None = None,
                     capability: str | None = None,
                     infrastructure: str | None = None,
                     victim: str | None = None,
@@ -47,11 +48,12 @@ def update_profile(name: str, adversary: str | None = None,
                     confidence: int | None = None,
                     first_seen: str | None = None,
                     last_seen: str | None = None) -> dict:
-    """Update Diamond Model corners and/or STIX profile metadata
-    (aliases, confidence 0-100, first_seen, last_seen). Only fields
-    you pass are changed."""
-    return core.update_profile(name, adversary, capability, infrastructure,
-                                victim, aliases, confidence, first_seen, last_seen)
+    """Update a cluster's description, Diamond Model corners, and/or
+    STIX profile metadata (aliases, confidence 0-100, first_seen,
+    last_seen). Only fields you pass are changed."""
+    return core.update_profile(name, description, adversary, capability,
+                                infrastructure, victim, aliases, confidence,
+                                first_seen, last_seen)
 
 
 @mcp.tool()
