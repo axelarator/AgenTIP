@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import stix
+from . import report_ingest, stix
 
 # Data lives at the repo root (`<repo>/data/clusters`) so it's shared
 # across every harness surface (MCP server, CLI, any future UI) rather
@@ -77,6 +77,10 @@ def _new_cluster(name: str, description: str) -> dict[str, Any]:
         "hunt_log": [],   # [{date, entry}] append-only
         "detections": [], # [{id, description, status, updated}]
         "gaps": [],       # [{description, priority, created}]
+        "observables": {  # each entry: {value, sources: [...], first_seen, last_seen}
+            "hashes": [], "domains": [], "ips": [], "urls": [],
+        },
+        "report_sources": [],  # [{source, ingested, observables_found, ttps_found}]
     }
 
 
@@ -92,8 +96,11 @@ def _migrate(data: dict[str, Any]) -> dict[str, Any]:
         "adversary": "unknown", "capability": "unknown",
         "infrastructure": "unknown", "victim": "unknown",
     })
-    for key in ("ttps", "hunt_log", "detections", "gaps"):
+    for key in ("ttps", "hunt_log", "detections", "gaps", "report_sources"):
         data.setdefault(key, [])
+    data.setdefault("observables", {"hashes": [], "domains": [], "ips": [], "urls": []})
+    for category in ("hashes", "domains", "ips", "urls"):
+        data["observables"].setdefault(category, [])
     return data
 
 
@@ -236,6 +243,130 @@ def export_navigator_layer(name: str) -> dict[str, Any]:
     }
 
 
+def get_observables(name: str) -> dict[str, Any]:
+    """Return just the observables block for a cluster (hashes, domains,
+    ips, urls) plus the list of report sources they came from — the
+    quick "what's tied to this cluster" view."""
+    data = load_cluster(name)
+    return {
+        "name": data["name"],
+        "observables": data["observables"],
+        "report_sources": data["report_sources"],
+    }
+
+
+def analyze_report(source: str) -> dict[str, Any]:
+    """Fetch a report (URL or local file path) and extract observables,
+    ATT&CK technique IDs, and candidate cluster names, WITHOUT writing
+    anything. Use this to preview extraction — e.g. to pick the right
+    cluster_name yourself — before committing with `ingest_report`."""
+    text = report_ingest.fetch_text(source)
+    text = report_ingest.defang_normalize(text)
+    observables = report_ingest.extract_observables(text)
+    candidates = report_ingest.suggest_cluster_names(text)
+    return {
+        "source": source,
+        "observables": {k: v for k, v in observables.items() if k != "ttps"},
+        "ttps": observables["ttps"],
+        "candidate_cluster_names": candidates,
+    }
+
+
+def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
+                        source: str) -> dict[str, int]:
+    now = _now()
+    counts = {}
+    for category in ("hashes", "domains", "ips", "urls"):
+        bucket = data["observables"][category]
+        by_value = {o["value"]: o for o in bucket}
+        added = 0
+        for value in extracted[category]:
+            if value in by_value:
+                entry = by_value[value]
+                if source not in entry["sources"]:
+                    entry["sources"].append(source)
+                entry["last_seen"] = now
+            else:
+                bucket.append({"value": value, "sources": [source],
+                                "first_seen": now, "last_seen": now})
+                added += 1
+        counts[category] = added
+    return counts
+
+
+def _merge_ttps(data: dict[str, Any], technique_ids: list[str], source: str) -> list[str]:
+    """Add newly-seen technique IDs at status 0 (no coverage) so they
+    show up in the coverage table. Never touches an already-tracked
+    TTP's status/notes — automated extraction shouldn't clobber a
+    curated coverage assessment."""
+    existing = {t["id"] for t in data["ttps"]}
+    added = []
+    for tid in technique_ids:
+        if tid in existing:
+            continue
+        data["ttps"].append({
+            "id": tid, "name": tid, "status": 0,
+            "notes": f"auto-extracted from report: {source}",
+            "updated": _now(),
+        })
+        added.append(tid)
+    return added
+
+
+def ingest_report(source: str, cluster_name: str | None = None,
+                   create_if_missing: bool = True) -> dict[str, Any]:
+    """Fetch a report, extract observables/TTPs, and file them into a
+    cluster — creating it if it doesn't exist yet.
+
+    If cluster_name is omitted, this tries to infer one from the report
+    text (Microsoft/CrowdStrike/Mandiant-style actor names, or a
+    malware name next to a word like "ransomware"). That inference is a
+    regex heuristic, not attribution: if it finds zero or multiple
+    plausible candidates, this raises rather than guessing — re-run
+    with an explicit cluster_name (an agent reading the report can
+    almost always pick the right one). Prefer passing cluster_name
+    explicitly whenever you know it.
+
+    Existing TTP statuses/notes are never overwritten by extraction —
+    only new technique IDs are added, at status 0. Observables are
+    deduped by value; a repeated observable from a new source just adds
+    that source to its provenance list.
+    """
+    text = report_ingest.fetch_text(source)
+    text = report_ingest.defang_normalize(text)
+    extracted = report_ingest.extract_observables(text)
+
+    if cluster_name is None:
+        candidates = report_ingest.suggest_cluster_names(text)
+        if len(candidates) == 1:
+            cluster_name = candidates[0]
+        elif not candidates:
+            raise ValueError(
+                "could not infer a cluster name from the report; "
+                "re-run ingest_report with an explicit cluster_name")
+        else:
+            raise ValueError(
+                "multiple possible cluster names found in the report "
+                f"({candidates}); re-run ingest_report with an explicit cluster_name")
+
+    if _path(cluster_name).exists():
+        data = load_cluster(cluster_name)
+    elif create_if_missing:
+        data = _new_cluster(cluster_name, f"Auto-created from report ingestion: {source}")
+    else:
+        raise ClusterNotFound(f"No cluster named {cluster_name!r}")
+
+    observable_counts = _merge_observables(data, extracted, source)
+    ttps_added = _merge_ttps(data, extracted["ttps"], source)
+    data["report_sources"].append({
+        "source": source, "ingested": _now(),
+        "observables_found": observable_counts,
+        "ttps_found": extracted["ttps"],
+    })
+    save_cluster(data)
+    return data
+
+
 def export_stix_bundle(name: str) -> dict[str, Any]:
     """Export the cluster as a STIX 2.1 bundle (Intrusion Set + Attack
     Patterns + Relationships + Notes) for sharing outside this tool."""
@@ -318,6 +449,23 @@ def _write_markdown(data: dict[str, Any]) -> None:
               "|---|---|---|"]
     for g in data["gaps"]:
         lines.append(f"| {g['description']} | {g['priority']} | {g['created']} |")
+    lines += ["", "## Observables"]
+    obs = data["observables"]
+    for category in ("hashes", "domains", "ips", "urls"):
+        items = obs.get(category, [])
+        lines.append(f"\n### {category.capitalize()} ({len(items)})")
+        if items:
+            lines.append("| Value | Sources | First seen | Last seen |")
+            lines.append("|---|---|---|---|")
+            for o in items:
+                lines.append(f"| {o['value']} | {', '.join(o['sources'])} | "
+                              f"{o['first_seen']} | {o['last_seen']} |")
+        else:
+            lines.append("none")
+    lines += ["", "## Report sources"]
+    for r in data["report_sources"]:
+        lines.append(f"- **{r['ingested']}** — {r['source']} "
+                      f"(TTPs: {', '.join(r['ttps_found']) or 'none'})")
     lines += ["", "## Hunt log (append-only)"]
     for h in data["hunt_log"]:
         lines.append(f"- **{h['date']}** — {h['entry']}")

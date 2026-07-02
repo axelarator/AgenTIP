@@ -137,3 +137,57 @@ def test_markdown_regenerated_on_save(tmp_path):
     content = md_path.read_text()
     assert "STIX ID" in content
     assert "Markdown Test" in content
+
+
+def test_ingest_report_creates_cluster_from_actor_name(tmp_path):
+    report = tmp_path / "report.txt"
+    report.write_text(
+        "Fox Tempest deployed a loader using T1059.001. "
+        "C2 at badactor-c2[.]xyz, hash 098f6bcd4621d373cade4e832627b4f6."
+    )
+    data = core.ingest_report(str(report))
+    assert data["name"] == "Fox Tempest"
+    assert "fox-tempest" in core.list_clusters()
+    assert any(o["value"] == "badactor-c2.xyz" for o in data["observables"]["domains"])
+    assert any(t["id"] == "T1059.001" and t["status"] == 0 for t in data["ttps"])
+
+
+def test_ingest_report_merges_into_existing_cluster_without_clobbering_status():
+    core.create_cluster("Fox Tempest")
+    core.update_ttp("Fox Tempest", "T1059.001", "PowerShell", 3, notes="validated")
+
+    import tempfile, os
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.write(fd, b"Fox Tempest seen again using T1059.001 and T1053.005, "
+                  b"C2 at second-c2[.]xyz")
+    os.close(fd)
+    try:
+        data = core.ingest_report(path, cluster_name="Fox Tempest")
+    finally:
+        os.remove(path)
+
+    ttp_lookup = {t["id"]: t for t in data["ttps"]}
+    assert ttp_lookup["T1059.001"]["status"] == 3  # untouched by extraction
+    assert ttp_lookup["T1053.005"]["status"] == 0  # newly added
+    assert any(o["value"] == "second-c2.xyz" for o in data["observables"]["domains"])
+
+
+def test_ingest_report_ambiguous_name_raises(tmp_path):
+    report = tmp_path / "ambiguous.txt"
+    report.write_text("Both Fox Tempest and UNC4321 were observed at shared-infra[.]xyz.")
+    with pytest.raises(ValueError):
+        core.ingest_report(str(report))
+
+
+def test_ingest_report_no_candidate_raises(tmp_path):
+    report = tmp_path / "no_names.txt"
+    report.write_text("C2 at random-c2[.]xyz, no actor name mentioned here.")
+    with pytest.raises(ValueError):
+        core.ingest_report(str(report))
+
+
+def test_get_observables_view():
+    core.create_cluster("Obs View Test")
+    view = core.get_observables("Obs View Test")
+    assert view["observables"] == {"hashes": [], "domains": [], "ips": [], "urls": []}
+    assert view["report_sources"] == []

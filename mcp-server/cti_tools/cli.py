@@ -15,6 +15,7 @@ import json
 import sys
 
 from . import core
+from .report_ingest import UnsupportedSource
 
 
 def _print(obj) -> None:
@@ -70,6 +71,18 @@ def main(argv: list[str] | None = None) -> int:
     n = sub.add_parser("export-navigator")
     n.add_argument("name")
 
+    obs = sub.add_parser("get-observables")
+    obs.add_argument("name")
+
+    ar = sub.add_parser("analyze-report")
+    ar.add_argument("source", help="URL or local file path")
+
+    ir = sub.add_parser("ingest-report")
+    ir.add_argument("source", help="URL or local file path")
+    ir.add_argument("--name", help="cluster name; inferred from the report if omitted")
+    ir.add_argument("--no-create", action="store_true",
+                     help="fail instead of creating a new cluster if none matches")
+
     es = sub.add_parser("export-stix")
     es.add_argument("name")
 
@@ -106,13 +119,21 @@ def main(argv: list[str] | None = None) -> int:
             _print(core.add_gap(args.name, args.description, args.priority))
         elif args.command == "export-navigator":
             _print(core.export_navigator_layer(args.name))
+        elif args.command == "get-observables":
+            _print(core.get_observables(args.name))
+        elif args.command == "analyze-report":
+            _print(core.analyze_report(args.source))
+        elif args.command == "ingest-report":
+            _print(core.ingest_report(args.source, args.name,
+                                       create_if_missing=not args.no_create))
         elif args.command == "export-stix":
             _print(core.export_stix_bundle(args.name))
         elif args.command == "import-stix":
             raw = sys.stdin.read() if args.bundle_path == "-" else open(args.bundle_path).read()
             bundle = json.loads(raw)
             _print(core.import_stix_bundle(bundle, args.name, args.overwrite))
-    except (core.ClusterNotFound, FileExistsError, ValueError) as e:
+    except (core.ClusterNotFound, FileExistsError, ValueError,
+            FileNotFoundError, UnsupportedSource) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     return 0

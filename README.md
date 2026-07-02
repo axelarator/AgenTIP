@@ -55,3 +55,10 @@ Clusters export as STIX 2.1 bundles (Intrusion Set + Attack Pattern +
 Relationship + Note) and can ingest bundles from other tools, so a
 cluster tracked here is portable to any STIX-consuming platform without
 a bespoke converter.
+
+Clusters can also be populated directly from a threat report (URL or
+local file): `ingest_report` extracts hashes/domains/IPs/URLs/TTPs and
+files them into an existing or new cluster (inferring the cluster name
+from the report text when not given explicitly), and `get_observables`
+lists everything gathered for a cluster so far. See
+`mcp-server/README.md` for the extraction/attribution caveats.

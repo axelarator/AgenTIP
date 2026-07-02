@@ -87,6 +87,33 @@ def export_navigator_layer(name: str) -> dict:
 
 
 @mcp.tool()
+def get_observables(name: str) -> dict:
+    """Get all observables (hashes, domains, ips, urls) tracked for a
+    cluster, with provenance (report sources) and first/last seen."""
+    return core.get_observables(name)
+
+
+@mcp.tool()
+def analyze_report(source: str) -> dict:
+    """Fetch a threat report (URL or local file path) and extract
+    observables/ATT&CK TTPs/candidate cluster names WITHOUT writing
+    anything. Use to preview before calling ingest_report, especially
+    when you want to pick the cluster_name yourself."""
+    return core.analyze_report(source)
+
+
+@mcp.tool()
+def ingest_report(source: str, cluster_name: str | None = None,
+                   create_if_missing: bool = True) -> dict:
+    """Fetch a threat report (URL or local file path), extract
+    observables and ATT&CK TTPs, and file them into a cluster —
+    creating it if needed. If cluster_name is omitted, tries to infer
+    the threat actor/malware name from the report text and raises if
+    that's ambiguous (pass cluster_name explicitly in that case)."""
+    return core.ingest_report(source, cluster_name, create_if_missing)
+
+
+@mcp.tool()
 def export_stix_bundle(name: str) -> dict:
     """Export a cluster as a STIX 2.1 bundle (Intrusion Set, Attack
     Patterns, Relationships, Notes) for sharing with other tools/orgs."""

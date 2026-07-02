@@ -130,6 +130,32 @@ tool whose whole design point is "no external services, minimal deps."
 If a downstream consumer needs strict spec validation, run the exported
 bundle through `stix2validator` before sharing it.
 
+## Report ingestion
+
+`ingest_report(source, cluster_name=None)` / `cti ingest-report <source>`
+fetches a threat report (URL or local file — `report_ingest.py` strips
+HTML to text; PDFs aren't supported yet, extract text first e.g. with
+`pdftotext`) and regex-extracts hashes (md5/sha1/sha256), domains, IPs
+(private/reserved ranges filtered out), URLs, and ATT&CK technique IDs.
+Extracted data is filed into a cluster — created automatically if it
+doesn't exist — with observables deduped by value (repeats just add a
+new source to that observable's provenance) and new TTPs added at
+coverage status 0 without ever touching an already-tracked TTP's
+status/notes.
+
+If `cluster_name` is omitted, it's inferred from the report text via a
+few vendor-style naming regexes (Microsoft weather names, CrowdStrike
+animal names, Mandiant/Proofpoint numbered clusters, or a name next to
+"ransomware"/"malware"/etc.). This is a heuristic, not attribution —
+zero or multiple candidates raises rather than guessing wrong. Use
+`analyze_report` / `cti analyze-report <source>` to preview extraction
+and candidate names without writing anything first.
+
+`get_observables(name)` / `cti get-observables <name>` returns just the
+hashes/domains/ips/urls tracked for a cluster (with provenance and
+first/last seen) plus the list of report sources ingested — the fast
+path to "what's tied to this cluster" instead of the full cluster dump.
+
 ## Extending toward Censys / hunt.io / Validin
 
 Add new functions to `core.py` (e.g. `censys_query(cert_hash)`), mirror
