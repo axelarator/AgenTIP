@@ -44,8 +44,12 @@ def _attack_pattern_id(technique_id: str) -> str:
     return f"attack-pattern--{uuid.uuid5(_NAMESPACE, technique_id.upper())}"
 
 
-def _relationship_id(source_ref: str, target_ref: str) -> str:
-    return f"relationship--{uuid.uuid5(_NAMESPACE, source_ref + ':' + target_ref)}"
+def _relationship_id(source_ref: str, target_ref: str, relationship_type: str) -> str:
+    # relationship_type is part of the namespaced input (not just the
+    # source/target pair) so two different relationship types between
+    # the same pair of objects - e.g. a TTP "uses" link and, separately,
+    # a cross-cluster "uses" vs. "related-to" link - never collide.
+    return f"relationship--{uuid.uuid5(_NAMESPACE, source_ref + ':' + target_ref + ':' + relationship_type)}"
 
 
 def _note_id(intrusion_set_id: str, date: str, entry: str) -> str:
@@ -98,13 +102,32 @@ def to_bundle(data: dict[str, Any]) -> dict[str, Any]:
         objects.append({
             "type": "relationship",
             "spec_version": SPEC_VERSION,
-            "id": _relationship_id(intrusion_set_id, ap_id),
+            "id": _relationship_id(intrusion_set_id, ap_id, "uses"),
             "created": t.get("updated") or created,
             "modified": t.get("updated") or modified,
             "relationship_type": "uses",
             "source_ref": intrusion_set_id,
             "target_ref": ap_id,
             "description": t.get("notes", ""),
+        })
+
+    for rel in data.get("relationships", []):
+        objects.append({
+            "type": "relationship",
+            "spec_version": SPEC_VERSION,
+            "id": _relationship_id(intrusion_set_id, rel["target_stix_id"], rel["relationship_type"]),
+            "created": rel.get("created") or created,
+            "modified": rel.get("created") or modified,
+            "relationship_type": rel["relationship_type"],
+            "source_ref": intrusion_set_id,
+            "target_ref": rel["target_stix_id"],
+            "description": rel.get("description", ""),
+            # Custom property (x_ prefix per STIX spec) carrying the
+            # target cluster's name through export: the target
+            # Intrusion Set object itself isn't included in this
+            # cluster's bundle, so its name wouldn't otherwise survive
+            # a round trip through from_bundle on another system.
+            "x_cti_agent_target_name": rel["target_cluster"],
         })
 
     for h in data.get("hunt_log", []):
@@ -137,14 +160,22 @@ def from_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
     intrusion_set_id = iset["id"]
 
     attack_patterns = {o["id"]: o for o in objects if o.get("type") == "attack-pattern"}
-    relationships = [o for o in objects if o.get("type") == "relationship"
-                      and o.get("relationship_type") == "uses"
-                      and o.get("source_ref") == intrusion_set_id]
+    all_relationships = [o for o in objects if o.get("type") == "relationship"
+                          and o.get("source_ref") == intrusion_set_id]
+    ttp_relationships = [r for r in all_relationships
+                         if r.get("relationship_type") == "uses"
+                         and r.get("target_ref") in attack_patterns]
+    # Cross-cluster links: same source Intrusion Set, but the target
+    # isn't one of this bundle's own Attack Patterns - i.e. a
+    # relationship to another cluster's Intrusion Set (which, per
+    # to_bundle, isn't itself included in a single-cluster export).
+    cross_cluster_relationships = [r for r in all_relationships
+                                    if r.get("target_ref") not in attack_patterns]
     notes = [o for o in objects if o.get("type") == "note"
              and intrusion_set_id in o.get("object_refs", [])]
 
     ttps = []
-    for rel in relationships:
+    for rel in ttp_relationships:
         ap = attack_patterns.get(rel["target_ref"])
         if not ap:
             continue
@@ -163,6 +194,18 @@ def from_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
             "updated": rel.get("modified") or _now(),
         })
 
+    relationships = [
+        {
+            "relationship_type": rel["relationship_type"],
+            "target_cluster": rel.get("x_cti_agent_target_name", rel["target_ref"]),
+            "target_stix_id": rel["target_ref"],
+            "description": rel.get("description", ""),
+            "source": "",
+            "created": rel.get("created") or _now(),
+        }
+        for rel in cross_cluster_relationships
+    ]
+
     hunt_notes = [
         {"date": n.get("created") or _now(), "entry": n.get("content", "")}
         for n in notes
@@ -177,4 +220,5 @@ def from_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
         "last_seen": iset.get("last_seen"),
         "ttps": ttps,
         "notes": hunt_notes,
+        "relationships": relationships,
     }

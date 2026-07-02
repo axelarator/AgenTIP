@@ -191,3 +191,154 @@ def test_get_observables_view():
     view = core.get_observables("Obs View Test")
     assert view["observables"] == {"hashes": [], "domains": [], "ips": [], "urls": []}
     assert view["report_sources"] == []
+
+
+# --- MITRE technique validation -------------------------------------------
+
+def test_update_ttp_unknown_id_warns():
+    core.create_cluster("Unknown TTP Test")
+    data = core.update_ttp("Unknown TTP Test", "T9999", "Not A Real Technique", 1)
+    assert "not a known ATT&CK" in data["warning"]
+
+
+def test_update_ttp_correct_pair_no_warning():
+    core.create_cluster("Correct TTP Test")
+    data = core.update_ttp("Correct TTP Test", "T1558.003", "Kerberoasting", 1)
+    assert "warning" not in data
+    data = core.update_ttp("Correct TTP Test", "T1059.001",
+                            "Command and Scripting Interpreter: PowerShell", 2)
+    assert "warning" not in data
+
+
+def test_update_ttp_name_mismatch_warns():
+    core.create_cluster("Mismatch TTP Test")
+    data = core.update_ttp("Mismatch TTP Test", "T1558.003", "AS-REP Roasting", 1)
+    assert "canonical name is" in data["warning"]
+    assert "Kerberoasting" in data["warning"]
+
+
+def test_update_ttp_revoked_technique_warns_with_replacement():
+    core.create_cluster("Revoked TTP Test")
+    data = core.update_ttp("Revoked TTP Test", "T1562", "Impair Defenses", 1)
+    assert "revoked" in data["warning"]
+    assert "T1685" in data["warning"]
+
+
+def test_warning_is_not_persisted():
+    core.create_cluster("Warning Persist Test")
+    core.update_ttp("Warning Persist Test", "T9999", "Fake", 1)
+    reloaded = core.get_cluster("Warning Persist Test")
+    assert "warning" not in reloaded
+
+
+def test_ingest_report_autofill_uses_canonical_name(tmp_path):
+    report = tmp_path / "report.txt"
+    report.write_text("Fake Cluster used T1558.003 during the intrusion. "
+                       "C2 at fakecluster-c2[.]xyz.")
+    data = core.ingest_report(str(report), cluster_name="Fake Cluster")
+    ttp = next(t for t in data["ttps"] if t["id"] == "T1558.003")
+    assert ttp["name"] == "Steal or Forge Kerberos Tickets: Kerberoasting"
+
+
+# --- extraction-empty warning ----------------------------------------------
+
+def test_analyze_report_warns_when_nothing_extracted(tmp_path):
+    report = tmp_path / "empty.txt"
+    report.write_text("This report mentions no hashes, domains, IPs, or ATT&CK IDs at all.")
+    result = core.analyze_report(str(report))
+    assert "warning" in result
+
+
+def test_analyze_report_no_warning_when_something_found(tmp_path):
+    report = tmp_path / "full.txt"
+    report.write_text("Seen using T1059.001 from infra-c2[.]xyz.")
+    result = core.analyze_report(str(report))
+    assert "warning" not in result
+
+
+def test_ingest_report_warns_when_nothing_extracted(tmp_path):
+    report = tmp_path / "empty.txt"
+    report.write_text("Empty Actor malware showed up with nothing extractable in this text.")
+    data = core.ingest_report(str(report), cluster_name="Empty Actor")
+    assert "warning" in data
+
+
+# --- shared detection registry ---------------------------------------------
+
+def test_add_detection_requires_technique_ids():
+    core.create_cluster("Detection Req Test")
+    with pytest.raises(ValueError):
+        core.add_detection("DET-1", "desc", [])
+
+
+def test_add_detection_shared_across_clusters():
+    core.create_cluster("Detection Cluster A")
+    core.create_cluster("Detection Cluster B")
+    core.update_ttp("Detection Cluster A", "T1558.003", "Kerberoasting", 0)
+    core.update_ttp("Detection Cluster B", "T1558.003", "Kerberoasting", 0)
+
+    core.add_detection("DET-KERB", "Kerberoasting ticket request volume", ["T1558.003"],
+                        status="validated", cluster_name="Detection Cluster A")
+
+    a = core.get_cluster("Detection Cluster A")
+    b = core.get_cluster("Detection Cluster B")
+    assert any(d["id"] == "DET-KERB" for d in a["detections"])
+    assert any(d["id"] == "DET-KERB" for d in b["detections"])  # shared, not duplicated per cluster
+
+
+def test_add_detection_upsert_merges_technique_ids():
+    core.add_detection("DET-2", "first pass", ["T1558.003"])
+    det = core.add_detection("DET-2", "refined", ["T1558.003", "T1003"])
+    assert set(det["technique_ids"]) == {"T1558.003", "T1003"}
+    assert det["description"] == "refined"
+
+
+def test_get_technique_usage_single_technique():
+    core.create_cluster("Usage Test A")
+    core.create_cluster("Usage Test B")
+    core.update_ttp("Usage Test A", "T1003", "OS Credential Dumping", 2)
+    core.update_ttp("Usage Test B", "T1003", "OS Credential Dumping", 0)
+    core.add_detection("DET-3", "LSASS access monitoring", ["T1003"])
+
+    usage = core.get_technique_usage("T1003")
+    used_by_clusters = {u["cluster"] for u in usage["used_by"]}
+    assert {"Usage Test A", "Usage Test B"} <= used_by_clusters
+    assert any(d["id"] == "DET-3" for d in usage["detections"])
+
+
+def test_get_technique_usage_full_matrix():
+    core.create_cluster("Matrix Test")
+    core.update_ttp("Matrix Test", "T1078", "Valid Accounts", 1)
+    matrix = core.get_technique_usage()
+    assert any(e["technique_id"] == "T1078" for e in matrix["techniques"])
+
+
+# --- cross-cluster relationships -------------------------------------------
+
+def test_add_relationship_requires_existing_target():
+    core.create_cluster("Rel Source Test")
+    with pytest.raises(core.ClusterNotFound):
+        core.add_relationship("Rel Source Test", "uses", "Nonexistent Cluster")
+
+
+def test_add_relationship_and_stix_roundtrip():
+    core.create_cluster("Rel Source")
+    core.create_cluster("Rel Target")
+    core.add_relationship("Rel Source", "uses", "Rel Target",
+                           description="customer relationship", source="https://example.com/report")
+
+    data = core.get_cluster("Rel Source")
+    assert data["relationships"][0]["target_cluster"] == "Rel Target"
+    target_stix_id = data["relationships"][0]["target_stix_id"]
+    assert target_stix_id == core.get_cluster("Rel Target")["stix_id"]
+
+    bundle = core.export_stix_bundle("Rel Source")
+    cross_rels = [o for o in bundle["objects"] if o.get("type") == "relationship"
+                  and o.get("target_ref") == target_stix_id]
+    assert len(cross_rels) == 1
+    assert cross_rels[0]["relationship_type"] == "uses"
+    assert cross_rels[0]["x_cti_agent_target_name"] == "Rel Target"
+
+    imported = core.import_stix_bundle(bundle, name="Rel Source Import")
+    assert imported["relationships"][0]["target_cluster"] == "Rel Target"
+    assert imported["relationships"][0]["relationship_type"] == "uses"

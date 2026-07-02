@@ -1,12 +1,15 @@
 # cti-tools
 
 Self-hosted MCP server + CLI for threat cluster tracking. No external
-API calls — everything is local JSON under `../data/clusters/` (shared
-at the repo root so every harness surface sees the same store), with a
-regenerated markdown view alongside each. `core.py` is the single
+API calls at runtime — everything is local JSON under `../data/clusters/`
+(shared at the repo root so every harness surface sees the same store),
+with a regenerated markdown view alongside each. `core.py` is the single
 source of truth; `stix.py`, `server.py`, and `cli.py` are thin surfaces
 over it, which is what makes the same tool behave identically whether
-it's called over MCP, over Bash, or exported as STIX.
+it's called over MCP, over Bash, or exported as STIX. `attack.py` bundles
+a static, offline MITRE ATT&CK technique lookup (see "MITRE ATT&CK
+technique validation" below) — the one static reference dataset in the
+repo, refreshed occasionally and offline, not fetched per call.
 
 ## Install
 
@@ -95,6 +98,59 @@ providers drive the exact same skill and tool surface, that swap is the
 cleanest isolated model-effect comparison you can run — harness and
 capabilities held constant, only the model changes.
 
+## MITRE ATT&CK technique validation
+
+`attack.py` bundles a flat `technique_id -> {name, display_name, tactics,
+revoked, deprecated, revoked_by}` lookup at
+`attack_data/enterprise_attack_techniques.json`, generated from the
+official MITRE STIX corpus (`mitre-attack/attack-stix-data`) by
+`scripts/refresh_attack_data.py`. `update_ttp` (and TTP auto-extraction
+during `ingest_report`) check every technique_id/technique_name pair
+against it:
+
+- unknown ID → warns, doesn't block the write (could be a legitimately
+  private/custom ID, or the bundle is stale),
+- revoked ID → warns with its replacement technique ID if MITRE recorded
+  one (ATT&CK restructures periodically — e.g. T1562 "Impair Defenses"
+  was revoked and replaced by T1685 "Disable or Modify Tools" upstream),
+- deprecated ID → warns,
+- name mismatch → warns with the canonical name, checked against both
+  ATT&CK's bare technique name and this repo's "Parent: Sub" display
+  convention for sub-techniques (e.g. "Steal or Forge Kerberos Tickets:
+  Kerberoasting" for T1558.003).
+
+The warning comes back as a `warning` key on the function's return value
+and is never written to the cluster's stored JSON — advisory, not a hard
+gate. Auto-extracted TTPs from report ingestion now also get their
+canonical display name filled in automatically (previously they were
+stored with `name` == the bare technique ID until someone corrected them
+by hand).
+
+Re-run `python scripts/refresh_attack_data.py` from `mcp-server/` when a
+new ATT&CK Enterprise release ships; it's a one-off/occasional script,
+not run automatically, consistent with this tool making no network calls
+at runtime.
+
+## Detections and technique usage
+
+Detections live in a shared, technique-keyed registry
+(`data/clusters/_registry/detections.json`), not duplicated per cluster —
+the same Kerberoasting detection covers every adversary that does
+Kerberoasting. `add_detection(detection_id, description, technique_ids,
+status="draft", cluster_name=None)` requires at least one technique_id;
+`cluster_name` is optional provenance for "which investigation prompted
+this," not a scoping key. A cluster's `detections` field (from
+`get_cluster` / `load_cluster`) is always a live join against the
+registry by technique_id — computed at read time, never trusted from
+whatever was last written to that cluster's own JSON file — so it never
+goes stale relative to the cluster's current TTP table.
+
+`get_technique_usage(technique_id=None)` is the reverse index: given a
+technique, which tracked clusters use it and what detections cover it.
+Omit `technique_id` for the full matrix across every technique any
+tracked cluster has logged. Check this before writing a new detection —
+another cluster may already have one for the same technique.
+
 ## STIX 2.1 export/import
 
 `export_stix_bundle` / `cti export-stix` renders a cluster as a STIX 2.1
@@ -109,6 +165,12 @@ capabilities held constant, only the model changes.
   the 0-4 coverage score,
 - one **Relationship** (`uses`) per TTP, linking the Intrusion Set to
   its Attack Pattern, carrying the TTP's notes as its description,
+- one **Relationship** per cross-cluster link added via
+  `add_relationship`, linking this Intrusion Set directly to another
+  cluster's Intrusion Set `stix_id` (the target object itself isn't
+  included in a single-cluster export, so its name is carried through
+  via a custom `x_cti_agent_target_name` property for a clean re-import
+  elsewhere),
 - one **Note** per hunt log entry, linked back to the Intrusion Set.
 
 The Intrusion Set's STIX id is minted once at cluster creation and
@@ -118,11 +180,17 @@ update, not a duplicate. Attack Pattern ids are derived deterministically
 from the ATT&CK technique ID (UUIDv5 under a fixed namespace in
 `stix.py`), so the same technique gets the same id across every cluster
 and every export, without needing MITRE's own STIX corpus bundled in.
+Relationship ids are derived from `(source, target, relationship_type)`
+so a TTP `uses` link and a cross-cluster link never collide even when
+they'd otherwise share a source/target pair.
 
 `import_stix_bundle` / `cti import-stix` does the reverse: given a
 bundle with at least one Intrusion Set, it creates a new cluster (or
-merges into an existing one with `--overwrite`, unioning in TTPs and
-appending hunt log notes without touching existing detections/gaps).
+merges into an existing one with `--overwrite`, unioning in TTPs,
+cross-cluster relationships, and hunt log notes without touching
+existing gaps). Detections aren't part of the bundle at all — they're
+resolved locally by joining the imported TTPs against your own
+detection registry.
 
 This is hand-rolled JSON, not the `stix2` library — the object graph is
 small and a hard dependency on a validating library isn't worth it for a
@@ -150,6 +218,14 @@ animal names, Mandiant/Proofpoint numbered clusters, or a name next to
 zero or multiple candidates raises rather than guessing wrong. Use
 `analyze_report` / `cti analyze-report <source>` to preview extraction
 and candidate names without writing anything first.
+
+Both `analyze_report` and `ingest_report` add a `warning` field to their
+return value when regex extraction finds zero observables *and* zero
+TTPs — don't read that the same as "a clean report with nothing to
+report." It usually means the source keeps its IOCs/techniques in a
+table, image, or appendix the plain-text extractor can't reach (common
+in older vendor posts); check the source manually when that seems
+unlikely for the report at hand.
 
 `get_observables(name)` / `cti get-observables <name>` returns just the
 hashes/domains/ips/urls tracked for a cluster (with provenance and

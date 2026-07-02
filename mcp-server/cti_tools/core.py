@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import report_ingest, stix
+from . import attack, report_ingest, stix
 
 # Data lives at the repo root (`<repo>/data/clusters`) so it's shared
 # across every harness surface (MCP server, CLI, any future UI) rather
@@ -46,6 +46,19 @@ class ClusterNotFound(Exception):
     pass
 
 
+_EXTRACTION_EMPTY_WARNING = (
+    "no observables or TTPs were extracted from this source - the page may "
+    "keep IOCs/techniques in a table, image, or PDF appendix the plain-text "
+    "extractor can't reach, or it may genuinely contain none. Don't treat "
+    "this the same as a clean report with nothing to report; check the "
+    "source manually if that seems unlikely."
+)
+
+
+def _nothing_extracted(extracted: dict[str, list[str]]) -> bool:
+    return not any(extracted[c] for c in ("hashes", "domains", "ips", "urls", "ttps"))
+
+
 def _path(name: str) -> Path:
     safe = name.strip().lower().replace(" ", "-")
     return DATA_DIR / f"{safe}.json"
@@ -75,12 +88,13 @@ def _new_cluster(name: str, description: str) -> dict[str, Any]:
         },
         "ttps": [],       # [{id, name, status, notes, updated}]
         "hunt_log": [],   # [{date, entry}] append-only
-        "detections": [], # [{id, description, status, updated}]
+        "detections": [], # computed join onto the shared registry at load time, not stored
         "gaps": [],       # [{description, priority, created}]
         "observables": {  # each entry: {value, sources: [...], first_seen, last_seen}
             "hashes": [], "domains": [], "ips": [], "urls": [],
         },
         "report_sources": [],  # [{source, ingested, observables_found, ttps_found}]
+        "relationships": [],  # [{relationship_type, target_cluster, target_stix_id, description, source, created}]
     }
 
 
@@ -96,7 +110,7 @@ def _migrate(data: dict[str, Any]) -> dict[str, Any]:
         "adversary": "unknown", "capability": "unknown",
         "infrastructure": "unknown", "victim": "unknown",
     })
-    for key in ("ttps", "hunt_log", "detections", "gaps", "report_sources"):
+    for key in ("ttps", "hunt_log", "detections", "gaps", "report_sources", "relationships"):
         data.setdefault(key, [])
     data.setdefault("observables", {"hashes": [], "domains": [], "ips": [], "urls": []})
     for category in ("hashes", "domains", "ips", "urls"):
@@ -108,7 +122,13 @@ def load_cluster(name: str) -> dict[str, Any]:
     p = _path(name)
     if not p.exists():
         raise ClusterNotFound(f"No cluster named {name!r}")
-    return _migrate(json.loads(p.read_text()))
+    data = _migrate(json.loads(p.read_text()))
+    # Detections live in the shared registry, keyed by technique - not
+    # duplicated per cluster - so what a cluster "has" is always a live
+    # join against its current TTP table, computed on every load rather
+    # than trusted from whatever was last written to disk.
+    data["detections"] = _detections_for_cluster(data)
+    return data
 
 
 def save_cluster(data: dict[str, Any]) -> None:
@@ -188,6 +208,12 @@ def update_ttp(name: str, technique_id: str, technique_name: str,
         ttps.append({"id": technique_id, "name": technique_name,
                       "status": status, "notes": notes, "updated": _now()})
     save_cluster(data)
+    # Advisory only, checked against the bundled MITRE corpus - never
+    # blocks the write, since a stale bundle or a legitimately custom ID
+    # shouldn't stop an analyst from recording what they observed.
+    warning = attack.validate(technique_id, technique_name)
+    if warning:
+        data = {**data, "warning": warning}
     return data
 
 
@@ -198,12 +224,158 @@ def append_hunt_log(name: str, entry: str) -> dict[str, Any]:
     return data
 
 
-def add_detection(name: str, detection_id: str, description: str,
-                   status: str = "draft") -> dict[str, Any]:
+def _registry_path() -> Path:
+    # Under DATA_DIR (not a sibling of it) so tests that monkeypatch
+    # DATA_DIR to an isolated tmp dir get an isolated registry for free.
+    # A subdirectory, not a file directly in DATA_DIR, so it can never
+    # collide with list_clusters()'s non-recursive `*.json` glob there.
+    return DATA_DIR / "_registry" / "detections.json"
+
+
+def _load_detection_registry() -> dict[str, Any]:
+    p = _registry_path()
+    if not p.exists():
+        return {"detections": []}
+    return json.loads(p.read_text())
+
+
+def _save_detection_registry(registry: dict[str, Any]) -> None:
+    p = _registry_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(registry, indent=2))
+
+
+def _detections_for_cluster(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Detections relevant to this cluster: anything in the shared
+    registry whose technique_ids overlap this cluster's TTP table, or
+    that explicitly names this cluster (e.g. filed before the TTP that
+    justifies it was added). Each result is annotated with exactly
+    which of this cluster's TTPs it covers."""
+    registry = _load_detection_registry()
+    ttp_ids = {t["id"].upper() for t in data["ttps"]}
+    name = data["name"]
+    result = []
+    for det in registry["detections"]:
+        covers = sorted({tid.upper() for tid in det["technique_ids"]} & ttp_ids)
+        if covers or name in det.get("clusters", []):
+            result.append({**det, "covers_ttps": covers})
+    return result
+
+
+def add_detection(detection_id: str, description: str, technique_ids: list[str],
+                   status: str = "draft", cluster_name: str | None = None) -> dict[str, Any]:
+    """Upsert a detection into the shared, technique-keyed detection
+    registry (data/clusters/_registry/detections.json) rather than into
+    one cluster's own record - a Kerberoasting detection covers every
+    adversary that does Kerberoasting, so it's modeled once per
+    technique and joined onto clusters by technique_id, not
+    hand-duplicated into each cluster that happens to use it.
+
+    technique_ids is required (at least one) - that's what makes the
+    detection discoverable from a cluster's TTP table and from
+    get_technique_usage(). cluster_name is optional provenance (which
+    investigation prompted writing this detection); pass it to also get
+    the refreshed cluster view back.
+    """
+    if not technique_ids:
+        raise ValueError("add_detection requires at least one technique_id")
+    if cluster_name is not None:
+        load_cluster(cluster_name)  # raises ClusterNotFound if it doesn't exist
+
+    registry = _load_detection_registry()
+    now = _now()
+    for det in registry["detections"]:
+        if det["id"] == detection_id:
+            det["description"] = description
+            det["status"] = status
+            det["technique_ids"] = sorted(set(det["technique_ids"]) | set(technique_ids))
+            if cluster_name and cluster_name not in det["clusters"]:
+                det["clusters"].append(cluster_name)
+            det["updated"] = now
+            break
+    else:
+        registry["detections"].append({
+            "id": detection_id, "description": description, "status": status,
+            "technique_ids": sorted(set(technique_ids)),
+            "clusters": [cluster_name] if cluster_name else [],
+            "created": now, "updated": now,
+        })
+    _save_detection_registry(registry)
+
+    # The cluster JSON's `detections` field (and its rendered markdown)
+    # is a snapshot from the last time that cluster was saved - refresh
+    # every cluster this detection now covers, not just cluster_name,
+    # so an update here doesn't leave other clusters' .md views stale.
+    technique_id_set = {tid.upper() for tid in technique_ids}
+    for cname in list_clusters():
+        data = load_cluster(cname)
+        if technique_id_set & {t["id"].upper() for t in data["ttps"]}:
+            save_cluster(data)
+
+    if cluster_name:
+        return load_cluster(cluster_name)
+    return next(d for d in registry["detections"] if d["id"] == detection_id)
+
+
+def get_technique_usage(technique_id: str | None = None) -> dict[str, Any]:
+    """Reverse index from technique to adversary: for a given ATT&CK
+    technique, which tracked clusters use it and what detections (if
+    any) cover it - the "who uses what" view that per-cluster TTP
+    tables alone don't answer. Omit technique_id to get the full matrix
+    across every technique any tracked cluster has logged."""
+    registry = _load_detection_registry()
+    by_technique: dict[str, dict[str, Any]] = {}
+    for cname in list_clusters():
+        data = load_cluster(cname)
+        for t in data["ttps"]:
+            tid = t["id"]
+            entry = by_technique.setdefault(tid, {
+                "technique_id": tid,
+                "name": attack.canonical_name(tid) or t["name"],
+                "used_by": [],
+                "detections": [],
+            })
+            entry["used_by"].append({
+                "cluster": data["name"], "status": t["status"], "notes": t.get("notes", ""),
+            })
+    for det in registry["detections"]:
+        for tid in det["technique_ids"]:
+            if tid in by_technique:
+                by_technique[tid]["detections"].append({
+                    "id": det["id"], "description": det["description"],
+                    "status": det["status"],
+                })
+
+    if technique_id is None:
+        return {"techniques": sorted(by_technique.values(), key=lambda e: e["technique_id"])}
+
+    tid = technique_id.upper()
+    entry = next((e for e in by_technique.values() if e["technique_id"].upper() == tid), None)
+    if entry is None:
+        entry = {"technique_id": tid, "name": attack.canonical_name(tid) or tid,
+                  "used_by": [], "detections": []}
+    return entry
+
+
+def add_relationship(name: str, relationship_type: str, target_cluster: str,
+                      description: str = "", source: str = "") -> dict[str, Any]:
+    """Record a structured relationship from this cluster to another
+    tracked cluster - e.g. "uses" for a supply-chain/tooling link
+    (customer of an MSaaS, deploys another cluster's backdoor), or
+    "related-to" for a suspected-but-unconfirmed overlap. This is the
+    structured counterpart to the free-text "See cluster 'X'"
+    cross-references already common in hunt log entries; it exports as
+    a real STIX Relationship between the two Intrusion Sets rather than
+    prose the receiving system has to parse."""
     data = load_cluster(name)
-    data["detections"].append({
-        "id": detection_id, "description": description,
-        "status": status, "updated": _now(),
+    target = load_cluster(target_cluster)  # raises ClusterNotFound if it doesn't exist
+    data["relationships"].append({
+        "relationship_type": relationship_type,
+        "target_cluster": target["name"],
+        "target_stix_id": target["stix_id"],
+        "description": description,
+        "source": source,
+        "created": _now(),
     })
     save_cluster(data)
     return data
@@ -267,12 +439,15 @@ def analyze_report(source: str) -> dict[str, Any]:
     text = report_ingest.defang_normalize(text)
     observables = report_ingest.extract_observables(text)
     candidates = report_ingest.suggest_cluster_names(text)
-    return {
+    result = {
         "source": source,
         "observables": {k: v for k, v in observables.items() if k != "ttps"},
         "ttps": observables["ttps"],
         "candidate_cluster_names": candidates,
     }
+    if _nothing_extracted(observables):
+        result["warning"] = _EXTRACTION_EMPTY_WARNING
+    return result
 
 
 def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
@@ -308,7 +483,7 @@ def _merge_ttps(data: dict[str, Any], technique_ids: list[str], source: str) -> 
         if tid in existing:
             continue
         data["ttps"].append({
-            "id": tid, "name": tid, "status": 0,
+            "id": tid, "name": attack.canonical_name(tid) or tid, "status": 0,
             "notes": f"auto-extracted from report: {source}",
             "updated": _now(),
         })
@@ -360,13 +535,15 @@ def ingest_report(source: str, cluster_name: str | None = None,
         raise ClusterNotFound(f"No cluster named {cluster_name!r}")
 
     observable_counts = _merge_observables(data, extracted, source)
-    ttps_added = _merge_ttps(data, extracted["ttps"], source)
+    _merge_ttps(data, extracted["ttps"], source)
     data["report_sources"].append({
         "source": source, "ingested": _now(),
         "observables_found": observable_counts,
         "ttps_found": extracted["ttps"],
     })
     save_cluster(data)
+    if _nothing_extracted(extracted):
+        data = {**data, "warning": _EXTRACTION_EMPTY_WARNING}
     return data
 
 
@@ -402,6 +579,11 @@ def import_stix_bundle(bundle: dict[str, Any], name: str | None = None,
                 data["ttps"].append(t)
         for note in parsed["notes"]:
             data["hunt_log"].append(note)
+        existing_rels = {(r["relationship_type"], r["target_stix_id"]) for r in data["relationships"]}
+        for rel in parsed["relationships"]:
+            key = (rel["relationship_type"], rel["target_stix_id"])
+            if key not in existing_rels:
+                data["relationships"].append(rel)
     else:
         data = _new_cluster(cluster_name, parsed["description"])
         data["stix_id"] = parsed["stix_id"]
@@ -410,6 +592,7 @@ def import_stix_bundle(bundle: dict[str, Any], name: str | None = None,
         data["last_seen"] = parsed["last_seen"]
         data["ttps"] = parsed["ttps"]
         data["hunt_log"] = parsed["notes"]
+        data["relationships"] = parsed["relationships"]
     save_cluster(data)
     return data
 
@@ -443,11 +626,18 @@ def _write_markdown(data: dict[str, Any]) -> None:
     for t in data["ttps"]:
         lines.append(f"| {t['id']} | {t['name']} | {t['status']} | "
                       f"{t.get('notes', '')} | {t['updated']} |")
-    lines += ["", "## Detection inventory",
-              "| ID | Description | Status | Updated |", "|---|---|---|---|"]
+    lines += ["", "## Detection inventory (shared registry, joined by technique)",
+              "| ID | Description | Status | Covers | Updated |", "|---|---|---|---|---|"]
     for det in data["detections"]:
-        lines.append(f"| {det['id']} | {det['description']} | "
-                      f"{det['status']} | {det['updated']} |")
+        lines.append(f"| {det['id']} | {det['description']} | {det['status']} | "
+                      f"{', '.join(det.get('covers_ttps', [])) or ', '.join(det['technique_ids'])} | "
+                      f"{det['updated']} |")
+    lines += ["", "## Relationships"]
+    for rel in data.get("relationships", []):
+        lines.append(f"- **{rel['relationship_type']}** → {rel['target_cluster']}"
+                      f"{' — ' + rel['description'] if rel.get('description') else ''}")
+    if not data.get("relationships"):
+        lines.append("none")
     lines += ["", "## Gaps backlog", "| Description | Priority | Created |",
               "|---|---|---|"]
     for g in data["gaps"]:

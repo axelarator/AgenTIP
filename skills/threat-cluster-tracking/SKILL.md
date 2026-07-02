@@ -89,6 +89,18 @@ preview (extraction + candidate names) without writing anything — useful
 when you're not sure yet which cluster a report belongs to, or want to
 sanity-check the candidates before committing.
 
+## Technique ID validation
+
+`update_ttp` and report-driven TTP extraction both check the
+technique_id/technique_name pair against a bundled MITRE ATT&CK
+Enterprise corpus. If the ID is unknown, revoked (with its
+replacement), deprecated, or the name doesn't match ATT&CK's canonical
+name for that ID, the call still succeeds but the returned cluster
+carries a `warning` field — read it, don't ignore it, but don't treat
+it as a failure either (a slightly stale bundle or a legitimately
+private/custom ID shouldn't block recording what you observed). This
+warning is never persisted to the cluster's stored JSON.
+
 ## TTP coverage scale (0–4)
 
 - 0 — no coverage, technique not addressed
@@ -103,6 +115,40 @@ what matters is that every technique has a status and it's kept current.
 Each TTP entry also becomes a STIX Attack Pattern (identified by its
 ATT&CK technique ID via `external_references`) linked to the cluster's
 Intrusion Set by a `uses` Relationship on export.
+
+## Detections and technique usage
+
+Detections are **not** stored per-cluster. They live in a shared,
+technique-keyed registry — the same Kerberoasting detection covers
+every adversary that does Kerberoasting, so it's modeled once and
+joined onto whichever clusters' TTP tables reference that technique_id,
+rather than hand-copied into each one. `add_detection` requires at
+least one `technique_id`; pass `cluster_name` too if you want that
+cluster's refreshed view back (optional — it's just provenance for
+"which investigation prompted writing this"). A cluster's `detections`
+field in `get_cluster` is always this live join, annotated with which
+of that cluster's own TTPs each detection covers.
+
+To go the other direction — given a technique, which adversaries use it
+and what covers it — use `get_technique_usage(technique_id)` (omit the
+ID for the full matrix across every technique any tracked cluster has
+logged). This is the "who uses what" view: check it before writing a
+new detection, so you don't duplicate coverage that already exists for
+a technique another cluster also uses.
+
+## Cross-cluster relationships
+
+Clusters often relate to each other — a customer of another cluster's
+service, a downstream payload, a suspected-same-actor overlap. Prose
+cross-references in the hunt log ("See cluster 'X'") are still fine for
+narrative detail, but for anything you want to survive a STIX export or
+be machine-queryable, use `add_relationship(name, relationship_type,
+target_cluster, description, source)` / `cti add-relationship` —
+common `relationship_type` values are `"uses"` (supply-chain/tooling:
+is a customer of, deploys, delivers) and `"related-to"` (suspected
+overlap, not confirmed enough to merge via `aliases`). This exports as
+a real STIX Relationship between the two Intrusion Sets, not just text
+a receiving system has to parse.
 
 ## Hunt log discipline
 
@@ -123,29 +169,38 @@ STIX Note objects tied to the cluster's Intrusion Set.
 4. As you investigate, append hunt log entries as you go, not at the end
    from memory.
 5. When a technique is identified, upsert it into the TTP table with a
-   status — don't leave techniques implicit in prose.
-6. When a detection is written, record it in the detection inventory
-   linked to the technique it covers.
+   status — don't leave techniques implicit in prose. Check any
+   `warning` in the response; it flags an unknown/revoked/mismatched
+   technique_id without blocking the write.
+6. Before writing a new detection, check `get_technique_usage` — the
+   same detection may already cover this technique for another cluster.
+   When a detection is written, record it with `add_detection` linked
+   to the technique_id(s) it covers, not duplicated per cluster.
 7. When you hit something you can't currently detect or verify, add it
    to the gaps backlog instead of letting it drop.
-8. If asked for an ATT&CK Navigator layer, export it from the cluster's
+8. When you identify a relationship to another tracked cluster (customer,
+   downstream payload, suspected overlap), record it with
+   `add_relationship` so it's structured and exportable, in addition to
+   any narrative detail in the hunt log.
+9. If asked for an ATT&CK Navigator layer, export it from the cluster's
    current TTP table rather than hand-building one — it should always
    reflect the stored data, not a snapshot.
-9. If asked to share a cluster, export it, or hand it to another
-   tool/team, use `export_stix_bundle` / `cti export-stix` rather than
-   serializing the JSON record directly — the STIX form is the
-   interoperable one.
-10. If handed a STIX bundle to ingest, use `import_stix_bundle` /
+10. If asked to share a cluster, export it, or hand it to another
+    tool/team, use `export_stix_bundle` / `cti export-stix` rather than
+    serializing the JSON record directly — the STIX form is the
+    interoperable one.
+11. If handed a STIX bundle to ingest, use `import_stix_bundle` /
     `cti import-stix`. It fails on a name collision unless you pass
     `overwrite`/`--overwrite`, which merges rather than replaces
-    (existing hunt log, detections, and gaps are preserved; TTPs and
+    (existing hunt log and gaps are preserved; TTPs, relationships, and
     notes are unioned in).
 
 ## Tool availability
 
 Prefer the MCP tools if the harness exposes them: `list_clusters`,
 `get_cluster`, `create_cluster`, `update_profile`, `update_ttp`,
-`append_hunt_log`, `add_detection`, `add_gap`, `export_navigator_layer`,
+`append_hunt_log`, `add_detection`, `get_technique_usage`,
+`add_relationship`, `add_gap`, `export_navigator_layer`,
 `export_stix_bundle`, `import_stix_bundle`, `get_observables`,
 `analyze_report`, `ingest_report`.
 
@@ -160,7 +215,9 @@ python -m cti_tools.cli create-cluster <name> --description "..."
 python -m cti_tools.cli update-profile <name> --adversary "..." --confidence 60 --aliases "Alias A,Alias B"
 python -m cti_tools.cli update-ttp <name> <technique_id> <technique_name> <status> --notes "..."
 python -m cti_tools.cli append-hunt-log <name> "<entry>"
-python -m cti_tools.cli add-detection <name> <detection_id> "<description>" <status>
+python -m cti_tools.cli add-detection <detection_id> "<description>" <technique_ids> <status> --cluster <name>
+python -m cti_tools.cli get-technique-usage [<technique_id>]
+python -m cti_tools.cli add-relationship <name> <relationship_type> <target_cluster> --description "..." --source "..."
 python -m cti_tools.cli add-gap <name> "<description>" <priority>
 python -m cti_tools.cli export-navigator <name>
 python -m cti_tools.cli export-stix <name>

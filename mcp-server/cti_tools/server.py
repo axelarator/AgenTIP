@@ -70,10 +70,33 @@ def append_hunt_log(name: str, entry: str) -> dict:
 
 
 @mcp.tool()
-def add_detection(name: str, detection_id: str, description: str,
-                   status: str = "draft") -> dict:
-    """Record a detection in a cluster's detection inventory."""
-    return core.add_detection(name, detection_id, description, status)
+def add_detection(detection_id: str, description: str, technique_ids: list[str],
+                   status: str = "draft", cluster_name: str | None = None) -> dict:
+    """Upsert a detection into the shared, technique-keyed detection
+    registry (not into one cluster's own record) - the same detection
+    can cover every adversary that uses a given technique instead of
+    being duplicated per cluster. technique_ids is required. Pass
+    cluster_name to also get that cluster's refreshed view back."""
+    return core.add_detection(detection_id, description, technique_ids, status, cluster_name)
+
+
+@mcp.tool()
+def get_technique_usage(technique_id: str | None = None) -> dict:
+    """Reverse index from ATT&CK technique to adversary: which tracked
+    clusters use a technique and which detections cover it. Omit
+    technique_id for the full matrix across every technique any tracked
+    cluster has logged."""
+    return core.get_technique_usage(technique_id)
+
+
+@mcp.tool()
+def add_relationship(name: str, relationship_type: str, target_cluster: str,
+                      description: str = "", source: str = "") -> dict:
+    """Record a structured relationship from this cluster to another
+    tracked cluster (e.g. relationship_type="uses" for a supply-chain/
+    tooling link, "related-to" for a suspected overlap). Exports as a
+    real STIX Relationship between the two Intrusion Sets."""
+    return core.add_relationship(name, relationship_type, target_cluster, description, source)
 
 
 @mcp.tool()

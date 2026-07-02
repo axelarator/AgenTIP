@@ -59,10 +59,23 @@ def main(argv: list[str] | None = None) -> int:
     h.add_argument("entry")
 
     d = sub.add_parser("add-detection")
-    d.add_argument("name")
     d.add_argument("detection_id")
     d.add_argument("description")
+    d.add_argument("technique_ids", help="comma-separated ATT&CK technique IDs this detection covers")
     d.add_argument("status", nargs="?", default="draft")
+    d.add_argument("--cluster", help="cluster this investigation came from (optional provenance); "
+                                      "also returns that cluster's refreshed view")
+
+    tu = sub.add_parser("get-technique-usage")
+    tu.add_argument("technique_id", nargs="?", default=None,
+                     help="omit for the full matrix across every tracked technique")
+
+    rel = sub.add_parser("add-relationship")
+    rel.add_argument("name")
+    rel.add_argument("relationship_type", help='e.g. "uses", "related-to"')
+    rel.add_argument("target_cluster")
+    rel.add_argument("--description", default="")
+    rel.add_argument("--source", default="")
 
     gap = sub.add_parser("add-gap")
     gap.add_argument("name")
@@ -115,8 +128,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "append-hunt-log":
             _print(core.append_hunt_log(args.name, args.entry))
         elif args.command == "add-detection":
-            _print(core.add_detection(args.name, args.detection_id,
-                                       args.description, args.status))
+            technique_ids = [t.strip() for t in args.technique_ids.split(",") if t.strip()]
+            _print(core.add_detection(args.detection_id, args.description,
+                                       technique_ids, args.status, args.cluster))
+        elif args.command == "get-technique-usage":
+            _print(core.get_technique_usage(args.technique_id))
+        elif args.command == "add-relationship":
+            _print(core.add_relationship(args.name, args.relationship_type,
+                                          args.target_cluster, args.description, args.source))
         elif args.command == "add-gap":
             _print(core.add_gap(args.name, args.description, args.priority))
         elif args.command == "export-navigator":

@@ -16,3 +16,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["cti_tools*"]
+
+[tool.setuptools.package-data]
+cti_tools = ["attack_data/*.json"]
