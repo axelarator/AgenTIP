@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import attack, report_ingest, stix
+from . import attack, pivot, report_ingest, stix
 
 # Data lives at the repo root (`<repo>/data/clusters`) so it's shared
 # across every harness surface (MCP server, CLI, any future UI) rather
@@ -458,6 +458,41 @@ def find_observable(value: str) -> dict[str, Any]:
                         "last_seen": o["last_seen"],
                     })
     return {"value": value, "matches": matches}
+
+
+def pivot_observable(value: str) -> dict[str, Any]:
+    """On-demand infrastructure pivot for a single hash/domain/ip/url
+    against free, no-recurring-cost public data sources - RDAP
+    (registration data), RIPEstat (ASN/network context, IP only), and
+    VirusTotal (reputation + resolution history, if VT_API_KEY is set
+    in the environment). Display only: nothing here is written to any
+    cluster or store, unlike ingest_report. If a pivot surfaces
+    something worth keeping, record it yourself via append_hunt_log,
+    add_gap, or by filing the new indicator into a cluster.
+
+    VirusTotal is skipped (with a note, not an error) if VT_API_KEY
+    isn't configured - RDAP and RIPEstat need no key at all and always
+    run for the observable types they apply to.
+    """
+    kind = pivot.classify(value)
+    result: dict[str, Any] = {"value": value, "kind": kind}
+
+    if kind in ("domain", "ip"):
+        result["rdap"] = pivot.rdap_lookup(value, kind)
+    if kind == "ip":
+        result["ripestat"] = pivot.ripestat_lookup(value)
+
+    api_key = os.environ.get(pivot.VT_API_KEY_ENV)
+    if not api_key:
+        result["virustotal"] = {
+            "skipped": f"set {pivot.VT_API_KEY_ENV} to enable VirusTotal lookups"}
+    else:
+        try:
+            result["virustotal"] = pivot.virustotal_lookup(value, kind, api_key)
+        except pivot.PivotError as e:
+            result["virustotal"] = {"error": str(e)}
+
+    return result
 
 
 def analyze_report(source: str) -> dict[str, Any]:

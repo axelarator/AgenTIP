@@ -128,6 +128,17 @@ def find_observable(value: str) -> dict:
 
 
 @mcp.tool()
+def pivot_observable(value: str) -> dict:
+    """On-demand infrastructure pivot for a hash/domain/ip/url against
+    free public sources: RDAP (registration data), RIPEstat (ASN/
+    network, IP only), and VirusTotal (reputation + resolution
+    history, if VT_API_KEY is set - skipped gracefully otherwise).
+    Display only - nothing is written to any cluster; record anything
+    worth keeping yourself via append_hunt_log/add_gap/etc."""
+    return core.pivot_observable(value)
+
+
+@mcp.tool()
 def analyze_report(source: str) -> dict:
     """Fetch a threat report (URL or local file path) and extract
     observables/ATT&CK TTPs/candidate cluster names WITHOUT writing

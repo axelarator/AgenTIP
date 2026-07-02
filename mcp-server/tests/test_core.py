@@ -425,3 +425,69 @@ def test_export_stix_ecosystem_single_cluster_no_relationships():
     intrusion_sets = [o for o in bundle["objects"] if o["type"] == "intrusion-set"]
     assert len(intrusion_sets) == 1
     assert intrusion_sets[0]["name"] == "Lonely Cluster"
+
+
+# --- pivot_observable orchestration -----------------------------------------
+
+def test_pivot_observable_domain_calls_rdap_not_ripestat(monkeypatch):
+    monkeypatch.delenv("VT_API_KEY", raising=False)
+    monkeypatch.setattr(core.pivot, "rdap_lookup", lambda value, kind: {"handle": "H"})
+    result = core.pivot_observable("example.com")
+    assert result["kind"] == "domain"
+    assert result["rdap"] == {"handle": "H"}
+    assert "ripestat" not in result
+    assert "skipped" in result["virustotal"]
+
+
+def test_pivot_observable_ip_calls_rdap_and_ripestat(monkeypatch):
+    monkeypatch.delenv("VT_API_KEY", raising=False)
+    monkeypatch.setattr(core.pivot, "rdap_lookup", lambda value, kind: {"handle": "IP-H"})
+    monkeypatch.setattr(core.pivot, "ripestat_lookup", lambda ip: {"asn": [999]})
+    result = core.pivot_observable("1.2.3.4")
+    assert result["kind"] == "ip"
+    assert result["rdap"] == {"handle": "IP-H"}
+    assert result["ripestat"] == {"asn": [999]}
+
+
+def test_pivot_observable_hash_skips_rdap_and_ripestat(monkeypatch):
+    monkeypatch.delenv("VT_API_KEY", raising=False)
+    result = core.pivot_observable("098f6bcd4621d373cade4e832627b4f6")
+    assert result["kind"] == "hash"
+    assert "rdap" not in result
+    assert "ripestat" not in result
+    assert "skipped" in result["virustotal"]
+
+
+def test_pivot_observable_virustotal_skipped_without_key(monkeypatch):
+    monkeypatch.delenv("VT_API_KEY", raising=False)
+    result = core.pivot_observable("example.com")
+    assert "skipped" in result["virustotal"]
+    assert "VT_API_KEY" in result["virustotal"]["skipped"]
+
+
+def test_pivot_observable_virustotal_used_with_key(monkeypatch):
+    monkeypatch.setenv("VT_API_KEY", "fake-key")
+    monkeypatch.setattr(core.pivot, "rdap_lookup", lambda value, kind: {})
+    monkeypatch.setattr(core.pivot, "virustotal_lookup",
+                         lambda value, kind, api_key: {"reputation": 10, "key_used": api_key})
+    result = core.pivot_observable("example.com")
+    assert result["virustotal"] == {"reputation": 10, "key_used": "fake-key"}
+
+
+def test_pivot_observable_virustotal_error_is_contained(monkeypatch):
+    monkeypatch.setenv("VT_API_KEY", "fake-key")
+    monkeypatch.setattr(core.pivot, "rdap_lookup", lambda value, kind: {})
+
+    def raise_error(value, kind, api_key):
+        raise core.pivot.PivotError("vt down")
+    monkeypatch.setattr(core.pivot, "virustotal_lookup", raise_error)
+    result = core.pivot_observable("example.com")
+    assert "error" in result["virustotal"]
+
+
+def test_pivot_observable_does_not_write_to_any_cluster():
+    core.create_cluster("Pivot Side Effect Test")
+    before = core.get_cluster("Pivot Side Effect Test")
+    core.pivot_observable("example.com")
+    after = core.get_cluster("Pivot Side Effect Test")
+    assert before == after

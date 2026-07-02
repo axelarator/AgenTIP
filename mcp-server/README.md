@@ -1,15 +1,21 @@
 # cti-tools
 
-Self-hosted MCP server + CLI for threat cluster tracking. No external
-API calls at runtime — everything is local JSON under `../data/clusters/`
-(shared at the repo root so every harness surface sees the same store),
-with a regenerated markdown view alongside each. `core.py` is the single
-source of truth; `stix.py`, `server.py`, and `cli.py` are thin surfaces
-over it, which is what makes the same tool behave identically whether
-it's called over MCP, over Bash, or exported as STIX. `attack.py` bundles
-a static, offline MITRE ATT&CK technique lookup (see "MITRE ATT&CK
-technique validation" below) — the one static reference dataset in the
-repo, refreshed occasionally and offline, not fetched per call.
+Self-hosted MCP server + CLI for threat cluster tracking. Cluster
+tracking itself makes no external API calls — everything is local JSON
+under `../data/clusters/` (shared at the repo root so every harness
+surface sees the same store), with a regenerated markdown view
+alongside each. `core.py` is the single source of truth; `stix.py`,
+`server.py`, and `cli.py` are thin surfaces over it, which is what makes
+the same tool behave identically whether it's called over MCP, over
+Bash, or exported as STIX. `attack.py` bundles a static, offline MITRE
+ATT&CK technique lookup (see "MITRE ATT&CK technique validation" below)
+— the one static reference dataset in the repo, refreshed occasionally
+and offline, not fetched per call.
+
+The one deliberate exception is `pivot_observable` (see "Infrastructure
+pivoting" below): an opt-in, per-call lookup against free third-party
+data sources, never automatic and never triggered by anything else in
+this tool.
 
 ## Install
 
@@ -253,9 +259,53 @@ or url, which tracked clusters have seen it. The observable counterpart
 to `get_technique_usage`; there's no separate index to keep in sync, it
 just scans every tracked cluster the same way `get_technique_usage` does.
 
+## Infrastructure pivoting
+
+`pivot_observable(value)` / `cti pivot-observable <value>` is an
+on-demand "what else is tied to this indicator" lookup against free,
+no-recurring-cost public sources — deliberately *not* Censys/hunt.io/
+Validin, which are paid. It's the one place this tool makes an outbound
+call to a third party that isn't a report URL you handed it yourself,
+and it only ever runs when explicitly called — never automatically, never
+on a schedule. Nothing it returns is written anywhere; it's display-only.
+If a pivot surfaces something worth keeping, record it yourself
+(`append_hunt_log`, `add_gap`, or file the new indicator into a cluster).
+
+Sources, all implemented in `pivot.py`:
+
+- **RDAP** (WHOIS's standardized successor) via the public `rdap.org`
+  bootstrap redirector — no API key. Domain/IP lookups only: registrar/
+  registrant handle, registration/expiry/transfer events, nameservers.
+- **RIPEstat**'s free Data API — no API key. IP lookups only: ASN,
+  routing prefix, AS holder name, geolocation. Despite the name, it
+  covers globally routed space, not just the RIPE region.
+- **VirusTotal** public API v3 — requires your own free API key
+  (`VT_API_KEY` env var; get one at virustotal.com). Rate-limited (4
+  req/min, 500/day as of writing), so fine for on-demand single lookups,
+  not bulk sweeps. Domain/IP lookups include VT's resolution history
+  (its passive-DNS equivalent); hash lookups return detection verdicts
+  and known filenames; URL lookups return detection verdicts. Skipped
+  with a note (not an error) if `VT_API_KEY` isn't set — RDAP/RIPEstat
+  still run.
+
+Which sources run depends on the observable's type (`pivot.classify`):
+domain → RDAP + VT; ip → RDAP + RIPEstat + VT; hash/url → VT only. A
+failure in one source doesn't kill the whole lookup — RIPEstat's three
+sub-calls and RDAP each record their own failure independently, and a
+VirusTotal failure surfaces as `{"error": ...}` in its own section
+rather than raising.
+
+This was deliberately scoped to display-only, on-demand lookups for now
+— no caching, no scheduled re-checking of already-tracked observables
+for infrastructure changes. That's a real next step (see the project's
+own notes) but needs a diff/cache store designed first; don't add one
+speculatively.
+
 ## Extending toward Censys / hunt.io / Validin
 
-Add new functions to `core.py` (e.g. `censys_query(cert_hash)`), mirror
+If you do want a paid source later (better bulk/pivot throughput than
+the free stack above), the pattern is the same one `pivot.py` follows:
+add new functions to `core.py` (e.g. `censys_query(cert_hash)`), mirror
 them as a tool in `server.py` and a subcommand in `cli.py`, and mention
 them in the skill's "Tool availability" section. Keep API keys out of
 this repo — read them from environment variables in `core.py`, never
