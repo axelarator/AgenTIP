@@ -259,6 +259,14 @@ or url, which tracked clusters have seen it. The observable counterpart
 to `get_technique_usage`; there's no separate index to keep in sync, it
 just scans every tracked cluster the same way `get_technique_usage` does.
 
+`add_observable(name, category, value, source)` / `cti add-observable
+<name> <hashes|domains|ips|urls> <value> <source>` manually files a
+single observable onto a cluster — the counterpart to `ingest_report`'s
+automatic extraction, for an indicator that didn't come from a
+parseable report (a `pivot_observable` finding, something told to you
+directly). Same dedup/provenance semantics as `ingest_report`: a value
+already tracked just gets `source` appended to its provenance list.
+
 ## Infrastructure pivoting
 
 `pivot_observable(value)` / `cti pivot-observable <value>` is an
@@ -294,6 +302,13 @@ failure in one source doesn't kill the whole lookup — RIPEstat's three
 sub-calls and RDAP each record their own failure independently, and a
 VirusTotal failure surfaces as `{"error": ...}` in its own section
 rather than raising.
+
+If a pivot turns up something worth keeping as a tracked indicator (not
+just narrative), use `add_observable` to file it in with a source
+citation describing the pivot (e.g. `"pivot_observable(signspace.cloud)
+via VirusTotal resolution history, checked 2026-07-02"`), rather than a
+bare local file path — `add_observable` doesn't require the source to
+look like a report URL the way `ingest_report`'s sources do.
 
 This was deliberately scoped to display-only, on-demand lookups for now
 — no caching, no scheduled re-checking of already-tracked observables

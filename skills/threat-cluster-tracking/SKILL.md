@@ -82,11 +82,14 @@ domain still doing anything." Reach for it when:
 
 This is explicitly on-demand and display-only — nothing from a pivot is
 written to any cluster automatically. If it surfaces something worth
-keeping (a new related indicator, confirmation something's dead), record
-it yourself: `append_hunt_log` for narrative, `add_gap` if it's a lead
-you haven't run down yet, or file a genuinely new indicator into the
-right cluster's observables via a fresh `ingest_report`/manual note.
-Don't treat pivot output as itself part of the cluster record.
+keeping, record it yourself: `append_hunt_log` for narrative (what the
+pivot found and why it matters), `add_gap` if it's a lead you haven't
+run down yet, and `add_observable(name, category, value, source)` for
+any new indicator worth tracking (a historical resolution, a co-hosted
+domain) — cite the pivot itself as the source (e.g. "pivot_observable
+via VirusTotal resolution history, checked <date>"), not a report URL.
+Don't treat pivot output as itself part of the cluster record until
+you've explicitly filed it.
 
 ## Ingesting threat reports
 
@@ -240,8 +243,8 @@ Prefer the MCP tools if the harness exposes them: `list_clusters`,
 `append_hunt_log`, `add_detection`, `get_technique_usage`,
 `add_relationship`, `add_gap`, `export_navigator_layer`,
 `export_stix_bundle`, `export_stix_ecosystem`, `import_stix_bundle`,
-`get_observables`, `find_observable`, `pivot_observable`,
-`analyze_report`, `ingest_report`.
+`get_observables`, `find_observable`, `add_observable`,
+`pivot_observable`, `analyze_report`, `ingest_report`.
 
 If MCP tools are not available in this harness, use the CLI directly via
 the shell/bash tool from the `mcp-server` directory (or run `./setup.sh`
@@ -264,6 +267,7 @@ python -m cti_tools.cli export-stix-ecosystem <name>
 python -m cti_tools.cli import-stix <bundle.json | -> [--name "..."] [--overwrite]
 python -m cti_tools.cli get-observables <name>
 python -m cti_tools.cli find-observable <value>
+python -m cti_tools.cli add-observable <name> <hashes|domains|ips|urls> <value> <source>
 python -m cti_tools.cli pivot-observable <value>
 python -m cti_tools.cli analyze-report <url-or-file>
 python -m cti_tools.cli ingest-report <url-or-file> [--name "..."] [--no-create]

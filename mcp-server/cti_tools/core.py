@@ -460,6 +460,23 @@ def find_observable(value: str) -> dict[str, Any]:
     return {"value": value, "matches": matches}
 
 
+def add_observable(name: str, category: str, value: str, source: str) -> dict[str, Any]:
+    """Manually file a single hash/domain/ip/url onto a cluster - the
+    counterpart to ingest_report's automatic extraction, for an
+    indicator that came from somewhere other than a parseable report
+    (e.g. a pivot_observable finding, or something told to you
+    directly). Reuses the exact same dedup/provenance logic as
+    ingest_report: a value already tracked just gets `source` appended
+    to its provenance list rather than creating a duplicate entry."""
+    if category not in ("hashes", "domains", "ips", "urls"):
+        raise ValueError('category must be one of "hashes", "domains", "ips", "urls"')
+    data = load_cluster(name)
+    extracted = {c: ([value] if c == category else []) for c in ("hashes", "domains", "ips", "urls")}
+    _merge_observables(data, extracted, source)
+    save_cluster(data)
+    return data
+
+
 def pivot_observable(value: str) -> dict[str, Any]:
     """On-demand infrastructure pivot for a single hash/domain/ip/url
     against free, no-recurring-cost public data sources - RDAP

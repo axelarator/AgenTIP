@@ -491,3 +491,28 @@ def test_pivot_observable_does_not_write_to_any_cluster():
     core.pivot_observable("example.com")
     after = core.get_cluster("Pivot Side Effect Test")
     assert before == after
+
+
+# --- manual observable entry -------------------------------------------------
+
+def test_add_observable_files_new_entry():
+    core.create_cluster("Manual Observable Test")
+    data = core.add_observable("Manual Observable Test", "ips", "31.59.58.9",
+                                "VirusTotal pivot on signspace.cloud (resolution history)")
+    ip = next(o for o in data["observables"]["ips"] if o["value"] == "31.59.58.9")
+    assert ip["sources"] == ["VirusTotal pivot on signspace.cloud (resolution history)"]
+
+
+def test_add_observable_dedupes_by_value_appends_source():
+    core.create_cluster("Manual Observable Dedup Test")
+    core.add_observable("Manual Observable Dedup Test", "domains", "evil.example", "source A")
+    data = core.add_observable("Manual Observable Dedup Test", "domains", "evil.example", "source B")
+    domain = next(o for o in data["observables"]["domains"] if o["value"] == "evil.example")
+    assert domain["sources"] == ["source A", "source B"]
+    assert len(data["observables"]["domains"]) == 1
+
+
+def test_add_observable_bad_category_raises():
+    core.create_cluster("Bad Category Test")
+    with pytest.raises(ValueError):
+        core.add_observable("Bad Category Test", "bogus", "value", "source")

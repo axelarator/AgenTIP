@@ -128,6 +128,16 @@ def find_observable(value: str) -> dict:
 
 
 @mcp.tool()
+def add_observable(name: str, category: str, value: str, source: str) -> dict:
+    """Manually file a single hash/domain/ip/url onto a cluster - the
+    counterpart to ingest_report's automatic extraction, for an
+    indicator from somewhere other than a parseable report (e.g. a
+    pivot_observable finding). category must be one of "hashes",
+    "domains", "ips", "urls". Dedupes by value like ingest_report does."""
+    return core.add_observable(name, category, value, source)
+
+
+@mcp.tool()
 def pivot_observable(value: str) -> dict:
     """On-demand infrastructure pivot for a hash/domain/ip/url against
     free public sources: RDAP (registration data), RIPEstat (ASN/

@@ -94,6 +94,12 @@ def main(argv: list[str] | None = None) -> int:
     po = sub.add_parser("pivot-observable")
     po.add_argument("value", help="hash, domain, ip, or url to pivot on via RDAP/RIPEstat/VirusTotal")
 
+    aob = sub.add_parser("add-observable")
+    aob.add_argument("name")
+    aob.add_argument("category", choices=["hashes", "domains", "ips", "urls"])
+    aob.add_argument("value")
+    aob.add_argument("source")
+
     ar = sub.add_parser("analyze-report")
     ar.add_argument("source", help="URL or local file path")
 
@@ -155,6 +161,8 @@ def main(argv: list[str] | None = None) -> int:
             _print(core.find_observable(args.value))
         elif args.command == "pivot-observable":
             _print(core.pivot_observable(args.value))
+        elif args.command == "add-observable":
+            _print(core.add_observable(args.name, args.category, args.value, args.source))
         elif args.command == "analyze-report":
             _print(core.analyze_report(args.source))
         elif args.command == "ingest-report":
