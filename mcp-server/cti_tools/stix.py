@@ -148,6 +148,23 @@ def to_bundle(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def merge_bundles(bundles: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge several single-cluster bundles (as produced by to_bundle)
+    into one self-contained bundle. Objects are deduplicated by id -
+    two clusters sharing an ATT&CK technique produce the same
+    deterministic Attack Pattern id, for instance, and should end up as
+    one object in the merged bundle, not two copies of it."""
+    objects_by_id: dict[str, Any] = {}
+    for bundle in bundles:
+        for obj in bundle.get("objects", []):
+            objects_by_id.setdefault(obj["id"], obj)
+    return {
+        "type": "bundle",
+        "id": f"bundle--{uuid.uuid5(_NAMESPACE, '|'.join(sorted(objects_by_id)))}",
+        "objects": list(objects_by_id.values()),
+    }
+
+
 def from_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
     """Parse a STIX 2.1 bundle into the fields `core.py` needs to
     create or merge a cluster. Raises ValueError if no Intrusion Set is

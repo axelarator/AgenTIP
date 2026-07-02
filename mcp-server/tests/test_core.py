@@ -342,3 +342,86 @@ def test_add_relationship_and_stix_roundtrip():
     imported = core.import_stix_bundle(bundle, name="Rel Source Import")
     assert imported["relationships"][0]["target_cluster"] == "Rel Target"
     assert imported["relationships"][0]["relationship_type"] == "uses"
+
+
+# --- observable reverse index -----------------------------------------------
+
+def test_find_observable_matches_across_clusters(tmp_path):
+    core.create_cluster("Observable Cluster A")
+    core.create_cluster("Observable Cluster B")
+
+    report_a = tmp_path / "a.txt"
+    report_a.write_text("Observable Cluster A seen at shared-c2[.]xyz.")
+    core.ingest_report(str(report_a), cluster_name="Observable Cluster A")
+
+    report_b = tmp_path / "b.txt"
+    report_b.write_text("Observable Cluster B also seen at shared-c2[.]xyz.")
+    core.ingest_report(str(report_b), cluster_name="Observable Cluster B")
+
+    result = core.find_observable("shared-c2.xyz")
+    clusters = {m["cluster"] for m in result["matches"]}
+    assert clusters == {"Observable Cluster A", "Observable Cluster B"}
+    assert all(m["category"] == "domains" for m in result["matches"])
+
+
+def test_find_observable_matches_hash_with_or_without_prefix(tmp_path):
+    core.create_cluster("Hash Cluster")
+    report = tmp_path / "hash.txt"
+    report.write_text("Hash Cluster dropped 098f6bcd4621d373cade4e832627b4f6 on disk.")
+    core.ingest_report(str(report), cluster_name="Hash Cluster")
+
+    bare = core.find_observable("098f6bcd4621d373cade4e832627b4f6")
+    prefixed = core.find_observable("md5:098f6bcd4621d373cade4e832627b4f6")
+    assert len(bare["matches"]) == 1
+    assert len(prefixed["matches"]) == 1
+    assert bare["matches"][0]["cluster"] == "Hash Cluster"
+
+
+def test_find_observable_no_match():
+    core.create_cluster("Empty Observable Cluster")
+    result = core.find_observable("never-seen-anywhere.example")
+    assert result["matches"] == []
+
+
+# --- multi-cluster STIX ecosystem export ------------------------------------
+
+def test_export_stix_ecosystem_includes_related_clusters():
+    core.create_cluster("Ecosystem A")
+    core.create_cluster("Ecosystem B")
+    core.create_cluster("Ecosystem C")
+    core.add_relationship("Ecosystem A", "uses", "Ecosystem B", description="A uses B")
+    core.add_relationship("Ecosystem B", "uses", "Ecosystem C", description="B uses C")
+
+    bundle = core.export_stix_ecosystem("Ecosystem A")
+    intrusion_sets = {o["name"] for o in bundle["objects"] if o["type"] == "intrusion-set"}
+    assert intrusion_sets == {"Ecosystem A", "Ecosystem B", "Ecosystem C"}
+
+    # every relationship's target_ref must resolve to an object actually in the bundle
+    ids_in_bundle = {o["id"] for o in bundle["objects"]}
+    for rel in (o for o in bundle["objects"] if o["type"] == "relationship"):
+        assert rel["target_ref"] in ids_in_bundle
+
+
+def test_export_stix_ecosystem_dedupes_shared_technique():
+    core.create_cluster("Ecosystem D")
+    core.create_cluster("Ecosystem E")
+    core.add_relationship("Ecosystem D", "related-to", "Ecosystem E")
+    core.update_ttp("Ecosystem D", "T1566", "Phishing", 1)
+    core.update_ttp("Ecosystem E", "T1566", "Phishing", 2)
+
+    bundle = core.export_stix_ecosystem("Ecosystem D")
+    attack_patterns = [o for o in bundle["objects"] if o["type"] == "attack-pattern"]
+    assert len(attack_patterns) == 1  # same technique -> same deterministic id, not duplicated
+
+
+def test_export_stix_ecosystem_unknown_cluster_raises():
+    with pytest.raises(core.ClusterNotFound):
+        core.export_stix_ecosystem("Does Not Exist")
+
+
+def test_export_stix_ecosystem_single_cluster_no_relationships():
+    core.create_cluster("Lonely Cluster")
+    bundle = core.export_stix_ecosystem("Lonely Cluster")
+    intrusion_sets = [o for o in bundle["objects"] if o["type"] == "intrusion-set"]
+    assert len(intrusion_sets) == 1
+    assert intrusion_sets[0]["name"] == "Lonely Cluster"

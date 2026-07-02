@@ -55,6 +55,12 @@ timestamps. View them with `get_observables` / `cti get-observables` —
 this is the fast path to "what's tied to this cluster", instead of
 scrolling the full `get_cluster` dump.
 
+Given a hash/domain/ip/url with no cluster context yet — e.g. an IOC
+that showed up somewhere else and you want to know if it's already
+tracked — use `find_observable(value)` / `cti find-observable <value>`
+instead of checking each cluster by hand. Hash lookups work with or
+without the algo prefix (`sha256:...` or bare).
+
 ## Ingesting threat reports
 
 `ingest_report(source, cluster_name=None)` / `cti ingest-report <source>
@@ -188,7 +194,12 @@ STIX Note objects tied to the cluster's Intrusion Set.
 10. If asked to share a cluster, export it, or hand it to another
     tool/team, use `export_stix_bundle` / `cti export-stix` rather than
     serializing the JSON record directly — the STIX form is the
-    interoperable one.
+    interoperable one. If the cluster has relationships to other
+    tracked clusters and the receiving system won't already have those,
+    use `export_stix_ecosystem` / `cti export-stix-ecosystem` instead —
+    it bundles every transitively related cluster together so no
+    Relationship in the export points at an object the receiving
+    system doesn't have.
 11. If handed a STIX bundle to ingest, use `import_stix_bundle` /
     `cti import-stix`. It fails on a name collision unless you pass
     `overwrite`/`--overwrite`, which merges rather than replaces
@@ -201,8 +212,8 @@ Prefer the MCP tools if the harness exposes them: `list_clusters`,
 `get_cluster`, `create_cluster`, `update_profile`, `update_ttp`,
 `append_hunt_log`, `add_detection`, `get_technique_usage`,
 `add_relationship`, `add_gap`, `export_navigator_layer`,
-`export_stix_bundle`, `import_stix_bundle`, `get_observables`,
-`analyze_report`, `ingest_report`.
+`export_stix_bundle`, `export_stix_ecosystem`, `import_stix_bundle`,
+`get_observables`, `find_observable`, `analyze_report`, `ingest_report`.
 
 If MCP tools are not available in this harness, use the CLI directly via
 the shell/bash tool from the `mcp-server` directory (or run `./setup.sh`
@@ -221,8 +232,10 @@ python -m cti_tools.cli add-relationship <name> <relationship_type> <target_clus
 python -m cti_tools.cli add-gap <name> "<description>" <priority>
 python -m cti_tools.cli export-navigator <name>
 python -m cti_tools.cli export-stix <name>
+python -m cti_tools.cli export-stix-ecosystem <name>
 python -m cti_tools.cli import-stix <bundle.json | -> [--name "..."] [--overwrite]
 python -m cti_tools.cli get-observables <name>
+python -m cti_tools.cli find-observable <value>
 python -m cti_tools.cli analyze-report <url-or-file>
 python -m cti_tools.cli ingest-report <url-or-file> [--name "..."] [--no-create]
 ```

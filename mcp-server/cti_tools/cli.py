@@ -88,6 +88,9 @@ def main(argv: list[str] | None = None) -> int:
     obs = sub.add_parser("get-observables")
     obs.add_argument("name")
 
+    fo = sub.add_parser("find-observable")
+    fo.add_argument("value", help="hash (with or without algo prefix), domain, ip, or url")
+
     ar = sub.add_parser("analyze-report")
     ar.add_argument("source", help="URL or local file path")
 
@@ -99,6 +102,9 @@ def main(argv: list[str] | None = None) -> int:
 
     es = sub.add_parser("export-stix")
     es.add_argument("name")
+
+    ee = sub.add_parser("export-stix-ecosystem")
+    ee.add_argument("name")
 
     ims = sub.add_parser("import-stix")
     ims.add_argument("bundle_path", help="path to a STIX 2.1 bundle JSON file, or '-' for stdin")
@@ -142,6 +148,8 @@ def main(argv: list[str] | None = None) -> int:
             _print(core.export_navigator_layer(args.name))
         elif args.command == "get-observables":
             _print(core.get_observables(args.name))
+        elif args.command == "find-observable":
+            _print(core.find_observable(args.value))
         elif args.command == "analyze-report":
             _print(core.analyze_report(args.source))
         elif args.command == "ingest-report":
@@ -149,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
                                        create_if_missing=not args.no_create))
         elif args.command == "export-stix":
             _print(core.export_stix_bundle(args.name))
+        elif args.command == "export-stix-ecosystem":
+            _print(core.export_stix_ecosystem(args.name))
         elif args.command == "import-stix":
             raw = sys.stdin.read() if args.bundle_path == "-" else open(args.bundle_path).read()
             bundle = json.loads(raw)

@@ -430,6 +430,36 @@ def get_observables(name: str) -> dict[str, Any]:
     }
 
 
+def find_observable(value: str) -> dict[str, Any]:
+    """Reverse index from an observable value to the clusters that have
+    seen it - the symmetric counterpart to get_technique_usage(), but
+    for hashes/domains/ips/urls instead of ATT&CK techniques. Scans
+    every tracked cluster (there's no separate observable index to keep
+    in sync, consistent with how get_technique_usage is computed).
+
+    A hash value matches whether or not you include its algo prefix -
+    passing either "sha256:abc..." or bare "abc..." finds the same
+    entries, since callers often only have the bare hash on hand."""
+    needle = value.strip().lower()
+    matches = []
+    for cname in list_clusters():
+        data = load_cluster(cname)
+        for category in ("hashes", "domains", "ips", "urls"):
+            for o in data["observables"][category]:
+                stored = o["value"].lower()
+                bare = stored.split(":", 1)[1] if category == "hashes" and ":" in stored else stored
+                if needle in (stored, bare):
+                    matches.append({
+                        "cluster": data["name"],
+                        "category": category,
+                        "value": o["value"],
+                        "sources": o["sources"],
+                        "first_seen": o["first_seen"],
+                        "last_seen": o["last_seen"],
+                    })
+    return {"value": value, "matches": matches}
+
+
 def analyze_report(source: str) -> dict[str, Any]:
     """Fetch a report (URL or local file path) and extract observables,
     ATT&CK technique IDs, and candidate cluster names, WITHOUT writing
@@ -552,6 +582,44 @@ def export_stix_bundle(name: str) -> dict[str, Any]:
     Patterns + Relationships + Notes) for sharing outside this tool."""
     data = load_cluster(name)
     return stix.to_bundle(data)
+
+
+def export_stix_ecosystem(name: str) -> dict[str, Any]:
+    """Export this cluster and every cluster it's (transitively) related
+    to via add_relationship as one self-contained STIX 2.1 bundle.
+
+    export_stix_bundle only exports one cluster's own Intrusion Set, so
+    a cross-cluster Relationship's target_ref points at a STIX id that
+    isn't actually an object in that bundle - fine if the receiving
+    system already tracks the target cluster, a dangling reference if
+    not. This walks the relationship graph outward from `name` (via
+    each visited cluster's own `relationships`) and merges every
+    reachable cluster's bundle into one, so every Relationship's target
+    is guaranteed to be present as an object. A relationship pointing
+    at a since-renamed/deleted cluster is skipped rather than failing
+    the whole export.
+    """
+    visited: dict[str, dict[str, Any]] = {}
+    queue = [name]
+    while queue:
+        cname = queue.pop(0)
+        if cname in visited:
+            continue
+        try:
+            data = load_cluster(cname)
+        except ClusterNotFound:
+            continue
+        visited[cname] = data
+        for rel in data.get("relationships", []):
+            target = rel["target_cluster"]
+            if target not in visited:
+                queue.append(target)
+
+    if name not in visited:
+        raise ClusterNotFound(f"No cluster named {name!r}")
+
+    bundles = [stix.to_bundle(data) for data in visited.values()]
+    return stix.merge_bundles(bundles)
 
 
 def import_stix_bundle(bundle: dict[str, Any], name: str | None = None,

@@ -192,6 +192,21 @@ existing gaps). Detections aren't part of the bundle at all — they're
 resolved locally by joining the imported TTPs against your own
 detection registry.
 
+`export_stix_bundle` only ever includes *this* cluster's own Intrusion
+Set — a cross-cluster Relationship's `target_ref` points at another
+cluster's `stix_id`, but that target object isn't itself in the bundle,
+so a receiving system without it already loaded gets a dangling
+reference. `export_stix_ecosystem(name)` / `cti export-stix-ecosystem
+<name>` fixes that: it walks the relationship graph outward from
+`name` (via every visited cluster's own `relationships`), exports each
+reachable cluster, and merges them into one bundle via
+`stix.merge_bundles` (deduplicating objects by id, so a technique two
+clusters share doesn't end up as two copies of the same Attack
+Pattern). Every Relationship's target is guaranteed to resolve to an
+actual object in the result. A relationship pointing at a
+since-renamed/deleted cluster is skipped rather than failing the whole
+export.
+
 This is hand-rolled JSON, not the `stix2` library — the object graph is
 small and a hard dependency on a validating library isn't worth it for a
 tool whose whole design point is "no external services, minimal deps."
@@ -231,6 +246,12 @@ unlikely for the report at hand.
 hashes/domains/ips/urls tracked for a cluster (with provenance and
 first/last seen) plus the list of report sources ingested — the fast
 path to "what's tied to this cluster" instead of the full cluster dump.
+
+`find_observable(value)` / `cti find-observable <value>` goes the other
+direction — given a hash (with or without its algo prefix), domain, ip,
+or url, which tracked clusters have seen it. The observable counterpart
+to `get_technique_usage`; there's no separate index to keep in sync, it
+just scans every tracked cluster the same way `get_technique_usage` does.
 
 ## Extending toward Censys / hunt.io / Validin
 

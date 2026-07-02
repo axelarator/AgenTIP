@@ -119,6 +119,15 @@ def get_observables(name: str) -> dict:
 
 
 @mcp.tool()
+def find_observable(value: str) -> dict:
+    """Reverse index from an observable value (hash - with or without
+    its algo prefix - domain, ip, or url) to every tracked cluster that
+    has seen it, with provenance and first/last seen. The symmetric
+    counterpart to get_technique_usage, but for IOCs."""
+    return core.find_observable(value)
+
+
+@mcp.tool()
 def analyze_report(source: str) -> dict:
     """Fetch a threat report (URL or local file path) and extract
     observables/ATT&CK TTPs/candidate cluster names WITHOUT writing
@@ -143,6 +152,16 @@ def export_stix_bundle(name: str) -> dict:
     """Export a cluster as a STIX 2.1 bundle (Intrusion Set, Attack
     Patterns, Relationships, Notes) for sharing with other tools/orgs."""
     return core.export_stix_bundle(name)
+
+
+@mcp.tool()
+def export_stix_ecosystem(name: str) -> dict:
+    """Export this cluster and every cluster it's transitively related
+    to (via add_relationship) as one self-contained STIX 2.1 bundle -
+    unlike export_stix_bundle, every cross-cluster Relationship's
+    target is guaranteed to actually be present as an object, not just
+    referenced by id."""
+    return core.export_stix_ecosystem(name)
 
 
 @mcp.tool()
