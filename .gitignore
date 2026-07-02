@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+
+# Local cluster data. Threat intel tracked here is often sensitive/
+# org-specific, so it's not committed by default — fork this repo or
+# point CTI_DATA_DIR at a separate (possibly private) data repo if you
+# want cluster JSON under version control.
+data/clusters/*
+!data/clusters/.gitkeep
+
+# Harness-local state
+.claude/settings.local.json

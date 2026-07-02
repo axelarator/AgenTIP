@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "cti-tools": {
+      "type": "stdio",
+      "command": "/home/axelarator/cti-agent/mcp-server/.venv/bin/python",
+      "args": ["-m", "cti_tools.server"],
+      "cwd": "/home/axelarator/cti-agent/mcp-server",
+      "env": {}
+    }
+  }
+}

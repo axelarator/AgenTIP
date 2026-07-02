@@ -1,0 +1,126 @@
+---
+name: threat-cluster-tracking
+description: Use when the user is investigating, naming, or updating a threat actor cluster; asks to log a hunt, update ATT&CK/TTP coverage, record a detection, or note a gap; or mentions tracking infrastructure/campaign activity over time. Provides the workflow and data model for maintaining persistent cluster profiles instead of one-off notes.
+---
+
+# Threat cluster tracking
+
+This skill maintains durable, structured cluster profiles instead of
+disposable investigation notes. Each cluster is a JSON record with a
+rendered markdown view, backed by the `cti-tools` MCP server (or its CLI
+equivalent — see "Tool availability" below). Clusters are modeled so
+they can be losslessly exported as STIX 2.1 (Intrusion Set + Attack
+Pattern + Relationship + Note objects) for sharing outside this tool.
+
+## When to create vs. update a cluster
+
+- New named activity with no existing profile and enough signal for at
+  least one Diamond Model corner (adversary, capability, infrastructure,
+  or victim) → create a cluster.
+- Activity that maps to JA4/JA4S/JA4X reuse, certificate reuse, ASN
+  patterns, or TTPs already logged under an existing cluster → update
+  that cluster, do not create a duplicate.
+- If unsure whether two clusters are the same actor, log both separately
+  with a note in each hunt log cross-referencing the other, and record
+  the other cluster's name in `aliases` only once you're confident
+  enough to actually merge — do not merge speculatively.
+- Receiving a STIX bundle from another team/tool that anchors on an
+  Intrusion Set → import it (`import_stix_bundle` / `cti import-stix`)
+  rather than hand-transcribing it into a new cluster.
+
+## Cluster fields
+
+- **Diamond Model** (`adversary`, `capability`, `infrastructure`,
+  `victim`) — fill in only what's evidenced. Leave a field explicitly
+  `unknown` rather than guessing; a visible gap is more useful than a
+  false positive you can't take back.
+- **Profile metadata** (`aliases`, `confidence` 0–100, `first_seen`,
+  `last_seen`) — these map directly onto STIX Intrusion Set properties.
+  Set them with `update_profile` / `cti update-profile` as they become
+  known; don't leave them stuck at cluster-creation defaults once you
+  have signal.
+- **STIX ID** — minted once at cluster creation and never changes. It's
+  what lets a re-exported bundle be recognized as an update to the same
+  Intrusion Set rather than a duplicate. Don't try to set or edit it by
+  hand.
+
+## TTP coverage scale (0–4)
+
+- 0 — no coverage, technique not addressed
+- 1 — detection idea exists, not yet built
+- 2 — detection built, not yet validated against real or emulated data
+- 3 — validated, in production
+- 4 — validated, in production, and tuned against at least one observed
+  false-positive class
+
+Adjust this scale in your own copy if your detection lifecycle differs —
+what matters is that every technique has a status and it's kept current.
+Each TTP entry also becomes a STIX Attack Pattern (identified by its
+ATT&CK technique ID via `external_references`) linked to the cluster's
+Intrusion Set by a `uses` Relationship on export.
+
+## Hunt log discipline
+
+Append-only. Never edit or delete a past entry — if a hypothesis was
+wrong, add a new entry saying so. This preserves the actual investigation
+history instead of a cleaned-up retelling. Hunt log entries export as
+STIX Note objects tied to the cluster's Intrusion Set.
+
+## Workflow
+
+1. Check whether a cluster already exists (`list_clusters` /
+   `cti list-clusters`) before creating one.
+2. Create or load the cluster.
+3. As you learn Diamond Model or profile details (adversary,
+   capability, infrastructure, victim, aliases, confidence, first/last
+   seen), record them with `update_profile` / `cti update-profile` —
+   don't let them sit at `unknown` once you have evidence.
+4. As you investigate, append hunt log entries as you go, not at the end
+   from memory.
+5. When a technique is identified, upsert it into the TTP table with a
+   status — don't leave techniques implicit in prose.
+6. When a detection is written, record it in the detection inventory
+   linked to the technique it covers.
+7. When you hit something you can't currently detect or verify, add it
+   to the gaps backlog instead of letting it drop.
+8. If asked for an ATT&CK Navigator layer, export it from the cluster's
+   current TTP table rather than hand-building one — it should always
+   reflect the stored data, not a snapshot.
+9. If asked to share a cluster, export it, or hand it to another
+   tool/team, use `export_stix_bundle` / `cti export-stix` rather than
+   serializing the JSON record directly — the STIX form is the
+   interoperable one.
+10. If handed a STIX bundle to ingest, use `import_stix_bundle` /
+    `cti import-stix`. It fails on a name collision unless you pass
+    `overwrite`/`--overwrite`, which merges rather than replaces
+    (existing hunt log, detections, and gaps are preserved; TTPs and
+    notes are unioned in).
+
+## Tool availability
+
+Prefer the MCP tools if the harness exposes them: `list_clusters`,
+`get_cluster`, `create_cluster`, `update_profile`, `update_ttp`,
+`append_hunt_log`, `add_detection`, `add_gap`, `export_navigator_layer`,
+`export_stix_bundle`, `import_stix_bundle`.
+
+If MCP tools are not available in this harness, use the CLI directly via
+the shell/bash tool from the `mcp-server` directory (or run `./setup.sh`
+once from the repo root first, to create the venv and wire `.mcp.json`):
+
+```
+python -m cti_tools.cli list-clusters
+python -m cti_tools.cli get-cluster <name>
+python -m cti_tools.cli create-cluster <name> --description "..."
+python -m cti_tools.cli update-profile <name> --adversary "..." --confidence 60 --aliases "Alias A,Alias B"
+python -m cti_tools.cli update-ttp <name> <technique_id> <technique_name> <status> --notes "..."
+python -m cti_tools.cli append-hunt-log <name> "<entry>"
+python -m cti_tools.cli add-detection <name> <detection_id> "<description>" <status>
+python -m cti_tools.cli add-gap <name> "<description>" <priority>
+python -m cti_tools.cli export-navigator <name>
+python -m cti_tools.cli export-stix <name>
+python -m cti_tools.cli import-stix <bundle.json | -> [--name "..."] [--overwrite]
+```
+
+Both paths write to the same JSON store, so the data is identical
+regardless of which harness you're running in — this is what makes the
+harness comparison meaningful.

@@ -1,0 +1,139 @@
+"""Tests for cti_tools.core. Run with:
+
+    cd mcp-server && source .venv/bin/activate && pip install -e '.[test]'
+    pytest
+"""
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from cti_tools import core
+
+
+@pytest.fixture(autouse=True)
+def isolated_data_dir(tmp_path, monkeypatch):
+    """Never touch the real data/clusters/ directory from tests."""
+    monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+    yield tmp_path
+
+
+def test_create_and_get_cluster():
+    core.create_cluster("Test Cluster", description="desc")
+    data = core.get_cluster("Test Cluster")
+    assert data["name"] == "Test Cluster"
+    assert data["description"] == "desc"
+    assert data["stix_id"].startswith("intrusion-set--")
+
+
+def test_create_duplicate_fails():
+    core.create_cluster("Dup")
+    with pytest.raises(FileExistsError):
+        core.create_cluster("Dup")
+
+
+def test_get_missing_cluster_raises():
+    with pytest.raises(core.ClusterNotFound):
+        core.get_cluster("Nope")
+
+
+def test_update_profile_partial():
+    core.create_cluster("Profile Test")
+    core.update_profile("Profile Test", adversary="APT-Fake", confidence=70)
+    data = core.get_cluster("Profile Test")
+    assert data["diamond"]["adversary"] == "APT-Fake"
+    assert data["confidence"] == 70
+    assert data["diamond"]["capability"] == "unknown"  # untouched
+
+
+def test_update_profile_bad_confidence():
+    core.create_cluster("Bad Confidence")
+    with pytest.raises(ValueError):
+        core.update_profile("Bad Confidence", confidence=150)
+
+
+def test_update_ttp_insert_and_upsert():
+    core.create_cluster("TTP Test")
+    core.update_ttp("TTP Test", "T1059", "Command and Scripting Interpreter", 1)
+    data = core.update_ttp("TTP Test", "T1059", "Command and Scripting Interpreter", 3, notes="validated")
+    assert len(data["ttps"]) == 1
+    assert data["ttps"][0]["status"] == 3
+    assert data["ttps"][0]["notes"] == "validated"
+
+
+def test_update_ttp_bad_status():
+    core.create_cluster("Bad Status")
+    with pytest.raises(ValueError):
+        core.update_ttp("Bad Status", "T1059", "x", 9)
+
+
+def test_hunt_log_append_only():
+    core.create_cluster("Hunt Log Test")
+    core.append_hunt_log("Hunt Log Test", "first")
+    data = core.append_hunt_log("Hunt Log Test", "second")
+    assert [h["entry"] for h in data["hunt_log"]] == ["first", "second"]
+
+
+def test_navigator_layer_shape():
+    core.create_cluster("Nav Test")
+    core.update_ttp("Nav Test", "T1059", "Command and Scripting Interpreter", 4)
+    layer = core.export_navigator_layer("Nav Test")
+    assert layer["domain"] == "enterprise-attack"
+    assert layer["techniques"][0]["techniqueID"] == "T1059"
+    assert layer["techniques"][0]["score"] == 4
+
+
+def test_stix_export_roundtrip():
+    core.create_cluster("Stix Test", description="desc")
+    core.update_profile("Stix Test", aliases=["Alias A"], first_seen="2026-01-01")
+    core.update_ttp("Stix Test", "T1059.001", "PowerShell", 2, notes="loader stage")
+    core.append_hunt_log("Stix Test", "beacon confirmed")
+
+    bundle = core.export_stix_bundle("Stix Test")
+    assert bundle["type"] == "bundle"
+    types = {o["type"] for o in bundle["objects"]}
+    assert types == {"intrusion-set", "attack-pattern", "relationship", "note"}
+
+    imported = core.import_stix_bundle(bundle, name="Stix Import")
+    assert imported["name"] == "Stix Import"
+    assert imported["aliases"] == ["Alias A"]
+    assert imported["ttps"][0]["id"] == "T1059.001"
+    assert imported["hunt_log"][0]["entry"] == "beacon confirmed"
+
+
+def test_stix_attack_pattern_ids_are_deterministic():
+    core.create_cluster("Determinism A")
+    core.create_cluster("Determinism B")
+    core.update_ttp("Determinism A", "T1566", "Phishing", 1)
+    core.update_ttp("Determinism B", "T1566", "Phishing", 3)
+
+    bundle_a = core.export_stix_bundle("Determinism A")
+    bundle_b = core.export_stix_bundle("Determinism B")
+
+    ap_a = next(o for o in bundle_a["objects"] if o["type"] == "attack-pattern")
+    ap_b = next(o for o in bundle_b["objects"] if o["type"] == "attack-pattern")
+    assert ap_a["id"] == ap_b["id"]
+
+
+def test_import_stix_requires_intrusion_set():
+    with pytest.raises(ValueError):
+        core.import_stix_bundle({"type": "bundle", "objects": []})
+
+
+def test_import_stix_existing_cluster_requires_overwrite():
+    core.create_cluster("Collision")
+    bundle = core.export_stix_bundle("Collision")
+    with pytest.raises(FileExistsError):
+        core.import_stix_bundle(bundle, name="Collision")
+    # succeeds with overwrite=True
+    core.import_stix_bundle(bundle, name="Collision", overwrite=True)
+
+
+def test_markdown_regenerated_on_save(tmp_path):
+    core.create_cluster("Markdown Test")
+    md_path = tmp_path / "markdown-test.md"
+    assert md_path.exists()
+    content = md_path.read_text()
+    assert "STIX ID" in content
+    assert "Markdown Test" in content
