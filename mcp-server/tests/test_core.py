@@ -709,6 +709,14 @@ def test_classify_domain_lifecycle_active_and_dead():
     assert core.pivot.classify_domain_lifecycle(rdap, None) == "unknown"
 
 
+def test_classify_domain_lifecycle_degrades_when_rdap_errors():
+    # RDAP timed out/failed (dict carries only an "error"), but the name
+    # still resolves -> classify from resolution instead of "unknown".
+    assert core.pivot.classify_domain_lifecycle({"error": "timed out"}, ["1.2.3.4"]) == "active"
+    assert core.pivot.classify_domain_lifecycle({"error": "timed out"}, []) == "dead"
+    assert core.pivot.classify_domain_lifecycle({"error": "timed out"}, None) == "unknown"
+
+
 def test_classify_ip_lifecycle():
     assert core.pivot.classify_ip_lifecycle({"prefix": "185.10.0.0/16", "asn": [64500]}) == "routed"
     assert core.pivot.classify_ip_lifecycle({"prefix": None}) == "unrouted"

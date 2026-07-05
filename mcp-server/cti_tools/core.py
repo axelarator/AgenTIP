@@ -6,6 +6,7 @@ identical. No MCP or argparse imports belong in this file.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import tempfile
@@ -725,7 +726,24 @@ def pivot_observable(value: str) -> dict[str, Any]:
     return result
 
 
-@_synchronized
+_PIVOT_CLUSTER_WORKERS = 6
+
+
+def _domain_lifecycle(value: str) -> tuple[str, dict[str, Any]]:
+    rdap = _cached_pivot("rdap", value, lambda: pivot.rdap_lookup(value, "domain"))
+    resolved = pivot.resolve_host(value)  # live, not cached — liveness is the point
+    status = pivot.classify_domain_lifecycle(rdap, resolved)
+    return status, {"resolved": resolved,
+                    "nameservers": rdap.get("nameservers") if isinstance(rdap, dict) else None}
+
+
+def _ip_lifecycle(value: str) -> tuple[str, dict[str, Any]]:
+    ripe = _cached_pivot("ripestat", value, lambda: pivot.ripestat_lookup(value))
+    status = pivot.classify_ip_lifecycle(ripe)
+    return status, {"asn": ripe.get("asn") if isinstance(ripe, dict) else None,
+                    "prefix": ripe.get("prefix") if isinstance(ripe, dict) else None}
+
+
 def pivot_cluster(name: str) -> dict[str, Any]:
     """Sweep every tracked domain and IP for a cluster through the free
     pivot sources and stamp a lifecycle status onto each, turning a
@@ -735,38 +753,50 @@ def pivot_cluster(name: str) -> dict[str, Any]:
     status, the time it was checked, and the supporting detail are
     written back onto each observable (unlike pivot_observable, which is
     display-only), and a summary is returned. Successful source lookups
-    are cached (see CTI_PIVOT_CACHE_TTL) so re-sweeping is cheap."""
-    data = load_cluster(name)
+    are cached (see CTI_PIVOT_CACHE_TTL) so re-sweeping is cheap.
+
+    The network lookups run concurrently and, crucially, OUTSIDE the data
+    lock - a cluster with dozens of domains would otherwise serialize
+    into minutes of blocking I/O with the whole store locked. Only the
+    final write-back takes the lock, re-reading the cluster so it applies
+    onto current on-disk state."""
+    data = load_cluster(name)  # existence check + snapshot the values to check
+    domains = [o["value"] for o in data["observables"]["domains"]]
+    ips = [o["value"] for o in data["observables"]["ips"]]
+
+    # Network phase: concurrent, no lock held.
+    results: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
+    jobs = ([("domains", v, _domain_lifecycle) for v in domains]
+            + [("ips", v, _ip_lifecycle) for v in ips])
+    if jobs:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_PIVOT_CLUSTER_WORKERS) as ex:
+            futures = {ex.submit(fn, v): (cat, v) for cat, v, fn in jobs}
+            for fut in concurrent.futures.as_completed(futures):
+                cat, v = futures[fut]
+                try:
+                    results[(cat, v)] = fut.result()
+                except Exception as e:  # a single lookup blowing up shouldn't sink the sweep
+                    results[(cat, v)] = ("unknown", {"error": str(e)})
+
+    # Write phase: brief lock, applied onto a fresh read of the cluster.
     now = _now()
-    summary: dict[str, Any] = {"name": data["name"], "checked": now, "domains": [], "ips": []}
-
-    for o in data["observables"]["domains"]:
-        value = o["value"]
-        rdap = _cached_pivot("rdap", value, lambda v=value: pivot.rdap_lookup(v, "domain"))
-        resolved = pivot.resolve_host(value)  # live, not cached — liveness is the point
-        status = pivot.classify_domain_lifecycle(rdap, resolved)
-        o["status"] = status
-        o["status_checked"] = now
-        o["status_detail"] = {
-            "resolved": resolved,
-            "nameservers": rdap.get("nameservers") if isinstance(rdap, dict) else None,
-        }
-        summary["domains"].append({"value": value, "status": status, "resolved": resolved})
-
-    for o in data["observables"]["ips"]:
-        value = o["value"]
-        ripe = _cached_pivot("ripestat", value, lambda v=value: pivot.ripestat_lookup(v))
-        status = pivot.classify_ip_lifecycle(ripe)
-        o["status"] = status
-        o["status_checked"] = now
-        o["status_detail"] = {
-            "asn": ripe.get("asn") if isinstance(ripe, dict) else None,
-            "prefix": ripe.get("prefix") if isinstance(ripe, dict) else None,
-        }
-        summary["ips"].append({"value": value, "status": status,
-                                "asn": ripe.get("asn") if isinstance(ripe, dict) else None})
-
-    save_cluster(data)
+    with _data_lock():
+        data = load_cluster(name)
+        summary: dict[str, Any] = {"name": data["name"], "checked": now, "domains": [], "ips": []}
+        for cat in ("domains", "ips"):
+            for o in data["observables"][cat]:
+                found = results.get((cat, o["value"]))
+                if not found:
+                    continue
+                status, detail = found
+                o["status"] = status
+                o["status_checked"] = now
+                o["status_detail"] = detail
+                row = {"value": o["value"], "status": status}
+                row["resolved" if cat == "domains" else "asn"] = \
+                    detail.get("resolved") if cat == "domains" else detail.get("asn")
+                summary[cat].append(row)
+        save_cluster(data)
     return summary
 
 

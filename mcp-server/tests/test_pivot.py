@@ -57,6 +57,27 @@ def test_rdap_lookup_error_is_contained(monkeypatch):
     assert "error" in result
 
 
+def test_get_json_read_timeout_becomes_pivoterror(monkeypatch):
+    # A read-phase timeout raises a bare TimeoutError, not URLError; it must
+    # still surface as PivotError so callers return {"error": ...} rather
+    # than letting the exception escape mid-pivot.
+    def boom(req, timeout=None):
+        raise TimeoutError("The read operation timed out")
+    monkeypatch.setattr(pivot.urllib.request, "urlopen", boom)
+    with pytest.raises(pivot.PivotError):
+        pivot._get_json("https://rdap.org/domain/example.com")
+
+
+def test_get_json_unparseable_body_becomes_pivoterror(monkeypatch):
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b"<html>rate limited</html>"
+    monkeypatch.setattr(pivot.urllib.request, "urlopen", lambda req, timeout=None: FakeResp())
+    with pytest.raises(pivot.PivotError):
+        pivot._get_json("https://api.certspotter.com/v1/issuances?domain=x")
+
+
 def test_ripestat_lookup_merges_three_calls(monkeypatch):
     calls = []
 
@@ -179,6 +200,16 @@ def test_hackertarget_reverse_ip_quota_message_is_error(monkeypatch):
     monkeypatch.setattr(pivot, "_get_text",
                         lambda url, headers=None: "API count exceeded - Increase Quota with Membership")
     assert "error" in pivot.hackertarget_reverse_ip("1.2.3.4")
+
+
+def test_hackertarget_reverse_ip_no_records_message_is_error(monkeypatch):
+    # Regression: "No DNS A records found" used to slip through and get
+    # parsed as a bogus domain (it isn't caught by a naive "no records"
+    # substring check, and has spaces so it isn't a hostname).
+    monkeypatch.setattr(pivot, "_get_text", lambda url, headers=None: "No DNS A records found")
+    result = pivot.hackertarget_reverse_ip("4.4.3.12")
+    assert "error" in result
+    assert "domains" not in result
 
 
 def test_resolve_host_distinguishes_dead_from_inconclusive(monkeypatch):

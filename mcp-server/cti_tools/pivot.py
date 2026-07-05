@@ -58,6 +58,15 @@ def _get_json(url: str, headers: dict[str, str] | None = None) -> Any:
         raise PivotError(f"{url} returned HTTP {e.code}") from e
     except urllib.error.URLError as e:
         raise PivotError(f"failed to reach {url}: {e.reason}") from e
+    # A read-phase timeout raises a bare TimeoutError (not URLError), and a
+    # reset raises ConnectionError - both OSError subclasses. Catch them so
+    # every caller reliably gets a PivotError to turn into {"error": ...}
+    # instead of an exception escaping mid-pivot. ValueError covers a
+    # non-JSON body from a rate-limit/error page.
+    except (TimeoutError, OSError) as e:
+        raise PivotError(f"failed to reach {url}: {e}") from e
+    except ValueError as e:
+        raise PivotError(f"{url} returned an unparseable response: {e}") from e
 
 
 def _get_text(url: str, headers: dict[str, str] | None = None) -> str:
@@ -71,25 +80,30 @@ def _get_text(url: str, headers: dict[str, str] | None = None) -> str:
         raise PivotError(f"{url} returned HTTP {e.code}") from e
     except urllib.error.URLError as e:
         raise PivotError(f"failed to reach {url}: {e.reason}") from e
+    except (TimeoutError, OSError) as e:
+        raise PivotError(f"failed to reach {url}: {e}") from e
 
 
-def resolve_host(host: str, timeout: int = 5) -> list[str] | None:
+def resolve_host(host: str) -> list[str] | None:
     """Current A/AAAA answers for a hostname via the system resolver, or
     [] if it doesn't resolve (NXDOMAIN/no address), or None if the lookup
-    was inconclusive (timeout / resolver error). The []-vs-None
-    distinction is what lets lifecycle classification tell "dead" (really
-    doesn't resolve) apart from "couldn't check right now"."""
-    old = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(timeout)
+    was inconclusive (resolver error). The []-vs-None distinction is what
+    lets lifecycle classification tell "dead" (really doesn't resolve)
+    apart from "couldn't check right now".
+
+    Deliberately does NOT touch socket.setdefaulttimeout: that's
+    process-global state, and pivot_cluster resolves many hosts
+    concurrently, so mutating it per-call would race across threads and
+    could leave every other socket in the process on a short timeout.
+    Relies on the system resolver's own timeout instead; callers that
+    fan this out should bound it at the thread-pool level."""
     try:
         infos = socket.getaddrinfo(host, None)
-        return sorted({info[4][0] for info in infos})
     except socket.gaierror:
         return []
     except OSError:
         return None
-    finally:
-        socket.setdefaulttimeout(old)
+    return sorted({info[4][0] for info in infos})
 
 
 def classify(value: str) -> str:
@@ -280,9 +294,19 @@ def hackertarget_reverse_ip(ip: str) -> dict[str, Any]:
     except PivotError as e:
         return {"error": str(e)}
     low = text.lower()
-    if not text or "api count exceeded" in low or "error" in low or "no records" in low:
+    # Hackertarget signals "nothing here" / quota / bad input as a single
+    # human-readable line rather than an HTTP error, e.g. "No DNS A records
+    # found" or "API count exceeded". Catch the known phrases explicitly.
+    if not text or any(marker in low for marker in
+                       ("api count exceeded", "no dns", "no records", "invalid", "error")):
         return {"error": text or "empty response"}
-    domains = sorted({line.strip() for line in text.splitlines() if line.strip()})
+    # Defense in depth: real results are one hostname per line. Drop any
+    # line that can't be a hostname (has spaces, or no dot) so a novel
+    # status message can't slip through as a bogus domain.
+    domains = sorted({line.strip() for line in text.splitlines()
+                      if line.strip() and " " not in line.strip() and "." in line.strip()})
+    if not domains:
+        return {"error": text or "no domains returned"}
     return {"domains": domains}
 
 
