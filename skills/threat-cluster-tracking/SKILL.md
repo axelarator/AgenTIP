@@ -61,6 +61,15 @@ tracked — use `find_observable(value)` / `cti find-observable <value>`
 instead of checking each cluster by hand. Hash lookups work with or
 without the algo prefix (`sha256:...` or bare).
 
+Extraction is best-effort and over-matches (a legitimate service the
+malware merely contacts, a shared-hosting IP, a version string that
+looks like an IP). When you spot a false positive or benign reference
+in a cluster, prune it with `remove_observable(name, category, value)` /
+`cti remove-observable <name> <category> <value>` — the counterpart to
+`add_observable`. It matches case-insensitively (and, for hashes, with
+or without the algo prefix), removing every matching entry. Note why in
+the hunt log when you do, so the removal is auditable rather than silent.
+
 ## Infrastructure pivoting
 
 Tracked observables are a static record until you actually check
@@ -268,8 +277,8 @@ Prefer the MCP tools if the harness exposes them: `list_clusters`,
 `add_relationship`, `add_gap`, `export_navigator_layer`,
 `export_stix_bundle`, `export_stix_ecosystem`, `import_stix_bundle`,
 `get_observables`, `find_observable`, `add_observable`,
-`pivot_observable`, `pivot_cluster`, `pivot_and_expand`,
-`analyze_report`, `ingest_report`.
+`remove_observable`, `pivot_observable`, `pivot_cluster`,
+`pivot_and_expand`, `analyze_report`, `ingest_report`.
 
 If MCP tools are not available in this harness, use the CLI directly via
 the shell/bash tool from the `mcp-server` directory (or run `./setup.sh`
@@ -293,6 +302,7 @@ python -m cti_tools.cli import-stix <bundle.json | -> [--name "..."] [--overwrit
 python -m cti_tools.cli get-observables <name>
 python -m cti_tools.cli find-observable <value>
 python -m cti_tools.cli add-observable <name> <hashes|domains|ips|urls> <value> <source>
+python -m cti_tools.cli remove-observable <name> <category> <value>
 python -m cti_tools.cli pivot-observable <value>
 python -m cti_tools.cli pivot-cluster <name>
 python -m cti_tools.cli pivot-and-expand <value> <cluster_name> [--include-cohosted]

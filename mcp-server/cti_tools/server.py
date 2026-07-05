@@ -139,6 +139,16 @@ def add_observable(name: str, category: str, value: str, source: str) -> dict:
 
 
 @mcp.tool()
+def remove_observable(name: str, category: str, value: str) -> dict:
+    """Remove an observable (a false positive or benign reference the
+    extractor over-matched) from a cluster - the counterpart to
+    add_observable. Matches case-insensitively and, for hashes, with or
+    without the algo prefix, removing every match. category is one of
+    "hashes", "domains", "ips", "urls", "emails", "cves", "wallets"."""
+    return core.remove_observable(name, category, value)
+
+
+@mcp.tool()
 def pivot_observable(value: str) -> dict:
     """On-demand infrastructure pivot for a hash/domain/ip/url against
     free public sources: RDAP (registration data), RIPEstat (ASN/

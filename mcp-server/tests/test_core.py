@@ -532,6 +532,44 @@ def test_add_observable_bad_category_raises():
         core.add_observable("Bad Category Test", "bogus", "value", "source")
 
 
+def test_remove_observable_drops_entry():
+    core.create_cluster("Prune Test")
+    core.add_observable("Prune Test", "domains", "keep.example", "r")
+    core.add_observable("Prune Test", "domains", "noise.example", "r")
+    result = core.remove_observable("Prune Test", "domains", "noise.example")
+    assert result["removed"] == ["noise.example"]
+    domains = {o["value"] for o in core.get_cluster("Prune Test")["observables"]["domains"]}
+    assert domains == {"keep.example"}
+
+
+def test_remove_observable_case_insensitive_removes_all_variants():
+    core.create_cluster("Prune Case")
+    core.add_observable("Prune Case", "domains", "UKR.NET", "r")
+    core.add_observable("Prune Case", "domains", "ukr.net", "r")
+    result = core.remove_observable("Prune Case", "domains", "ukr.net")
+    assert set(result["removed"]) == {"UKR.NET", "ukr.net"}
+    assert core.get_cluster("Prune Case")["observables"]["domains"] == []
+
+
+def test_remove_observable_hash_bare_or_prefixed():
+    core.create_cluster("Prune Hash")
+    core.add_observable("Prune Hash", "hashes", "md5:098f6bcd4621d373cade4e832627b4f6", "r")
+    core.remove_observable("Prune Hash", "hashes", "098f6bcd4621d373cade4e832627b4f6")  # bare
+    assert core.get_cluster("Prune Hash")["observables"]["hashes"] == []
+
+
+def test_remove_observable_not_found_raises():
+    core.create_cluster("Prune Miss")
+    with pytest.raises(ValueError):
+        core.remove_observable("Prune Miss", "ips", "1.2.3.4")
+
+
+def test_remove_observable_bad_category_raises():
+    core.create_cluster("Prune Bad Cat")
+    with pytest.raises(ValueError):
+        core.remove_observable("Prune Bad Cat", "bogus", "x")
+
+
 def test_add_observable_new_categories():
     core.create_cluster("New Cats")
     core.add_observable("New Cats", "emails", "ops@evil.example", "src")

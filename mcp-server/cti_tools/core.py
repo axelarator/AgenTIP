@@ -621,6 +621,36 @@ def add_observable(name: str, category: str, value: str, source: str) -> dict[st
     return data
 
 
+@_synchronized
+def remove_observable(name: str, category: str, value: str) -> dict[str, Any]:
+    """Remove an observable from a cluster - the counterpart to
+    add_observable, for pruning a false positive or a benign reference
+    that the extractor over-matched (a legitimate service the malware
+    merely contacts, a shared-hosting IP, etc.).
+
+    Matches case-insensitively and, for hashes, with or without the algo
+    prefix, removing every entry in `category` that matches - so removing
+    "ukr.net" also clears a differently-cased "UKR.NET". Raises if the
+    cluster doesn't exist or nothing matched. The returned cluster carries
+    a transient `removed` list of the values dropped (not persisted)."""
+    if category not in OBSERVABLE_CATEGORIES:
+        raise ValueError("category must be one of " + ", ".join(OBSERVABLE_CATEGORIES))
+    data = load_cluster(name)
+    bucket = data["observables"][category]
+    needle = value.strip().lower()
+    kept: list[dict[str, Any]] = []
+    removed: list[dict[str, Any]] = []
+    for o in bucket:
+        stored = o["value"].lower()
+        bare = stored.split(":", 1)[1] if category == "hashes" and ":" in stored else stored
+        (removed if needle in (stored, bare) else kept).append(o)
+    if not removed:
+        raise ValueError(f"no {category} observable matching {value!r} in cluster {name!r}")
+    data["observables"][category] = kept
+    save_cluster(data)
+    return {**data, "removed": [o["value"] for o in removed]}
+
+
 # Pivot enrichment cache. VirusTotal's free tier is 4 req/min, 500/day,
 # so refetching the same indicator on every pivot burns straight through
 # it; RDAP/RIPEstat are also slow round-trips worth not repeating. This
