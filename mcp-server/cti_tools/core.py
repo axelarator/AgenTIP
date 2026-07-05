@@ -302,6 +302,24 @@ def update_ttp(name: str, technique_id: str, technique_name: str,
 
 
 @_synchronized
+def remove_ttp(name: str, technique_id: str) -> dict[str, Any]:
+    """Remove a technique from a cluster's TTP coverage table - the
+    counterpart to update_ttp, for dropping a mis-attributed technique or
+    one whose ATT&CK ID was revoked (update_ttp's validation flags those
+    but can't remove them, since it only upserts). Matches technique_id
+    case-insensitively. Raises if the cluster or the technique isn't
+    found. The returned cluster carries a transient `removed` id."""
+    data = load_cluster(name)
+    tid = technique_id.strip().upper()
+    kept = [t for t in data["ttps"] if t["id"].upper() != tid]
+    if len(kept) == len(data["ttps"]):
+        raise ValueError(f"no technique {technique_id!r} tracked on cluster {name!r}")
+    data["ttps"] = kept
+    save_cluster(data)
+    return {**data, "removed": technique_id}
+
+
+@_synchronized
 def append_hunt_log(name: str, entry: str) -> dict[str, Any]:
     data = load_cluster(name)
     data["hunt_log"].append({"date": _now(), "entry": entry})

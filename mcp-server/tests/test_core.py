@@ -68,6 +68,22 @@ def test_update_ttp_bad_status():
         core.update_ttp("Bad Status", "T1059", "x", 9)
 
 
+def test_remove_ttp_drops_technique():
+    core.create_cluster("TTP Remove")
+    core.update_ttp("TTP Remove", "T1059", "Command and Scripting Interpreter", 1)
+    core.update_ttp("TTP Remove", "T1566", "Phishing", 2)
+    result = core.remove_ttp("TTP Remove", "t1059")  # case-insensitive
+    assert result["removed"] == "t1059"
+    ids = {t["id"] for t in core.get_cluster("TTP Remove")["ttps"]}
+    assert ids == {"T1566"}
+
+
+def test_remove_ttp_not_found_raises():
+    core.create_cluster("TTP Remove Miss")
+    with pytest.raises(ValueError):
+        core.remove_ttp("TTP Remove Miss", "T9999")
+
+
 def test_hunt_log_append_only():
     core.create_cluster("Hunt Log Test")
     core.append_hunt_log("Hunt Log Test", "first")

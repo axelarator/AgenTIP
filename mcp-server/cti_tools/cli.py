@@ -54,6 +54,10 @@ def main(argv: list[str] | None = None) -> int:
     u.add_argument("status", type=int)
     u.add_argument("--notes", default="")
 
+    rt = sub.add_parser("remove-ttp")
+    rt.add_argument("name")
+    rt.add_argument("technique_id", help="ATT&CK technique ID to drop (case-insensitive)")
+
     h = sub.add_parser("append-hunt-log")
     h.add_argument("name")
     h.add_argument("entry")
@@ -154,6 +158,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "update-ttp":
             _print(core.update_ttp(args.name, args.technique_id,
                                     args.technique_name, args.status, args.notes))
+        elif args.command == "remove-ttp":
+            _print(core.remove_ttp(args.name, args.technique_id))
         elif args.command == "append-hunt-log":
             _print(core.append_hunt_log(args.name, args.entry))
         elif args.command == "add-detection":

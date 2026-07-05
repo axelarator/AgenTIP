@@ -64,6 +64,14 @@ def update_ttp(name: str, technique_id: str, technique_name: str,
 
 
 @mcp.tool()
+def remove_ttp(name: str, technique_id: str) -> dict:
+    """Remove a technique from a cluster's TTP coverage table - the
+    counterpart to update_ttp, for dropping a mis-attributed technique or
+    one whose ATT&CK ID was revoked. Matches technique_id case-insensitively."""
+    return core.remove_ttp(name, technique_id)
+
+
+@mcp.tool()
 def append_hunt_log(name: str, entry: str) -> dict:
     """Append an entry to a cluster's hunt log. Append-only, never edits."""
     return core.append_hunt_log(name, entry)

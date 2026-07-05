@@ -170,6 +170,12 @@ it as a failure either (a slightly stale bundle or a legitimately
 private/custom ID shouldn't block recording what you observed). This
 warning is never persisted to the cluster's stored JSON.
 
+When the warning flags a revoked ID or a mis-attribution you'd rather
+correct than keep, drop the entry with `remove_ttp(name, technique_id)`
+/ `cti remove-ttp <name> <technique_id>` (the counterpart to
+`update_ttp`, which only ever upserts) and re-add the right technique —
+e.g. replace a revoked `T1562.002` with its successor `T1685.001`.
+
 ## TTP coverage scale (0–4)
 
 - 0 — no coverage, technique not addressed
@@ -273,6 +279,7 @@ STIX Note objects tied to the cluster's Intrusion Set.
 
 Prefer the MCP tools if the harness exposes them: `list_clusters`,
 `get_cluster`, `create_cluster`, `update_profile`, `update_ttp`,
+`remove_ttp`,
 `append_hunt_log`, `add_detection`, `get_technique_usage`,
 `add_relationship`, `add_gap`, `export_navigator_layer`,
 `export_stix_bundle`, `export_stix_ecosystem`, `import_stix_bundle`,
@@ -290,6 +297,7 @@ python -m cti_tools.cli get-cluster <name>
 python -m cti_tools.cli create-cluster <name> --description "..."
 python -m cti_tools.cli update-profile <name> --adversary "..." --confidence 60 --aliases "Alias A,Alias B"
 python -m cti_tools.cli update-ttp <name> <technique_id> <technique_name> <status> --notes "..."
+python -m cti_tools.cli remove-ttp <name> <technique_id>
 python -m cti_tools.cli append-hunt-log <name> "<entry>"
 python -m cti_tools.cli add-detection <detection_id> "<description>" <technique_ids> <status> --cluster <name>
 python -m cti_tools.cli get-technique-usage [<technique_id>]
