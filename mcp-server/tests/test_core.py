@@ -189,7 +189,7 @@ def test_ingest_report_no_candidate_raises(tmp_path):
 def test_get_observables_view():
     core.create_cluster("Obs View Test")
     view = core.get_observables("Obs View Test")
-    assert view["observables"] == {"hashes": [], "domains": [], "ips": [], "urls": []}
+    assert view["observables"] == {c: [] for c in core.OBSERVABLE_CATEGORIES}
     assert view["report_sources"] == []
 
 
@@ -516,3 +516,155 @@ def test_add_observable_bad_category_raises():
     core.create_cluster("Bad Category Test")
     with pytest.raises(ValueError):
         core.add_observable("Bad Category Test", "bogus", "value", "source")
+
+
+def test_add_observable_new_categories():
+    core.create_cluster("New Cats")
+    core.add_observable("New Cats", "emails", "ops@evil.example", "src")
+    core.add_observable("New Cats", "cves", "CVE-2024-1234", "src")
+    data = core.add_observable("New Cats", "wallets", "0x52908400098527886E0F7030069857D2E4169EE7", "src")
+    assert any(o["value"] == "ops@evil.example" for o in data["observables"]["emails"])
+    assert any(o["value"] == "CVE-2024-1234" for o in data["observables"]["cves"])
+    assert data["observables"]["wallets"][0]["value"].startswith("0x")
+
+
+# --- observables in STIX export/import --------------------------------------
+
+def test_stix_export_emits_indicators_for_observables():
+    core.create_cluster("IOC Export")
+    core.add_observable("IOC Export", "domains", "evil.example", "report X")
+    core.add_observable("IOC Export", "ips", "185.220.101.47", "report X")
+    core.add_observable("IOC Export", "hashes", "md5:098f6bcd4621d373cade4e832627b4f6", "report X")
+    core.add_observable("IOC Export", "emails", "admin@evil.example", "report X")
+
+    bundle = core.export_stix_bundle("IOC Export")
+    indicators = [o for o in bundle["objects"] if o["type"] == "indicator"]
+    assert len(indicators) == 4
+    iset_id = next(o["id"] for o in bundle["objects"] if o["type"] == "intrusion-set")
+    indicates = [o for o in bundle["objects"]
+                 if o.get("relationship_type") == "indicates"]
+    assert len(indicates) == 4
+    assert all(r["target_ref"] == iset_id for r in indicates)
+    patterns = {i["pattern"] for i in indicators}
+    assert "[domain-name:value = 'evil.example']" in patterns
+    assert "[file:hashes.'MD5' = '098f6bcd4621d373cade4e832627b4f6']" in patterns
+
+
+def test_stix_observable_roundtrip():
+    core.create_cluster("IOC Round")
+    core.add_observable("IOC Round", "domains", "evil.example", "report X")
+    core.add_observable("IOC Round", "ips", "185.220.101.47", "report X")
+    core.add_observable("IOC Round", "hashes", "md5:098f6bcd4621d373cade4e832627b4f6", "report X")
+    core.add_observable("IOC Round", "emails", "admin@evil.example", "report X")
+
+    bundle = core.export_stix_bundle("IOC Round")
+    imported = core.import_stix_bundle(bundle, name="IOC Round Import")
+    obs = imported["observables"]
+    assert any(o["value"] == "evil.example" for o in obs["domains"])
+    assert any(o["value"] == "185.220.101.47" for o in obs["ips"])
+    assert any(o["value"] == "md5:098f6bcd4621d373cade4e832627b4f6" for o in obs["hashes"])
+    assert any(o["value"] == "admin@evil.example" for o in obs["emails"])
+
+
+def test_stix_export_skips_non_scoable_observables():
+    core.create_cluster("NonSCO")
+    core.add_observable("NonSCO", "cves", "CVE-2024-1234", "r")
+    core.add_observable("NonSCO", "wallets", "0x52908400098527886E0F7030069857D2E4169EE7", "r")
+    bundle = core.export_stix_bundle("NonSCO")
+    # CVEs/wallets have no clean STIX SCO pattern, so no indicators are emitted.
+    assert not any(o["type"] == "indicator" for o in bundle["objects"])
+
+
+def test_stix_shared_indicator_id_dedupes_across_clusters():
+    core.create_cluster("Shared IOC A")
+    core.create_cluster("Shared IOC B")
+    core.add_observable("Shared IOC A", "domains", "shared.example", "r")
+    core.add_observable("Shared IOC B", "domains", "shared.example", "r")
+    core.add_relationship("Shared IOC A", "related-to", "Shared IOC B")
+    bundle = core.export_stix_ecosystem("Shared IOC A")
+    indicators = [o for o in bundle["objects"] if o["type"] == "indicator"]
+    assert len(indicators) == 1  # same pattern -> same id -> one object
+
+
+# --- reverse index -----------------------------------------------------------
+
+def test_find_observable_email_via_index():
+    core.create_cluster("Email Idx")
+    core.add_observable("Email Idx", "emails", "ops@evil.example", "r")
+    res = core.find_observable("ops@evil.example")
+    assert res["matches"][0]["cluster"] == "Email Idx"
+    assert res["matches"][0]["category"] == "emails"
+
+
+def test_reverse_index_reflects_new_writes():
+    core.create_cluster("Idx Fresh")
+    core.add_observable("Idx Fresh", "domains", "one.example", "r")
+    assert core.find_observable("one.example")["matches"]  # builds + caches the index
+    core.add_observable("Idx Fresh", "domains", "two.example", "r")  # bumps fingerprint
+    # a stale cache would miss this; the index must rebuild and see it
+    assert core.find_observable("two.example")["matches"]
+
+
+def test_reverse_index_technique_usage_after_detection():
+    core.create_cluster("Idx Tech")
+    core.update_ttp("Idx Tech", "T1003", "OS Credential Dumping", 1)
+    core.get_technique_usage("T1003")  # cache the index
+    core.add_detection("DET-IDX", "LSASS monitoring", ["T1003"])  # bumps registry mtime
+    usage = core.get_technique_usage("T1003")
+    assert any(d["id"] == "DET-IDX" for d in usage["detections"])
+
+
+# --- atomic writes -----------------------------------------------------------
+
+def test_no_leftover_temp_files(isolated_data_dir):
+    core.create_cluster("Atomic Test")
+    core.update_ttp("Atomic Test", "T1059", "Command and Scripting Interpreter", 1)
+    leftover = list(isolated_data_dir.rglob("*.tmp"))
+    assert leftover == []
+
+
+# --- pivot caching -----------------------------------------------------------
+
+def test_pivot_cache_avoids_refetch(monkeypatch):
+    monkeypatch.delenv("VT_API_KEY", raising=False)
+    monkeypatch.delenv("CTI_PIVOT_CACHE_TTL", raising=False)
+    calls = {"n": 0}
+
+    def fake_rdap(value, kind):
+        calls["n"] += 1
+        return {"handle": "H"}
+
+    monkeypatch.setattr(core.pivot, "rdap_lookup", fake_rdap)
+    core.pivot_observable("example.com")
+    core.pivot_observable("example.com")
+    assert calls["n"] == 1  # second lookup served from cache
+
+
+def test_pivot_cache_disabled_with_ttl_zero(monkeypatch):
+    monkeypatch.delenv("VT_API_KEY", raising=False)
+    monkeypatch.setenv("CTI_PIVOT_CACHE_TTL", "0")
+    calls = {"n": 0}
+
+    def fake_rdap(value, kind):
+        calls["n"] += 1
+        return {"handle": "H"}
+
+    monkeypatch.setattr(core.pivot, "rdap_lookup", fake_rdap)
+    core.pivot_observable("example.com")
+    core.pivot_observable("example.com")
+    assert calls["n"] == 2  # caching off -> refetched
+
+
+def test_pivot_cache_does_not_cache_errors(monkeypatch):
+    monkeypatch.delenv("VT_API_KEY", raising=False)
+    monkeypatch.delenv("CTI_PIVOT_CACHE_TTL", raising=False)
+    calls = {"n": 0}
+
+    def fake_rdap(value, kind):
+        calls["n"] += 1
+        return {"error": "rdap down"}
+
+    monkeypatch.setattr(core.pivot, "rdap_lookup", fake_rdap)
+    core.pivot_observable("example.com")
+    core.pivot_observable("example.com")
+    assert calls["n"] == 2  # soft errors aren't cached, so they're retried

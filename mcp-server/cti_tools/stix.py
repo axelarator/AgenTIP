@@ -20,11 +20,19 @@ Design notes:
 """
 from __future__ import annotations
 
+import ipaddress
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 SPEC_VERSION = "2.1"
+
+# Map this tool's hash algo prefixes to STIX hash-algorithm names and
+# back, and infer algo from bare-hash length when no prefix is stored.
+_HASH_ALGO_TO_STIX = {"md5": "MD5", "sha1": "SHA-1", "sha256": "SHA-256"}
+_HASH_STIX_TO_ALGO = {v: k for k, v in _HASH_ALGO_TO_STIX.items()}
+_HASH_LEN_TO_STIX = {32: "MD5", 40: "SHA-1", 64: "SHA-256"}
 
 # Fixed, arbitrary namespace for this tool's deterministic STIX ids.
 # Do not change this once clusters have been shared — it would break
@@ -54,6 +62,73 @@ def _relationship_id(source_ref: str, target_ref: str, relationship_type: str) -
 
 def _note_id(intrusion_set_id: str, date: str, entry: str) -> str:
     return f"note--{uuid.uuid5(_NAMESPACE, intrusion_set_id + date + entry)}"
+
+
+def _indicator_id(pattern: str) -> str:
+    # Deterministic from the STIX pattern, so the same IOC exported from
+    # two different clusters mints the same Indicator id and merges to a
+    # single object (mirroring how Attack Pattern ids dedupe).
+    return f"indicator--{uuid.uuid5(_NAMESPACE, pattern)}"
+
+
+def _pattern_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def observable_to_pattern(category: str, value: str) -> str | None:
+    """STIX 2.1 pattern for one tracked observable, or None for
+    categories that have no clean STIX Cyber-observable representation
+    (cves -> would be a Vulnerability SDO, wallets -> no standard SCO),
+    which are simply left out of the bundle rather than forced."""
+    if category == "hashes":
+        if ":" in value:
+            algo, digest = value.split(":", 1)
+            stix_algo = _HASH_ALGO_TO_STIX.get(algo.lower())
+        else:
+            digest = value
+            stix_algo = _HASH_LEN_TO_STIX.get(len(value))
+        if not stix_algo:
+            return None
+        return f"[file:hashes.'{stix_algo}' = '{_pattern_escape(digest)}']"
+    if category == "domains":
+        return f"[domain-name:value = '{_pattern_escape(value)}']"
+    if category == "ips":
+        try:
+            objtype = "ipv6-addr" if ipaddress.ip_address(value).version == 6 else "ipv4-addr"
+        except ValueError:
+            objtype = "ipv4-addr"
+        return f"[{objtype}:value = '{_pattern_escape(value)}']"
+    if category == "urls":
+        return f"[url:value = '{_pattern_escape(value)}']"
+    if category == "emails":
+        return f"[email-addr:value = '{_pattern_escape(value)}']"
+    return None
+
+
+_PATTERN_RE = re.compile(r"\[\s*([a-z0-9-]+):(\S+?)\s*=\s*'(.*)'\s*\]")
+
+
+def pattern_to_observable(pattern: str) -> tuple[str, str] | None:
+    """Inverse of observable_to_pattern: (category, value) from a simple
+    single-comparison STIX pattern, or None if it isn't one we emit."""
+    m = _PATTERN_RE.match(pattern or "")
+    if not m:
+        return None
+    objtype, path, raw = m.groups()
+    value = raw.replace("\\'", "'").replace("\\\\", "\\")
+    if objtype == "file":
+        algo_m = re.search(r"hashes\.'([^']+)'", path)
+        algo = _HASH_STIX_TO_ALGO.get(algo_m.group(1)) if algo_m else None
+        if not algo:
+            return None
+        return "hashes", f"{algo}:{value}"
+    return {
+        "domain-name": ("domains", value),
+        "ipv4-addr": ("ips", value),
+        "ipv6-addr": ("ips", value),
+        "url": ("urls", value),
+        "email-addr": ("emails", value),
+    }.get(objtype)
 
 
 def to_bundle(data: dict[str, Any]) -> dict[str, Any]:
@@ -140,6 +215,43 @@ def to_bundle(data: dict[str, Any]) -> dict[str, Any]:
             "content": h["entry"],
             "object_refs": [intrusion_set_id],
         })
+
+    # Tracked observables become STIX Indicators (with a pattern) tied to
+    # the Intrusion Set by an `indicates` relationship, so the IOCs a
+    # cluster has accumulated survive an export instead of being dropped.
+    for category, items in data.get("observables", {}).items():
+        for o in items:
+            pattern = observable_to_pattern(category, o["value"])
+            if not pattern:
+                continue
+            ind_id = _indicator_id(pattern)
+            first = o.get("first_seen") or created
+            last = o.get("last_seen") or modified
+            objects.append({
+                "type": "indicator",
+                "spec_version": SPEC_VERSION,
+                "id": ind_id,
+                "created": first,
+                "modified": last,
+                "name": o["value"],
+                "pattern": pattern,
+                "pattern_type": "stix",
+                "valid_from": first,
+                # Custom prop so the exact category round-trips even for
+                # patterns pattern_to_observable could otherwise only
+                # approximate; parsing falls back to the pattern if absent.
+                "x_cti_agent_category": category,
+            })
+            objects.append({
+                "type": "relationship",
+                "spec_version": SPEC_VERSION,
+                "id": _relationship_id(ind_id, intrusion_set_id, "indicates"),
+                "created": first,
+                "modified": last,
+                "relationship_type": "indicates",
+                "source_ref": ind_id,
+                "target_ref": intrusion_set_id,
+            })
 
     return {
         "type": "bundle",
@@ -228,6 +340,22 @@ def from_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
         for n in notes
     ]
 
+    # Reconstruct tracked observables from any Indicator objects in the
+    # bundle (the inverse of to_bundle's Indicator emission), deduped
+    # per category, so IOCs survive a full export/import round trip.
+    observables: dict[str, list[str]] = {}
+    for o in objects:
+        if o.get("type") != "indicator":
+            continue
+        parsed = pattern_to_observable(o.get("pattern", ""))
+        if not parsed:
+            continue
+        category, value = parsed
+        category = o.get("x_cti_agent_category", category)
+        bucket = observables.setdefault(category, [])
+        if value not in bucket:
+            bucket.append(value)
+
     return {
         "name": iset.get("name", "imported-cluster"),
         "description": iset.get("description", ""),
@@ -238,4 +366,5 @@ def from_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
         "ttps": ttps,
         "notes": hunt_notes,
         "relationships": relationships,
+        "observables": observables,
     }

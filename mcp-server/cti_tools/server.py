@@ -129,11 +129,12 @@ def find_observable(value: str) -> dict:
 
 @mcp.tool()
 def add_observable(name: str, category: str, value: str, source: str) -> dict:
-    """Manually file a single hash/domain/ip/url onto a cluster - the
+    """Manually file a single observable onto a cluster - the
     counterpart to ingest_report's automatic extraction, for an
     indicator from somewhere other than a parseable report (e.g. a
     pivot_observable finding). category must be one of "hashes",
-    "domains", "ips", "urls". Dedupes by value like ingest_report does."""
+    "domains", "ips", "urls", "emails", "cves", "wallets". Dedupes by
+    value like ingest_report does."""
     return core.add_observable(name, category, value, source)
 
 
@@ -171,7 +172,8 @@ def ingest_report(source: str, cluster_name: str | None = None,
 @mcp.tool()
 def export_stix_bundle(name: str) -> dict:
     """Export a cluster as a STIX 2.1 bundle (Intrusion Set, Attack
-    Patterns, Relationships, Notes) for sharing with other tools/orgs."""
+    Patterns, Indicators, Relationships, Notes) for sharing with other
+    tools/orgs. Tracked observables are exported as Indicators."""
     return core.export_stix_bundle(name)
 
 

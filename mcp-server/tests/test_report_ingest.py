@@ -39,6 +39,35 @@ def test_extract_observables():
     assert set(obs["ttps"]) == {"T1059.001", "T1053.005", "T1566.001"}
 
 
+def test_extract_emails_cves_wallets():
+    text = report_ingest.defang_normalize(
+        "Operator reachable at admin@badactor-c2[.]xyz, exploiting CVE-2024-1234 "
+        "and cve-2023-99999. Ransom to bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq "
+        "or 0x52908400098527886E0F7030069857D2E4169EE7."
+    )
+    obs = report_ingest.extract_observables(text)
+    assert "admin@badactor-c2.xyz" in obs["emails"]
+    assert "CVE-2024-1234" in obs["cves"]
+    assert "CVE-2023-99999" in obs["cves"]  # normalized to upper-case
+    assert "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq" in obs["wallets"]
+    assert "0x52908400098527886E0F7030069857D2E4169EE7" in obs["wallets"]
+
+
+def test_extract_ipv6():
+    obs = report_ingest.extract_observables("C2 resolved to 2606:4700:4700::1111 today.")
+    assert "2606:4700:4700::1111" in obs["ips"]
+
+
+def test_extract_ipv6_private_filtered():
+    obs = report_ingest.extract_observables("Loopback fe80::1 and ::1 should not count.")
+    assert obs["ips"] == []
+
+
+def test_defang_dot_and_at_variants():
+    assert report_ingest.defang_normalize("evil[dot]com") == "evil.com"
+    assert report_ingest.defang_normalize("user[at]evil(dot)com") == "user@evil.com"
+
+
 def test_suggest_cluster_names_single_candidate():
     text = report_ingest.defang_normalize(SAMPLE)
     assert report_ingest.suggest_cluster_names(text) == ["Fox Tempest"]
@@ -66,10 +95,36 @@ def test_fetch_text_missing_file():
         report_ingest.fetch_text("/no/such/file.txt")
 
 
-def test_fetch_text_pdf_unsupported():
+def test_fetch_text_pdf_without_poppler(tmp_path, monkeypatch):
     import pytest
+    # Simulate poppler not being installed: a PDF then falls back to the
+    # instructive UnsupportedSource error instead of extracting.
+    monkeypatch.setattr(report_ingest.shutil, "which", lambda name: None)
+    p = tmp_path / "report.pdf"
+    p.write_bytes(b"%PDF-1.4 not really a pdf")
     with pytest.raises(report_ingest.UnsupportedSource):
-        report_ingest.fetch_text("/tmp/report.pdf")
+        report_ingest.fetch_text(str(p))
+
+
+def test_fetch_text_pdf_with_poppler(tmp_path):
+    import pytest
+    import shutil
+    if not shutil.which("pdftotext"):
+        pytest.skip("pdftotext (poppler-utils) not installed")
+    # Minimal single-page PDF that renders the literal text "T1059.001".
+    pdf = (b"%PDF-1.1\n"
+           b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+           b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+           b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]"
+           b"/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n"
+           b"4 0 obj<</Length 44>>stream\n"
+           b"BT /F1 12 Tf 20 100 Td (T1059.001) Tj ET\n"
+           b"endstream endobj\n"
+           b"5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n"
+           b"trailer<</Root 1 0 R>>\n")
+    p = tmp_path / "report.pdf"
+    p.write_bytes(pdf)
+    assert "T1059.001" in report_ingest.fetch_text(str(p))
 
 
 def test_html_stripped(tmp_path):

@@ -8,13 +8,19 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import uuid
-from dataclasses import dataclass, field
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from . import attack, pivot, report_ingest, stix
+
+try:
+    import fcntl  # POSIX-only; the lock degrades to a no-op elsewhere.
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None  # type: ignore[assignment]
 
 # Data lives at the repo root (`<repo>/data/clusters`) so it's shared
 # across every harness surface (MCP server, CLI, any future UI) rather
@@ -22,6 +28,12 @@ from . import attack, pivot, report_ingest, stix
 # or alternate deployments (e.g. a separate private data repo).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = Path(os.environ.get("CTI_DATA_DIR", _REPO_ROOT / "data" / "clusters"))
+
+# The observable categories a cluster tracks. Single source of truth
+# lives in report_ingest (the extractor); re-exported here so the rest
+# of core, the CLI, and callers can reference core.OBSERVABLE_CATEGORIES
+# without reaching across modules.
+OBSERVABLE_CATEGORIES = report_ingest.OBSERVABLE_CATEGORIES
 
 # 0-4 TTP coverage scale -> ATT&CK Navigator color. Edit to match your
 # own detection lifecycle if you change the scale in the skill.
@@ -56,7 +68,7 @@ _EXTRACTION_EMPTY_WARNING = (
 
 
 def _nothing_extracted(extracted: dict[str, list[str]]) -> bool:
-    return not any(extracted[c] for c in ("hashes", "domains", "ips", "urls", "ttps"))
+    return not any(extracted[c] for c in (*OBSERVABLE_CATEGORIES, "ttps"))
 
 
 def _path(name: str) -> Path:
@@ -66,6 +78,76 @@ def _path(name: str) -> Path:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write text so readers never see a partial file: write to a temp
+    file in the same directory, then os.replace (atomic on the same
+    filesystem). Prevents a crash mid-write from leaving a truncated
+    JSON, and prevents the .json/.md pair from going out of sync on a
+    torn write."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# Serializes mutating operations across processes (the MCP server and
+# the CLI both write the same store) so two read-modify-write sequences
+# can't interleave and clobber each other. Reads (load/list/find) don't
+# take it. Reentrant within a thread so a locked op calling another
+# locked helper won't deadlock on flock.
+import threading  # noqa: E402  (kept next to the lock it serves)
+
+_lock_state = threading.local()
+
+
+@contextmanager
+def _data_lock() -> Iterator[None]:
+    if fcntl is None:  # non-POSIX: best-effort, no cross-process lock
+        yield
+        return
+    depth = getattr(_lock_state, "depth", 0)
+    if depth:  # already held in this thread; re-acquiring flock would deadlock
+        _lock_state.depth = depth + 1
+        try:
+            yield
+        finally:
+            _lock_state.depth -= 1
+        return
+    lock_path = DATA_DIR / "_registry" / ".lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(lock_path, "w")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        _lock_state.depth = 1
+        yield
+    finally:
+        _lock_state.depth = 0
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        finally:
+            f.close()
+
+
+def _synchronized(fn):
+    """Decorator: run a mutating public operation under _data_lock."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _data_lock():
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 def _new_cluster(name: str, description: str) -> dict[str, Any]:
@@ -90,9 +172,8 @@ def _new_cluster(name: str, description: str) -> dict[str, Any]:
         "hunt_log": [],   # [{date, entry}] append-only
         "detections": [], # computed join onto the shared registry at load time, not stored
         "gaps": [],       # [{description, priority, created}]
-        "observables": {  # each entry: {value, sources: [...], first_seen, last_seen}
-            "hashes": [], "domains": [], "ips": [], "urls": [],
-        },
+        # each entry: {value, sources: [...], first_seen, last_seen}
+        "observables": {c: [] for c in OBSERVABLE_CATEGORIES},
         "report_sources": [],  # [{source, ingested, observables_found, ttps_found}]
         "relationships": [],  # [{relationship_type, target_cluster, target_stix_id, description, source, created}]
     }
@@ -112,8 +193,8 @@ def _migrate(data: dict[str, Any]) -> dict[str, Any]:
     })
     for key in ("ttps", "hunt_log", "detections", "gaps", "report_sources", "relationships"):
         data.setdefault(key, [])
-    data.setdefault("observables", {"hashes": [], "domains": [], "ips": [], "urls": []})
-    for category in ("hashes", "domains", "ips", "urls"):
+    data.setdefault("observables", {})
+    for category in OBSERVABLE_CATEGORIES:
         data["observables"].setdefault(category, [])
     return data
 
@@ -132,9 +213,8 @@ def load_cluster(name: str) -> dict[str, Any]:
 
 
 def save_cluster(data: dict[str, Any]) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     p = _path(data["name"])
-    p.write_text(json.dumps(data, indent=2))
+    _atomic_write_text(p, json.dumps(data, indent=2))
     _write_markdown(data)
 
 
@@ -144,6 +224,7 @@ def list_clusters() -> list[str]:
     return sorted(p.stem for p in DATA_DIR.glob("*.json"))
 
 
+@_synchronized
 def create_cluster(name: str, description: str = "") -> dict[str, Any]:
     if _path(name).exists():
         raise FileExistsError(f"Cluster {name!r} already exists")
@@ -156,6 +237,7 @@ def get_cluster(name: str) -> dict[str, Any]:
     return load_cluster(name)
 
 
+@_synchronized
 def update_profile(name: str, description: str | None = None,
                     adversary: str | None = None,
                     capability: str | None = None,
@@ -193,6 +275,7 @@ def update_profile(name: str, description: str | None = None,
     return data
 
 
+@_synchronized
 def update_ttp(name: str, technique_id: str, technique_name: str,
                 status: int, notes: str = "") -> dict[str, Any]:
     if not 0 <= status <= 4:
@@ -217,6 +300,7 @@ def update_ttp(name: str, technique_id: str, technique_name: str,
     return data
 
 
+@_synchronized
 def append_hunt_log(name: str, entry: str) -> dict[str, Any]:
     data = load_cluster(name)
     data["hunt_log"].append({"date": _now(), "entry": entry})
@@ -240,9 +324,99 @@ def _load_detection_registry() -> dict[str, Any]:
 
 
 def _save_detection_registry(registry: dict[str, Any]) -> None:
-    p = _registry_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(registry, indent=2))
+    _atomic_write_text(_registry_path(), json.dumps(registry, indent=2))
+
+
+# --- reverse index cache ----------------------------------------------------
+# find_observable and get_technique_usage answer "which clusters have this
+# IOC / use this technique". Computed naively they load and parse every
+# cluster file on every call - fine at a handful of clusters, O(n) file
+# I/O as the store grows. This caches both reverse maps in one file,
+# rebuilt only when the underlying clusters or the detection registry
+# actually change (detected by a size+mtime fingerprint), so lookups are
+# a single file read in the common case. The cache is self-healing: a
+# stale or corrupt index just triggers a rebuild, never a wrong answer.
+
+def _index_path() -> Path:
+    return DATA_DIR / "_registry" / "index.json"
+
+
+def _index_signature() -> str:
+    """A fingerprint of everything the index is derived from. Any change
+    to a cluster file or the detection registry changes this string,
+    which invalidates the cache. Uses nanosecond mtime + size, which is
+    reliable on Linux and cheap to compute (a stat per file, no reads)."""
+    parts = []
+    if DATA_DIR.exists():
+        for p in sorted(DATA_DIR.glob("*.json")):  # top-level only; skips _registry/
+            st = p.stat()
+            parts.append(f"{p.name}:{st.st_size}:{st.st_mtime_ns}")
+    reg = _registry_path()
+    if reg.exists():
+        st = reg.stat()
+        parts.append(f"@registry:{st.st_size}:{st.st_mtime_ns}")
+    return "|".join(parts)
+
+
+def _build_reverse_index() -> dict[str, Any]:
+    registry = _load_detection_registry()
+    observables: dict[str, list[dict[str, Any]]] = {}
+    techniques: dict[str, dict[str, Any]] = {}
+    for cname in list_clusters():
+        data = load_cluster(cname)
+        for category in OBSERVABLE_CATEGORIES:
+            for o in data["observables"].get(category, []):
+                match = {
+                    "cluster": data["name"], "category": category,
+                    "value": o["value"], "sources": o["sources"],
+                    "first_seen": o["first_seen"], "last_seen": o["last_seen"],
+                }
+                stored = o["value"].lower()
+                keys = {stored}
+                # hashes are findable with or without their algo prefix
+                if category == "hashes" and ":" in stored:
+                    keys.add(stored.split(":", 1)[1])
+                for k in keys:
+                    observables.setdefault(k, []).append(match)
+        for t in data["ttps"]:
+            tid = t["id"]
+            entry = techniques.setdefault(tid, {
+                "technique_id": tid,
+                "name": attack.canonical_name(tid) or t["name"],
+                "used_by": [], "detections": [],
+            })
+            entry["used_by"].append({
+                "cluster": data["name"], "status": t["status"], "notes": t.get("notes", ""),
+            })
+    for det in registry["detections"]:
+        for tid in det["technique_ids"]:
+            if tid in techniques:
+                techniques[tid]["detections"].append({
+                    "id": det["id"], "description": det["description"],
+                    "status": det["status"],
+                })
+    return {"signature": _index_signature(), "observables": observables,
+            "techniques": techniques}
+
+
+def _reverse_index() -> dict[str, Any]:
+    """Return the reverse index, rebuilding it only if the cluster/registry
+    fingerprint has changed since it was last cached."""
+    sig = _index_signature()
+    p = _index_path()
+    if p.exists():
+        try:
+            cached = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            cached = None
+        if cached and cached.get("signature") == sig:
+            return cached
+    idx = _build_reverse_index()
+    try:
+        _atomic_write_text(p, json.dumps(idx))
+    except OSError:
+        pass  # cache is best-effort; a read-only store still answers correctly
+    return idx
 
 
 def _detections_for_cluster(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -262,6 +436,7 @@ def _detections_for_cluster(data: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+@_synchronized
 def add_detection(detection_id: str, description: str, technique_ids: list[str],
                    status: str = "draft", cluster_name: str | None = None) -> dict[str, Any]:
     """Upsert a detection into the shared, technique-keyed detection
@@ -323,28 +498,7 @@ def get_technique_usage(technique_id: str | None = None) -> dict[str, Any]:
     any) cover it - the "who uses what" view that per-cluster TTP
     tables alone don't answer. Omit technique_id to get the full matrix
     across every technique any tracked cluster has logged."""
-    registry = _load_detection_registry()
-    by_technique: dict[str, dict[str, Any]] = {}
-    for cname in list_clusters():
-        data = load_cluster(cname)
-        for t in data["ttps"]:
-            tid = t["id"]
-            entry = by_technique.setdefault(tid, {
-                "technique_id": tid,
-                "name": attack.canonical_name(tid) or t["name"],
-                "used_by": [],
-                "detections": [],
-            })
-            entry["used_by"].append({
-                "cluster": data["name"], "status": t["status"], "notes": t.get("notes", ""),
-            })
-    for det in registry["detections"]:
-        for tid in det["technique_ids"]:
-            if tid in by_technique:
-                by_technique[tid]["detections"].append({
-                    "id": det["id"], "description": det["description"],
-                    "status": det["status"],
-                })
+    by_technique = _reverse_index()["techniques"]
 
     if technique_id is None:
         return {"techniques": sorted(by_technique.values(), key=lambda e: e["technique_id"])}
@@ -357,6 +511,7 @@ def get_technique_usage(technique_id: str | None = None) -> dict[str, Any]:
     return entry
 
 
+@_synchronized
 def add_relationship(name: str, relationship_type: str, target_cluster: str,
                       description: str = "", source: str = "") -> dict[str, Any]:
     """Record a structured relationship from this cluster to another
@@ -381,6 +536,7 @@ def add_relationship(name: str, relationship_type: str, target_cluster: str,
     return data
 
 
+@_synchronized
 def add_gap(name: str, description: str, priority: str = "medium") -> dict[str, Any]:
     data = load_cluster(name)
     data["gaps"].append({
@@ -432,49 +588,95 @@ def get_observables(name: str) -> dict[str, Any]:
 
 def find_observable(value: str) -> dict[str, Any]:
     """Reverse index from an observable value to the clusters that have
-    seen it - the symmetric counterpart to get_technique_usage(), but
-    for hashes/domains/ips/urls instead of ATT&CK techniques. Scans
-    every tracked cluster (there's no separate observable index to keep
-    in sync, consistent with how get_technique_usage is computed).
+    seen it - the symmetric counterpart to get_technique_usage(), across
+    every observable category. Backed by the cached reverse index, so it
+    doesn't re-scan every cluster file per call.
 
     A hash value matches whether or not you include its algo prefix -
     passing either "sha256:abc..." or bare "abc..." finds the same
     entries, since callers often only have the bare hash on hand."""
     needle = value.strip().lower()
-    matches = []
-    for cname in list_clusters():
-        data = load_cluster(cname)
-        for category in ("hashes", "domains", "ips", "urls"):
-            for o in data["observables"][category]:
-                stored = o["value"].lower()
-                bare = stored.split(":", 1)[1] if category == "hashes" and ":" in stored else stored
-                if needle in (stored, bare):
-                    matches.append({
-                        "cluster": data["name"],
-                        "category": category,
-                        "value": o["value"],
-                        "sources": o["sources"],
-                        "first_seen": o["first_seen"],
-                        "last_seen": o["last_seen"],
-                    })
+    matches = _reverse_index()["observables"].get(needle, [])
     return {"value": value, "matches": matches}
 
 
+@_synchronized
 def add_observable(name: str, category: str, value: str, source: str) -> dict[str, Any]:
-    """Manually file a single hash/domain/ip/url onto a cluster - the
-    counterpart to ingest_report's automatic extraction, for an
-    indicator that came from somewhere other than a parseable report
+    """Manually file a single observable (category is one of
+    OBSERVABLE_CATEGORIES: hashes, domains, ips, urls, emails, cves,
+    wallets) onto a cluster - the counterpart to ingest_report's
+    automatic extraction, for an indicator that came from somewhere
+    other than a parseable report
     (e.g. a pivot_observable finding, or something told to you
     directly). Reuses the exact same dedup/provenance logic as
     ingest_report: a value already tracked just gets `source` appended
     to its provenance list rather than creating a duplicate entry."""
-    if category not in ("hashes", "domains", "ips", "urls"):
-        raise ValueError('category must be one of "hashes", "domains", "ips", "urls"')
+    if category not in OBSERVABLE_CATEGORIES:
+        raise ValueError("category must be one of " + ", ".join(OBSERVABLE_CATEGORIES))
     data = load_cluster(name)
-    extracted = {c: ([value] if c == category else []) for c in ("hashes", "domains", "ips", "urls")}
+    extracted = {c: ([value] if c == category else []) for c in OBSERVABLE_CATEGORIES}
     _merge_observables(data, extracted, source)
     save_cluster(data)
     return data
+
+
+# Pivot enrichment cache. VirusTotal's free tier is 4 req/min, 500/day,
+# so refetching the same indicator on every pivot burns straight through
+# it; RDAP/RIPEstat are also slow round-trips worth not repeating. This
+# caches each source's answer for a value for a short TTL. It is NOT
+# cluster data - just a transient enrichment cache under _registry -
+# and only successful lookups are cached (never errors or the VT skip
+# note). Set CTI_PIVOT_CACHE_TTL=0 to disable caching entirely.
+_PIVOT_CACHE_TTL_ENV = "CTI_PIVOT_CACHE_TTL"
+_PIVOT_CACHE_TTL_DEFAULT = 3600
+
+
+def _pivot_cache_path() -> Path:
+    return DATA_DIR / "_registry" / "pivot_cache.json"
+
+
+def _pivot_cache_ttl() -> int:
+    try:
+        return int(os.environ.get(_PIVOT_CACHE_TTL_ENV, _PIVOT_CACHE_TTL_DEFAULT))
+    except ValueError:
+        return _PIVOT_CACHE_TTL_DEFAULT
+
+
+def _load_pivot_cache() -> dict[str, Any]:
+    p = _pivot_cache_path()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _cached_pivot(source: str, value: str, fetch) -> Any:
+    """Return a cached source result for `value` if it's fresh, else call
+    `fetch()`, cache a successful result, and return it. `fetch` may
+    raise (e.g. VirusTotal) - exceptions propagate uncached so a transient
+    outage isn't remembered as the answer."""
+    import time
+    ttl = _pivot_cache_ttl()
+    if ttl <= 0:
+        return fetch()
+    key = f"{source}:{value}"
+    cache = _load_pivot_cache()
+    entry = cache.get(key)
+    now = time.time()
+    if entry and now - entry.get("ts", 0) < ttl:
+        return entry["result"]
+    result = fetch()
+    # Don't cache soft failures (RDAP/RIPEstat return an "error" key rather
+    # than raising); a later retry should be able to succeed.
+    if not (isinstance(result, dict) and "error" in result):
+        cache[key] = {"ts": now, "result": result}
+        try:
+            _atomic_write_text(_pivot_cache_path(), json.dumps(cache))
+        except OSError:
+            pass
+    return result
 
 
 def pivot_observable(value: str) -> dict[str, Any]:
@@ -482,10 +684,12 @@ def pivot_observable(value: str) -> dict[str, Any]:
     against free, no-recurring-cost public data sources - RDAP
     (registration data), RIPEstat (ASN/network context, IP only), and
     VirusTotal (reputation + resolution history, if VT_API_KEY is set
-    in the environment). Display only: nothing here is written to any
-    cluster or store, unlike ingest_report. If a pivot surfaces
-    something worth keeping, record it yourself via append_hunt_log,
-    add_gap, or by filing the new indicator into a cluster.
+    in the environment). Display only: no cluster data is written, unlike
+    ingest_report - though successful lookups are cached transiently
+    under _registry to respect source rate limits (see CTI_PIVOT_CACHE_TTL).
+    If a pivot surfaces something worth keeping, record it yourself via
+    append_hunt_log, add_gap, or by filing the new indicator into a
+    cluster.
 
     VirusTotal is skipped (with a note, not an error) if VT_API_KEY
     isn't configured - RDAP and RIPEstat need no key at all and always
@@ -495,9 +699,9 @@ def pivot_observable(value: str) -> dict[str, Any]:
     result: dict[str, Any] = {"value": value, "kind": kind}
 
     if kind in ("domain", "ip"):
-        result["rdap"] = pivot.rdap_lookup(value, kind)
+        result["rdap"] = _cached_pivot("rdap", value, lambda: pivot.rdap_lookup(value, kind))
     if kind == "ip":
-        result["ripestat"] = pivot.ripestat_lookup(value)
+        result["ripestat"] = _cached_pivot("ripestat", value, lambda: pivot.ripestat_lookup(value))
 
     api_key = os.environ.get(pivot.VT_API_KEY_ENV)
     if not api_key:
@@ -505,7 +709,8 @@ def pivot_observable(value: str) -> dict[str, Any]:
             "skipped": f"set {pivot.VT_API_KEY_ENV} to enable VirusTotal lookups"}
     else:
         try:
-            result["virustotal"] = pivot.virustotal_lookup(value, kind, api_key)
+            result["virustotal"] = _cached_pivot(
+                "virustotal", value, lambda: pivot.virustotal_lookup(value, kind, api_key))
         except pivot.PivotError as e:
             result["virustotal"] = {"error": str(e)}
 
@@ -536,7 +741,7 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                         source: str) -> dict[str, int]:
     now = _now()
     counts = {}
-    for category in ("hashes", "domains", "ips", "urls"):
+    for category in OBSERVABLE_CATEGORIES:
         bucket = data["observables"][category]
         by_value = {o["value"]: o for o in bucket}
         added = 0
@@ -573,6 +778,7 @@ def _merge_ttps(data: dict[str, Any], technique_ids: list[str], source: str) -> 
     return added
 
 
+@_synchronized
 def ingest_report(source: str, cluster_name: str | None = None,
                    create_if_missing: bool = True) -> dict[str, Any]:
     """Fetch a report, extract observables/TTPs, and file them into a
@@ -631,7 +837,9 @@ def ingest_report(source: str, cluster_name: str | None = None,
 
 def export_stix_bundle(name: str) -> dict[str, Any]:
     """Export the cluster as a STIX 2.1 bundle (Intrusion Set + Attack
-    Patterns + Relationships + Notes) for sharing outside this tool."""
+    Patterns + Indicators + Relationships + Notes) for sharing outside
+    this tool. Tracked observables become Indicators tied to the
+    Intrusion Set."""
     data = load_cluster(name)
     return stix.to_bundle(data)
 
@@ -674,12 +882,14 @@ def export_stix_ecosystem(name: str) -> dict[str, Any]:
     return stix.merge_bundles(bundles)
 
 
+@_synchronized
 def import_stix_bundle(bundle: dict[str, Any], name: str | None = None,
                         overwrite: bool = False) -> dict[str, Any]:
     """Create or update a cluster from an external STIX 2.1 bundle
     containing an Intrusion Set (plus optional Attack Patterns /
-    Relationships / Notes). Existing local fields not present in the
-    bundle (hunt log, detections, gaps) are preserved on update."""
+    Indicators / Relationships / Notes). Indicators are reconstructed
+    into the cluster's observables. Existing local fields not present in
+    the bundle (hunt log, detections, gaps) are preserved on update."""
     parsed = stix.from_bundle(bundle)
     cluster_name = name or parsed["name"]
     p = _path(cluster_name)
@@ -713,6 +923,11 @@ def import_stix_bundle(bundle: dict[str, Any], name: str | None = None,
         data["ttps"] = parsed["ttps"]
         data["hunt_log"] = parsed["notes"]
         data["relationships"] = parsed["relationships"]
+
+    parsed_obs = parsed.get("observables", {})
+    if parsed_obs:
+        extracted = {c: parsed_obs.get(c, []) for c in OBSERVABLE_CATEGORIES}
+        _merge_observables(data, extracted, f"STIX import ({parsed['stix_id']})")
     save_cluster(data)
     return data
 
@@ -764,7 +979,7 @@ def _write_markdown(data: dict[str, Any]) -> None:
         lines.append(f"| {g['description']} | {g['priority']} | {g['created']} |")
     lines += ["", "## Observables"]
     obs = data["observables"]
-    for category in ("hashes", "domains", "ips", "urls"):
+    for category in OBSERVABLE_CATEGORIES:
         items = obs.get(category, [])
         lines.append(f"\n### {category.capitalize()} ({len(items)})")
         if items:
@@ -783,4 +998,4 @@ def _write_markdown(data: dict[str, Any]) -> None:
     for h in data["hunt_log"]:
         lines.append(f"- **{h['date']}** — {h['entry']}")
     md_path = _path(data["name"]).with_suffix(".md")
-    md_path.write_text("\n".join(lines) + "\n")
+    _atomic_write_text(md_path, "\n".join(lines) + "\n")

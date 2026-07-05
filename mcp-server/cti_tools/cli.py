@@ -96,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
 
     aob = sub.add_parser("add-observable")
     aob.add_argument("name")
-    aob.add_argument("category", choices=["hashes", "domains", "ips", "urls"])
+    aob.add_argument("category", choices=list(core.OBSERVABLE_CATEGORIES))
     aob.add_argument("value")
     aob.add_argument("source")
 

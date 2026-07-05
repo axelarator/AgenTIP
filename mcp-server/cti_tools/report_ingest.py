@@ -16,11 +16,23 @@ from __future__ import annotations
 import html
 import ipaddress
 import re
+import shutil
+import subprocess
+import tempfile
 import urllib.request
 from collections import Counter
+from pathlib import Path
 
 USER_AGENT = "cti-agent-report-ingest/1.0 (+local analysis tool, no telemetry)"
 FETCH_TIMEOUT = 20
+
+# The observable categories a cluster tracks, in a single place so the
+# extractor, the core data model, STIX export, and the CLI all agree on
+# the set. "hashes/domains/ips/urls" are the original network-infra
+# indicators; "emails/cves/wallets" were added later. Extraction returns
+# one list per category (plus "ttps", which is handled separately since
+# it isn't an observable).
+OBSERVABLE_CATEGORIES = ("hashes", "domains", "ips", "urls", "emails", "cves", "wallets")
 
 # Deliberately curated, not exhaustive: generic TLDs plus ccTLDs/newer
 # gTLDs that show up disproportionately often in malicious infrastructure
@@ -44,12 +56,27 @@ _HASH_PATTERNS = {
     "md5": re.compile(r"\b[A-Fa-f0-9]{32}\b"),
 }
 _IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+# Loose IPv6 matcher — deliberately over-broad; every hit is validated
+# with ipaddress.ip_address() below, so a false match just gets dropped.
+_IPV6_PATTERN = re.compile(r"\b(?:[A-Fa-f0-9]{0,4}:){2,7}[A-Fa-f0-9]{0,4}\b")
 _URL_PATTERN = re.compile(r"https?://[^\s\"'<>\)\]]+", re.IGNORECASE)
 _DOMAIN_CANDIDATE = re.compile(
     r"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
     r"([a-zA-Z]{2,24})\b"
 )
 _TTP_PATTERN = re.compile(r"\bT1\d{3}(?:\.\d{3})?\b")
+_EMAIL_PATTERN = re.compile(
+    r"\b[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+([A-Za-z]{2,24}))\b")
+_CVE_PATTERN = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
+# Crypto wallets: bech32 Bitcoin (bc1...) and Ethereum-style 0x + 40 hex.
+# Legacy base58 Bitcoin addresses are intentionally NOT matched — their
+# charset is too permissive and produces frequent false positives on
+# ordinary alphanumeric tokens; bech32 and 0x forms are self-delimiting
+# enough to stay precise.
+_WALLET_PATTERNS = [
+    re.compile(r"\bbc1[a-z0-9]{25,87}\b"),
+    re.compile(r"\b0x[a-fA-F0-9]{40}\b"),
+]
 
 # Naming conventions from the major vendor taxonomies. Best-effort:
 # these catch the common cases, not every alias scheme in use.
@@ -68,8 +95,10 @@ _DEFANG_SUBS = [
     (re.compile(r"hxxps", re.IGNORECASE), "https"),
     (re.compile(r"hxxp", re.IGNORECASE), "http"),
     (re.compile(r"\[\.\]|\(\.\)|\{\.\}"), "."),
+    (re.compile(r"\[dot\]|\(dot\)", re.IGNORECASE), "."),
+    (re.compile(r"\[://\]|\(://\)"), "://"),
     (re.compile(r"\[:\]|\(:\)"), ":"),
-    (re.compile(r"\[at\]|\(at\)", re.IGNORECASE), "@"),
+    (re.compile(r"\[at\]|\(at\)|\[@\]", re.IGNORECASE), "@"),
 ]
 
 
@@ -93,29 +122,60 @@ def _strip_html(raw: str) -> str:
     return html.unescape(raw)
 
 
+def _pdftotext(path: str) -> str:
+    """Extract text from a local PDF via the `pdftotext` CLI (poppler).
+    Kept as an external binary rather than a Python PDF dependency so the
+    package's zero-runtime-deps posture holds; if poppler isn't installed
+    we fall back to the same instructive error as before."""
+    exe = shutil.which("pdftotext")
+    if not exe:
+        raise UnsupportedSource(
+            "PDF source given but `pdftotext` (poppler-utils) isn't installed; "
+            "install it, or extract the text yourself (e.g. "
+            "`pdftotext report.pdf report.txt`) and pass the .txt file")
+    try:
+        # "-" writes the extracted text to stdout; "-q" suppresses noise.
+        out = subprocess.run([exe, "-q", path, "-"], capture_output=True,
+                             timeout=FETCH_TIMEOUT, check=True)
+    except subprocess.CalledProcessError as e:
+        raise UnsupportedSource(f"pdftotext failed on {path}: "
+                                f"{e.stderr.decode('utf-8', 'replace').strip()}") from e
+    except subprocess.TimeoutExpired as e:
+        raise UnsupportedSource(f"pdftotext timed out on {path}") from e
+    return out.stdout.decode("utf-8", errors="replace")
+
+
 def fetch_text(source: str) -> str:
     """Return plain text for a URL or local file path. HTML is stripped
-    to text; PDFs and other binary formats are explicitly unsupported —
-    extract text yourself first and pass a .txt file if you hit one."""
-    if source.lower().endswith(".pdf"):
-        raise UnsupportedSource(
-            "PDF sources aren't supported yet; extract the text first "
-            "(e.g. `pdftotext report.pdf report.txt`) and pass that file")
+    to text; PDFs are extracted via `pdftotext` if poppler-utils is
+    installed (otherwise a clear error asks you to extract the text
+    first). Other binary formats are unsupported."""
+    is_pdf = source.lower().endswith(".pdf")
 
     if source.startswith(("http://", "https://")):
         req = urllib.request.Request(source, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
             content_type = resp.headers.get_content_type()
-            raw = resp.read().decode(resp.headers.get_content_charset() or "utf-8",
-                                      errors="replace")
+            body = resp.read()
+        if is_pdf or content_type == "application/pdf":
+            # pdftotext needs a real file; buffer the download and clean up.
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+                tf.write(body)
+                tmp = tf.name
+            try:
+                return _pdftotext(tmp)
+            finally:
+                Path(tmp).unlink(missing_ok=True)
+        raw = body.decode(resp.headers.get_content_charset() or "utf-8", errors="replace")
         if content_type == "text/html":
             return _strip_html(raw)
         return raw
 
-    from pathlib import Path
     p = Path(source)
     if not p.exists():
         raise FileNotFoundError(f"no such file: {source}")
+    if is_pdf:
+        return _pdftotext(str(p))
     raw = p.read_text(errors="replace")
     if p.suffix.lower() in (".htm", ".html"):
         return _strip_html(raw)
@@ -123,12 +183,14 @@ def fetch_text(source: str) -> str:
 
 
 def extract_observables(text: str) -> dict[str, list[str]]:
-    """Pull hashes/IPs/domains/URLs/ATT&CK technique IDs out of report
-    text. Input should already be defang-normalized."""
+    """Pull hashes/IPs/domains/URLs/emails/CVEs/crypto-wallets and ATT&CK
+    technique IDs out of report text. Input should already be
+    defang-normalized. Returns one list per OBSERVABLE_CATEGORIES key
+    plus "ttps"."""
     urls = sorted(set(_URL_PATTERN.findall(text)))
 
     ips = []
-    for m in _IP_PATTERN.findall(text):
+    for m in _IP_PATTERN.findall(text) + _IPV6_PATTERN.findall(text):
         try:
             addr = ipaddress.ip_address(m)
         except ValueError:
@@ -136,7 +198,7 @@ def extract_observables(text: str) -> dict[str, list[str]]:
         if addr.is_private or addr.is_loopback or addr.is_link_local \
                 or addr.is_multicast or addr.is_reserved or addr.is_unspecified:
             continue  # not useful as adversary infrastructure
-        ips.append(m)
+        ips.append(addr.compressed)
     ips = sorted(set(ips))
 
     domains = set()
@@ -157,8 +219,14 @@ def extract_observables(text: str) -> dict[str, list[str]]:
 
     ttps = sorted(set(_TTP_PATTERN.findall(text)))
 
+    emails = sorted({m.group(0).lower() for m in _EMAIL_PATTERN.finditer(text)
+                     if m.group(2).lower() in _TLDS})
+    cves = sorted({m.group(0).upper() for m in _CVE_PATTERN.finditer(text)})
+    wallets = sorted({w for pat in _WALLET_PATTERNS for w in pat.findall(text)})
+
     return {"hashes": hash_list, "domains": domains, "ips": ips,
-            "urls": urls, "ttps": ttps}
+            "urls": urls, "emails": emails, "cves": cves, "wallets": wallets,
+            "ttps": ttps}
 
 
 def suggest_cluster_names(text: str, max_candidates: int = 5) -> list[str]:
