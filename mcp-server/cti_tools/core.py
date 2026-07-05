@@ -693,7 +693,10 @@ def pivot_observable(value: str) -> dict[str, Any]:
 
     VirusTotal is skipped (with a note, not an error) if VT_API_KEY
     isn't configured - RDAP and RIPEstat need no key at all and always
-    run for the observable types they apply to.
+    run for the observable types they apply to. Certificate-transparency
+    history (Cert Spotter, for domains) and reverse-IP co-hosting
+    (Hackertarget, for IPs) are also keyless and surface sibling
+    infrastructure as new pivot leads.
     """
     kind = pivot.classify(value)
     result: dict[str, Any] = {"value": value, "kind": kind}
@@ -702,6 +705,11 @@ def pivot_observable(value: str) -> dict[str, Any]:
         result["rdap"] = _cached_pivot("rdap", value, lambda: pivot.rdap_lookup(value, kind))
     if kind == "ip":
         result["ripestat"] = _cached_pivot("ripestat", value, lambda: pivot.ripestat_lookup(value))
+        result["reverse_ip"] = _cached_pivot(
+            "reverse_ip", value, lambda: pivot.hackertarget_reverse_ip(value))
+    if kind == "domain":
+        result["certspotter"] = _cached_pivot(
+            "certspotter", value, lambda: pivot.certspotter_lookup(value))
 
     api_key = os.environ.get(pivot.VT_API_KEY_ENV)
     if not api_key:
@@ -715,6 +723,155 @@ def pivot_observable(value: str) -> dict[str, Any]:
             result["virustotal"] = {"error": str(e)}
 
     return result
+
+
+@_synchronized
+def pivot_cluster(name: str) -> dict[str, Any]:
+    """Sweep every tracked domain and IP for a cluster through the free
+    pivot sources and stamp a lifecycle status onto each, turning a
+    static observable list into a live "what's still up" view. Domains
+    are classified active/dead/sinkholed/expired/unknown (RDAP + a live
+    resolution attempt); IPs routed/unrouted/unknown (RIPEstat). The
+    status, the time it was checked, and the supporting detail are
+    written back onto each observable (unlike pivot_observable, which is
+    display-only), and a summary is returned. Successful source lookups
+    are cached (see CTI_PIVOT_CACHE_TTL) so re-sweeping is cheap."""
+    data = load_cluster(name)
+    now = _now()
+    summary: dict[str, Any] = {"name": data["name"], "checked": now, "domains": [], "ips": []}
+
+    for o in data["observables"]["domains"]:
+        value = o["value"]
+        rdap = _cached_pivot("rdap", value, lambda v=value: pivot.rdap_lookup(v, "domain"))
+        resolved = pivot.resolve_host(value)  # live, not cached — liveness is the point
+        status = pivot.classify_domain_lifecycle(rdap, resolved)
+        o["status"] = status
+        o["status_checked"] = now
+        o["status_detail"] = {
+            "resolved": resolved,
+            "nameservers": rdap.get("nameservers") if isinstance(rdap, dict) else None,
+        }
+        summary["domains"].append({"value": value, "status": status, "resolved": resolved})
+
+    for o in data["observables"]["ips"]:
+        value = o["value"]
+        ripe = _cached_pivot("ripestat", value, lambda v=value: pivot.ripestat_lookup(v))
+        status = pivot.classify_ip_lifecycle(ripe)
+        o["status"] = status
+        o["status_checked"] = now
+        o["status_detail"] = {
+            "asn": ripe.get("asn") if isinstance(ripe, dict) else None,
+            "prefix": ripe.get("prefix") if isinstance(ripe, dict) else None,
+        }
+        summary["ips"].append({"value": value, "status": status,
+                                "asn": ripe.get("asn") if isinstance(ripe, dict) else None})
+
+    save_cluster(data)
+    return summary
+
+
+def _safe_vt(value: str, kind: str, api_key: str) -> dict[str, Any]:
+    """VirusTotal lookup that returns an {"error": ...} dict instead of
+    raising, so it composes with _cached_pivot (which caches successes,
+    never errors) inside a larger expansion."""
+    try:
+        return pivot.virustotal_lookup(value, kind, api_key)
+    except pivot.PivotError as e:
+        return {"error": str(e)}
+
+
+def _file_new_observables(data: dict[str, Any], category: str, values: list[str],
+                           source: str) -> list[str]:
+    """Merge only values not already tracked on the cluster in `category`,
+    returning the ones actually added (deduped, order-preserving)."""
+    existing = {o["value"] for o in data["observables"][category]}
+    new = [v for v in dict.fromkeys(values) if v and v not in existing]
+    if new:
+        extracted = {c: (new if c == category else []) for c in OBSERVABLE_CATEGORIES}
+        _merge_observables(data, extracted, source)
+    return new
+
+
+@_synchronized
+def pivot_and_expand(value: str, cluster_name: str,
+                     include_cohosted: bool = False) -> dict[str, Any]:
+    """Pivot a domain or IP and file the high-confidence new indicators it
+    surfaces straight onto an existing cluster (with provenance and a
+    hunt-log entry), instead of leaving you to copy each finding back by
+    hand. What gets filed:
+
+    - domain: sibling hostnames from certificate-transparency logs that
+      sit under the queried name (same operator, high confidence), and
+      the domain's historical resolution IPs from VirusTotal.
+    - ip: the IP's historical resolutions (domains) from VirusTotal.
+
+    Reverse-IP co-hosted domains are NOT filed by default (shared-hosting
+    noise); pass include_cohosted=True to file them too, or read them from
+    the returned `review` block and file the real ones yourself. Anything
+    not filed (co-hosted domains, CT names outside the queried name) is
+    returned under `review` for manual follow-up. Only genuinely new
+    indicators are filed; ones already tracked are left as-is."""
+    data = load_cluster(cluster_name)  # must already exist; expansion targets an investigation
+    kind = pivot.classify(value)
+    if kind not in ("domain", "ip"):
+        raise ValueError(
+            f"pivot_and_expand supports domain/ip values; got kind={kind!r} for {value!r}")
+    now = _now()
+    api_key = os.environ.get(pivot.VT_API_KEY_ENV)
+    filed: dict[str, list[str]] = {}
+    review: dict[str, Any] = {}
+
+    def record(category: str, values: list[str], source: str) -> None:
+        added = _file_new_observables(data, category, values, source)
+        if added:
+            filed.setdefault(category, []).extend(added)
+
+    if kind == "domain":
+        ct = _cached_pivot("certspotter", value, lambda: pivot.certspotter_lookup(value))
+        if isinstance(ct, dict) and ct.get("error"):
+            review["certspotter_error"] = ct["error"]
+        elif isinstance(ct, dict):
+            hostnames = ct.get("hostnames", [])
+            siblings = [h for h in hostnames if h != value and h.endswith("." + value)]
+            record("domains", siblings,
+                   f"pivot_and_expand via Cert Spotter CT log, checked {now}")
+            others = [h for h in hostnames if h != value and not h.endswith("." + value)]
+            if others:
+                review["certspotter_other_hostnames"] = others
+        if api_key:
+            vt = _cached_pivot("virustotal", value, lambda: _safe_vt(value, kind, api_key))
+            ips = [r["ip"] for r in (vt.get("resolutions") or []) if r.get("ip")] \
+                if isinstance(vt, dict) else []
+            record("ips", ips,
+                   f"pivot_and_expand via VirusTotal resolution history, checked {now}")
+    else:  # ip
+        if api_key:
+            vt = _cached_pivot("virustotal", value, lambda: _safe_vt(value, kind, api_key))
+            domains = [r["domain"] for r in (vt.get("resolutions") or []) if r.get("domain")] \
+                if isinstance(vt, dict) else []
+            record("domains", domains,
+                   f"pivot_and_expand via VirusTotal resolution history, checked {now}")
+        rev = _cached_pivot("reverse_ip", value, lambda: pivot.hackertarget_reverse_ip(value))
+        cohosted = rev.get("domains", []) if isinstance(rev, dict) and not rev.get("error") else []
+        if include_cohosted:
+            record("domains", cohosted,
+                   f"pivot_and_expand via Hackertarget reverse-IP, checked {now}")
+        elif cohosted:
+            review["cohosted_domains"] = cohosted
+
+    filed = {c: sorted(set(v)) for c, v in filed.items() if v}
+    total = sum(len(v) for v in filed.values())
+    breakdown = ", ".join(f"{len(v)} {c}" for c, v in filed.items()) or "none"
+    entry = f"pivot_and_expand on {value}: filed {total} new indicator(s) ({breakdown})"
+    if review:
+        n_review = sum(len(v) for v in review.values() if isinstance(v, list))
+        if n_review:
+            entry += f"; {n_review} candidate(s) left for review"
+    data["hunt_log"].append({"date": now, "entry": entry})
+    save_cluster(data)
+
+    return {"value": value, "kind": kind, "cluster": cluster_name,
+            "filed": filed, "review": review, "cluster_state": load_cluster(cluster_name)}
 
 
 def analyze_report(source: str) -> dict[str, Any]:
@@ -983,10 +1140,13 @@ def _write_markdown(data: dict[str, Any]) -> None:
         items = obs.get(category, [])
         lines.append(f"\n### {category.capitalize()} ({len(items)})")
         if items:
-            lines.append("| Value | Sources | First seen | Last seen |")
-            lines.append("|---|---|---|---|")
+            lines.append("| Value | Status | Sources | First seen | Last seen |")
+            lines.append("|---|---|---|---|---|")
             for o in items:
-                lines.append(f"| {o['value']} | {', '.join(o['sources'])} | "
+                status = o.get("status", "")
+                if status and o.get("status_checked"):
+                    status = f"{status} ({o['status_checked'][:10]})"
+                lines.append(f"| {o['value']} | {status} | {', '.join(o['sources'])} | "
                               f"{o['first_seen']} | {o['last_seen']} |")
         else:
             lines.append("none")

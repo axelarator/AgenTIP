@@ -141,3 +141,59 @@ def test_virustotal_lookup_hash(monkeypatch):
 def test_virustotal_lookup_unsupported_kind_raises():
     with pytest.raises(pivot.PivotError):
         pivot.virustotal_lookup("x", "bogus-kind", "fake-key")
+
+
+def test_certspotter_lookup_collects_hostnames(monkeypatch):
+    def fake_get_json(url, headers=None):
+        assert "api.certspotter.com" in url and "example.com" in url
+        return [
+            {"dns_names": ["example.com", "*.example.com"],
+             "issuer": {"name": "Let's Encrypt"},
+             "not_before": "2026-01-01T00:00:00Z", "not_after": "2026-04-01T00:00:00Z"},
+            {"dns_names": ["vpn.example.com"], "issuer": {"name": "ZeroSSL"},
+             "not_before": "2026-02-01T00:00:00Z", "not_after": "2026-05-01T00:00:00Z"},
+        ]
+    monkeypatch.setattr(pivot, "_get_json", fake_get_json)
+    result = pivot.certspotter_lookup("example.com")
+    assert result["issuance_count"] == 2
+    # wildcard prefix stripped, deduped, lower-cased
+    assert result["hostnames"] == ["example.com", "vpn.example.com"]
+    assert result["issuances"][0]["issuer"] == "Let's Encrypt"
+
+
+def test_certspotter_lookup_error_is_contained(monkeypatch):
+    def raise_error(url, headers=None):
+        raise pivot.PivotError("HTTP 429")
+    monkeypatch.setattr(pivot, "_get_json", raise_error)
+    assert "error" in pivot.certspotter_lookup("example.com")
+
+
+def test_hackertarget_reverse_ip_parses_lines(monkeypatch):
+    monkeypatch.setattr(pivot, "_get_text",
+                        lambda url, headers=None: "a.example\nb.example\n\nc.example\n")
+    result = pivot.hackertarget_reverse_ip("1.2.3.4")
+    assert result["domains"] == ["a.example", "b.example", "c.example"]
+
+
+def test_hackertarget_reverse_ip_quota_message_is_error(monkeypatch):
+    monkeypatch.setattr(pivot, "_get_text",
+                        lambda url, headers=None: "API count exceeded - Increase Quota with Membership")
+    assert "error" in pivot.hackertarget_reverse_ip("1.2.3.4")
+
+
+def test_resolve_host_distinguishes_dead_from_inconclusive(monkeypatch):
+    import socket
+
+    def gaierror(*a, **k):
+        raise socket.gaierror("NXDOMAIN")
+    monkeypatch.setattr(pivot.socket, "getaddrinfo", gaierror)
+    assert pivot.resolve_host("nope.invalid") == []  # doesn't resolve
+
+    def oserror(*a, **k):
+        raise OSError("timeout")
+    monkeypatch.setattr(pivot.socket, "getaddrinfo", oserror)
+    assert pivot.resolve_host("nope.invalid") is None  # inconclusive
+
+    monkeypatch.setattr(pivot.socket, "getaddrinfo",
+                        lambda *a, **k: [(0, 0, 0, "", ("185.10.10.10", 0))])
+    assert pivot.resolve_host("live.example") == ["185.10.10.10"]

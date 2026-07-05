@@ -429,63 +429,77 @@ def test_export_stix_ecosystem_single_cluster_no_relationships():
 
 # --- pivot_observable orchestration -----------------------------------------
 
-def test_pivot_observable_domain_calls_rdap_not_ripestat(monkeypatch):
-    monkeypatch.delenv("VT_API_KEY", raising=False)
+@pytest.fixture
+def stub_pivot_net(monkeypatch):
+    """Stub every pivot network source so pivot_observable tests are
+    hermetic. Individual tests override specific sources as needed."""
     monkeypatch.setattr(core.pivot, "rdap_lookup", lambda value, kind: {"handle": "H"})
+    monkeypatch.setattr(core.pivot, "ripestat_lookup", lambda ip: {"asn": [999]})
+    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {"hostnames": []})
+    monkeypatch.setattr(core.pivot, "hackertarget_reverse_ip", lambda ip: {"domains": []})
+    return monkeypatch
+
+
+def test_pivot_observable_domain_calls_rdap_and_certspotter_not_ripestat(stub_pivot_net):
+    stub_pivot_net.delenv("VT_API_KEY", raising=False)
     result = core.pivot_observable("example.com")
     assert result["kind"] == "domain"
     assert result["rdap"] == {"handle": "H"}
+    assert result["certspotter"] == {"hostnames": []}
     assert "ripestat" not in result
+    assert "reverse_ip" not in result  # domain, not ip
     assert "skipped" in result["virustotal"]
 
 
-def test_pivot_observable_ip_calls_rdap_and_ripestat(monkeypatch):
-    monkeypatch.delenv("VT_API_KEY", raising=False)
-    monkeypatch.setattr(core.pivot, "rdap_lookup", lambda value, kind: {"handle": "IP-H"})
-    monkeypatch.setattr(core.pivot, "ripestat_lookup", lambda ip: {"asn": [999]})
+def test_pivot_observable_ip_calls_rdap_ripestat_and_reverse_ip(stub_pivot_net):
+    stub_pivot_net.delenv("VT_API_KEY", raising=False)
+    stub_pivot_net.setattr(core.pivot, "hackertarget_reverse_ip",
+                           lambda ip: {"domains": ["co-hosted.example"]})
     result = core.pivot_observable("1.2.3.4")
     assert result["kind"] == "ip"
-    assert result["rdap"] == {"handle": "IP-H"}
+    assert result["rdap"] == {"handle": "H"}
     assert result["ripestat"] == {"asn": [999]}
+    assert result["reverse_ip"] == {"domains": ["co-hosted.example"]}
+    assert "certspotter" not in result  # ip, not domain
 
 
-def test_pivot_observable_hash_skips_rdap_and_ripestat(monkeypatch):
+def test_pivot_observable_hash_skips_network_sources(monkeypatch):
     monkeypatch.delenv("VT_API_KEY", raising=False)
     result = core.pivot_observable("098f6bcd4621d373cade4e832627b4f6")
     assert result["kind"] == "hash"
     assert "rdap" not in result
     assert "ripestat" not in result
+    assert "certspotter" not in result
+    assert "reverse_ip" not in result
     assert "skipped" in result["virustotal"]
 
 
-def test_pivot_observable_virustotal_skipped_without_key(monkeypatch):
-    monkeypatch.delenv("VT_API_KEY", raising=False)
+def test_pivot_observable_virustotal_skipped_without_key(stub_pivot_net):
+    stub_pivot_net.delenv("VT_API_KEY", raising=False)
     result = core.pivot_observable("example.com")
     assert "skipped" in result["virustotal"]
     assert "VT_API_KEY" in result["virustotal"]["skipped"]
 
 
-def test_pivot_observable_virustotal_used_with_key(monkeypatch):
-    monkeypatch.setenv("VT_API_KEY", "fake-key")
-    monkeypatch.setattr(core.pivot, "rdap_lookup", lambda value, kind: {})
-    monkeypatch.setattr(core.pivot, "virustotal_lookup",
-                         lambda value, kind, api_key: {"reputation": 10, "key_used": api_key})
+def test_pivot_observable_virustotal_used_with_key(stub_pivot_net):
+    stub_pivot_net.setenv("VT_API_KEY", "fake-key")
+    stub_pivot_net.setattr(core.pivot, "virustotal_lookup",
+                           lambda value, kind, api_key: {"reputation": 10, "key_used": api_key})
     result = core.pivot_observable("example.com")
     assert result["virustotal"] == {"reputation": 10, "key_used": "fake-key"}
 
 
-def test_pivot_observable_virustotal_error_is_contained(monkeypatch):
-    monkeypatch.setenv("VT_API_KEY", "fake-key")
-    monkeypatch.setattr(core.pivot, "rdap_lookup", lambda value, kind: {})
+def test_pivot_observable_virustotal_error_is_contained(stub_pivot_net):
+    stub_pivot_net.setenv("VT_API_KEY", "fake-key")
 
     def raise_error(value, kind, api_key):
         raise core.pivot.PivotError("vt down")
-    monkeypatch.setattr(core.pivot, "virustotal_lookup", raise_error)
+    stub_pivot_net.setattr(core.pivot, "virustotal_lookup", raise_error)
     result = core.pivot_observable("example.com")
     assert "error" in result["virustotal"]
 
 
-def test_pivot_observable_does_not_write_to_any_cluster():
+def test_pivot_observable_does_not_write_to_any_cluster(stub_pivot_net):
     core.create_cluster("Pivot Side Effect Test")
     before = core.get_cluster("Pivot Side Effect Test")
     core.pivot_observable("example.com")
@@ -625,46 +639,165 @@ def test_no_leftover_temp_files(isolated_data_dir):
 
 # --- pivot caching -----------------------------------------------------------
 
-def test_pivot_cache_avoids_refetch(monkeypatch):
-    monkeypatch.delenv("VT_API_KEY", raising=False)
-    monkeypatch.delenv("CTI_PIVOT_CACHE_TTL", raising=False)
+def test_pivot_cache_avoids_refetch(stub_pivot_net):
+    stub_pivot_net.delenv("VT_API_KEY", raising=False)
+    stub_pivot_net.delenv("CTI_PIVOT_CACHE_TTL", raising=False)
     calls = {"n": 0}
 
     def fake_rdap(value, kind):
         calls["n"] += 1
         return {"handle": "H"}
 
-    monkeypatch.setattr(core.pivot, "rdap_lookup", fake_rdap)
+    stub_pivot_net.setattr(core.pivot, "rdap_lookup", fake_rdap)
     core.pivot_observable("example.com")
     core.pivot_observable("example.com")
     assert calls["n"] == 1  # second lookup served from cache
 
 
-def test_pivot_cache_disabled_with_ttl_zero(monkeypatch):
-    monkeypatch.delenv("VT_API_KEY", raising=False)
-    monkeypatch.setenv("CTI_PIVOT_CACHE_TTL", "0")
+def test_pivot_cache_disabled_with_ttl_zero(stub_pivot_net):
+    stub_pivot_net.delenv("VT_API_KEY", raising=False)
+    stub_pivot_net.setenv("CTI_PIVOT_CACHE_TTL", "0")
     calls = {"n": 0}
 
     def fake_rdap(value, kind):
         calls["n"] += 1
         return {"handle": "H"}
 
-    monkeypatch.setattr(core.pivot, "rdap_lookup", fake_rdap)
+    stub_pivot_net.setattr(core.pivot, "rdap_lookup", fake_rdap)
     core.pivot_observable("example.com")
     core.pivot_observable("example.com")
     assert calls["n"] == 2  # caching off -> refetched
 
 
-def test_pivot_cache_does_not_cache_errors(monkeypatch):
-    monkeypatch.delenv("VT_API_KEY", raising=False)
-    monkeypatch.delenv("CTI_PIVOT_CACHE_TTL", raising=False)
+def test_pivot_cache_does_not_cache_errors(stub_pivot_net):
+    stub_pivot_net.delenv("VT_API_KEY", raising=False)
+    stub_pivot_net.delenv("CTI_PIVOT_CACHE_TTL", raising=False)
     calls = {"n": 0}
 
     def fake_rdap(value, kind):
         calls["n"] += 1
         return {"error": "rdap down"}
 
-    monkeypatch.setattr(core.pivot, "rdap_lookup", fake_rdap)
+    stub_pivot_net.setattr(core.pivot, "rdap_lookup", fake_rdap)
     core.pivot_observable("example.com")
     core.pivot_observable("example.com")
     assert calls["n"] == 2  # soft errors aren't cached, so they're retried
+
+
+# --- lifecycle classification (pure) ----------------------------------------
+
+def test_classify_domain_lifecycle_sinkholed():
+    rdap = {"nameservers": ["ns1.microsoftinternetsafety.net"], "status": ["active"]}
+    assert core.pivot.classify_domain_lifecycle(rdap, ["10.0.0.1"]) == "sinkholed"
+
+
+def test_classify_domain_lifecycle_expired_by_status():
+    rdap = {"nameservers": [], "status": ["client hold", "pending delete"]}
+    assert core.pivot.classify_domain_lifecycle(rdap, None) == "expired"
+
+
+def test_classify_domain_lifecycle_expired_by_event():
+    rdap = {"nameservers": [], "status": [],
+            "events": [{"action": "expiration", "date": "2000-01-01T00:00:00Z"}]}
+    assert core.pivot.classify_domain_lifecycle(rdap, None) == "expired"
+
+
+def test_classify_domain_lifecycle_active_and_dead():
+    rdap = {"nameservers": ["ns1.legit.example"], "status": ["active"]}
+    assert core.pivot.classify_domain_lifecycle(rdap, ["185.10.10.10"]) == "active"
+    assert core.pivot.classify_domain_lifecycle(rdap, []) == "dead"
+    assert core.pivot.classify_domain_lifecycle(rdap, None) == "unknown"
+
+
+def test_classify_ip_lifecycle():
+    assert core.pivot.classify_ip_lifecycle({"prefix": "185.10.0.0/16", "asn": [64500]}) == "routed"
+    assert core.pivot.classify_ip_lifecycle({"prefix": None}) == "unrouted"
+    assert core.pivot.classify_ip_lifecycle({"network_info_error": "boom"}) == "unknown"
+    assert core.pivot.classify_ip_lifecycle(None) == "unknown"
+
+
+# --- pivot_cluster sweep -----------------------------------------------------
+
+def test_pivot_cluster_stamps_lifecycle_status(monkeypatch):
+    core.create_cluster("Sweep")
+    core.add_observable("Sweep", "domains", "dead-c2.example", "r")
+    core.add_observable("Sweep", "ips", "185.10.10.10", "r")
+
+    monkeypatch.setattr(core.pivot, "rdap_lookup",
+                        lambda value, kind: {"nameservers": [], "status": [], "events": []})
+    monkeypatch.setattr(core.pivot, "resolve_host", lambda host: [])  # NXDOMAIN -> dead
+    monkeypatch.setattr(core.pivot, "ripestat_lookup",
+                        lambda ip: {"prefix": "185.10.0.0/16", "asn": [64500]})
+
+    summary = core.pivot_cluster("Sweep")
+    assert summary["domains"][0]["status"] == "dead"
+    assert summary["ips"][0]["status"] == "routed"
+
+    # status is persisted onto the observable, not just returned
+    data = core.get_cluster("Sweep")
+    dom = next(o for o in data["observables"]["domains"] if o["value"] == "dead-c2.example")
+    assert dom["status"] == "dead"
+    assert dom["status_checked"]
+
+
+# --- pivot_and_expand filing loop -------------------------------------------
+
+def test_pivot_and_expand_files_ct_subdomains_and_vt_resolutions(monkeypatch):
+    core.create_cluster("Expand")
+    core.add_observable("Expand", "domains", "evil.example", "seed report")
+
+    monkeypatch.setenv("VT_API_KEY", "fake-key")
+    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {
+        "hostnames": ["evil.example", "mail.evil.example", "vpn.evil.example",
+                      "unrelated.other.example"]})
+    monkeypatch.setattr(core.pivot, "virustotal_lookup", lambda value, kind, api_key: {
+        "resolutions": [{"ip": "185.55.55.55", "date": 1}, {"ip": "185.66.66.66", "date": 2}]})
+
+    result = core.pivot_and_expand("evil.example", "Expand")
+    assert set(result["filed"]["domains"]) == {"mail.evil.example", "vpn.evil.example"}
+    assert set(result["filed"]["ips"]) == {"185.55.55.55", "185.66.66.66"}
+    # the non-sibling hostname is surfaced for review, not filed
+    assert "unrelated.other.example" in result["review"]["certspotter_other_hostnames"]
+
+    data = core.get_cluster("Expand")
+    domains = {o["value"] for o in data["observables"]["domains"]}
+    assert {"mail.evil.example", "vpn.evil.example"} <= domains
+    # a hunt-log entry documents the expansion
+    assert any("pivot_and_expand on evil.example" in h["entry"] for h in data["hunt_log"])
+
+
+def test_pivot_and_expand_only_files_new_indicators(monkeypatch):
+    core.create_cluster("Expand Dedup")
+    core.add_observable("Expand Dedup", "domains", "evil.example", "seed")
+    core.add_observable("Expand Dedup", "domains", "mail.evil.example", "already tracked")
+
+    monkeypatch.delenv("VT_API_KEY", raising=False)
+    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {
+        "hostnames": ["mail.evil.example", "new.evil.example"]})
+
+    result = core.pivot_and_expand("evil.example", "Expand Dedup")
+    assert result["filed"]["domains"] == ["new.evil.example"]  # mail.* already tracked, not refiled
+
+
+def test_pivot_and_expand_cohosted_gated(monkeypatch):
+    core.create_cluster("Expand IP")
+    core.add_observable("Expand IP", "ips", "185.10.10.10", "seed")
+
+    monkeypatch.delenv("VT_API_KEY", raising=False)
+    monkeypatch.setattr(core.pivot, "hackertarget_reverse_ip",
+                        lambda ip: {"domains": ["shared-a.example", "shared-b.example"]})
+
+    # default: co-hosted domains are surfaced for review, not filed
+    result = core.pivot_and_expand("185.10.10.10", "Expand IP")
+    assert result["filed"] == {}
+    assert set(result["review"]["cohosted_domains"]) == {"shared-a.example", "shared-b.example"}
+
+    # opt-in: they get filed
+    result = core.pivot_and_expand("185.10.10.10", "Expand IP", include_cohosted=True)
+    assert set(result["filed"]["domains"]) == {"shared-a.example", "shared-b.example"}
+
+
+def test_pivot_and_expand_rejects_hash(monkeypatch):
+    core.create_cluster("Expand Hash")
+    with pytest.raises(ValueError):
+        core.pivot_and_expand("098f6bcd4621d373cade4e832627b4f6", "Expand Hash")

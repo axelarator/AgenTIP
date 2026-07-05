@@ -64,32 +64,56 @@ without the algo prefix (`sha256:...` or bare).
 ## Infrastructure pivoting
 
 Tracked observables are a static record until you actually check
-whether they're still live. `pivot_observable(value)` / `cti
-pivot-observable <value>` looks a hash/domain/ip/url up against free
-public sources (RDAP registration data; RIPEstat ASN/network context
-for IPs; VirusTotal reputation + resolution history if `VT_API_KEY` is
-set) — this is what turns "we saw this domain once" into "is this
-domain still doing anything." Reach for it when:
+whether they're still live. Three tools cover this, from lightest to
+heaviest:
+
+**`pivot_observable(value)`** / `cti pivot-observable <value>` — look a
+single hash/domain/ip/url up against free public sources and show the
+result, writing nothing. Sources: RDAP registration data; RIPEstat
+ASN/network context (IPs); Cert Spotter certificate-transparency
+history (domains — sibling subdomains as pivot leads, the keyless
+stand-in for crt.sh, which is no longer reachable); Hackertarget
+reverse-IP co-hosting (IPs); and VirusTotal reputation + resolution
+history if `VT_API_KEY` is set. Reach for it when:
 
 - you want to know if a tracked domain/IP is still active or has been
-  sinkholed/taken down (check RDAP nameservers/status — a domain
-  suddenly pointed at a vendor's sinkhole nameservers, e.g.
+  sinkholed/taken down (RDAP nameservers/status — a domain suddenly
+  pointed at a vendor's sinkhole nameservers, e.g.
   `*.microsoftinternetsafety.net`, means it's dead),
 - you want the ASN/network owner behind an IP before deciding it's
   worth its own observable entry vs. shared hosting noise,
-- you want other domains/IPs historically tied to an indicator
-  (VirusTotal's resolution history) as new pivot leads.
+- you want sibling infrastructure the same operator stood up (Cert
+  Spotter subdomains, VirusTotal resolution history, reverse-IP
+  co-hosting) as new pivot leads.
 
-This is explicitly on-demand and display-only — nothing from a pivot is
-written to any cluster automatically. If it surfaces something worth
-keeping, record it yourself: `append_hunt_log` for narrative (what the
-pivot found and why it matters), `add_gap` if it's a lead you haven't
-run down yet, and `add_observable(name, category, value, source)` for
-any new indicator worth tracking (a historical resolution, a co-hosted
-domain) — cite the pivot itself as the source (e.g. "pivot_observable
-via VirusTotal resolution history, checked <date>"), not a report URL.
-Don't treat pivot output as itself part of the cluster record until
-you've explicitly filed it.
+Display-only: nothing is written. If it surfaces something worth
+keeping, record it yourself with `append_hunt_log`, `add_gap`, or
+`add_observable(name, category, value, source)` — cite the pivot as the
+source (e.g. "pivot_observable via VirusTotal resolution history,
+checked <date>"), not a report URL.
+
+**`pivot_cluster(name)`** / `cti pivot-cluster <name>` — sweep *every*
+tracked domain and IP for a cluster at once and stamp a lifecycle status
+onto each: domains become `active` / `dead` / `sinkholed` / `expired` /
+`unknown` (RDAP + a live DNS resolution), IPs `routed` / `unrouted` /
+`unknown` (RIPEstat). Unlike `pivot_observable`, this **writes** the
+status (and when it was checked) back onto the observables, so the
+cluster's markdown shows at a glance what's still up. Run it to
+re-validate a cluster's infrastructure periodically.
+
+**`pivot_and_expand(value, cluster_name)`** / `cti pivot-and-expand
+<value> <cluster_name>` — pivot a domain/IP and **file** the
+high-confidence new indicators it surfaces straight onto an existing
+cluster, with provenance and a hunt-log entry, instead of copying each
+finding back by hand. Files by default: Cert Spotter sibling subdomains
+under the queried name (same operator) and VirusTotal historical
+resolutions. Reverse-IP co-hosted domains are *not* filed by default
+(shared-hosting noise) — they come back in the result's `review` block,
+or pass `--include-cohosted` / `include_cohosted=True` to file them too.
+Only genuinely new indicators are filed; the `review` block lists
+everything left for you to judge. Use this once you trust a pivot
+enough to expand from it; use `pivot_observable` first when you just
+want to look.
 
 ## Ingesting threat reports
 
@@ -244,7 +268,8 @@ Prefer the MCP tools if the harness exposes them: `list_clusters`,
 `add_relationship`, `add_gap`, `export_navigator_layer`,
 `export_stix_bundle`, `export_stix_ecosystem`, `import_stix_bundle`,
 `get_observables`, `find_observable`, `add_observable`,
-`pivot_observable`, `analyze_report`, `ingest_report`.
+`pivot_observable`, `pivot_cluster`, `pivot_and_expand`,
+`analyze_report`, `ingest_report`.
 
 If MCP tools are not available in this harness, use the CLI directly via
 the shell/bash tool from the `mcp-server` directory (or run `./setup.sh`
@@ -269,6 +294,8 @@ python -m cti_tools.cli get-observables <name>
 python -m cti_tools.cli find-observable <value>
 python -m cti_tools.cli add-observable <name> <hashes|domains|ips|urls> <value> <source>
 python -m cti_tools.cli pivot-observable <value>
+python -m cti_tools.cli pivot-cluster <name>
+python -m cti_tools.cli pivot-and-expand <value> <cluster_name> [--include-cohosted]
 python -m cti_tools.cli analyze-report <url-or-file>
 python -m cti_tools.cli ingest-report <url-or-file> [--name "..."] [--no-create]
 ```

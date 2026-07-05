@@ -94,6 +94,15 @@ def main(argv: list[str] | None = None) -> int:
     po = sub.add_parser("pivot-observable")
     po.add_argument("value", help="hash, domain, ip, or url to pivot on via RDAP/RIPEstat/VirusTotal")
 
+    pc = sub.add_parser("pivot-cluster")
+    pc.add_argument("name", help="cluster whose domains/ips get a lifecycle status sweep")
+
+    pe = sub.add_parser("pivot-and-expand")
+    pe.add_argument("value", help="domain or ip to pivot and expand from")
+    pe.add_argument("cluster_name", help="existing cluster to file new indicators onto")
+    pe.add_argument("--include-cohosted", action="store_true",
+                     help="also file reverse-IP co-hosted domains (shared-hosting noise by default)")
+
     aob = sub.add_parser("add-observable")
     aob.add_argument("name")
     aob.add_argument("category", choices=list(core.OBSERVABLE_CATEGORIES))
@@ -161,6 +170,11 @@ def main(argv: list[str] | None = None) -> int:
             _print(core.find_observable(args.value))
         elif args.command == "pivot-observable":
             _print(core.pivot_observable(args.value))
+        elif args.command == "pivot-cluster":
+            _print(core.pivot_cluster(args.name))
+        elif args.command == "pivot-and-expand":
+            _print(core.pivot_and_expand(args.value, args.cluster_name,
+                                          include_cohosted=args.include_cohosted))
         elif args.command == "add-observable":
             _print(core.add_observable(args.name, args.category, args.value, args.source))
         elif args.command == "analyze-report":

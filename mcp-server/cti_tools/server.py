@@ -150,6 +150,30 @@ def pivot_observable(value: str) -> dict:
 
 
 @mcp.tool()
+def pivot_cluster(name: str) -> dict:
+    """Sweep every tracked domain/ip for a cluster through the free pivot
+    sources and stamp a lifecycle status onto each observable: domains
+    become active/dead/sinkholed/expired/unknown (RDAP + live
+    resolution), ips routed/unrouted/unknown (RIPEstat). Unlike
+    pivot_observable, this WRITES the status back onto the cluster.
+    Returns a per-observable summary."""
+    return core.pivot_cluster(name)
+
+
+@mcp.tool()
+def pivot_and_expand(value: str, cluster_name: str,
+                     include_cohosted: bool = False) -> dict:
+    """Pivot a domain/ip and file the high-confidence new indicators it
+    surfaces onto an existing cluster (with provenance + a hunt-log
+    entry): CT-log sibling subdomains and VirusTotal historical
+    resolutions. Reverse-IP co-hosted domains are returned for review
+    unless include_cohosted=True. Only genuinely new indicators are
+    filed; the `review` block lists everything left for manual
+    follow-up."""
+    return core.pivot_and_expand(value, cluster_name, include_cohosted)
+
+
+@mcp.tool()
 def analyze_report(source: str) -> dict:
     """Fetch a threat report (URL or local file path) and extract
     observables/ATT&CK TTPs/candidate cluster names WITHOUT writing

@@ -55,6 +55,66 @@ timestamps. View them with `get_observables` / `cti get-observables` —
 this is the fast path to "what's tied to this cluster", instead of
 scrolling the full `get_cluster` dump.
 
+Given a hash/domain/ip/url with no cluster context yet — e.g. an IOC
+that showed up somewhere else and you want to know if it's already
+tracked — use `find_observable(value)` / `cti find-observable <value>`
+instead of checking each cluster by hand. Hash lookups work with or
+without the algo prefix (`sha256:...` or bare).
+
+## Infrastructure pivoting
+
+Tracked observables are a static record until you actually check
+whether they're still live. Three tools cover this, from lightest to
+heaviest:
+
+**`pivot_observable(value)`** / `cti pivot-observable <value>` — look a
+single hash/domain/ip/url up against free public sources and show the
+result, writing nothing. Sources: RDAP registration data; RIPEstat
+ASN/network context (IPs); Cert Spotter certificate-transparency
+history (domains — sibling subdomains as pivot leads, the keyless
+stand-in for crt.sh, which is no longer reachable); Hackertarget
+reverse-IP co-hosting (IPs); and VirusTotal reputation + resolution
+history if `VT_API_KEY` is set. Reach for it when:
+
+- you want to know if a tracked domain/IP is still active or has been
+  sinkholed/taken down (RDAP nameservers/status — a domain suddenly
+  pointed at a vendor's sinkhole nameservers, e.g.
+  `*.microsoftinternetsafety.net`, means it's dead),
+- you want the ASN/network owner behind an IP before deciding it's
+  worth its own observable entry vs. shared hosting noise,
+- you want sibling infrastructure the same operator stood up (Cert
+  Spotter subdomains, VirusTotal resolution history, reverse-IP
+  co-hosting) as new pivot leads.
+
+Display-only: nothing is written. If it surfaces something worth
+keeping, record it yourself with `append_hunt_log`, `add_gap`, or
+`add_observable(name, category, value, source)` — cite the pivot as the
+source (e.g. "pivot_observable via VirusTotal resolution history,
+checked <date>"), not a report URL.
+
+**`pivot_cluster(name)`** / `cti pivot-cluster <name>` — sweep *every*
+tracked domain and IP for a cluster at once and stamp a lifecycle status
+onto each: domains become `active` / `dead` / `sinkholed` / `expired` /
+`unknown` (RDAP + a live DNS resolution), IPs `routed` / `unrouted` /
+`unknown` (RIPEstat). Unlike `pivot_observable`, this **writes** the
+status (and when it was checked) back onto the observables, so the
+cluster's markdown shows at a glance what's still up. Run it to
+re-validate a cluster's infrastructure periodically.
+
+**`pivot_and_expand(value, cluster_name)`** / `cti pivot-and-expand
+<value> <cluster_name>` — pivot a domain/IP and **file** the
+high-confidence new indicators it surfaces straight onto an existing
+cluster, with provenance and a hunt-log entry, instead of copying each
+finding back by hand. Files by default: Cert Spotter sibling subdomains
+under the queried name (same operator) and VirusTotal historical
+resolutions. Reverse-IP co-hosted domains are *not* filed by default
+(shared-hosting noise) — they come back in the result's `review` block,
+or pass `--include-cohosted` / `include_cohosted=True` to file them too.
+Only genuinely new indicators are filed; the `review` block lists
+everything left for you to judge. Use this once you trust a pivot
+enough to expand from it; use `pivot_observable` first when you just
+want to look.
+
 ## Ingesting threat reports
 
 `ingest_report(source, cluster_name=None)` / `cti ingest-report <source>
@@ -89,6 +149,18 @@ preview (extraction + candidate names) without writing anything — useful
 when you're not sure yet which cluster a report belongs to, or want to
 sanity-check the candidates before committing.
 
+## Technique ID validation
+
+`update_ttp` and report-driven TTP extraction both check the
+technique_id/technique_name pair against a bundled MITRE ATT&CK
+Enterprise corpus. If the ID is unknown, revoked (with its
+replacement), deprecated, or the name doesn't match ATT&CK's canonical
+name for that ID, the call still succeeds but the returned cluster
+carries a `warning` field — read it, don't ignore it, but don't treat
+it as a failure either (a slightly stale bundle or a legitimately
+private/custom ID shouldn't block recording what you observed). This
+warning is never persisted to the cluster's stored JSON.
+
 ## TTP coverage scale (0–4)
 
 - 0 — no coverage, technique not addressed
@@ -103,6 +175,40 @@ what matters is that every technique has a status and it's kept current.
 Each TTP entry also becomes a STIX Attack Pattern (identified by its
 ATT&CK technique ID via `external_references`) linked to the cluster's
 Intrusion Set by a `uses` Relationship on export.
+
+## Detections and technique usage
+
+Detections are **not** stored per-cluster. They live in a shared,
+technique-keyed registry — the same Kerberoasting detection covers
+every adversary that does Kerberoasting, so it's modeled once and
+joined onto whichever clusters' TTP tables reference that technique_id,
+rather than hand-copied into each one. `add_detection` requires at
+least one `technique_id`; pass `cluster_name` too if you want that
+cluster's refreshed view back (optional — it's just provenance for
+"which investigation prompted writing this"). A cluster's `detections`
+field in `get_cluster` is always this live join, annotated with which
+of that cluster's own TTPs each detection covers.
+
+To go the other direction — given a technique, which adversaries use it
+and what covers it — use `get_technique_usage(technique_id)` (omit the
+ID for the full matrix across every technique any tracked cluster has
+logged). This is the "who uses what" view: check it before writing a
+new detection, so you don't duplicate coverage that already exists for
+a technique another cluster also uses.
+
+## Cross-cluster relationships
+
+Clusters often relate to each other — a customer of another cluster's
+service, a downstream payload, a suspected-same-actor overlap. Prose
+cross-references in the hunt log ("See cluster 'X'") are still fine for
+narrative detail, but for anything you want to survive a STIX export or
+be machine-queryable, use `add_relationship(name, relationship_type,
+target_cluster, description, source)` / `cti add-relationship` —
+common `relationship_type` values are `"uses"` (supply-chain/tooling:
+is a customer of, deploys, delivers) and `"related-to"` (suspected
+overlap, not confirmed enough to merge via `aliases`). This exports as
+a real STIX Relationship between the two Intrusion Sets, not just text
+a receiving system has to parse.
 
 ## Hunt log discipline
 
@@ -123,30 +229,46 @@ STIX Note objects tied to the cluster's Intrusion Set.
 4. As you investigate, append hunt log entries as you go, not at the end
    from memory.
 5. When a technique is identified, upsert it into the TTP table with a
-   status — don't leave techniques implicit in prose.
-6. When a detection is written, record it in the detection inventory
-   linked to the technique it covers.
+   status — don't leave techniques implicit in prose. Check any
+   `warning` in the response; it flags an unknown/revoked/mismatched
+   technique_id without blocking the write.
+6. Before writing a new detection, check `get_technique_usage` — the
+   same detection may already cover this technique for another cluster.
+   When a detection is written, record it with `add_detection` linked
+   to the technique_id(s) it covers, not duplicated per cluster.
 7. When you hit something you can't currently detect or verify, add it
    to the gaps backlog instead of letting it drop.
-8. If asked for an ATT&CK Navigator layer, export it from the cluster's
+8. When you identify a relationship to another tracked cluster (customer,
+   downstream payload, suspected overlap), record it with
+   `add_relationship` so it's structured and exportable, in addition to
+   any narrative detail in the hunt log.
+9. If asked for an ATT&CK Navigator layer, export it from the cluster's
    current TTP table rather than hand-building one — it should always
    reflect the stored data, not a snapshot.
-9. If asked to share a cluster, export it, or hand it to another
-   tool/team, use `export_stix_bundle` / `cti export-stix` rather than
-   serializing the JSON record directly — the STIX form is the
-   interoperable one.
-10. If handed a STIX bundle to ingest, use `import_stix_bundle` /
+10. If asked to share a cluster, export it, or hand it to another
+    tool/team, use `export_stix_bundle` / `cti export-stix` rather than
+    serializing the JSON record directly — the STIX form is the
+    interoperable one. If the cluster has relationships to other
+    tracked clusters and the receiving system won't already have those,
+    use `export_stix_ecosystem` / `cti export-stix-ecosystem` instead —
+    it bundles every transitively related cluster together so no
+    Relationship in the export points at an object the receiving
+    system doesn't have.
+11. If handed a STIX bundle to ingest, use `import_stix_bundle` /
     `cti import-stix`. It fails on a name collision unless you pass
     `overwrite`/`--overwrite`, which merges rather than replaces
-    (existing hunt log, detections, and gaps are preserved; TTPs and
+    (existing hunt log and gaps are preserved; TTPs, relationships, and
     notes are unioned in).
 
 ## Tool availability
 
 Prefer the MCP tools if the harness exposes them: `list_clusters`,
 `get_cluster`, `create_cluster`, `update_profile`, `update_ttp`,
-`append_hunt_log`, `add_detection`, `add_gap`, `export_navigator_layer`,
-`export_stix_bundle`, `import_stix_bundle`, `get_observables`,
+`append_hunt_log`, `add_detection`, `get_technique_usage`,
+`add_relationship`, `add_gap`, `export_navigator_layer`,
+`export_stix_bundle`, `export_stix_ecosystem`, `import_stix_bundle`,
+`get_observables`, `find_observable`, `add_observable`,
+`pivot_observable`, `pivot_cluster`, `pivot_and_expand`,
 `analyze_report`, `ingest_report`.
 
 If MCP tools are not available in this harness, use the CLI directly via
@@ -160,12 +282,20 @@ python -m cti_tools.cli create-cluster <name> --description "..."
 python -m cti_tools.cli update-profile <name> --adversary "..." --confidence 60 --aliases "Alias A,Alias B"
 python -m cti_tools.cli update-ttp <name> <technique_id> <technique_name> <status> --notes "..."
 python -m cti_tools.cli append-hunt-log <name> "<entry>"
-python -m cti_tools.cli add-detection <name> <detection_id> "<description>" <status>
+python -m cti_tools.cli add-detection <detection_id> "<description>" <technique_ids> <status> --cluster <name>
+python -m cti_tools.cli get-technique-usage [<technique_id>]
+python -m cti_tools.cli add-relationship <name> <relationship_type> <target_cluster> --description "..." --source "..."
 python -m cti_tools.cli add-gap <name> "<description>" <priority>
 python -m cti_tools.cli export-navigator <name>
 python -m cti_tools.cli export-stix <name>
+python -m cti_tools.cli export-stix-ecosystem <name>
 python -m cti_tools.cli import-stix <bundle.json | -> [--name "..."] [--overwrite]
 python -m cti_tools.cli get-observables <name>
+python -m cti_tools.cli find-observable <value>
+python -m cti_tools.cli add-observable <name> <hashes|domains|ips|urls> <value> <source>
+python -m cti_tools.cli pivot-observable <value>
+python -m cti_tools.cli pivot-cluster <name>
+python -m cti_tools.cli pivot-and-expand <value> <cluster_name> [--include-cohosted]
 python -m cti_tools.cli analyze-report <url-or-file>
 python -m cti_tools.cli ingest-report <url-or-file> [--name "..."] [--no-create]
 ```

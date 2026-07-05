@@ -26,13 +26,23 @@ from __future__ import annotations
 import base64
 import ipaddress
 import json
+import socket
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from typing import Any
 
 USER_AGENT = "cti-agent-pivot/1.0 (+local analysis tool, on-demand only)"
 TIMEOUT = 15
 VT_API_KEY_ENV = "VT_API_KEY"
+
+# Nameserver substrings that indicate a domain has been sinkholed/taken
+# down rather than being live adversary infrastructure. Extend as you
+# encounter new takedown providers.
+_SINKHOLE_NS_PATTERNS = (
+    "sinkhole", "microsoftinternetsafety.net", "shadowserver", "sink-dns",
+    "sinkdns", "unallocated", "cscdns-sinkhole", "sinkholed",
+)
 
 
 class PivotError(Exception):
@@ -48,6 +58,38 @@ def _get_json(url: str, headers: dict[str, str] | None = None) -> Any:
         raise PivotError(f"{url} returned HTTP {e.code}") from e
     except urllib.error.URLError as e:
         raise PivotError(f"failed to reach {url}: {e.reason}") from e
+
+
+def _get_text(url: str, headers: dict[str, str] | None = None) -> str:
+    """Fetch a plain-text response (some free enrichment endpoints return
+    newline-delimited text rather than JSON)."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        raise PivotError(f"{url} returned HTTP {e.code}") from e
+    except urllib.error.URLError as e:
+        raise PivotError(f"failed to reach {url}: {e.reason}") from e
+
+
+def resolve_host(host: str, timeout: int = 5) -> list[str] | None:
+    """Current A/AAAA answers for a hostname via the system resolver, or
+    [] if it doesn't resolve (NXDOMAIN/no address), or None if the lookup
+    was inconclusive (timeout / resolver error). The []-vs-None
+    distinction is what lets lifecycle classification tell "dead" (really
+    doesn't resolve) apart from "couldn't check right now"."""
+    old = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout)
+    try:
+        infos = socket.getaddrinfo(host, None)
+        return sorted({info[4][0] for info in infos})
+    except socket.gaierror:
+        return []
+    except OSError:
+        return None
+    finally:
+        socket.setdefaulttimeout(old)
 
 
 def classify(value: str) -> str:
@@ -184,3 +226,105 @@ def virustotal_lookup(value: str, kind: str, api_key: str) -> dict[str, Any]:
         }
 
     raise PivotError(f"unsupported kind for VirusTotal lookup: {kind}")
+
+
+def certspotter_lookup(domain: str) -> dict[str, Any]:
+    """Certificate-transparency history for a domain via SSLMate's Cert
+    Spotter API - the free, no-key stand-in for crt.sh (which is no longer
+    reliably reachable). Returns every hostname seen in a CT-logged
+    certificate for the domain and its subdomains (`hostnames`), plus a
+    per-issuance summary (issuer + validity window). Those sibling
+    hostnames are the pivot leads: infrastructure the same operator stood
+    up under the same name that you might not have observed directly.
+
+    The public endpoint is rate-limited without an API token; a 429/HTTP
+    error comes back as {"error": ...} rather than raising, so a batch
+    pivot degrades gracefully."""
+    url = (f"https://api.certspotter.com/v1/issuances?domain={domain}"
+           "&include_subdomains=true&expand=dns_names&expand=issuer")
+    try:
+        data = _get_json(url)
+    except PivotError as e:
+        return {"error": str(e)}
+    if not isinstance(data, list):
+        return {"error": "unexpected Cert Spotter response shape"}
+
+    hostnames: set[str] = set()
+    issuances = []
+    for iss in data:
+        names = iss.get("dns_names") or []
+        for n in names:
+            hostnames.add(n.lstrip("*.").lower())
+        issuer = iss.get("issuer")
+        issuances.append({
+            "issuer": issuer.get("name") if isinstance(issuer, dict) else issuer,
+            "not_before": iss.get("not_before"),
+            "not_after": iss.get("not_after"),
+            "dns_names": names,
+        })
+    return {
+        "issuance_count": len(issuances),
+        "hostnames": sorted(hostnames),
+        "issuances": issuances[:50],  # cap the verbose part; hostnames is the pivot surface
+    }
+
+
+def hackertarget_reverse_ip(ip: str) -> dict[str, Any]:
+    """Domains currently/recently hosted on an IP via Hackertarget's free
+    reverse-IP endpoint (plain text, no key, low daily quota). Treat the
+    result as co-hosting, NOT confirmed shared ownership: on shared
+    hosting these are unrelated tenants. Their own error/quota strings
+    come back as {"error": ...}."""
+    try:
+        text = _get_text(f"https://api.hackertarget.com/reverseiplookup/?q={ip}").strip()
+    except PivotError as e:
+        return {"error": str(e)}
+    low = text.lower()
+    if not text or "api count exceeded" in low or "error" in low or "no records" in low:
+        return {"error": text or "empty response"}
+    domains = sorted({line.strip() for line in text.splitlines() if line.strip()})
+    return {"domains": domains}
+
+
+def _is_past(date_str: str | None) -> bool:
+    if not date_str:
+        return False
+    try:
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt < datetime.now(timezone.utc)
+
+
+def classify_domain_lifecycle(rdap: dict[str, Any] | None,
+                               resolved: list[str] | None) -> str:
+    """Best-effort lifecycle state for a domain from its RDAP record and
+    a live resolution attempt: "sinkholed", "expired", "active", "dead",
+    or "unknown". Signals are checked most-conclusive first."""
+    if isinstance(rdap, dict):
+        nameservers = [(ns or "").lower() for ns in (rdap.get("nameservers") or [])]
+        if any(pat in ns for ns in nameservers for pat in _SINKHOLE_NS_PATTERNS):
+            return "sinkholed"
+        statuses = " ".join(rdap.get("status") or []).lower()
+        if any(k in statuses for k in
+               ("pending delete", "redemption", "client hold", "server hold", "inactive")):
+            return "expired"
+        for ev in rdap.get("events") or []:
+            if (ev.get("action") or "").lower() in ("expiration", "expiry") and _is_past(ev.get("date")):
+                return "expired"
+    if resolved:
+        return "active"
+    if resolved == []:  # resolution attempted and the name has no address
+        return "dead"
+    return "unknown"
+
+
+def classify_ip_lifecycle(ripestat: dict[str, Any] | None) -> str:
+    """Lifecycle state for an IP: "routed" if it's in an announced prefix
+    with an origin ASN, "unrouted" if not currently announced, "unknown"
+    if the lookup failed."""
+    if not isinstance(ripestat, dict) or ripestat.get("network_info_error"):
+        return "unknown"
+    return "routed" if ripestat.get("prefix") else "unrouted"
