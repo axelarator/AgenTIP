@@ -78,8 +78,10 @@ def _pattern_escape(value: str) -> str:
 def observable_to_pattern(category: str, value: str) -> str | None:
     """STIX 2.1 pattern for one tracked observable, or None for
     categories that have no clean STIX Cyber-observable representation
-    (cves -> would be a Vulnerability SDO, wallets -> no standard SCO),
-    which are simply left out of the bundle rather than forced."""
+    (cves -> would be a Vulnerability SDO, wallets -> no standard SCO,
+    ja4/ja4s/ja4h/ja4l/ja4x/ja4t/ja4ts/ja4ssh/jarm -> no standard SCO for
+    TLS/TCP/SSH fingerprints), which are simply left out of the bundle
+    rather than forced."""
     if category == "hashes":
         if ":" in value:
             algo, digest = value.split(":", 1)

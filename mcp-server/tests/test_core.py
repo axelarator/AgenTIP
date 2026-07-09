@@ -596,6 +596,58 @@ def test_add_observable_new_categories():
     assert data["observables"]["wallets"][0]["value"].startswith("0x")
 
 
+def test_add_observable_ja4_and_jarm_categories():
+    core.create_cluster("Fingerprint Cats")
+    data = core.add_observable("Fingerprint Cats", "ja4",
+                                "t13d1516h2_8daaf6152771_02713d6af862", "JA4 via isolated VM")
+    data = core.add_observable("Fingerprint Cats", "jarm",
+                                "2ad2ad0002ad2ad00002ad2ad2ad00c25be1de0dc4400e5cadb8c840f2ba9",
+                                "JARM via isolated VM")
+    assert data["observables"]["ja4"][0]["value"] == "t13d1516h2_8daaf6152771_02713d6af862"
+    assert data["observables"]["jarm"][0]["sources"] == ["JARM via isolated VM"]
+
+
+# --- pending fingerprint queue -----------------------------------------------
+
+def test_new_domain_or_ip_is_queued_for_fingerprinting():
+    core.create_cluster("Queue Test")
+    core.add_observable("Queue Test", "domains", "evil.example", "report X")
+    core.add_observable("Queue Test", "ips", "185.220.101.47", "report X")
+    core.add_observable("Queue Test", "hashes", "md5:098f6bcd4621d373cade4e832627b4f6", "report X")
+    pending = core.list_pending_fingerprints()
+    queued = {(e["cluster"], e["category"], e["value"]) for e in pending}
+    assert ("Queue Test", "domains", "evil.example") in queued
+    assert ("Queue Test", "ips", "185.220.101.47") in queued
+    assert not any(e["category"] == "hashes" for e in pending)
+
+
+def test_already_tracked_value_is_not_requeued():
+    core.create_cluster("Requeue Test")
+    core.add_observable("Requeue Test", "domains", "evil.example", "report X")
+    core.pop_pending_fingerprints()
+    core.add_observable("Requeue Test", "domains", "evil.example", "report Y")
+    assert core.list_pending_fingerprints() == []
+
+
+def test_pop_pending_fingerprints_clears_the_queue():
+    core.create_cluster("Pop Test")
+    core.add_observable("Pop Test", "domains", "evil.example", "report X")
+    popped = core.pop_pending_fingerprints()
+    assert any(e["value"] == "evil.example" for e in popped)
+    assert core.list_pending_fingerprints() == []
+    assert core.pop_pending_fingerprints() == []
+
+
+def test_pending_fingerprints_respect_isolated_data_dir(isolated_data_dir):
+    """Regression test: the queue file must follow a monkeypatched
+    DATA_DIR like cluster files do, not a path computed once at import
+    time - otherwise tests (or any DATA_DIR override) would leak into
+    the real data dir instead of the isolated one."""
+    core.create_cluster("Isolation Test")
+    core.add_observable("Isolation Test", "domains", "evil.example", "report X")
+    assert (isolated_data_dir.parent / "pending_fingerprints.json").exists()
+
+
 # --- observables in STIX export/import --------------------------------------
 
 def test_stix_export_emits_indicators_for_observables():

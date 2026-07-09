@@ -70,6 +70,165 @@ in a cluster, prune it with `remove_observable(name, category, value)` /
 or without the algo prefix), removing every matching entry. Note why in
 the hunt log when you do, so the removal is auditable rather than silent.
 
+## JA4+ and JARM fingerprints
+
+Beyond hashes/domains/ips/urls/emails/cves/wallets, a cluster can also
+track network/TLS/TCP/SSH fingerprints of its infrastructure: the full
+JA4+ suite (`ja4`, `ja4s`, `ja4h`, `ja4l`, `ja4x`, `ja4t`, `ja4ts`,
+`ja4ssh`) and `jarm`. Unlike every other category, these are **never**
+produced by `ingest_report`'s regex extraction — report text doesn't
+carry a TLS fingerprint of infrastructure you haven't probed yourself.
+They only get filed via `add_observable(name, "ja4", value, source)` /
+`cti add-observable <name> ja4 <value> <source>` (swap in whichever of
+the nine categories applies), same as any other manually-filed
+observable.
+
+Collecting the value itself means having a real handshake with a
+tracked domain/IP occur somewhere you can observe it — not something
+you can derive from report text. JA4+ and JARM differ in *how* that
+handshake has to happen, though:
+
+- **JA4+** (`ja4`/`ja4s`/`ja4h`/`ja4l`/`ja4x`/`ja4t`/`ja4ts`/`ja4ssh`)
+  is computed from an ordinary handshake — if you already run a JA4
+  plugin on Zeek/Suricata, any traffic mirrored past it (organic, or
+  one you deliberately generate) gets fingerprinted for free, no
+  dedicated JA4 tooling needed. But four of the eight fingerprint
+  whoever *initiates* the connection (`ja4` TLS client, `ja4h` HTTP
+  client, `ja4t` TCP client, `ja4ssh` interactive-SSH-session
+  timing/length) — so probing *outbound* to a report's IOC only ever
+  yields your own vantage point's client signature, not intel about
+  the target. Those four only mean something derived from a connection
+  the target *itself* initiated (malware calling back to a
+  sinkhole/honeypot you control, or a sandboxed sample's traffic
+  trace) or an interactive session you actually held with it. The
+  other four (`ja4s`, `ja4x`, `ja4ts`, `ja4l`) characterize the
+  *responder* and so are exactly what an outbound probe gets you.
+- **JARM** doesn't come from a passive plugin at all — its algorithm is
+  a specific sequence of intentionally-malformed TLS ClientHellos, a
+  distinct active technique from anything a JA4 capture plugin
+  produces. It always needs a dedicated probe.
+
+Either way, do the probing from wherever you already trust touching
+malicious infrastructure from (an isolated vantage point, VPN egress
+you don't mind burning) — never from whatever host runs this MCP
+server/CLI unless that's the same trusted vantage point. Cite the
+collection method and date as `source` (e.g. `"JARM via isolated VM,
+2026-07-05"`), the same way pivot findings are cited, so a later reader
+knows the value was actively fingerprinted rather than lifted from a
+report.
+
+These categories have no standard STIX 2.1 Cyber-observable type, so
+(like `cves` and `wallets`) they're tracked and exportable in this
+tool's own data model but silently omitted from `export_stix_bundle` /
+`export_stix_ecosystem` rather than forced into a nonstandard pattern.
+
+### Automating the handoff to a fingerprinting vantage point
+
+Every domain/ip newly filed via `add_observable`, `ingest_report`, or
+`import_stix_bundle` is automatically queued for fingerprinting —
+nothing to remember to trigger by hand. `list_pending_fingerprints()` /
+`cti list-pending-fingerprints` peeks at the queue (read-only);
+`pop_pending_fingerprints()` / `cti pop-pending-fingerprints` returns
+every queued `{cluster, category, value, queued_at}` entry and clears
+it atomically in one step — the one-shot "give me everything waiting"
+call a fingerprinting script should make each cycle, so nothing gets
+processed twice. Already-tracked domains/ips are never re-queued just
+because a later report mentions them again; only genuinely new infra
+lands in the queue.
+
+That queue only tells you *what* needs probing — moving it to and from
+wherever you actually do the probing is outside this tool's scope, but
+`mcp-server/scripts/probe_pending_fingerprints.py` +
+`mcp-server/scripts/win_probe_helper.py` +
+`mcp-server/scripts/zeek_log_query.py` are a reference implementation
+for a specific, common lab shape: a probe VM and a Zeek sensor VM that
+both sit inside an isolated network segment (its own VLAN, its own
+OPNsense-fronted LAN) which is deliberately firewalled so it can
+*never* connect back out to the host running this tool — one-way
+access only, into the lab. That directionality, not "which side is
+less trusted," is what decides who initiates: since the lab segment
+can't reach out regardless, the cti host always initiates outbound
+over SSH, in — never the reverse.
+
+Probing and log-reading are two separate hops to two separate VMs, not
+one — learned the hard way by first trying to run the probe directly
+from the Zeek sensor VM itself. Its own self-generated traffic didn't
+mirror the way third-party VMs' traffic does: a probe launched from
+the sensor's own interface showed up in conn.log as a one-sided ghost
+connection (the response visible, the VM's own outbound SYN never
+mirrored back to itself, or vice versa depending on mirror direction),
+so ja4ts/ja4l came back empty or garbage no matter how long you polled
+— not a bug in the query logic, a tap-placement mismatch. A dedicated
+probe VM sitting as an ordinary port on the same mirrored bridge (same
+footing as any other lab VM, Windows or Linux, doesn't matter) doesn't
+have that problem — its traffic mirrors cleanly in both directions,
+same as everything else on that bridge.
+
+- `probe_pending_fingerprints.py` runs on the cti host itself (it
+  imports `core.py` directly — no listener, nothing accepts inbound
+  connections here). It pops the queue locally, then per entry: SSHes
+  into the probe VM piping `{"target": value}` as JSON on stdin
+  (avoiding shell-quoting an IOC value that traces back to report
+  text), then SSHes *separately* into the Zeek VM piping
+  `{"target": resolved_ip}` (handed back by the probe hop) to read
+  back whatever landed in Zeek's logs, filing whatever comes back from
+  either hop with `add_observable`.
+- `win_probe_helper.py` runs on the probe VM (needs nothing from this
+  repo — standalone, pure standard library so it doesn't matter if
+  it's Windows or Linux). Per target it: resolves the target to an IP
+  once (Zeek's logs only ever key on the resolved address, never a
+  hostname string) and reuses that same IP for the handshake rather
+  than letting the connection call re-resolve it — found live-testing
+  against a CDN-fronted domain that a second, separate lookup moments
+  later can come back with a different edge IP than the first,
+  silently pointing the Zeek-side query at an address nothing was ever
+  sent to. Then it runs a JARM scan (the one value nothing passive
+  produces) and fires one ordinary TLS handshake — via Python's own
+  `ssl`/`socket` modules rather than shelling out to `openssl`, so
+  nothing extra needs installing — purely to give the target something
+  real to respond to. The handshake's own result is discarded; Zeek's
+  log is the source of truth for what it produced, read back in the
+  next hop.
+- `zeek_log_query.py` runs on the Zeek sensor VM (needs nothing from
+  this repo either). Given a resolved IP, it polls ssl.log for ja4s
+  and conn.log for ja4ts/ja4l — polls rather than a fixed sleep, since
+  conn.log entries are normally only finalized once a connection tears
+  down (clean FIN or idle timeout), which can lag well behind ssl.log's
+  handshake-time write. It deliberately does not attempt
+  ja4/ja4h/ja4t/ja4ssh, for the client-vs-responder reason above, nor
+  ja4x (needs x509.log, and wasn't computed at all by the zeek-ja4
+  build tested against here — confirm against your own build before
+  assuming otherwise). Recency filtering is measured entirely on this
+  VM's own local clock (`RECENCY_WINDOW_SECONDS`), not a timestamp
+  handed over from the probe VM — an earlier version passed one across,
+  which broke as soon as testing showed the two VMs' clocks were about
+  an hour apart with nothing keeping them in sync. Don't assume two
+  hosts in the same lab share a clock any more than you'd assume they
+  share a filesystem.
+
+All three scripts have environment-specific constants marked for you
+to fill in (SSH host/key/known_hosts per hop, JARM CLI path, Zeek log
+paths — the exact field names in your own ssl.log/conn.log depend on
+which JA4 plugin/version and log format (JSON-lines vs the default
+tab-separated) you're running, so verify against a real sample before
+trusting the output, the same way the ja4ts/ja4x gaps here were only
+found by testing against this lab's actual logs rather than assumed).
+File results with `add_observable` citing method + date in `source` as
+above.
+
+Windows probe VM gotcha worth knowing before you debug it blind: if
+the probe VM's account is a member of Administrators, Windows OpenSSH
+only honors `C:\ProgramData\ssh\administrators_authorized_keys` (ACLed
+to SYSTEM + Administrators only), and only if sshd_config actually has
+`Match Group administrators` uncommented — the ordinary per-user
+`authorized_keys` is ignored for that account regardless of what's in
+it. And the forced `command=` restriction is worthless if a second,
+unrestricted line for the same key is sitting above it in that file
+(sshd matches the first line, not the most specific one) — if a raw
+key was added for initial connectivity testing before the restricted
+line was appended, delete it, don't just add the restricted one
+alongside it.
+
 ## Infrastructure pivoting
 
 Tracked observables are a static record until you actually check
@@ -284,7 +443,8 @@ Prefer the MCP tools if the harness exposes them: `list_clusters`,
 `add_relationship`, `add_gap`, `export_navigator_layer`,
 `export_stix_bundle`, `export_stix_ecosystem`, `import_stix_bundle`,
 `get_observables`, `find_observable`, `add_observable`,
-`remove_observable`, `pivot_observable`, `pivot_cluster`,
+`remove_observable`, `list_pending_fingerprints`,
+`pop_pending_fingerprints`, `pivot_observable`, `pivot_cluster`,
 `pivot_and_expand`, `analyze_report`, `ingest_report`.
 
 If MCP tools are not available in this harness, use the CLI directly via
@@ -311,6 +471,8 @@ python -m cti_tools.cli get-observables <name>
 python -m cti_tools.cli find-observable <value>
 python -m cti_tools.cli add-observable <name> <hashes|domains|ips|urls> <value> <source>
 python -m cti_tools.cli remove-observable <name> <category> <value>
+python -m cti_tools.cli list-pending-fingerprints
+python -m cti_tools.cli pop-pending-fingerprints
 python -m cti_tools.cli pivot-observable <value>
 python -m cti_tools.cli pivot-cluster <name>
 python -m cti_tools.cli pivot-and-expand <value> <cluster_name> [--include-cohosted]

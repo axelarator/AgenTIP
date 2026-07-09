@@ -118,6 +118,9 @@ def main(argv: list[str] | None = None) -> int:
     rob.add_argument("category", choices=list(core.OBSERVABLE_CATEGORIES))
     rob.add_argument("value", help="matched case-insensitively; for hashes, with or without algo prefix")
 
+    sub.add_parser("list-pending-fingerprints")
+    sub.add_parser("pop-pending-fingerprints")
+
     ar = sub.add_parser("analyze-report")
     ar.add_argument("source", help="URL or local file path")
 
@@ -190,6 +193,10 @@ def main(argv: list[str] | None = None) -> int:
             _print(core.add_observable(args.name, args.category, args.value, args.source))
         elif args.command == "remove-observable":
             _print(core.remove_observable(args.name, args.category, args.value))
+        elif args.command == "list-pending-fingerprints":
+            _print(core.list_pending_fingerprints())
+        elif args.command == "pop-pending-fingerprints":
+            _print(core.pop_pending_fingerprints())
         elif args.command == "analyze-report":
             _print(core.analyze_report(args.source))
         elif args.command == "ingest-report":

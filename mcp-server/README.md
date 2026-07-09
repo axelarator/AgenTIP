@@ -266,6 +266,10 @@ automatic extraction, for an indicator that didn't come from a
 parseable report (a `pivot_observable` finding, something told to you
 directly). Same dedup/provenance semantics as `ingest_report`: a value
 already tracked just gets `source` appended to its provenance list.
+Categories also include `emails`, `cves`, `wallets`, and the JA4+/JARM
+fingerprint categories (`ja4`, `ja4s`, `ja4h`, `ja4l`, `ja4x`, `ja4t`,
+`ja4ts`, `ja4ssh`, `jarm`) — see the threat-cluster-tracking skill for
+why those nine are never auto-extracted and have to be filed by hand.
 
 ## Infrastructure pivoting
 

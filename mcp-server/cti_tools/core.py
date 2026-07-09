@@ -30,6 +30,12 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = Path(os.environ.get("CTI_DATA_DIR", _REPO_ROOT / "data" / "clusters"))
 
+# Which newly-added observable categories get queued for fingerprinting.
+# Only domains/ips: they're the addresses you'd actively connect to.
+# hashes/urls/etc aren't something you probe, and the ja4*/jarm
+# categories are themselves fingerprint *results*, not queue inputs.
+_FINGERPRINTABLE_CATEGORIES = ("domains", "ips")
+
 # The observable categories a cluster tracks. Single source of truth
 # lives in report_ingest (the extractor); re-exported here so the rest
 # of core, the CLI, and callers can reference core.OBSERVABLE_CATEGORIES
@@ -75,6 +81,13 @@ def _nothing_extracted(extracted: dict[str, list[str]]) -> bool:
 def _path(name: str) -> Path:
     safe = name.strip().lower().replace(" ", "-")
     return DATA_DIR / f"{safe}.json"
+
+
+def _pending_fingerprints_path() -> Path:
+    # A function (not a module-level constant) so it re-reads DATA_DIR
+    # each call - tests monkeypatch DATA_DIR per-test, and a precomputed
+    # path would silently keep pointing at the real data dir instead.
+    return DATA_DIR.parent / "pending_fingerprints.json"
 
 
 def _now() -> str:
@@ -623,13 +636,14 @@ def find_observable(value: str) -> dict[str, Any]:
 def add_observable(name: str, category: str, value: str, source: str) -> dict[str, Any]:
     """Manually file a single observable (category is one of
     OBSERVABLE_CATEGORIES: hashes, domains, ips, urls, emails, cves,
-    wallets) onto a cluster - the counterpart to ingest_report's
-    automatic extraction, for an indicator that came from somewhere
-    other than a parseable report
-    (e.g. a pivot_observable finding, or something told to you
-    directly). Reuses the exact same dedup/provenance logic as
-    ingest_report: a value already tracked just gets `source` appended
-    to its provenance list rather than creating a duplicate entry."""
+    wallets, ja4, ja4s, ja4h, ja4l, ja4x, ja4t, ja4ts, ja4ssh, jarm) onto
+    a cluster - the counterpart to ingest_report's automatic extraction,
+    for an indicator that came from somewhere other than a parseable
+    report (e.g. a pivot_observable finding, an actively-collected
+    JA4+/JARM fingerprint, or something told to you directly). Reuses
+    the exact same dedup/provenance logic as ingest_report: a value
+    already tracked just gets `source` appended to its provenance list
+    rather than creating a duplicate entry."""
     if category not in OBSERVABLE_CATEGORIES:
         raise ValueError("category must be one of " + ", ".join(OBSERVABLE_CATEGORIES))
     data = load_cluster(name)
@@ -976,6 +990,7 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                         source: str) -> dict[str, int]:
     now = _now()
     counts = {}
+    newly_tracked: list[tuple[str, str]] = []  # (category, value), for the fingerprint queue
     for category in OBSERVABLE_CATEGORIES:
         bucket = data["observables"][category]
         by_value = {o["value"]: o for o in bucket}
@@ -990,8 +1005,52 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                 bucket.append({"value": value, "sources": [source],
                                 "first_seen": now, "last_seen": now})
                 added += 1
+                if category in _FINGERPRINTABLE_CATEGORIES:
+                    newly_tracked.append((category, value))
         counts[category] = added
+    if newly_tracked:
+        _enqueue_pending_fingerprints(data["name"], newly_tracked)
     return counts
+
+
+def _load_pending_fingerprints() -> list[dict[str, Any]]:
+    path = _pending_fingerprints_path()
+    if not path.exists():
+        return []
+    return json.loads(path.read_text())
+
+
+def _enqueue_pending_fingerprints(cluster_name: str, items: list[tuple[str, str]]) -> None:
+    # Called from inside _merge_observables, which only ever runs from a
+    # caller already holding _data_lock (add_observable/ingest_report/
+    # import_stix_bundle are all @_synchronized), so no lock of its own.
+    entries = _load_pending_fingerprints()
+    now = _now()
+    entries.extend({"cluster": cluster_name, "category": category, "value": value,
+                     "queued_at": now} for category, value in items)
+    _atomic_write_text(_pending_fingerprints_path(), json.dumps(entries, indent=2))
+
+
+def list_pending_fingerprints() -> list[dict[str, Any]]:
+    """Peek at domains/ips newly tracked (via add_observable, ingest_report,
+    or import_stix_bundle) since the last pop_pending_fingerprints call -
+    i.e. infrastructure that hasn't been actively fingerprinted (JA4+/
+    JARM) yet. Read-only; doesn't clear the queue. Each entry is
+    {cluster, category, value, queued_at}."""
+    return _load_pending_fingerprints()
+
+
+@_synchronized
+def pop_pending_fingerprints() -> list[dict[str, Any]]:
+    """Return every queued entry and clear the queue in one step - the
+    operation a fingerprinting script (e.g. running on an isolated VM)
+    calls each cycle to claim everything waiting without racing another
+    caller or re-processing the same entries next time. Use
+    list_pending_fingerprints instead to check without consuming."""
+    entries = _load_pending_fingerprints()
+    if entries:
+        _atomic_write_text(_pending_fingerprints_path(), "[]")
+    return entries
 
 
 def _merge_ttps(data: dict[str, Any], technique_ids: list[str], source: str) -> list[str]:

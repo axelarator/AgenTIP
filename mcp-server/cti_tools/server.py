@@ -121,8 +121,10 @@ def export_navigator_layer(name: str) -> dict:
 
 @mcp.tool()
 def get_observables(name: str) -> dict:
-    """Get all observables (hashes, domains, ips, urls) tracked for a
-    cluster, with provenance (report sources) and first/last seen."""
+    """Get all observables (hashes, domains, ips, urls, emails, cves,
+    wallets, and the JA4+/JARM fingerprint categories: ja4, ja4s, ja4h,
+    ja4l, ja4x, ja4t, ja4ts, ja4ssh, jarm) tracked for a cluster, with
+    provenance (report sources) and first/last seen."""
     return core.get_observables(name)
 
 
@@ -140,9 +142,11 @@ def add_observable(name: str, category: str, value: str, source: str) -> dict:
     """Manually file a single observable onto a cluster - the
     counterpart to ingest_report's automatic extraction, for an
     indicator from somewhere other than a parseable report (e.g. a
-    pivot_observable finding). category must be one of "hashes",
-    "domains", "ips", "urls", "emails", "cves", "wallets". Dedupes by
-    value like ingest_report does."""
+    pivot_observable finding, or a JA4+/JARM fingerprint you collected
+    by actively probing a tracked domain/IP). category must be one of
+    "hashes", "domains", "ips", "urls", "emails", "cves", "wallets",
+    "ja4", "ja4s", "ja4h", "ja4l", "ja4x", "ja4t", "ja4ts", "ja4ssh",
+    "jarm". Dedupes by value like ingest_report does."""
     return core.add_observable(name, category, value, source)
 
 
@@ -152,8 +156,31 @@ def remove_observable(name: str, category: str, value: str) -> dict:
     extractor over-matched) from a cluster - the counterpart to
     add_observable. Matches case-insensitively and, for hashes, with or
     without the algo prefix, removing every match. category is one of
-    "hashes", "domains", "ips", "urls", "emails", "cves", "wallets"."""
+    "hashes", "domains", "ips", "urls", "emails", "cves", "wallets",
+    "ja4", "ja4s", "ja4h", "ja4l", "ja4x", "ja4t", "ja4ts", "ja4ssh",
+    "jarm"."""
     return core.remove_observable(name, category, value)
+
+
+@mcp.tool()
+def list_pending_fingerprints() -> list[dict]:
+    """Peek at domains/ips newly tracked (via add_observable,
+    ingest_report, or import_stix_bundle) since the last
+    pop_pending_fingerprints call - infrastructure that hasn't been
+    actively fingerprinted (JA4+/JARM) yet. Read-only, doesn't clear the
+    queue. Each entry is {cluster, category, value, queued_at}."""
+    return core.list_pending_fingerprints()
+
+
+@mcp.tool()
+def pop_pending_fingerprints() -> list[dict]:
+    """Return every queued pending-fingerprint entry and clear the queue
+    in one step - call this from wherever you actively collect JA4+/JARM
+    fingerprints (e.g. an isolated VM) each cycle to claim everything
+    waiting without re-processing it next time. File results back with
+    add_observable. Use list_pending_fingerprints instead to check
+    without consuming."""
+    return core.pop_pending_fingerprints()
 
 
 @mcp.tool()

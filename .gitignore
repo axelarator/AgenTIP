@@ -14,5 +14,9 @@ dist/
 data/clusters/*
 !data/clusters/.gitkeep
 
+# Queue of infra awaiting active JA4+/JARM fingerprinting - transient
+# work state, not tracked intel.
+data/pending_fingerprints.json
+
 # Harness-local state
 .claude/settings.local.json
