@@ -118,7 +118,7 @@ def main() -> None:
 
         if probe_result.get("jarm"):
             core.add_observable(cluster, "jarm", probe_result["jarm"],
-                                 f"JARM via {SOURCE_LABEL}, {today}")
+                                 f"JARM against {target} via {SOURCE_LABEL}, {today}")
 
         resolved_ip = probe_result.get("resolved_ip")
         if not resolved_ip:
@@ -136,7 +136,8 @@ def main() -> None:
             value = zeek_result.get(category)
             if value:
                 core.add_observable(cluster, category, value,
-                                     f"Zeek passive (tap107) via {SOURCE_LABEL} handshake, {today}")
+                                     f"Zeek passive (tap107) via {SOURCE_LABEL} handshake against "
+                                     f"{target} ({resolved_ip}), {today}")
 
 
 if __name__ == "__main__":
