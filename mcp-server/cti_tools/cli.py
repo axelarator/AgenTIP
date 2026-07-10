@@ -86,6 +86,16 @@ def main(argv: list[str] | None = None) -> int:
     gap.add_argument("description")
     gap.add_argument("priority", nargs="?", default="medium")
 
+    ugap = sub.add_parser("update-gap")
+    ugap.add_argument("name")
+    ugap.add_argument("description", help="the gap's current, exact description text")
+    ugap.add_argument("--new-description", default=None)
+    ugap.add_argument("--priority", default=None)
+
+    rgap = sub.add_parser("remove-gap")
+    rgap.add_argument("name")
+    rgap.add_argument("description", help="the gap's current, exact description text")
+
     n = sub.add_parser("export-navigator")
     n.add_argument("name")
 
@@ -181,6 +191,11 @@ def main(argv: list[str] | None = None) -> int:
                                           args.target_cluster, args.description, args.source))
         elif args.command == "add-gap":
             _print(core.add_gap(args.name, args.description, args.priority))
+        elif args.command == "update-gap":
+            _print(core.update_gap(args.name, args.description,
+                                    args.new_description, args.priority))
+        elif args.command == "remove-gap":
+            _print(core.remove_gap(args.name, args.description))
         elif args.command == "export-navigator":
             _print(core.export_navigator_layer(args.name))
         elif args.command == "get-observables":

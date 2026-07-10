@@ -84,6 +84,54 @@ def test_remove_ttp_not_found_raises():
         core.remove_ttp("TTP Remove Miss", "T9999")
 
 
+def test_add_gap_defaults_to_medium_priority():
+    core.create_cluster("Gap Test")
+    data = core.add_gap("Gap Test", "no initial access vector reported")
+    assert data["gaps"] == [{
+        "description": "no initial access vector reported",
+        "priority": "medium",
+        "created": data["gaps"][0]["created"],
+    }]
+
+
+def test_update_gap_changes_only_fields_passed():
+    core.create_cluster("Gap Update")
+    core.add_gap("Gap Update", "sample coverage missing", priority="medium")
+    data = core.update_gap("Gap Update", "sample coverage missing", priority="low")
+    gap = data["gaps"][0]
+    assert gap["description"] == "sample coverage missing"
+    assert gap["priority"] == "low"
+    assert "updated" in gap
+
+    data = core.update_gap("Gap Update", "sample coverage missing",
+                            new_description="pivot tried, came up empty")
+    gap = data["gaps"][0]
+    assert gap["description"] == "pivot tried, came up empty"
+    assert gap["priority"] == "low"  # untouched by the second call
+
+
+def test_update_gap_not_found_raises():
+    core.create_cluster("Gap Update Miss")
+    with pytest.raises(ValueError):
+        core.update_gap("Gap Update Miss", "nonexistent gap", priority="low")
+
+
+def test_remove_gap_drops_matching_gap():
+    core.create_cluster("Gap Remove")
+    core.add_gap("Gap Remove", "gap one")
+    core.add_gap("Gap Remove", "gap two")
+    result = core.remove_gap("Gap Remove", "gap one")
+    assert result["removed"]["description"] == "gap one"
+    remaining = [g["description"] for g in core.get_cluster("Gap Remove")["gaps"]]
+    assert remaining == ["gap two"]
+
+
+def test_remove_gap_not_found_raises():
+    core.create_cluster("Gap Remove Miss")
+    with pytest.raises(ValueError):
+        core.remove_gap("Gap Remove Miss", "nonexistent gap")
+
+
 def test_hunt_log_append_only():
     core.create_cluster("Hunt Log Test")
     core.append_hunt_log("Hunt Log Test", "first")

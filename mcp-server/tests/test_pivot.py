@@ -145,6 +145,57 @@ def test_virustotal_lookup_domain(monkeypatch):
     assert result["resolutions"] == [{"ip": "1.2.3.4", "date": 111}]
 
 
+def test_virustotal_lookup_ip_includes_communicating_and_downloaded_files(monkeypatch):
+    def fake_get_json(url, headers=None):
+        assert headers == {"x-apikey": "fake-key"}
+        if url.endswith("/ip_addresses/1.2.3.4"):
+            return {"data": {"attributes": {
+                "reputation": -10, "as_owner": "Evil Hosting", "country": "RU",
+                "last_analysis_stats": {"malicious": 12},
+            }}}
+        if "resolutions" in url:
+            return {"data": [{"attributes": {"host_name": "evil.example", "date": 111}}]}
+        if "communicating_files" in url:
+            return {"data": [{
+                "id": "a" * 64,
+                "attributes": {
+                    "names": ["plugx.dll", "svchost.exe"],
+                    "popular_threat_classification": {"suggested_threat_label": "backdoor.win32.plugx"},
+                    "last_analysis_stats": {"malicious": 40, "undetected": 20},
+                    "first_submission_date": 1700000000,
+                },
+            }]}
+        if "downloaded_files" in url:
+            return {"data": []}
+        raise AssertionError(f"unexpected url {url}")
+
+    monkeypatch.setattr(pivot, "_get_json", fake_get_json)
+    result = pivot.virustotal_lookup("1.2.3.4", "ip", "fake-key")
+    assert result["reputation"] == -10
+    assert result["resolutions"] == [{"domain": "evil.example", "date": 111}]
+    assert len(result["communicating_files"]) == 1
+    cf = result["communicating_files"][0]
+    assert cf["sha256"] == "a" * 64
+    assert cf["suggested_label"] == "backdoor.win32.plugx"
+    assert cf["malicious"] == 40
+    assert cf["total_engines"] == 60
+    assert result["downloaded_files"] == []
+
+
+def test_virustotal_lookup_ip_tolerates_relationship_failure(monkeypatch):
+    def fake_get_json(url, headers=None):
+        if url.endswith("/ip_addresses/1.2.3.4"):
+            return {"data": {"attributes": {}}}
+        if "resolutions" in url:
+            return {"data": []}
+        raise pivot.PivotError("rate limited")
+
+    monkeypatch.setattr(pivot, "_get_json", fake_get_json)
+    result = pivot.virustotal_lookup("1.2.3.4", "ip", "fake-key")
+    assert result["communicating_files"] == []
+    assert result["downloaded_files"] == []
+
+
 def test_virustotal_lookup_hash(monkeypatch):
     def fake_get_json(url, headers=None):
         return {"data": {"attributes": {

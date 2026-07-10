@@ -18,8 +18,12 @@ Sources, none of which require a paid plan:
 - VirusTotal's public API - free tier, but does require your own API
   key (VT_API_KEY env var) and is rate-limited (4 req/min, 500/day as
   of writing). Gives reputation, resolution history (VT's equivalent
-  of passive DNS), and file/URL detection verdicts. Skipped gracefully
-  if no key is configured - RDAP/RIPEstat still work without one.
+  of passive DNS), file/URL detection verdicts, and - for IPs -
+  communicating_files/downloaded_files: samples VT has actually seen
+  talk to or fetch from that IP, useful for finding malware hashes
+  tied to a tracked C2 IP when the source report only gave you the
+  infrastructure, not per-sample coverage. Skipped gracefully if no
+  key is configured - RDAP/RIPEstat still work without one.
 """
 from __future__ import annotations
 
@@ -228,7 +232,7 @@ def virustotal_lookup(value: str, kind: str, api_key: str) -> dict[str, Any]:
         resolutions = _get_json(
             f"https://www.virustotal.com/api/v3/ip_addresses/{value}/resolutions?limit=20", headers)
         attrs = (base.get("data") or {}).get("attributes", {})
-        return {
+        result = {
             "reputation": attrs.get("reputation"),
             "as_owner": attrs.get("as_owner"),
             "country": attrs.get("country"),
@@ -238,6 +242,37 @@ def virustotal_lookup(value: str, kind: str, api_key: str) -> dict[str, Any]:
                 for r in resolutions.get("data", [])
             ],
         }
+        # Files VT has actually observed talking to this IP (its C2/callback
+        # traffic) or fetched from it (dropped/staged payloads) - the two
+        # relationships that can turn "we tracked this IP" into "here is a
+        # sample that used it", which resolution history alone can't do.
+        # Each entry carries just enough to triage by hand before filing
+        # anything: VT's own suggested family label plus the detection
+        # ratio, not a blind hash dump - a communicating/downloaded
+        # relationship on VT means "this file talked to this IP", not
+        # "this file belongs to the actor you're tracking that IP for".
+        for relationship, key in (("communicating_files", "communicating_files"),
+                                   ("downloaded_files", "downloaded_files")):
+            try:
+                rel = _get_json(
+                    f"https://www.virustotal.com/api/v3/ip_addresses/{value}/{relationship}?limit=20",
+                    headers)
+            except PivotError:
+                rel = {"data": []}
+            result[key] = [
+                {
+                    "sha256": f["id"],
+                    "names": (f.get("attributes") or {}).get("names", [])[:3],
+                    "suggested_label": ((f.get("attributes") or {}).get("popular_threat_classification") or {})
+                        .get("suggested_threat_label"),
+                    "malicious": ((f.get("attributes") or {}).get("last_analysis_stats") or {}).get("malicious"),
+                    "total_engines": sum(((f.get("attributes") or {}).get("last_analysis_stats") or {}).values())
+                        if (f.get("attributes") or {}).get("last_analysis_stats") else None,
+                    "first_submission_date": (f.get("attributes") or {}).get("first_submission_date"),
+                }
+                for f in rel.get("data", [])
+            ]
+        return result
 
     if kind == "hash":
         base = _get_json(f"https://www.virustotal.com/api/v3/files/{value}", headers)

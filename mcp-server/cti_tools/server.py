@@ -114,6 +114,27 @@ def add_gap(name: str, description: str, priority: str = "medium") -> dict:
 
 
 @mcp.tool()
+def update_gap(name: str, description: str, new_description: str | None = None,
+                priority: str | None = None) -> dict:
+    """Revise a gap in place - for when it's been investigated and its
+    status/priority needs updating but is worth keeping a record of
+    (e.g. "pivoted against X, came up empty, don't re-try without new
+    data") rather than silently disappearing the way remove_gap would.
+    Only fields you pass are changed. Matches the gap to update by its
+    current exact description text - gaps have no separate id."""
+    return core.update_gap(name, description, new_description, priority)
+
+
+@mcp.tool()
+def remove_gap(name: str, description: str) -> dict:
+    """Remove a gap from a cluster's backlog outright - the counterpart
+    to add_gap, for a gap that's fully closed and not worth keeping a
+    record of (see update_gap to revise in place instead). Matches by
+    exact description text (case-sensitive)."""
+    return core.remove_gap(name, description)
+
+
+@mcp.tool()
 def export_navigator_layer(name: str) -> dict:
     """Export a cluster's TTP table as an ATT&CK Navigator layer JSON."""
     return core.export_navigator_layer(name)

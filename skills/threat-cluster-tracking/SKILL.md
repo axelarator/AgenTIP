@@ -496,7 +496,15 @@ STIX Note objects tied to the cluster's Intrusion Set.
    When a detection is written, record it with `add_detection` linked
    to the technique_id(s) it covers, not duplicated per cluster.
 7. When you hit something you can't currently detect or verify, add it
-   to the gaps backlog instead of letting it drop.
+   to the gaps backlog instead of letting it drop. When you later
+   investigate a gap, don't just leave it as-is once you have an
+   answer: `update_gap` to revise it in place (e.g. downgrade priority
+   and note what was tried and why it came up empty, so a future pass
+   doesn't repeat the same dead-end pivot), or `remove_gap` if it's
+   fully resolved and not worth keeping a record of. Both match the
+   gap by its current exact description text - gaps have no separate
+   id, the description is the identifying content, same as
+   `remove_observable` matching by value.
 8. When you identify a relationship to another tracked cluster (customer,
    downstream payload, suspected overlap), record it with
    `add_relationship` so it's structured and exportable, in addition to
@@ -525,7 +533,7 @@ Prefer the MCP tools if the harness exposes them: `list_clusters`,
 `get_cluster`, `create_cluster`, `update_profile`, `update_ttp`,
 `remove_ttp`,
 `append_hunt_log`, `add_detection`, `get_technique_usage`,
-`add_relationship`, `add_gap`, `export_navigator_layer`,
+`add_relationship`, `add_gap`, `update_gap`, `remove_gap`, `export_navigator_layer`,
 `export_stix_bundle`, `export_stix_ecosystem`, `import_stix_bundle`,
 `get_observables`, `find_observable`, `add_observable`,
 `remove_observable`, `list_pending_fingerprints`,

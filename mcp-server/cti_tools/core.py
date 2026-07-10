@@ -637,6 +637,60 @@ def add_gap(name: str, description: str, priority: str = "medium") -> dict[str, 
     return data
 
 
+@_synchronized
+def update_gap(name: str, description: str, new_description: str | None = None,
+               priority: str | None = None) -> dict[str, Any]:
+    """Revise a gap in place - for when it's been investigated and its
+    status/priority needs updating, but it's worth keeping a record of
+    what was tried (e.g. "pivoted against X, came up empty, don't
+    re-try without new data") rather than silently disappearing the way
+    remove_gap would. Only fields you pass are changed, same convention
+    as update_profile. Stamps an `updated` timestamp on the gap either
+    way, so its history is visible even if only the priority moved.
+
+    Matches the gap to update by its current exact description text -
+    gaps have no separate id, same as add_gap/remove_gap. Raises if the
+    cluster doesn't exist or no gap matches that text."""
+    data = load_cluster(name)
+    for g in data["gaps"]:
+        if g["description"] == description:
+            if new_description is not None:
+                g["description"] = new_description
+            if priority is not None:
+                g["priority"] = priority
+            g["updated"] = _now()
+            save_cluster(data)
+            return data
+    raise ValueError(f"no gap matching that description in cluster {name!r}")
+
+
+@_synchronized
+def remove_gap(name: str, description: str) -> dict[str, Any]:
+    """Remove a gap from a cluster's backlog outright - the counterpart
+    to add_gap, for a gap that's fully closed and not worth keeping a
+    record of (see update_gap instead if you'd rather revise it in
+    place, e.g. downgrading priority with a note on what was tried).
+
+    Matches by exact description text (case-sensitive) - gaps have no
+    separate id, the description is the identifying content, same
+    convention as remove_observable matching by value. Raises if the
+    cluster doesn't exist or no gap matches. The returned cluster
+    carries a transient `removed` gap dict (not persisted)."""
+    data = load_cluster(name)
+    kept: list[dict[str, Any]] = []
+    removed: dict[str, Any] | None = None
+    for g in data["gaps"]:
+        if removed is None and g["description"] == description:
+            removed = g
+        else:
+            kept.append(g)
+    if removed is None:
+        raise ValueError(f"no gap matching that description in cluster {name!r}")
+    data["gaps"] = kept
+    save_cluster(data)
+    return {**data, "removed": removed}
+
+
 def export_navigator_layer(name: str) -> dict[str, Any]:
     data = load_cluster(name)
     return {
