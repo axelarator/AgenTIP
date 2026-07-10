@@ -368,6 +368,36 @@ everything left for you to judge. Use this once you trust a pivot
 enough to expand from it; use `pivot_observable` first when you just
 want to look.
 
+### Pivoting vs. probing — when each runs
+
+"Pivoting" and "probing" name two different operations here and they
+run on different triggers — don't conflate them:
+
+- **Pivoting** (`pivot_observable`, `pivot_cluster`, `pivot_and_expand`,
+  above) only ever touches free public sources (RDAP, RIPEstat, Cert
+  Spotter, Hackertarget, VirusTotal). It's passive from the target's
+  perspective — no traffic reaches the adversary's infrastructure.
+  **Run it automatically** as part of working through a report: after
+  `ingest_report`/`analyze_report` files new domains/IPs onto a
+  cluster, pivot them (a `pivot_cluster` sweep for lifecycle status, or
+  `pivot_and_expand` on ones worth expanding from) without waiting to
+  be asked. There's no reason to gate a public-source lookup behind an
+  explicit request.
+- **Probing** (JA4+/JARM fingerprinting via the vantage point described
+  below) generates *real* network traffic against the target — a live
+  TLS handshake or a JARM scan the adversary's infrastructure actually
+  receives. **Only run it when explicitly asked** ("probe the
+  indicators," "get fingerprints," etc.) — never automatically during
+  ingestion or pivoting, and never as a default follow-up to a pivot.
+  Always route it through the dedicated vantage point (the Win11 probe
+  VM pipeline, see "Automating the handoff" above) — never generate
+  probe traffic from wherever this tool itself is running.
+
+If a request says "pivot on infrastructure" but clearly means
+fingerprinting (JARM/JA4, a specific VM/vantage point named), treat it
+as a probing request, not a call to `pivot_*` — confirm with the user
+if genuinely ambiguous rather than guessing from the word alone.
+
 ## Ingesting threat reports
 
 `ingest_report(source, cluster_name=None)` / `cti ingest-report <source>
