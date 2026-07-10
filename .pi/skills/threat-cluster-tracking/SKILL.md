@@ -160,46 +160,95 @@ the queue.
 That queue only tells you *what* needs probing — moving it to and from
 wherever you actually do the probing is outside this tool's scope, but
 `mcp-server/scripts/probe_pending_fingerprints.py` +
-`mcp-server/scripts/win_probe_helper.py` +
-`mcp-server/scripts/zeek_log_query.py` are a reference implementation
-for a specific, common lab shape: a probe VM and a Zeek sensor VM that
-both sit inside an isolated network segment (its own VLAN, its own
-OPNsense-fronted LAN) which is deliberately firewalled so it can
-*never* connect back out to the host running this tool — one-way
-access only, into the lab. That directionality, not "which side is
-less trusted," is what decides who initiates: since the lab segment
-can't reach out regardless, the cti host always initiates outbound
-over SSH, in — never the reverse.
+`mcp-server/scripts/win_probe_helper.py` are a reference implementation
+for a specific, common lab shape: a dedicated probe VM sitting inside
+an isolated network segment (its own VLAN, its own OPNsense-fronted
+LAN) which is deliberately firewalled so it can *never* connect back
+out to the host running this tool — one-way access only, into the lab.
+That directionality, not "which side is less trusted," is what decides
+who initiates: since the lab segment can't reach out regardless, the
+cti host always initiates outbound, in — never the reverse.
 
-Probing and log-reading are two separate hops to two separate VMs, not
-one — learned the hard way by first trying to run the probe directly
-from the Zeek sensor VM itself. Its own self-generated traffic didn't
-mirror the way third-party VMs' traffic does: a probe launched from
-the sensor's own interface showed up in conn.log as a one-sided ghost
-connection (the response visible, the VM's own outbound SYN never
-mirrored back to itself, or vice versa depending on mirror direction),
-so ja4ts/ja4l came back empty or garbage no matter how long you polled
-— not a bug in the query logic, a tap-placement mismatch. A dedicated
-probe VM sitting as an ordinary port on the same mirrored bridge (same
-footing as any other lab VM, Windows or Linux, doesn't matter) doesn't
-have that problem — its traffic mirrors cleanly in both directions,
-same as everything else on that bridge.
+Generating the probe traffic and reading back what it produced are two
+different things happening on two different machines, but as of this
+design they're one SSH hop plus one HTTPS query, not two SSH hops.
+Earlier versions SSHed into a second VM (the Zeek sensor itself) and
+read `ssl.log`/`conn.log` directly off disk there — that's `mcp-server/scripts/zeek_log_query.py`,
+still present but **retired from the automated pipeline** (kept only
+for manual by-hand troubleshooting directly on a Zeek VM; nothing in
+`probe_pending_fingerprints.py` invokes it or the Zeek-VM SSH key
+anymore). Two real bugs, found only by testing against real multi-target
+runs, drove the move off raw files:
+
+- **Log rotation races.** `logs/current/ssl.log` is periodically rotated
+  out from under a reader. A bare `FileNotFoundError` mid-poll used to
+  abort that *target's whole Zeek lookup* outright, even though the
+  file reappeared moments later — 3 of 14 targets in one real run lost
+  their JA4S/JA4L/JA4TS window this way, confirmed by cross-checking
+  against an OpenSearch dashboard that showed the same connections
+  correctly indexed the whole time. The raw-file reader just couldn't
+  reliably see data that unquestionably existed.
+- **Recency filtering needing either a fixed-duration guess or a
+  cross-host clock comparison.** An even earlier version passed a
+  timestamp from the probe VM's own clock across to compare against the
+  Zeek VM's log timestamps, which broke once testing showed the two
+  VMs' clocks were about an hour apart with nothing keeping them in
+  sync (see below) — the fix at the time was a `RECENCY_WINDOW_SECONDS`
+  constant measured on the Zeek VM's own clock instead, which works but
+  is still just a guess at how long a probe might take.
+
+If your lab already ships Zeek's logs somewhere durable and queryable —
+here, an OpenSearch index (`zeek-*`) fed by a separate ingestion
+pipeline, already confirmed reliable independent of Zeek's own file
+rotation — querying that instead of raw files sidesteps both problems
+at the source rather than working around them. And if that queryable
+store is reachable directly from wherever this script runs (as
+OpenSearch was here, over the same Tailscale/home-LAN routes as the
+lab VMs, not proxied through any of them), there's no reason to keep a
+second SSH hop just to ask "what did Zeek see" — a plain outbound HTTPS
+call does it with one fewer moving part.
 
 - `probe_pending_fingerprints.py` runs on the cti host itself (it
   imports `core.py` directly — no listener, nothing accepts inbound
   connections here). It pops the queue locally, then per entry: SSHes
   into the probe VM piping `{"target": value}` as JSON on stdin
   (avoiding shell-quoting an IOC value that traces back to report
-  text), then SSHes *separately* into the Zeek VM piping
-  `{"target": resolved_ip}` (handed back by the probe hop) to read
-  back whatever landed in Zeek's logs, filing whatever comes back from
-  either hop with `add_observable`.
+  text), then queries OpenSearch for whatever landed in Zeek's logs for
+  the resolved IP, filing whatever comes back from either step with
+  `add_observable`.
 
-  Every run validates both hops before touching the queue
-  (`check_access()`) and aborts if either fails — probing/pivoting
-  shouldn't start without confirmed access. If you're picking this
-  pipeline up in a fresh session and just want to check access without
-  draining the queue, run `python3
+  The freshness filter for that OpenSearch query is worth calling out
+  since it's the fix for the clock-skew bug above, done properly this
+  time: right *before* dispatching each target's probe,
+  `_current_max_ts()` snapshots the newest `ts` already indexed for
+  *anything* in OpenSearch. After the probe returns with a resolved IP,
+  `collect_zeek_fingerprints()` only accepts documents for that IP
+  newer than that snapshot. Every timestamp compared here came from the
+  same clock (Zeek's, via whichever document OpenSearch indexed it as)
+  — never a wall-clock reading taken on the cti host or the probe VM.
+  That's what actually breaks when you compare across hosts; a fixed
+  offset or a bigger window wouldn't have been a real fix, only a
+  bigger unreliable guess. Taking the snapshot before the probe fires
+  (not right before querying, after the probe already finished) also
+  means the window naturally covers the probe's whole actual duration —
+  DNS resolution, JARM, the handshake — instead of a fixed guess that
+  could be too short for a slow probe.
+
+  The OpenSearch password is deliberately **not** a constant in the
+  script — it's read from `CTI_OPENSEARCH_PASSWORD` in the environment.
+  This file lives in a git-tracked repo; a plaintext credential written
+  into it would land in git history the same way the SSH private keys
+  never do (they're referenced by local file path, never embedded). Set
+  the env var before running:
+
+      export CTI_OPENSEARCH_PASSWORD='...'
+      python3 mcp-server/scripts/probe_pending_fingerprints.py
+
+  Every run validates both the SSH hop and OpenSearch reachability
+  before touching the queue (`check_access()`) and aborts if either
+  fails — probing/pivoting shouldn't start without confirmed access. If
+  you're picking this pipeline up in a fresh session and just want to
+  check access without draining the queue, run `python3
   mcp-server/scripts/probe_pending_fingerprints.py --check-access`
   rather than independently `ls`-ing for the SSH key files named above
   or `ping`-ing the lab IPs — that kind of ad hoc discovery (enumerating
@@ -207,12 +256,12 @@ same as everything else on that bridge.
   is indistinguishable from credential-scanning/lateral-movement recon
   to the auto-mode permission classifier and gets denied outright, even
   though the actual access being checked is this pipeline's own
-  pre-authorized keys against its own lab segment. `check_access()`
-  validates the same thing more precisely anyway — it round-trips a
-  request through each hop's real forced-command channel and confirms
-  a valid JSON reply comes back, which proves the configured key
-  authenticated and the remote helper ran, rather than inferring
-  reachability from a bare ping or a file's presence on disk.
+  pre-authorized keys and credentials against its own lab infrastructure.
+  `check_access()` validates the same thing more precisely anyway — it
+  round-trips a request through the SSH hop's real forced-command
+  channel and makes the exact same OpenSearch query `_current_max_ts()`
+  would, rather than inferring reachability from a bare ping or a
+  file's presence on disk.
 - `win_probe_helper.py` runs on the probe VM (needs nothing from this
   repo — standalone, pure standard library so it doesn't matter if
   it's Windows or Linux). Per target it: resolves the target to an IP
@@ -221,40 +270,36 @@ same as everything else on that bridge.
   than letting the connection call re-resolve it — found live-testing
   against a CDN-fronted domain that a second, separate lookup moments
   later can come back with a different edge IP than the first,
-  silently pointing the Zeek-side query at an address nothing was ever
-  sent to. Then it runs a JARM scan (the one value nothing passive
+  silently pointing the OpenSearch query at an address nothing was
+  ever sent to. Then it runs a JARM scan (the one value nothing passive
   produces) and fires one ordinary TLS handshake — via Python's own
   `ssl`/`socket` modules rather than shelling out to `openssl`, so
   nothing extra needs installing — purely to give the target something
   real to respond to. The handshake's own result is discarded; Zeek's
-  log is the source of truth for what it produced, read back in the
-  next hop.
-- `zeek_log_query.py` runs on the Zeek sensor VM (needs nothing from
-  this repo either). Given a resolved IP, it polls ssl.log for ja4s
-  and conn.log for ja4ts/ja4l — polls rather than a fixed sleep, since
-  conn.log entries are normally only finalized once a connection tears
-  down (clean FIN or idle timeout), which can lag well behind ssl.log's
-  handshake-time write. It deliberately does not attempt
-  ja4/ja4h/ja4t/ja4ssh, for the client-vs-responder reason above, nor
-  ja4x (needs x509.log, and wasn't computed at all by the zeek-ja4
-  build tested against here — confirm against your own build before
-  assuming otherwise). Recency filtering is measured entirely on this
-  VM's own local clock (`RECENCY_WINDOW_SECONDS`), not a timestamp
-  handed over from the probe VM — an earlier version passed one across,
-  which broke as soon as testing showed the two VMs' clocks were about
-  an hour apart with nothing keeping them in sync. Don't assume two
-  hosts in the same lab share a clock any more than you'd assume they
-  share a filesystem.
+  log (read back via OpenSearch) is the source of truth for what it
+  produced.
 
-All three scripts have environment-specific constants marked for you
-to fill in (SSH host/key/known_hosts per hop, JARM CLI path, Zeek log
-paths — the exact field names in your own ssl.log/conn.log depend on
-which JA4 plugin/version and log format (JSON-lines vs the default
-tab-separated) you're running, so verify against a real sample before
-trusting the output, the same way the ja4ts/ja4x gaps here were only
-found by testing against this lab's actual logs rather than assumed).
-File results with `add_observable` citing method + date in `source` as
-above.
+`collect_zeek_fingerprints()` takes the most recent *non-empty* value
+per field, not just whichever document is chronologically last — a
+single probe can produce several `ssl.log` rows for the same target
+(JARM's malformed-ClientHello attempts included, which show up with an
+empty `ja4s` and an alert like `illegal_parameter`/`handshake_failure`),
+so picking blindly by recency can land on an empty JARM-probe row
+instead of the one real handshake's actual result. It deliberately does
+not attempt ja4/ja4h/ja4t/ja4ssh, for the client-vs-responder reason
+above, nor ja4x (needs x509.log, and wasn't computed at all by the
+zeek-ja4 build tested against here — confirm against your own build
+before assuming otherwise).
+
+Both scripts have environment-specific constants marked for you to
+fill in (SSH host/key/known_hosts, JARM CLI path, the OpenSearch
+URL/index/username — the exact document field names in your own
+OpenSearch index depend on how your ingestion pipeline maps Zeek's
+fields, e.g. this lab's pipeline renames `id.resp_h` to a flat `dst_ip`
+field, so verify against a real query before trusting the output, the
+same way the ja4ts/ja4x gaps here were only found by testing against
+this lab's actual data rather than assumed). File results with
+`add_observable` citing method + date in `source` as above.
 
 Windows probe VM gotcha worth knowing before you debug it blind: if
 the probe VM's account is a member of Administrators, Windows OpenSSH

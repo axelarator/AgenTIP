@@ -1,4 +1,15 @@
-"""Runs on the Zeek sensor VM (10.20.0.7 in this lab - the box hosting
+"""RETIRED from the automated pipeline: probe_pending_fingerprints.py no
+longer calls this script or SSHes to this VM at all. It now reads
+ssl.log/conn.log results from OpenSearch directly (an existing
+ingestion pipeline already indexes them reliably, sidestepping the log
+rotation/FileNotFoundError races and the cross-host clock-skew issues
+this file's polling approach ran into - see probe_pending_fingerprints.py's
+module docstring for the full story). This file is left in place only
+for manual, by-hand troubleshooting directly on the Zeek VM if you ever
+need to inspect the raw logs yourself; nothing in the automated
+pipeline invokes it, and its SSH hop/key are unused.
+
+Runs on the Zeek sensor VM (10.20.0.7 in this lab - the box hosting
 Zeek itself, NOT where probes should be generated from). Read-only half
 of the fingerprinting handoff: probe_pending_fingerprints.py on the cti
 host calls win_probe_helper.py on a separate probe VM to actually touch
