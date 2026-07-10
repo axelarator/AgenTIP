@@ -32,6 +32,13 @@ Usage (run manually, or on a cron/systemd timer):
 
     python3 probe_pending_fingerprints.py
 
+Every run validates both hops first (see check_access()) and aborts
+before touching the queue if either fails - probing/pivoting shouldn't
+start without confirmed access. To check access on its own, without
+draining the queue:
+
+    python3 probe_pending_fingerprints.py --check-access
+
 Requires: cti_tools importable (run from within the mcp-server venv/repo
 checkout), and SSH keypairs authorized to reach both remote VMs.
 """
@@ -143,7 +150,43 @@ def query_zeek(resolved_ip: str) -> dict[str, object]:
                           ZEEK_HELPER_CMD, {"target": resolved_ip})
 
 
+def check_access() -> list[str]:
+    """Validates both hops before any probing starts, using the exact
+    transport the real probe uses rather than a separate ls-for-keys or
+    ping-the-host guess: round-trips an (intentionally incomplete)
+    request through each hop's own forced `command=` channel and
+    confirms it comes back as valid JSON. A JSON reply - even an error
+    one like {"error": "bad request: ..."} - proves the configured SSH
+    key authenticated and the remote helper actually ran; a transport
+    failure or garbage stdout (caught as ProbeError by _ssh_json_rpc)
+    means access isn't there yet. Returns one problem string per failed
+    hop; empty means both are reachable and authorized."""
+    problems = []
+    for label, user, host, key, known_hosts, remote_cmd in (
+        ("win probe VM", WIN_PROBE_USER, WIN_PROBE_HOST, WIN_SSH_KEY, WIN_KNOWN_HOSTS, WIN_HELPER_CMD),
+        ("zeek sensor VM", ZEEK_USER, ZEEK_HOST, ZEEK_SSH_KEY, ZEEK_KNOWN_HOSTS, ZEEK_HELPER_CMD),
+    ):
+        try:
+            _ssh_json_rpc(user, host, key, known_hosts, remote_cmd, {})
+        except ProbeError as e:
+            problems.append(f"{label} ({host}): {e}")
+    return problems
+
+
 def main() -> None:
+    problems = check_access()
+    if "--check-access" in sys.argv:
+        if problems:
+            for p in problems:
+                print(p, file=sys.stderr)
+            raise SystemExit(1)
+        print("access OK: both hops reachable and authorized")
+        return
+    if problems:
+        for p in problems:
+            print(p, file=sys.stderr)
+        raise SystemExit("aborting: SSH access check failed for one or both hops, see errors above")
+
     queue = core.pop_pending_fingerprints()
     if not queue:
         return
