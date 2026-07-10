@@ -966,12 +966,63 @@ def pivot_and_expand(value: str, cluster_name: str,
             "filed": filed, "review": review, "cluster_state": load_cluster(cluster_name)}
 
 
+# Report-fetch cache. analyze_report (preview) and ingest_report (commit)
+# are routinely called back-to-back on the same source - analyze first to
+# pick a cluster_name, then ingest to file it - which would otherwise
+# fetch identical content twice (a real cost for slow report sites, and
+# a pointless repeat request either way). Same _registry/TTL-env pattern
+# as the pivot cache above. Set CTI_REPORT_CACHE_TTL=0 to disable.
+_REPORT_CACHE_TTL_ENV = "CTI_REPORT_CACHE_TTL"
+_REPORT_CACHE_TTL_DEFAULT = 3600
+
+
+def _report_cache_path() -> Path:
+    return DATA_DIR / "_registry" / "report_fetch_cache.json"
+
+
+def _report_cache_ttl() -> int:
+    try:
+        return int(os.environ.get(_REPORT_CACHE_TTL_ENV, _REPORT_CACHE_TTL_DEFAULT))
+    except ValueError:
+        return _REPORT_CACHE_TTL_DEFAULT
+
+
+def _fetch_report_text(source: str) -> str:
+    """report_ingest.fetch_text(source), cached briefly so analyze_report
+    followed by ingest_report on the same source reuses one fetch instead
+    of two. Keyed by source string (URL or local path) - a local file
+    edited between the two calls within the TTL window would read stale,
+    but that gap is normally seconds, not the file's edit cadence."""
+    import time
+    ttl = _report_cache_ttl()
+    if ttl <= 0:
+        return report_ingest.fetch_text(source)
+    path = _report_cache_path()
+    cache: dict[str, Any] = {}
+    if path.exists():
+        try:
+            cache = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            cache = {}
+    now = time.time()
+    entry = cache.get(source)
+    if entry and now - entry.get("ts", 0) < ttl:
+        return entry["text"]
+    text = report_ingest.fetch_text(source)
+    cache[source] = {"ts": now, "text": text}
+    try:
+        _atomic_write_text(path, json.dumps(cache))
+    except OSError:
+        pass
+    return text
+
+
 def analyze_report(source: str) -> dict[str, Any]:
     """Fetch a report (URL or local file path) and extract observables,
     ATT&CK technique IDs, and candidate cluster names, WITHOUT writing
     anything. Use this to preview extraction — e.g. to pick the right
     cluster_name yourself — before committing with `ingest_report`."""
-    text = report_ingest.fetch_text(source)
+    text = _fetch_report_text(source)
     text = report_ingest.defang_normalize(text)
     observables = report_ingest.extract_observables(text)
     candidates = report_ingest.suggest_cluster_names(text)
@@ -1092,7 +1143,7 @@ def ingest_report(source: str, cluster_name: str | None = None,
     deduped by value; a repeated observable from a new source just adds
     that source to its provenance list.
     """
-    text = report_ingest.fetch_text(source)
+    text = _fetch_report_text(source)
     text = report_ingest.defang_normalize(text)
     extracted = report_ingest.extract_observables(text)
 
