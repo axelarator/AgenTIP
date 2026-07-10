@@ -136,6 +136,27 @@ processed twice. Already-tracked domains/ips are never re-queued just
 because a later report mentions them again; only genuinely new infra
 lands in the queue.
 
+A new value only reaches that queue if it also passes
+`core._is_probe_worthy` — extraction is a blind regex over report text
+(it'll happily match a version string, a public DNS resolver mentioned
+as "the malware checks connectivity against 8.8.8.8", or a vendor's own
+site named in passing) and `add_observable` trusts whatever it's handed
+verbatim, so without this gate a false match drives a live JARM scan /
+SSH round-trip exactly like a real IOC would. The gate rejects
+private/reserved/loopback/link-local IPs, a short curated list of
+well-known public DNS resolver IPs, and a short curated list of
+known-non-actor apex domains (major vendors, CDNs, sinkhole operators —
+exact-match only, not subdomains, since a subdomain of e.g. `github.io`
+or `amazonaws.com` is routine attacker-controlled shared hosting, not a
+false positive). It does **not** affect whether the value gets tracked
+as an observable — that stays exactly as permissive as before, it only
+gates the active-probing queue. A skip is visible on the caller's
+return value (and, for `ingest_report`, persisted on that ingest's
+`report_sources` entry) as `fingerprint_queue_skipped`:
+`[{category, value, reason}, ...]`. If a skip turns out to be wrong for
+a specific case, `requeue_fingerprint()` forces that value back onto
+the queue.
+
 That queue only tells you *what* needs probing — moving it to and from
 wherever you actually do the probing is outside this tool's scope, but
 `mcp-server/scripts/probe_pending_fingerprints.py` +

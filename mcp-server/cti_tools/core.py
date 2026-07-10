@@ -7,6 +7,7 @@ identical. No MCP or argparse imports belong in this file.
 from __future__ import annotations
 
 import concurrent.futures
+import ipaddress
 import json
 import os
 import tempfile
@@ -39,6 +40,60 @@ _FINGERPRINTABLE_CATEGORIES = ("domains", "ips")
 # reaching for the underscore-prefixed name (mirrors OBSERVABLE_CATEGORIES
 # below).
 FINGERPRINTABLE_CATEGORIES = _FINGERPRINTABLE_CATEGORIES
+
+# Values that pass extraction/dedup but are essentially never an actor's
+# own infrastructure - public DNS resolvers and the root domains of
+# hyperscale/security vendors that show up constantly as prose mentions
+# (a linked writeup, "hosted via Cloudflare", a contact address) rather
+# than as the IOC itself. report_ingest.extract_observables is a blind
+# regex over report text (see its docstring on over-matching) and
+# add_observable trusts whatever it's handed verbatim, so without a gate
+# here a false match turns into a live JARM scan / SSH round-trip
+# exactly like a real IOC would. Deliberately exact-match only, not
+# subdomain matching - a subdomain of e.g. github.io or amazonaws.com is
+# routine, genuinely-attacker-controlled shared hosting, not a false
+# positive, so only the bare apex domain (never itself attacker infra)
+# is listed. Curated, not exhaustive - extend as new false positives
+# turn up in real ingests, the same way _TLDS is extended in
+# report_ingest.py. This only gates the fingerprinting *queue*; the
+# value is still tracked as an observable exactly as before.
+_KNOWN_NON_ACTOR_DOMAINS = {
+    "microsoft.com", "microsoftinternetsafety.net", "google.com",
+    "github.com", "githubusercontent.com", "cloudflare.com",
+    "virustotal.com", "example.com", "mandiant.com", "crowdstrike.com",
+    "sophos.com", "kaspersky.com", "malwarebytes.com", "godaddy.com",
+    "sinkhole.abuse.ch", "iana.org",
+}
+# Same idea for IPs - well-known public DNS resolvers, the ones most
+# likely to appear in report text as "the malware checks connectivity
+# against 8.8.8.8" rather than as adversary infrastructure.
+_KNOWN_NON_ACTOR_IPS = {
+    "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1",
+    "9.9.9.9", "149.112.112.112", "208.67.222.222", "208.67.220.220",
+}
+
+
+def _is_probe_worthy(category: str, value: str) -> tuple[bool, str]:
+    """Gate applied only to what reaches the active-probing queue, right
+    before _enqueue_pending_fingerprints - not to whether a value gets
+    tracked as an observable at all, which stays exactly as permissive
+    as before (empty/skipped fingerprint results are still an expected,
+    fine outcome for infra that just isn't reachable). Returns
+    (True, "") if fine to queue, else (False, reason)."""
+    if category == "ips":
+        try:
+            addr = ipaddress.ip_address(value)
+        except ValueError:
+            return False, "not a valid IP literal"
+        if addr.is_private or addr.is_loopback or addr.is_link_local \
+                or addr.is_multicast or addr.is_reserved or addr.is_unspecified:
+            return False, "private/reserved/loopback/link-local address, not routable adversary infra"
+        if value in _KNOWN_NON_ACTOR_IPS:
+            return False, "known non-actor infrastructure (public DNS resolver)"
+    elif category == "domains":
+        if value.strip().lower() in _KNOWN_NON_ACTOR_DOMAINS:
+            return False, "known non-actor infrastructure (major vendor/CDN/sinkhole domain)"
+    return True, ""
 
 # The observable categories a cluster tracks. Single source of truth
 # lives in report_ingest (the extractor); re-exported here so the rest
@@ -647,13 +702,24 @@ def add_observable(name: str, category: str, value: str, source: str) -> dict[st
     JA4+/JARM fingerprint, or something told to you directly). Reuses
     the exact same dedup/provenance logic as ingest_report: a value
     already tracked just gets `source` appended to its provenance list
-    rather than creating a duplicate entry."""
+    rather than creating a duplicate entry.
+
+    A new domain/ip is still always tracked as an observable, but only
+    queued for active fingerprinting if it passes _is_probe_worthy (not
+    a private/reserved address, not a known-non-actor domain/resolver
+    IP like a public DNS resolver or a major vendor's own site) - see
+    that function's docstring. If it's skipped, the returned dict
+    carries a transient (not persisted) `fingerprint_queue_skipped`
+    list of {category, value, reason}; use requeue_fingerprint if you
+    disagree with the call and want it probed anyway."""
     if category not in OBSERVABLE_CATEGORIES:
         raise ValueError("category must be one of " + ", ".join(OBSERVABLE_CATEGORIES))
     data = load_cluster(name)
     extracted = {c: ([value] if c == category else []) for c in OBSERVABLE_CATEGORIES}
-    _merge_observables(data, extracted, source)
+    _, skipped = _merge_observables(data, extracted, source)
     save_cluster(data)
+    if skipped:
+        data = {**data, "fingerprint_queue_skipped": skipped}
     return data
 
 
@@ -884,7 +950,7 @@ def _file_new_observables(data: dict[str, Any], category: str, values: list[str]
     new = [v for v in dict.fromkeys(values) if v and v not in existing]
     if new:
         extracted = {c: (new if c == category else []) for c in OBSERVABLE_CATEGORIES}
-        _merge_observables(data, extracted, source)
+        _merge_observables(data, extracted, source)  # skip list unused - caller's own confidence filter already applies
     return new
 
 
@@ -1042,10 +1108,11 @@ def analyze_report(source: str) -> dict[str, Any]:
 
 
 def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
-                        source: str) -> dict[str, int]:
+                        source: str) -> tuple[dict[str, int], list[dict[str, str]]]:
     now = _now()
     counts = {}
     newly_tracked: list[tuple[str, str]] = []  # (category, value), for the fingerprint queue
+    skipped: list[dict[str, str]] = []  # entries tracked but not queued, with why
     for category in OBSERVABLE_CATEGORIES:
         bucket = data["observables"][category]
         by_value = {o["value"]: o for o in bucket}
@@ -1061,11 +1128,15 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                                 "first_seen": now, "last_seen": now})
                 added += 1
                 if category in _FINGERPRINTABLE_CATEGORIES:
-                    newly_tracked.append((category, value))
+                    ok, reason = _is_probe_worthy(category, value)
+                    if ok:
+                        newly_tracked.append((category, value))
+                    else:
+                        skipped.append({"category": category, "value": value, "reason": reason})
         counts[category] = added
     if newly_tracked:
         _enqueue_pending_fingerprints(data["name"], newly_tracked)
-    return counts
+    return counts, skipped
 
 
 def _load_pending_fingerprints() -> list[dict[str, Any]]:
@@ -1175,6 +1246,16 @@ def ingest_report(source: str, cluster_name: str | None = None,
     only new technique IDs are added, at status 0. Observables are
     deduped by value; a repeated observable from a new source just adds
     that source to its provenance list.
+
+    Every newly-tracked domain/ip is still filed as an observable, but
+    only queued for active fingerprinting if it passes
+    _is_probe_worthy — extraction is a blind regex over report text and
+    will happily match a version string, a public DNS resolver, or a
+    vendor's own site mentioned in passing, and none of those should
+    turn into a live probe just because they matched. Anything skipped
+    is listed (with why) under `fingerprint_queue_skipped` on both the
+    return value and the persisted `report_sources` entry for this
+    ingest; use requeue_fingerprint if a skip turns out to be wrong.
     """
     text = _fetch_report_text(source)
     text = report_ingest.defang_normalize(text)
@@ -1200,16 +1281,19 @@ def ingest_report(source: str, cluster_name: str | None = None,
     else:
         raise ClusterNotFound(f"No cluster named {cluster_name!r}")
 
-    observable_counts = _merge_observables(data, extracted, source)
+    observable_counts, skipped = _merge_observables(data, extracted, source)
     _merge_ttps(data, extracted["ttps"], source)
     data["report_sources"].append({
         "source": source, "ingested": _now(),
         "observables_found": observable_counts,
         "ttps_found": extracted["ttps"],
+        "fingerprint_queue_skipped": skipped,
     })
     save_cluster(data)
     if _nothing_extracted(extracted):
         data = {**data, "warning": _EXTRACTION_EMPTY_WARNING}
+    if skipped:
+        data = {**data, "fingerprint_queue_skipped": skipped}
     return data
 
 
@@ -1267,7 +1351,12 @@ def import_stix_bundle(bundle: dict[str, Any], name: str | None = None,
     containing an Intrusion Set (plus optional Attack Patterns /
     Indicators / Relationships / Notes). Indicators are reconstructed
     into the cluster's observables. Existing local fields not present in
-    the bundle (hunt log, detections, gaps) are preserved on update."""
+    the bundle (hunt log, detections, gaps) are preserved on update.
+
+    Same fingerprint-queue gating as add_observable/ingest_report: a
+    domain/ip that fails _is_probe_worthy is still tracked but not
+    queued for active probing; see `fingerprint_queue_skipped` on the
+    return value if any were skipped."""
     parsed = stix.from_bundle(bundle)
     cluster_name = name or parsed["name"]
     p = _path(cluster_name)
@@ -1303,10 +1392,13 @@ def import_stix_bundle(bundle: dict[str, Any], name: str | None = None,
         data["relationships"] = parsed["relationships"]
 
     parsed_obs = parsed.get("observables", {})
+    skipped: list[dict[str, str]] = []
     if parsed_obs:
         extracted = {c: parsed_obs.get(c, []) for c in OBSERVABLE_CATEGORIES}
-        _merge_observables(data, extracted, f"STIX import ({parsed['stix_id']})")
+        _, skipped = _merge_observables(data, extracted, f"STIX import ({parsed['stix_id']})")
     save_cluster(data)
+    if skipped:
+        data = {**data, "fingerprint_queue_skipped": skipped}
     return data
 
 

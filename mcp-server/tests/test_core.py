@@ -648,6 +648,74 @@ def test_pending_fingerprints_respect_isolated_data_dir(isolated_data_dir):
     assert (isolated_data_dir.parent / "pending_fingerprints.json").exists()
 
 
+# --- fingerprint queue validation gate ---------------------------------------
+
+def test_private_ip_is_tracked_but_not_queued():
+    # pending_fingerprints.json lives one level above the (monkeypatched)
+    # per-test DATA_DIR, which pytest's tmp_path makes a shared sibling
+    # dir across tests in the same session - so assert this value isn't
+    # queued, not that the whole (possibly session-shared) queue is empty.
+    core.create_cluster("Gate Test IP")
+    data = core.add_observable("Gate Test IP", "ips", "10.20.0.9", "report X")
+    assert any(o["value"] == "10.20.0.9" for o in data["observables"]["ips"])
+    assert not any(e["value"] == "10.20.0.9" for e in core.list_pending_fingerprints())
+    assert data["fingerprint_queue_skipped"] == [
+        {"category": "ips", "value": "10.20.0.9",
+         "reason": "private/reserved/loopback/link-local address, not routable adversary infra"}
+    ]
+
+
+def test_public_dns_resolver_is_tracked_but_not_queued():
+    core.create_cluster("Gate Test Resolver")
+    data = core.add_observable("Gate Test Resolver", "ips", "8.8.8.8", "report X")
+    assert any(o["value"] == "8.8.8.8" for o in data["observables"]["ips"])
+    assert not any(e["value"] == "8.8.8.8" for e in core.list_pending_fingerprints())
+    assert data["fingerprint_queue_skipped"][0]["reason"] == "known non-actor infrastructure (public DNS resolver)"
+
+
+def test_known_non_actor_domain_is_tracked_but_not_queued():
+    core.create_cluster("Gate Test Domain")
+    data = core.add_observable("Gate Test Domain", "domains", "microsoft.com", "report X")
+    assert any(o["value"] == "microsoft.com" for o in data["observables"]["domains"])
+    assert not any(e["value"] == "microsoft.com" for e in core.list_pending_fingerprints())
+    assert data["fingerprint_queue_skipped"][0]["reason"] == \
+        "known non-actor infrastructure (major vendor/CDN/sinkhole domain)"
+
+
+def test_subdomain_of_known_non_actor_domain_is_not_skipped():
+    """Deliberately exact-match only: a subdomain of hosting-platform-style
+    apex domains (github.io, amazonaws.com, ...) is routine attacker-
+    controlled shared hosting, not a false positive, so only the bare
+    apex is gated - a subdomain must still queue normally."""
+    core.create_cluster("Gate Test Subdomain")
+    data = core.add_observable("Gate Test Subdomain", "domains", "evil.github.com", "report X")
+    assert any(e["value"] == "evil.github.com" for e in core.list_pending_fingerprints())
+    assert "fingerprint_queue_skipped" not in data
+
+
+def test_ordinary_domain_and_ip_are_unaffected_by_the_gate():
+    core.create_cluster("Gate Test Normal")
+    data = core.add_observable("Gate Test Normal", "domains", "evil.example", "report X")
+    data = core.add_observable("Gate Test Normal", "ips", "185.220.101.47", "report X")
+    assert "fingerprint_queue_skipped" not in data
+    queued = {(e["category"], e["value"]) for e in core.list_pending_fingerprints()}
+    assert ("domains", "evil.example") in queued
+    assert ("ips", "185.220.101.47") in queued
+
+
+def test_ingest_report_records_skipped_entries_in_report_sources(tmp_path):
+    core.create_cluster("Gate Test Ingest")
+    report = tmp_path / "report.txt"
+    report.write_text("Fancy Bear infrastructure includes evil.example and "
+                       "microsoft.com (mentioned only in passing).")
+    data = core.ingest_report(str(report), cluster_name="Gate Test Ingest")
+    skipped = data["report_sources"][-1]["fingerprint_queue_skipped"]
+    assert any(s["value"] == "microsoft.com" for s in skipped)
+    queued = {e["value"] for e in core.list_pending_fingerprints()}
+    assert "evil.example" in queued
+    assert "microsoft.com" not in queued
+
+
 # --- observables in STIX export/import --------------------------------------
 
 def test_stix_export_emits_indicators_for_observables():
