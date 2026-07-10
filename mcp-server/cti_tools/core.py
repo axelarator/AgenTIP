@@ -1162,11 +1162,14 @@ def analyze_report(source: str) -> dict[str, Any]:
 
 
 def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
-                        source: str) -> tuple[dict[str, int], list[dict[str, str]]]:
+                        source: str,
+                        ip_ports: dict[str, int] | None = None,
+                        ) -> tuple[dict[str, int], list[dict[str, str]]]:
     now = _now()
     counts = {}
     newly_tracked: list[tuple[str, str]] = []  # (category, value), for the fingerprint queue
     skipped: list[dict[str, str]] = []  # entries tracked but not queued, with why
+    ip_ports = ip_ports or {}
     for category in OBSERVABLE_CATEGORIES:
         bucket = data["observables"][category]
         by_value = {o["value"]: o for o in bucket}
@@ -1178,8 +1181,9 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                     entry["sources"].append(source)
                 entry["last_seen"] = now
             else:
-                bucket.append({"value": value, "sources": [source],
-                                "first_seen": now, "last_seen": now})
+                entry = {"value": value, "sources": [source],
+                          "first_seen": now, "last_seen": now}
+                bucket.append(entry)
                 added += 1
                 if category in _FINGERPRINTABLE_CATEGORIES:
                     ok, reason = _is_probe_worthy(category, value)
@@ -1187,6 +1191,18 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                         newly_tracked.append((category, value))
                     else:
                         skipped.append({"category": category, "value": value, "reason": reason})
+            # A report naming a C2/service port near this IP (see
+            # report_ingest._extract_ip_ports) is stamped onto the IP's
+            # own observable entry so active fingerprinting can probe
+            # its real port instead of always defaulting to 443 - see
+            # probe_pending_fingerprints.py's _lookup_port. Appended
+            # (deduped), not overwritten, since a later report might
+            # name a second port for the same IP without invalidating
+            # the first.
+            if category == "ips" and value in ip_ports:
+                ports = entry.setdefault("ports", [])
+                if ip_ports[value] not in ports:
+                    ports.append(ip_ports[value])
         counts[category] = added
     if newly_tracked:
         _enqueue_pending_fingerprints(data["name"], newly_tracked)
@@ -1310,6 +1326,14 @@ def ingest_report(source: str, cluster_name: str | None = None,
     is listed (with why) under `fingerprint_queue_skipped` on both the
     return value and the persisted `report_sources` entry for this
     ingest; use requeue_fingerprint if a skip turns out to be wrong.
+
+    If the report names a C2/service port near one of the extracted IPs
+    (e.g. "TCP port 886 (IPs: 1.2.3.4, ...)" or a bare "1.2.3.4:8080"),
+    that port is stamped onto the IP's own observable entry
+    (`ports: [...]`, see report_ingest._extract_ip_ports). Active
+    fingerprinting checks that field first and only falls back to 443
+    if nothing was extracted — see probe_pending_fingerprints.py's
+    _lookup_port.
     """
     text = _fetch_report_text(source)
     text = report_ingest.defang_normalize(text)
@@ -1335,7 +1359,8 @@ def ingest_report(source: str, cluster_name: str | None = None,
     else:
         raise ClusterNotFound(f"No cluster named {cluster_name!r}")
 
-    observable_counts, skipped = _merge_observables(data, extracted, source)
+    observable_counts, skipped = _merge_observables(
+        data, extracted, source, ip_ports=extracted.get("ip_ports"))
     _merge_ttps(data, extracted["ttps"], source)
     data["report_sources"].append({
         "source": source, "ingested": _now(),

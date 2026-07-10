@@ -236,6 +236,40 @@ def test_ingest_report_merges_into_existing_cluster_without_clobbering_status():
     assert any(o["value"] == "second-c2.xyz" for o in data["observables"]["domains"])
 
 
+def test_ingest_report_stamps_ip_ports_from_extraction(tmp_path):
+    report = tmp_path / "report.txt"
+    report.write_text(
+        "TA4922 loader uses T1059.001. "
+        "Atlas RAT: TCP port 886 (IPs: 206.238.115.58, 154.211.86.110). "
+        "RomulusLoader: TCP port 1234 (IP: 43.156.77.97). "
+        "Unrelated IP 185.220.101.47 has no nearby port mention."
+    )
+    data = core.ingest_report(str(report), cluster_name="TA4922 Port Test")
+    by_value = {o["value"]: o for o in data["observables"]["ips"]}
+    assert by_value["206.238.115.58"]["ports"] == [886]
+    assert by_value["154.211.86.110"]["ports"] == [886]
+    assert by_value["43.156.77.97"]["ports"] == [1234]
+    assert "ports" not in by_value["185.220.101.47"]
+
+
+def test_ingest_report_appends_new_port_without_dropping_old(tmp_path):
+    core.create_cluster("Port Merge Test")
+    core.add_observable("Port Merge Test", "ips", "206.238.115.58", "manual")
+
+    report = tmp_path / "report.txt"
+    report.write_text("Second report: Atlas RAT: TCP port 886 (IP: 206.238.115.58).")
+    data = core.ingest_report(str(report), cluster_name="Port Merge Test",
+                               create_if_missing=False)
+    entry = next(o for o in data["observables"]["ips"] if o["value"] == "206.238.115.58")
+    assert entry["ports"] == [886]
+
+    # Re-ingesting the same port again shouldn't duplicate it.
+    data = core.ingest_report(str(report), cluster_name="Port Merge Test",
+                               create_if_missing=False)
+    entry = next(o for o in data["observables"]["ips"] if o["value"] == "206.238.115.58")
+    assert entry["ports"] == [886]
+
+
 def test_ingest_report_ambiguous_name_raises(tmp_path):
     report = tmp_path / "ambiguous.txt"
     report.write_text("Both Fox Tempest and UNC4321 were observed at shared-infra[.]xyz.")

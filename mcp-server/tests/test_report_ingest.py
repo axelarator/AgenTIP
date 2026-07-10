@@ -63,6 +63,49 @@ def test_extract_ipv6_private_filtered():
     assert obs["ips"] == []
 
 
+def test_extract_ip_port_inline():
+    obs = report_ingest.extract_observables("C2 beacon seen at 206.238.115.58:886 in traffic.")
+    assert obs["ip_ports"] == {"206.238.115.58": 886}
+
+
+def test_extract_ip_port_proximity_single_ip():
+    obs = report_ingest.extract_observables(
+        "RomulusLoader: TCP port 1234 (IP: 43.156.77.97)")
+    assert obs["ip_ports"] == {"43.156.77.97": 1234}
+
+
+def test_extract_ip_port_proximity_multiple_ips():
+    obs = report_ingest.extract_observables(
+        "Atlas RAT: TCP port 886 (IPs: 206.238.115.58, 154.211.86.110)")
+    assert obs["ip_ports"] == {"206.238.115.58": 886, "154.211.86.110": 886}
+
+
+def test_extract_ip_port_two_distinct_mentions():
+    obs = report_ingest.extract_observables(
+        "Atlas RAT: TCP port 886 (IPs: 206.238.115.58). "
+        "RomulusLoader: TCP port 1234 (IP: 43.156.77.97)."
+    )
+    assert obs["ip_ports"] == {"206.238.115.58": 886, "43.156.77.97": 1234}
+
+
+def test_extract_ip_port_no_mention():
+    obs = report_ingest.extract_observables("C2 at 185.220.101.47, no port mentioned.")
+    assert obs["ip_ports"] == {}
+
+
+def test_extract_ip_port_out_of_range_ignored():
+    obs = report_ingest.extract_observables("Build port 999999 near 185.220.101.47.")
+    assert obs["ip_ports"] == {}
+
+
+def test_extract_ip_port_far_apart_not_associated():
+    filler = " lorem ipsum" * 40  # well past _PORT_PROXIMITY_WINDOW
+    obs = report_ingest.extract_observables(
+        f"Uses TCP port 8443 for staging.{filler} Unrelated IP 185.220.101.47 mentioned later."
+    )
+    assert obs["ip_ports"] == {}
+
+
 def test_defang_dot_and_at_variants():
     assert report_ingest.defang_normalize("evil[dot]com") == "evil.com"
     assert report_ingest.defang_normalize("user[at]evil(dot)com") == "user@evil.com"

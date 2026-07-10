@@ -71,6 +71,31 @@ _IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 # Loose IPv6 matcher — deliberately over-broad; every hit is validated
 # with ipaddress.ip_address() below, so a false match just gets dropped.
 _IPV6_PATTERN = re.compile(r"\b(?:[A-Fa-f0-9]{0,4}:){2,7}[A-Fa-f0-9]{0,4}\b")
+# Direct "ip:port" adjacency, e.g. a bare "206.238.115.58:886" in text
+# (not a URL — no scheme). Unambiguous when it matches.
+_IP_PORT_INLINE_PATTERN = re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3}):(\d{2,5})\b")
+# Prose naming a C2/service port near the IP(s) it applies to without
+# direct adjacency, e.g. "Atlas RAT: TCP port 886 (IPs: 1.2.3.4, 5.6.7.8)"
+# or "listens on port 1234". _extract_ip_ports() below pairs each match
+# with any already-extracted IP found in the same "chunk" of text (see
+# _SENTENCE_SPLIT_RE).
+_PORT_MENTION_PATTERN = re.compile(
+    r"\b(?:TCP|UDP)?\s*port\s*[:#]?\s*(\d{2,5})\b", re.IGNORECASE)
+# Splits report text into sentence-or-line-sized chunks for
+# _extract_ip_ports()'s proximity pass: a sentence-ending punctuation
+# mark followed by whitespace, or a newline. HTML-stripped report text
+# often loses paragraph breaks but keeps sentence punctuation, and a
+# bullet-list report keeps newlines even without terminal periods -
+# covering both keeps "<malware>: TCP port N (IP: ...)." style clauses
+# (the common phrasing this targets) each in their own chunk regardless
+# of which form the source report uses.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+# A "chunk" (see above) longer than this isn't trusted as one semantic
+# unit for port<->IP pairing - an unpunctuated run of text this long is
+# more likely garbled/lost formatting than a single real sentence, and
+# pairing every IP in it with whatever port also happens to appear
+# would be a guess dressed up as an association.
+_MAX_PORT_CHUNK_LEN = 400
 _URL_PATTERN = re.compile(r"https?://[^\s\"'<>\)\]]+", re.IGNORECASE)
 _DOMAIN_CANDIDATE = re.compile(
     r"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
@@ -194,14 +219,72 @@ def fetch_text(source: str) -> str:
     return raw
 
 
+def _extract_ip_ports(text: str, ips: list[str]) -> dict[str, int]:
+    """Best-effort IP->port association for report prose that names a
+    C2/service port near (not necessarily immediately adjacent to) the
+    IP(s) it applies to, e.g. "Atlas RAT: TCP port 886 (IPs: 1.2.3.4,
+    5.6.7.8). RomulusLoader: TCP port 1234 (IP: 9.9.9.9)." `ips` should
+    be the already-extracted, already-validated (private/reserved
+    filtered) list from this same text — only IPs in that list are
+    eligible to receive a port here.
+
+    Two passes, most-confident first:
+
+    1. Direct "ip:port" adjacency (e.g. a bare "1.2.3.4:8080" with no
+       URL scheme) - unambiguous, always wins for that IP.
+    2. Text is split into sentence/line-sized chunks (_SENTENCE_SPLIT_RE)
+       and, within each chunk short enough to trust (_MAX_PORT_CHUNK_LEN),
+       every IP is paired with that chunk's port - but only if the chunk
+       names exactly one distinct port. A plain character-distance
+       window instead of chunk boundaries was tried first and rejected:
+       it let a port mention in one clause "win" an IP that actually
+       belongs to an adjacent clause's port whenever the two clauses sat
+       close together (e.g. two back-to-back "<malware>: TCP port N
+       (IP: ...)." sentences) purely because raw distance happened to
+       favor it - a chunk is the actual unit a report author associates
+       a port with, so containment beats distance here. A chunk naming
+       more than one distinct port is ambiguous and skipped rather than
+       guessed at.
+
+    Returns at most one port per IP. Ports outside 1-65535 (a
+    `\\d{2,5}` match that isn't actually a valid port, e.g. incidentally
+    matching part of a longer number) are dropped."""
+    ip_set = set(ips)
+    resolved: dict[str, int] = {}
+
+    for ip, port_str in _IP_PORT_INLINE_PATTERN.findall(text):
+        if ip in ip_set and ip not in resolved:
+            port = int(port_str)
+            if 1 <= port <= 65535:
+                resolved[ip] = port
+
+    for chunk in _SENTENCE_SPLIT_RE.split(text):
+        if len(chunk) > _MAX_PORT_CHUNK_LEN:
+            continue
+        ports_in_chunk = {int(p) for p in _PORT_MENTION_PATTERN.findall(chunk)}
+        ports_in_chunk = {p for p in ports_in_chunk if 1 <= p <= 65535}
+        if len(ports_in_chunk) != 1:
+            continue  # no port mentioned, or more than one distinct value - ambiguous
+        port = next(iter(ports_in_chunk))
+        for ip in _IP_PATTERN.findall(chunk):
+            if ip in ip_set and ip not in resolved:
+                resolved[ip] = port
+
+    return resolved
+
+
 def extract_observables(text: str) -> dict[str, list[str]]:
     """Pull hashes/IPs/domains/URLs/emails/CVEs/crypto-wallets and ATT&CK
     technique IDs out of report text. Input should already be
     defang-normalized. Returns one list per OBSERVABLE_CATEGORIES key
-    plus "ttps". The ja4*/jarm categories are always empty here - report
-    text doesn't carry TLS/TCP/SSH fingerprints of infrastructure you
-    haven't probed yourself; those are filed via add_observable instead,
-    see OBSERVABLE_CATEGORIES."""
+    plus "ttps" and "ip_ports". The ja4*/jarm categories are always
+    empty here - report text doesn't carry TLS/TCP/SSH fingerprints of
+    infrastructure you haven't probed yourself; those are filed via
+    add_observable instead, see OBSERVABLE_CATEGORIES. "ip_ports" is a
+    {ip: port} map, not an observable category of its own - a report
+    naming a C2 port near one of the extracted IPs (see
+    _extract_ip_ports), used downstream so active fingerprinting probes
+    that IP's actual service port instead of always defaulting to 443."""
     urls = sorted(set(_URL_PATTERN.findall(text)))
 
     ips = []
@@ -238,9 +321,11 @@ def extract_observables(text: str) -> dict[str, list[str]]:
                      if m.group(2).lower() in _TLDS})
     cves = sorted({m.group(0).upper() for m in _CVE_PATTERN.finditer(text)})
     wallets = sorted({w for pat in _WALLET_PATTERNS for w in pat.findall(text)})
+    ip_ports = _extract_ip_ports(text, ips)
 
     return {"hashes": hash_list, "domains": domains, "ips": ips,
             "urls": urls, "emails": emails, "cves": cves, "wallets": wallets,
+            "ip_ports": ip_ports,
             "ja4": [], "ja4s": [], "ja4h": [], "ja4l": [], "ja4x": [],
             "ja4t": [], "ja4ts": [], "ja4ssh": [], "jarm": [],
             "ttps": ttps}

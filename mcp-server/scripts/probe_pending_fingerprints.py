@@ -138,9 +138,22 @@ def _lookup_port(cluster: str, target: str) -> int:
     not the port its C2 traffic actually uses, and win_probe_helper.py
     defaults to 443 if none is given - which silently fingerprints
     whatever's on 443 (or nothing) instead of the real service for any
-    C2 running on a nonstandard port. Scans the cluster's tracked URLs
-    for one whose host matches target and pulls its port; falls back to
-    443 if nothing matches.
+    C2 running on a nonstandard port. Three sources, most direct first,
+    443 only if none apply:
+
+    1. For an IP target: the `ports` list report_ingest._extract_ip_ports
+       stamped onto that IP's own observable entry (a report saying "TCP
+       port 886 (IPs: 1.2.3.4, ...)" or a bare "1.2.3.4:8080" - see
+       core.ingest_report). Checked first since it's the most direct
+       signal a report gives about *that specific* IP's own port,
+       ahead of the more indirect "does some unrelated tracked URL
+       happen to share this host" heuristic below. Uses the first
+       entry if more than one port was ever recorded for the IP.
+    2. Scans the cluster's tracked URLs for one whose host matches
+       target and pulls its port - the original mechanism, still the
+       only source for domain targets (report_ingest doesn't attempt
+       port-near-domain extraction, only port-near-IP).
+    3. 443.
 
     Also matches target against "{target}.sslip.io" and vice versa,
     since sslip.io wildcard-DNS hostnames literally encode the IP in the
@@ -151,6 +164,15 @@ def _lookup_port(cluster: str, target: str) -> int:
     except Exception:
         return 443
     needle = target.strip().lower()
+
+    for entry in data["observables"].get("ips", []):
+        if entry["value"].strip().lower() != needle:
+            continue
+        ports = entry.get("ports")
+        if ports:
+            return ports[0]
+        break
+
     sslip_alias = f"{needle}.sslip.io"
     for entry in data["observables"].get("urls", []):
         url = entry["value"]
