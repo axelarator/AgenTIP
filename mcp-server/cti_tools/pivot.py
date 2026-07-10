@@ -86,10 +86,20 @@ def _get_text(url: str, headers: dict[str, str] | None = None) -> str:
 
 def resolve_host(host: str) -> list[str] | None:
     """Current A/AAAA answers for a hostname via the system resolver, or
-    [] if it doesn't resolve (NXDOMAIN/no address), or None if the lookup
-    was inconclusive (resolver error). The []-vs-None distinction is what
-    lets lifecycle classification tell "dead" (really doesn't resolve)
-    apart from "couldn't check right now".
+    [] if it doesn't resolve (NXDOMAIN/no address, or resolves only to
+    null-route/loopback sentinels - see below), or None if the lookup was
+    inconclusive (resolver error). The []-vs-None distinction is what lets
+    lifecycle classification tell "dead" (really doesn't resolve) apart
+    from "couldn't check right now".
+
+    Answers of 0.0.0.0/:: (unspecified) or 127.0.0.0/8/::1 (loopback) are
+    dropped before returning: they're what a local resolver's DNS-based
+    egress control (sinkholing a domain to "nowhere") returns instead of
+    NXDOMAIN, and a bare truthiness check on the raw getaddrinfo result
+    would otherwise read that as a real, live answer and misclassify a
+    null-routed domain as "active". Real infrastructure being hunted here
+    is never legitimately reachable at those addresses, so this can't
+    hide a genuine resolution.
 
     Deliberately does NOT touch socket.setdefaulttimeout: that's
     process-global state, and pivot_cluster resolves many hosts
@@ -103,7 +113,17 @@ def resolve_host(host: str) -> list[str] | None:
         return []
     except OSError:
         return None
-    return sorted({info[4][0] for info in infos})
+    addrs = {info[4][0] for info in infos}
+    real = set()
+    for addr in addrs:
+        try:
+            parsed = ipaddress.ip_address(addr.split("%", 1)[0])  # strip IPv6 zone id, if any
+        except ValueError:
+            real.add(addr)  # unparseable is unexpected; don't silently drop it
+            continue
+        if not (parsed.is_unspecified or parsed.is_loopback):
+            real.add(addr)
+    return sorted(real)
 
 
 def classify(value: str) -> str:

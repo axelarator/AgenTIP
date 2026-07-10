@@ -184,6 +184,20 @@ def pop_pending_fingerprints() -> list[dict]:
 
 
 @mcp.tool()
+def requeue_fingerprint(name: str, category: str, value: str) -> list[dict]:
+    """Put an already-tracked domain/ip back on the JA4+/JARM pending
+    queue for re-probing - use this after a prior fingerprint attempt
+    errored, timed out, or came back as a null/placeholder result (e.g.
+    JARM's all-zero no-response sentinel). add_observable/ingest_report
+    only enqueue a value the first time it's seen, so touching an
+    existing observable again does NOT requeue it on its own - this is
+    the supported way to force that instead of hand-editing the queue
+    file. category must be "domains" or "ips". Raises if the cluster or
+    the observable isn't found."""
+    return core.requeue_fingerprint(name, category, value)
+
+
+@mcp.tool()
 def pivot_observable(value: str) -> dict:
     """On-demand infrastructure pivot for a hash/domain/ip/url against
     free public sources: RDAP (registration data), RIPEstat (ASN/

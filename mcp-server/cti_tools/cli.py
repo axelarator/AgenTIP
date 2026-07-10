@@ -121,6 +121,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("list-pending-fingerprints")
     sub.add_parser("pop-pending-fingerprints")
 
+    rqf = sub.add_parser("requeue-fingerprint")
+    rqf.add_argument("name")
+    rqf.add_argument("category", choices=list(core.FINGERPRINTABLE_CATEGORIES))
+    rqf.add_argument("value")
+
     ar = sub.add_parser("analyze-report")
     ar.add_argument("source", help="URL or local file path")
 
@@ -197,6 +202,8 @@ def main(argv: list[str] | None = None) -> int:
             _print(core.list_pending_fingerprints())
         elif args.command == "pop-pending-fingerprints":
             _print(core.pop_pending_fingerprints())
+        elif args.command == "requeue-fingerprint":
+            _print(core.requeue_fingerprint(args.name, args.category, args.value))
         elif args.command == "analyze-report":
             _print(core.analyze_report(args.source))
         elif args.command == "ingest-report":

@@ -13,7 +13,14 @@ this runs the same way regardless of what's installed on the box
 beyond Python itself and your JARM tool). Reads one JSON object from
 stdin:
 
-    {"target": "<domain-or-ip>"}
+    {"target": "<domain-or-ip>", "port": 443}
+
+port is optional, defaulting to 443 - the caller (probe_pending_fingerprints.py)
+looks up the actual port a target's C2 traffic uses from the cluster's
+tracked URLs and sends it explicitly, since plenty of tracked C2s run on
+nonstandard ports and a hardcoded 443 here would silently fingerprint
+whatever's on 443 (or nothing, "connection refused") instead of the
+real service.
 
 and writes one JSON object to stdout:
 
@@ -68,15 +75,16 @@ def resolve_target_ip(target: str) -> str:
     return target if is_ip_literal(target) else socket.gethostbyname(target)
 
 
-def run_jarm(target: str) -> str | None:
-    proc = subprocess.run([*JARM_CMD, target], capture_output=True, text=True, timeout=30)
+def run_jarm(target: str, port: int) -> str | None:
+    proc = subprocess.run([*JARM_CMD, "-p", str(port), target],
+                          capture_output=True, text=True, timeout=30)
     line = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
     if ":" not in line:
         return None
     return line.split(":", 1)[1].strip() or None
 
 
-def run_tls_handshake(target: str, resolved_ip: str) -> None:
+def run_tls_handshake(target: str, resolved_ip: str, port: int) -> None:
     """Just puts one ordinary handshake on the wire - result intentionally
     discarded, Zeek's log (read separately, on the Zeek VM) is the
     source of truth for what came back. Connects to resolved_ip
@@ -87,7 +95,7 @@ def run_tls_handshake(target: str, resolved_ip: str) -> None:
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     server_hostname = None if is_ip_literal(target) else target
-    with socket.create_connection((resolved_ip, 443), timeout=10) as sock:
+    with socket.create_connection((resolved_ip, port), timeout=10) as sock:
         with ctx.wrap_socket(sock, server_hostname=server_hostname):
             pass
 
@@ -96,6 +104,7 @@ def main() -> int:
     try:
         request = json.loads(sys.stdin.read() or "{}")
         target = request["target"]
+        port = int(request.get("port") or 443)
     except Exception as e:
         json.dump({"error": f"bad request: {e}"}, sys.stdout)
         return 1
@@ -109,12 +118,12 @@ def main() -> int:
         return 1
 
     try:
-        response["jarm"] = run_jarm(target)
+        response["jarm"] = run_jarm(target, port)
     except Exception as e:
         response["error"] = f"jarm failed: {e}"
 
     try:
-        run_tls_handshake(target, resolved_ip)
+        run_tls_handshake(target, resolved_ip, port)
     except Exception as e:
         existing = response.get("error")
         response["error"] = f"{existing}; handshake failed: {e}" if existing else f"handshake failed: {e}"

@@ -35,6 +35,10 @@ DATA_DIR = Path(os.environ.get("CTI_DATA_DIR", _REPO_ROOT / "data" / "clusters")
 # hashes/urls/etc aren't something you probe, and the ja4*/jarm
 # categories are themselves fingerprint *results*, not queue inputs.
 _FINGERPRINTABLE_CATEGORIES = ("domains", "ips")
+# Public alias so the CLI/callers can reference the same tuple without
+# reaching for the underscore-prefixed name (mirrors OBSERVABLE_CATEGORIES
+# below).
+FINGERPRINTABLE_CATEGORIES = _FINGERPRINTABLE_CATEGORIES
 
 # The observable categories a cluster tracks. Single source of truth
 # lives in report_ingest (the extractor); re-exported here so the rest
@@ -1102,6 +1106,35 @@ def pop_pending_fingerprints() -> list[dict[str, Any]]:
     if entries:
         _atomic_write_text(_pending_fingerprints_path(), "[]")
     return entries
+
+
+@_synchronized
+def requeue_fingerprint(name: str, category: str, value: str) -> list[dict[str, Any]]:
+    """Force a domain/ip that's already tracked on a cluster back onto the
+    JA4+/JARM pending queue, bypassing the dedup check that normally only
+    enqueues genuinely new observables (_merge_observables only queues on
+    first sight of a value - touching an already-tracked one again via
+    add_observable does NOT re-queue it). The supported way to ask for a
+    re-probe - after a prior attempt errored, timed out, or returned a
+    null/placeholder result - without hand-editing pending_fingerprints.json
+    or re-adding the observable under a throwaway value just to trigger
+    the queue path.
+
+    category must be one of FINGERPRINTABLE_CATEGORIES ("domains", "ips").
+    Raises if the cluster doesn't exist or value isn't currently tracked
+    in that category - requeuing something never filed doesn't make
+    sense; file it with add_observable first. Returns the full pending
+    queue after the addition."""
+    if category not in _FINGERPRINTABLE_CATEGORIES:
+        raise ValueError("category must be one of " + ", ".join(_FINGERPRINTABLE_CATEGORIES))
+    data = load_cluster(name)
+    needle = value.strip().lower()
+    bucket = data["observables"][category]
+    if not any(o["value"].lower() == needle for o in bucket):
+        raise ValueError(f"no {category} observable matching {value!r} in cluster {name!r} - "
+                          "use add_observable to file it first")
+    _enqueue_pending_fingerprints(name, [(category, value)])
+    return _load_pending_fingerprints()
 
 
 def _merge_ttps(data: dict[str, Any], technique_ids: list[str], source: str) -> list[str]:
