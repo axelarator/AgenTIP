@@ -375,23 +375,31 @@ run on different triggers — don't conflate them:
 
 - **Pivoting** (`pivot_observable`, `pivot_cluster`, `pivot_and_expand`,
   above) only ever touches free public sources (RDAP, RIPEstat, Cert
-  Spotter, Hackertarget, VirusTotal). It's passive from the target's
-  perspective — no traffic reaches the adversary's infrastructure.
-  **Run it automatically** as part of working through a report: after
-  `ingest_report`/`analyze_report` files new domains/IPs onto a
+  Spotter, Hackertarget, VirusTotal). It's passive in the sense that no
+  crafted/active traffic reaches the adversary's infrastructure itself —
+  but a lookup still *names* the tracked indicator to a third-party
+  service (RDAP/RIPEstat/VT all see the domain or IP being pivoted on),
+  so it is not traffic-free. Every HTTP call and DNS resolution these
+  lookups make is proxied through the Win11 probe VM (`cti_tools.vm_proxy`
+  — same SSH channel probing uses, extended with `http_fetch`/`resolve_dns`
+  actions) rather than originating from wherever this tool itself is
+  running. **Run it automatically** as part of working through a report:
+  after `ingest_report`/`analyze_report` files new domains/IPs onto a
   cluster, pivot them (a `pivot_cluster` sweep for lifecycle status, or
   `pivot_and_expand` on ones worth expanding from) without waiting to
   be asked. There's no reason to gate a public-source lookup behind an
-  explicit request.
+  explicit request — the VM-routing requirement is about where the
+  traffic originates, not whether the lookup itself needs permission.
 - **Probing** (JA4+/JARM fingerprinting via the vantage point described
-  below) generates *real* network traffic against the target — a live
+  below) generates *active* network traffic against the target — a live
   TLS handshake or a JARM scan the adversary's infrastructure actually
-  receives. **Only run it when explicitly asked** ("probe the
-  indicators," "get fingerprints," etc.) — never automatically during
-  ingestion or pivoting, and never as a default follow-up to a pivot.
-  Always route it through the dedicated vantage point (the Win11 probe
-  VM pipeline, see "Automating the handoff" above) — never generate
-  probe traffic from wherever this tool itself is running.
+  receives, as opposed to pivoting's third-party-service lookups.
+  **Only run it when explicitly asked** ("probe the indicators," "get
+  fingerprints," etc.) — never automatically during ingestion or
+  pivoting, and never as a default follow-up to a pivot. Always route it
+  through the dedicated vantage point (the Win11 probe VM pipeline, see
+  "Automating the handoff" above) — never generate probe traffic from
+  wherever this tool itself is running.
 
 If a request says "pivot on infrastructure" but clearly means
 fingerprinting (JARM/JA4, a specific VM/vantage point named), treat it

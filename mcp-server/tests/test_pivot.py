@@ -1,4 +1,5 @@
-"""Tests for cti_tools.pivot. No real network calls - _get_json is
+"""Tests for cti_tools.pivot. No real network calls (and no real SSH to
+the Win11 VM) - _get_json/vm_proxy.http_fetch/vm_proxy.resolve_dns are
 monkeypatched everywhere so the suite runs offline."""
 from __future__ import annotations
 
@@ -57,25 +58,32 @@ def test_rdap_lookup_error_is_contained(monkeypatch):
     assert "error" in result
 
 
-def test_get_json_read_timeout_becomes_pivoterror(monkeypatch):
-    # A read-phase timeout raises a bare TimeoutError, not URLError; it must
-    # still surface as PivotError so callers return {"error": ...} rather
-    # than letting the exception escape mid-pivot.
-    def boom(req, timeout=None):
-        raise TimeoutError("The read operation timed out")
-    monkeypatch.setattr(pivot.urllib.request, "urlopen", boom)
+def test_get_json_transport_failure_becomes_pivoterror(monkeypatch):
+    # http_fetch (proxied through the Win11 VM) raises VMProxyError on any
+    # transport failure; _get_json must still surface a PivotError so
+    # callers return {"error": ...} rather than letting the exception
+    # escape mid-pivot.
+    def boom(url, headers=None, method="GET"):
+        raise pivot.vm_proxy.VMProxyError("ssh transport failed")
+    monkeypatch.setattr(pivot.vm_proxy, "http_fetch", boom)
     with pytest.raises(pivot.PivotError):
         pivot._get_json("https://rdap.org/domain/example.com")
 
 
 def test_get_json_unparseable_body_becomes_pivoterror(monkeypatch):
-    class FakeResp:
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-        def read(self): return b"<html>rate limited</html>"
-    monkeypatch.setattr(pivot.urllib.request, "urlopen", lambda req, timeout=None: FakeResp())
+    monkeypatch.setattr(pivot.vm_proxy, "http_fetch",
+                        lambda url, headers=None, method="GET":
+                            {"status": 200, "body": "<html>rate limited</html>", "error": None})
     with pytest.raises(pivot.PivotError):
         pivot._get_json("https://api.certspotter.com/v1/issuances?domain=x")
+
+
+def test_get_text_http_error_status_becomes_pivoterror(monkeypatch):
+    monkeypatch.setattr(pivot.vm_proxy, "http_fetch",
+                        lambda url, headers=None, method="GET":
+                            {"status": 429, "body": "rate limited", "error": None})
+    with pytest.raises(pivot.PivotError):
+        pivot._get_text("https://api.hackertarget.com/reverseiplookup/?q=1.2.3.4")
 
 
 def test_ripestat_lookup_merges_three_calls(monkeypatch):
@@ -264,18 +272,19 @@ def test_hackertarget_reverse_ip_no_records_message_is_error(monkeypatch):
 
 
 def test_resolve_host_distinguishes_dead_from_inconclusive(monkeypatch):
-    import socket
+    # Resolution now happens on the Win11 VM via vm_proxy.resolve_dns;
+    # resolve_host layers its own null-route/loopback filtering on top of
+    # whatever that returns.
+    monkeypatch.setattr(pivot.vm_proxy, "resolve_dns", lambda host: [])
+    assert pivot.resolve_host("nope.invalid") == []  # doesn't resolve (NXDOMAIN)
 
-    def gaierror(*a, **k):
-        raise socket.gaierror("NXDOMAIN")
-    monkeypatch.setattr(pivot.socket, "getaddrinfo", gaierror)
-    assert pivot.resolve_host("nope.invalid") == []  # doesn't resolve
-
-    def oserror(*a, **k):
-        raise OSError("timeout")
-    monkeypatch.setattr(pivot.socket, "getaddrinfo", oserror)
+    monkeypatch.setattr(pivot.vm_proxy, "resolve_dns", lambda host: None)
     assert pivot.resolve_host("nope.invalid") is None  # inconclusive
 
-    monkeypatch.setattr(pivot.socket, "getaddrinfo",
-                        lambda *a, **k: [(0, 0, 0, "", ("185.10.10.10", 0))])
+    monkeypatch.setattr(pivot.vm_proxy, "resolve_dns", lambda host: ["185.10.10.10"])
     assert pivot.resolve_host("live.example") == ["185.10.10.10"]
+
+    def boom(host):
+        raise pivot.vm_proxy.VMProxyError("ssh transport failed")
+    monkeypatch.setattr(pivot.vm_proxy, "resolve_dns", boom)
+    assert pivot.resolve_host("nope.invalid") is None  # transport failure -> inconclusive

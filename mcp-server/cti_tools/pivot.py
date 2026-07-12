@@ -24,20 +24,25 @@ Sources, none of which require a paid plan:
   tied to a tracked C2 IP when the source report only gave you the
   infrastructure, not per-sample coverage. Skipped gracefully if no
   key is configured - RDAP/RIPEstat still work without one.
+
+Every one of these lookups names a tracked indicator to a third party
+(the domain/IP/hash being pivoted on), so - same as active
+fingerprinting - none of it originates from this host. All HTTP calls
+and DNS resolution route through cti_tools.vm_proxy, which proxies them
+through the Win11 probe VM over its restricted SSH channel. See
+vm_proxy's module docstring for why.
 """
 from __future__ import annotations
 
 import base64
 import ipaddress
 import json
-import socket
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
+from . import vm_proxy
+
 USER_AGENT = "cti-agent-pivot/1.0 (+local analysis tool, on-demand only)"
-TIMEOUT = 15
 VT_API_KEY_ENV = "VT_API_KEY"
 
 # Nameserver substrings that indicate a domain has been sinkholed/taken
@@ -54,38 +59,26 @@ class PivotError(Exception):
 
 
 def _get_json(url: str, headers: dict[str, str] | None = None) -> Any:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
+    body = _get_text(url, headers)
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            return json.loads(resp.read().decode("utf-8", errors="replace"))
-    except urllib.error.HTTPError as e:
-        raise PivotError(f"{url} returned HTTP {e.code}") from e
-    except urllib.error.URLError as e:
-        raise PivotError(f"failed to reach {url}: {e.reason}") from e
-    # A read-phase timeout raises a bare TimeoutError (not URLError), and a
-    # reset raises ConnectionError - both OSError subclasses. Catch them so
-    # every caller reliably gets a PivotError to turn into {"error": ...}
-    # instead of an exception escaping mid-pivot. ValueError covers a
-    # non-JSON body from a rate-limit/error page.
-    except (TimeoutError, OSError) as e:
-        raise PivotError(f"failed to reach {url}: {e}") from e
+        return json.loads(body)
     except ValueError as e:
         raise PivotError(f"{url} returned an unparseable response: {e}") from e
 
 
 def _get_text(url: str, headers: dict[str, str] | None = None) -> str:
-    """Fetch a plain-text response (some free enrichment endpoints return
-    newline-delimited text rather than JSON)."""
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
+    """Fetch a response body (some free enrichment endpoints return
+    newline-delimited text rather than JSON, hence text rather than
+    always decoding JSON here). Proxied through the Win11 VM - see the
+    module docstring."""
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            return resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        raise PivotError(f"{url} returned HTTP {e.code}") from e
-    except urllib.error.URLError as e:
-        raise PivotError(f"failed to reach {url}: {e.reason}") from e
-    except (TimeoutError, OSError) as e:
+        result = vm_proxy.http_fetch(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
+    except vm_proxy.VMProxyError as e:
         raise PivotError(f"failed to reach {url}: {e}") from e
+    status = result.get("status")
+    if status is not None and status >= 400:
+        raise PivotError(f"{url} returned HTTP {status}")
+    return str(result.get("body") or "")
 
 
 def resolve_host(host: str) -> list[str] | None:
@@ -105,21 +98,17 @@ def resolve_host(host: str) -> list[str] | None:
     is never legitimately reachable at those addresses, so this can't
     hide a genuine resolution.
 
-    Deliberately does NOT touch socket.setdefaulttimeout: that's
-    process-global state, and pivot_cluster resolves many hosts
-    concurrently, so mutating it per-call would race across threads and
-    could leave every other socket in the process on a short timeout.
-    Relies on the system resolver's own timeout instead; callers that
-    fan this out should bound it at the thread-pool level."""
+    Resolution itself happens on the Win11 VM (see vm_proxy.resolve_dns)
+    rather than via this host's own resolver - same reasoning as every
+    other pivot lookup in this module."""
     try:
-        infos = socket.getaddrinfo(host, None)
-    except socket.gaierror:
-        return []
-    except OSError:
+        raw_addrs = vm_proxy.resolve_dns(host)
+    except vm_proxy.VMProxyError:
         return None
-    addrs = {info[4][0] for info in infos}
+    if raw_addrs is None or not raw_addrs:
+        return raw_addrs
     real = set()
-    for addr in addrs:
+    for addr in raw_addrs:
         try:
             parsed = ipaddress.ip_address(addr.split("%", 1)[0])  # strip IPv6 zone id, if any
         except ValueError:

@@ -83,7 +83,6 @@ import json
 import os
 import re
 import ssl
-import subprocess
 import sys
 import time
 import urllib.error
@@ -93,18 +92,14 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from cti_tools import core  # noqa: E402
+from cti_tools import core, vm_proxy  # noqa: E402
 
 # --- adjust for your environment --------------------------------------------
-WIN_PROBE_USER = "jadmin"
-WIN_PROBE_HOST = "10.20.0.9"  # Win11 probe VM's LAN IP/hostname
-WIN_SSH_KEY = "/home/axelarator/.ssh/id_ed25519_win_probe"
-WIN_KNOWN_HOSTS = "/home/axelarator/.ssh/known_hosts_win_probe"
-# Sent as the SSH command but only matters if the probe VM's
-# authorized_keys entry for this key does NOT set command=... - if it
-# does (recommended, see the skill doc), the forced command wins
-# regardless of what's requested here.
-WIN_HELPER_CMD = [r"C:\Users\jadmin\AppData\Local\Python\bin\python.exe", r"C:\tools\probe\win_probe_helper.py"]
+# SSH connection details for the Win11 probe VM (WIN_PROBE_USER/HOST,
+# WIN_SSH_KEY, WIN_KNOWN_HOSTS, WIN_HELPER_CMD) now live in
+# cti_tools.vm_proxy - that module is the shared chokepoint pivot.py
+# also routes through, so there's one source of truth for how this
+# process reaches the VM instead of two copies drifting apart.
 
 OPENSEARCH_URL = "https://10.20.0.14:9200"
 OPENSEARCH_INDEX = "zeek-*"
@@ -188,26 +183,11 @@ def _lookup_port(cluster: str, target: str) -> int:
     return 443
 
 
-def _ssh_json_rpc(user: str, host: str, key: str, known_hosts: str,
-                   remote_cmd: list[str], request: dict[str, object]) -> dict[str, object]:
-    proc = subprocess.run(
-        ["ssh", "-i", key,
-         "-o", "BatchMode=yes",
-         "-o", "StrictHostKeyChecking=yes",
-         "-o", f"UserKnownHostsFile={known_hosts}",
-         f"{user}@{host}", *remote_cmd],
-        input=json.dumps(request), capture_output=True, text=True, timeout=60)
-    if proc.returncode != 0 and not proc.stdout:
-        raise ProbeError(f"ssh transport to {host!r} failed: {proc.stderr.strip()}")
-    try:
-        return json.loads(proc.stdout)
-    except json.JSONDecodeError as e:
-        raise ProbeError(f"non-JSON response from {host!r}: {proc.stdout!r}") from e
-
-
 def probe_win(target: str, port: int) -> dict[str, object]:
-    return _ssh_json_rpc(WIN_PROBE_USER, WIN_PROBE_HOST, WIN_SSH_KEY, WIN_KNOWN_HOSTS,
-                          WIN_HELPER_CMD, {"target": target, "port": port})
+    try:
+        return vm_proxy.probe_win(target, port)
+    except vm_proxy.VMProxyError as e:
+        raise ProbeError(str(e)) from e
 
 
 def _opensearch_password() -> str:
@@ -305,9 +285,9 @@ def check_access() -> list[str]:
     reachable and authorized."""
     problems = []
     try:
-        _ssh_json_rpc(WIN_PROBE_USER, WIN_PROBE_HOST, WIN_SSH_KEY, WIN_KNOWN_HOSTS, WIN_HELPER_CMD, {})
-    except ProbeError as e:
-        problems.append(f"win probe VM ({WIN_PROBE_HOST}): {e}")
+        vm_proxy._ssh_json_rpc({})
+    except vm_proxy.VMProxyError as e:
+        problems.append(f"win probe VM ({vm_proxy.WIN_PROBE_HOST}): {e}")
     try:
         _opensearch_search({"match_all": {}}, size=1)
     except ProbeError as e:
