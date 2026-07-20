@@ -1,7 +1,7 @@
 """Single chokepoint for outbound network activity that touches a
 tracked indicator - active fingerprinting AND passive pivot lookups
 alike. Every one of those requests is proxied through the Win11 VM at
-10.20.0.9 over the same restricted SSH forced-command channel, rather
+10.20.30.16 over the same restricted SSH forced-command channel, rather
 than originating from the cti host itself: an RDAP/RIPEstat/VirusTotal
 lookup on a malicious domain is still traffic that names that domain to
 a third party, and the analyst's own desktop IP has no business being
@@ -29,20 +29,38 @@ trusted to do.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 
 # --- adjust for your environment --------------------------------------------
-WIN_PROBE_USER = "jadmin"
-WIN_PROBE_HOST = "10.20.0.9"  # Win11 probe VM's LAN IP/hostname
-WIN_SSH_KEY = "/home/axelarator/.ssh/id_ed25519_win_probe"
-WIN_KNOWN_HOSTS = "/home/axelarator/.ssh/known_hosts_win_probe"
+WIN_PROBE_USER = "detonate"
+WIN_PROBE_HOST = "10.20.30.16"  # Win11 probe VM's LAN IP/hostname
+WIN_SSH_KEY = os.path.expanduser("~/.ssh/id_ed25519_win_probe")
+WIN_KNOWN_HOSTS = os.path.expanduser("~/.ssh/known_hosts_win_probe")
 # Sent as the SSH command but only matters if the probe VM's
 # authorized_keys entry for this key does NOT set command=... - if it
 # does (recommended, see the skill doc), the forced command wins
 # regardless of what's requested here.
-WIN_HELPER_CMD = [r"C:\Users\jadmin\AppData\Local\Python\bin\python.exe", r"C:\tools\probe\win_probe_helper.py"]
+WIN_HELPER_CMD = [r"C:\Users\detonate\AppData\Local\Programs\Python\Python312\python.exe", r"C:\tools\probe\win_probe_helper.py"]
 
 SSH_TIMEOUT = 60
+# Reuse one already-authenticated connection across calls instead of paying
+# a fresh TCP handshake + SSH key exchange + pubkey auth on every single
+# pivot/probe lookup - each _ssh_json_rpc call still opens its own channel
+# on that connection (and so still starts its own instance of the forced
+# remote command; this isn't a persistent server on the far end), but the
+# expensive setup happens once per ControlPersist window instead of once
+# per call. This mattered less when this host was an analyst desktop
+# reaching the lab over a VPN/home-LAN hop, where the SSH setup cost was
+# small next to the link's own latency; now that this runs as a VM
+# colocated on the same lab server as the probe VM, that per-call setup
+# overhead is proportionally the dominant cost for anything that isn't
+# already latency-bound server-side (JARM's own scan time, Zeek's
+# indexing lag) - i.e. exactly the plain pivot lookups (RDAP/RIPEstat/
+# VT/CertSpotter/Hackertarget/resolve_dns/http_fetch), which are single
+# round trips with no server-side wait built in.
+WIN_SSH_CONTROL_PATH = os.path.expanduser("~/.ssh/cti-vm-proxy-control.sock")
+WIN_SSH_CONTROL_PERSIST = "300"  # seconds the shared connection is kept warm after the last use
 # -----------------------------------------------------------------------------
 
 
@@ -56,6 +74,9 @@ def _ssh_json_rpc(request: dict[str, object]) -> dict[str, object]:
          "-o", "BatchMode=yes",
          "-o", "StrictHostKeyChecking=yes",
          "-o", f"UserKnownHostsFile={WIN_KNOWN_HOSTS}",
+         "-o", "ControlMaster=auto",
+         "-o", f"ControlPersist={WIN_SSH_CONTROL_PERSIST}",
+         "-o", f"ControlPath={WIN_SSH_CONTROL_PATH}",
          f"{WIN_PROBE_USER}@{WIN_PROBE_HOST}", *WIN_HELPER_CMD],
         input=json.dumps(request), capture_output=True, text=True, timeout=SSH_TIMEOUT)
     if proc.returncode != 0 and not proc.stdout:

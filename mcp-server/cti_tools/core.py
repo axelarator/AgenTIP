@@ -73,6 +73,16 @@ _KNOWN_NON_ACTOR_IPS = {
 }
 
 
+def _is_ipv4(value: str) -> bool:
+    """True only for a parseable IPv4 literal. Used to strip IPv6 out of
+    pivot results before filing - functional rule: ignore IPv6 for
+    pivoting and probing, since the probe VM has no IPv6 route."""
+    try:
+        return ipaddress.ip_address(value).version == 4
+    except ValueError:
+        return False
+
+
 def _is_probe_worthy(category: str, value: str) -> tuple[bool, str]:
     """Gate applied only to what reaches the active-probing queue, right
     before _enqueue_pending_fingerprints - not to whether a value gets
@@ -88,6 +98,8 @@ def _is_probe_worthy(category: str, value: str) -> tuple[bool, str]:
         if addr.is_private or addr.is_loopback or addr.is_link_local \
                 or addr.is_multicast or addr.is_reserved or addr.is_unspecified:
             return False, "private/reserved/loopback/link-local address, not routable adversary infra"
+        if addr.version == 6:
+            return False, "IPv6 - the probe VM has no IPv6 route, active fingerprinting would only ever time out"
         if value in _KNOWN_NON_ACTOR_IPS:
             return False, "known non-actor infrastructure (public DNS resolver)"
     elif category == "domains":
@@ -1032,6 +1044,15 @@ def pivot_and_expand(value: str, cluster_name: str,
     if kind not in ("domain", "ip"):
         raise ValueError(
             f"pivot_and_expand supports domain/ip values; got kind={kind!r} for {value!r}")
+    if kind == "ip" and ipaddress.ip_address(value).version == 6:
+        # Functional rule: ignore IPv6 for pivoting and probing - the probe
+        # VM has no IPv6 route, so neither a VT lookup here nor anything
+        # downstream (fingerprinting) can act on the result.
+        entry = f"pivot_and_expand on {value}: skipped (IPv6, not pivoted)"
+        data["hunt_log"].append({"date": _now(), "entry": entry})
+        save_cluster(data)
+        return {"value": value, "kind": kind, "cluster": cluster_name,
+                "filed": {}, "review": {}, "cluster_state": load_cluster(cluster_name)}
     now = _now()
     api_key = os.environ.get(pivot.VT_API_KEY_ENV)
     filed: dict[str, list[str]] = {}
@@ -1058,6 +1079,7 @@ def pivot_and_expand(value: str, cluster_name: str,
             vt = _cached_pivot("virustotal", value, lambda: _safe_vt(value, kind, api_key))
             ips = [r["ip"] for r in (vt.get("resolutions") or []) if r.get("ip")] \
                 if isinstance(vt, dict) else []
+            ips = [ip for ip in ips if _is_ipv4(ip)]  # ignore IPv6 for pivoting/probing - no route from the probe VM
             record("ips", ips,
                    f"pivot_and_expand via VirusTotal resolution history, checked {now}")
     else:  # ip
@@ -1268,6 +1290,9 @@ def requeue_fingerprint(name: str, category: str, value: str) -> list[dict[str, 
     queue after the addition."""
     if category not in _FINGERPRINTABLE_CATEGORIES:
         raise ValueError("category must be one of " + ", ".join(_FINGERPRINTABLE_CATEGORIES))
+    if category == "ips" and not _is_ipv4(value):
+        raise ValueError(f"refusing to requeue {value!r}: IPv6 is ignored for pivoting/probing "
+                          "(no route from the probe VM)")
     data = load_cluster(name)
     needle = value.strip().lower()
     bucket = data["observables"][category]

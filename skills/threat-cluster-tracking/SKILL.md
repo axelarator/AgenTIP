@@ -143,19 +143,40 @@ as "the malware checks connectivity against 8.8.8.8", or a vendor's own
 site named in passing) and `add_observable` trusts whatever it's handed
 verbatim, so without this gate a false match drives a live JARM scan /
 SSH round-trip exactly like a real IOC would. The gate rejects
-private/reserved/loopback/link-local IPs, a short curated list of
-well-known public DNS resolver IPs, and a short curated list of
-known-non-actor apex domains (major vendors, CDNs, sinkhole operators —
-exact-match only, not subdomains, since a subdomain of e.g. `github.io`
-or `amazonaws.com` is routine attacker-controlled shared hosting, not a
-false positive). It does **not** affect whether the value gets tracked
-as an observable — that stays exactly as permissive as before, it only
-gates the active-probing queue. A skip is visible on the caller's
-return value (and, for `ingest_report`, persisted on that ingest's
-`report_sources` entry) as `fingerprint_queue_skipped`:
-`[{category, value, reason}, ...]`. If a skip turns out to be wrong for
-a specific case, `requeue_fingerprint()` forces that value back onto
-the queue.
+private/reserved/loopback/link-local IPs, IPv6 IPs (the probe VM has no
+IPv6 route out — see below), a short curated list of well-known public
+DNS resolver IPs, and a short curated list of known-non-actor apex
+domains (major vendors, CDNs, sinkhole operators — exact-match only, not
+subdomains, since a subdomain of e.g. `github.io` or `amazonaws.com` is
+routine attacker-controlled shared hosting, not a false positive). It
+does **not** affect whether the value gets tracked as an observable —
+that stays exactly as permissive as before, it only gates the
+active-probing queue. A skip is visible on the caller's return value
+(and, for `ingest_report`, persisted on that ingest's `report_sources`
+entry) as `fingerprint_queue_skipped`: `[{category, value, reason}, ...]`.
+If a skip turns out to be wrong for a specific case, `requeue_fingerprint()`
+forces that value back onto the queue — except for IPv6, which it also
+refuses (raises `ValueError`), since that skip is never wrong on this
+network.
+
+**Functional rule: ignore IPv6 for pivoting and probing.** The probe VM
+has no IPv6 route, so an IPv6 target can only ever time out — confirmed
+directly (every IPv6 target in a real probe run failed with `WinError
+10051`/"network unreachable", while the same run's IPv4 targets and
+DNS-driven pivot lookups worked fine). This is enforced in three places,
+not just left to the caller's discipline: `_is_probe_worthy` rejects
+IPv6 IPs from the fingerprint queue (as above); `pivot_and_expand`
+filters IPv6 addresses out of VirusTotal resolution-history results
+before filing them as new `ips` observables, and short-circuits entirely
+(no VT lookup at all) when called directly on an IPv6 target; and
+`requeue_fingerprint` refuses to force an IPv6 IP back onto the queue.
+`pivot_cluster`'s per-IP RIPEstat lifecycle check is unaffected and still
+runs on tracked IPv6 IPs — it's a third-party API query keyed on the IP
+as a parameter, not a direct connection to it, so it doesn't hit the
+routing problem and stays informative. IPv6 addresses appearing in a
+domain's own DNS resolution (e.g. an AAAA record in `pivot_cluster`'s
+`resolved` list) are left alone for the same reason — that's descriptive
+DNS footprint, not a queued probe/pivot target.
 
 That queue only tells you *what* needs probing — moving it to and from
 wherever you actually do the probing is outside this tool's scope, but

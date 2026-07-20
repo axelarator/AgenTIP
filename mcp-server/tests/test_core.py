@@ -775,6 +775,18 @@ def test_subdomain_of_known_non_actor_domain_is_not_skipped():
     assert "fingerprint_queue_skipped" not in data
 
 
+def test_ipv6_ip_is_tracked_but_not_queued():
+    """Functional rule: ignore IPv6 for pivoting and probing - the probe
+    VM has no IPv6 route, so an IPv6 literal in the queue would only ever
+    time out."""
+    core.create_cluster("Gate Test IPv6")
+    data = core.add_observable("Gate Test IPv6", "ips", "2a10:1fc0:6::de96:9634", "report X")
+    assert any(o["value"] == "2a10:1fc0:6::de96:9634" for o in data["observables"]["ips"])
+    assert not any(e["value"] == "2a10:1fc0:6::de96:9634" for e in core.list_pending_fingerprints())
+    assert data["fingerprint_queue_skipped"][0]["reason"] == \
+        "IPv6 - the probe VM has no IPv6 route, active fingerprinting would only ever time out"
+
+
 def test_ordinary_domain_and_ip_are_unaffected_by_the_gate():
     core.create_cluster("Gate Test Normal")
     data = core.add_observable("Gate Test Normal", "domains", "evil.example", "report X")
@@ -1065,3 +1077,41 @@ def test_pivot_and_expand_rejects_hash(monkeypatch):
     core.create_cluster("Expand Hash")
     with pytest.raises(ValueError):
         core.pivot_and_expand("098f6bcd4621d373cade4e832627b4f6", "Expand Hash")
+
+
+def test_pivot_and_expand_filters_ipv6_from_vt_resolutions(monkeypatch):
+    """Functional rule: ignore IPv6 for pivoting - VT resolution history
+    for a domain can return AAAA records alongside A records, and only
+    the IPv4 ones are worth filing (the probe VM can't act on the rest)."""
+    core.create_cluster("Expand IPv6 Filter")
+    core.add_observable("Expand IPv6 Filter", "domains", "evil.example", "seed")
+
+    monkeypatch.setenv("VT_API_KEY", "fake-key")
+    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {"hostnames": []})
+    monkeypatch.setattr(core.pivot, "virustotal_lookup", lambda value, kind, api_key: {
+        "resolutions": [{"ip": "185.55.55.55", "date": 1},
+                        {"ip": "2a10:1fc0:6::de96:9634", "date": 2}]})
+
+    result = core.pivot_and_expand("evil.example", "Expand IPv6 Filter")
+    assert result["filed"]["ips"] == ["185.55.55.55"]
+    ips = {o["value"] for o in core.get_cluster("Expand IPv6 Filter")["observables"]["ips"]}
+    assert "2a10:1fc0:6::de96:9634" not in ips
+
+
+def test_pivot_and_expand_skips_ipv6_target():
+    """Pivoting directly on an IPv6 IP is a no-op - no VT/reverse-IP
+    lookup is even attempted, since nothing downstream can use IPv6."""
+    core.create_cluster("Expand IPv6 Target")
+    core.add_observable("Expand IPv6 Target", "ips", "2a10:1fc0:6::de96:9634", "seed")
+
+    result = core.pivot_and_expand("2a10:1fc0:6::de96:9634", "Expand IPv6 Target")
+    assert result["filed"] == {}
+    data = core.get_cluster("Expand IPv6 Target")
+    assert any("skipped (IPv6" in h["entry"] for h in data["hunt_log"])
+
+
+def test_requeue_fingerprint_rejects_ipv6():
+    core.create_cluster("Requeue IPv6")
+    core.add_observable("Requeue IPv6", "ips", "2a10:1fc0:6::de96:9634", "seed")
+    with pytest.raises(ValueError):
+        core.requeue_fingerprint("Requeue IPv6", "ips", "2a10:1fc0:6::de96:9634")
