@@ -1185,7 +1185,7 @@ def analyze_report(source: str) -> dict[str, Any]:
 
 def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                         source: str,
-                        ip_ports: dict[str, int] | None = None,
+                        ip_ports: dict[str, list[int]] | None = None,
                         ) -> tuple[dict[str, int], list[dict[str, str]]]:
     now = _now()
     counts = {}
@@ -1213,18 +1213,20 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                         newly_tracked.append((category, value))
                     else:
                         skipped.append({"category": category, "value": value, "reason": reason})
-            # A report naming a C2/service port near this IP (see
+            # Every C2/service port a report names near this IP (see
             # report_ingest._extract_ip_ports) is stamped onto the IP's
             # own observable entry so active fingerprinting can probe
-            # its real port instead of always defaulting to 443 - see
-            # probe_pending_fingerprints.py's _lookup_port. Appended
+            # its real port(s) instead of always defaulting to 443 - see
+            # probe_pending_fingerprints.py's _lookup_ports. Appended
             # (deduped), not overwritten, since a later report might
-            # name a second port for the same IP without invalidating
-            # the first.
+            # name another port for the same IP (a genuinely multi-port
+            # C2, or just a second report) without invalidating the
+            # ones already recorded.
             if category == "ips" and value in ip_ports:
                 ports = entry.setdefault("ports", [])
-                if ip_ports[value] not in ports:
-                    ports.append(ip_ports[value])
+                for port in ip_ports[value]:
+                    if port not in ports:
+                        ports.append(port)
         counts[category] = added
     if newly_tracked:
         _enqueue_pending_fingerprints(data["name"], newly_tracked)
@@ -1354,11 +1356,12 @@ def ingest_report(source: str, cluster_name: str | None = None,
 
     If the report names a C2/service port near one of the extracted IPs
     (e.g. "TCP port 886 (IPs: 1.2.3.4, ...)" or a bare "1.2.3.4:8080"),
-    that port is stamped onto the IP's own observable entry
-    (`ports: [...]`, see report_ingest._extract_ip_ports). Active
-    fingerprinting checks that field first and only falls back to 443
-    if nothing was extracted — see probe_pending_fingerprints.py's
-    _lookup_port.
+    every such port is stamped onto the IP's own observable entry
+    (`ports: [...]`, see report_ingest._extract_ip_ports — usually one
+    port, but a genuinely multi-port C2 can accumulate more than one).
+    Active fingerprinting checks that field first and only falls back to
+    443 if nothing was extracted — see probe_pending_fingerprints.py's
+    _lookup_ports, which probes every recorded port, not just the first.
     """
     text = _fetch_report_text(source)
     text = report_ingest.defang_normalize(text)

@@ -219,8 +219,8 @@ def fetch_text(source: str) -> str:
     return raw
 
 
-def _extract_ip_ports(text: str, ips: list[str]) -> dict[str, int]:
-    """Best-effort IP->port association for report prose that names a
+def _extract_ip_ports(text: str, ips: list[str]) -> dict[str, list[int]]:
+    """Best-effort IP->port(s) association for report prose that names a
     C2/service port near (not necessarily immediately adjacent to) the
     IP(s) it applies to, e.g. "Atlas RAT: TCP port 886 (IPs: 1.2.3.4,
     5.6.7.8). RomulusLoader: TCP port 1234 (IP: 9.9.9.9)." `ips` should
@@ -246,17 +246,35 @@ def _extract_ip_ports(text: str, ips: list[str]) -> dict[str, int]:
        more than one distinct port is ambiguous and skipped rather than
        guessed at.
 
-    Returns at most one port per IP. Ports outside 1-65535 (a
-    `\\d{2,5}` match that isn't actually a valid port, e.g. incidentally
-    matching part of a longer number) are dropped."""
+    Returns every distinct port found for an IP across all unambiguous
+    mentions in the whole text (deduped, in the order first seen) - not
+    just the first. A C2 genuinely running on more than one port shows up
+    in report prose as more than one unambiguous mention (a direct
+    "ip:port" plus a separate proximity sentence, or two separate
+    single-port sentences naming the same IP), and each of those is
+    independently just as trustworthy as if it were the only mention in
+    the report - there's no reason a second, equally-unambiguous mention
+    should lose to whichever happened to be found first. What still makes
+    a single *mention* untrustworthy - and so still skipped rather than
+    guessed at - is unchanged: a chunk naming more than one distinct port
+    with no way to tell which IP goes with which.
+
+    Ports outside 1-65535 (a `\\d{2,5}` match that isn't actually a valid
+    port, e.g. incidentally matching part of a longer number) are
+    dropped."""
     ip_set = set(ips)
-    resolved: dict[str, int] = {}
+    resolved: dict[str, list[int]] = {}
+
+    def _add(ip: str, port: int) -> None:
+        ports = resolved.setdefault(ip, [])
+        if port not in ports:
+            ports.append(port)
 
     for ip, port_str in _IP_PORT_INLINE_PATTERN.findall(text):
-        if ip in ip_set and ip not in resolved:
+        if ip in ip_set:
             port = int(port_str)
             if 1 <= port <= 65535:
-                resolved[ip] = port
+                _add(ip, port)
 
     for chunk in _SENTENCE_SPLIT_RE.split(text):
         if len(chunk) > _MAX_PORT_CHUNK_LEN:
@@ -267,8 +285,8 @@ def _extract_ip_ports(text: str, ips: list[str]) -> dict[str, int]:
             continue  # no port mentioned, or more than one distinct value - ambiguous
         port = next(iter(ports_in_chunk))
         for ip in _IP_PATTERN.findall(chunk):
-            if ip in ip_set and ip not in resolved:
-                resolved[ip] = port
+            if ip in ip_set:
+                _add(ip, port)
 
     return resolved
 
@@ -281,10 +299,12 @@ def extract_observables(text: str) -> dict[str, list[str]]:
     empty here - report text doesn't carry TLS/TCP/SSH fingerprints of
     infrastructure you haven't probed yourself; those are filed via
     add_observable instead, see OBSERVABLE_CATEGORIES. "ip_ports" is a
-    {ip: port} map, not an observable category of its own - a report
-    naming a C2 port near one of the extracted IPs (see
-    _extract_ip_ports), used downstream so active fingerprinting probes
-    that IP's actual service port instead of always defaulting to 443."""
+    {ip: [port, ...]} map, not an observable category of its own - every
+    C2 port a report unambiguously names near one of the extracted IPs
+    (see _extract_ip_ports; usually one port, but a genuinely
+    multi-port C2 can turn up more than one), used downstream so active
+    fingerprinting probes that IP's actual service port(s) instead of
+    always defaulting to 443."""
     urls = sorted(set(_URL_PATTERN.findall(text)))
 
     ips = []

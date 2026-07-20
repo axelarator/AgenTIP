@@ -65,19 +65,19 @@ def test_extract_ipv6_private_filtered():
 
 def test_extract_ip_port_inline():
     obs = report_ingest.extract_observables("C2 beacon seen at 206.238.115.58:886 in traffic.")
-    assert obs["ip_ports"] == {"206.238.115.58": 886}
+    assert obs["ip_ports"] == {"206.238.115.58": [886]}
 
 
 def test_extract_ip_port_proximity_single_ip():
     obs = report_ingest.extract_observables(
         "RomulusLoader: TCP port 1234 (IP: 43.156.77.97)")
-    assert obs["ip_ports"] == {"43.156.77.97": 1234}
+    assert obs["ip_ports"] == {"43.156.77.97": [1234]}
 
 
 def test_extract_ip_port_proximity_multiple_ips():
     obs = report_ingest.extract_observables(
         "Atlas RAT: TCP port 886 (IPs: 206.238.115.58, 154.211.86.110)")
-    assert obs["ip_ports"] == {"206.238.115.58": 886, "154.211.86.110": 886}
+    assert obs["ip_ports"] == {"206.238.115.58": [886], "154.211.86.110": [886]}
 
 
 def test_extract_ip_port_two_distinct_mentions():
@@ -85,7 +85,7 @@ def test_extract_ip_port_two_distinct_mentions():
         "Atlas RAT: TCP port 886 (IPs: 206.238.115.58). "
         "RomulusLoader: TCP port 1234 (IP: 43.156.77.97)."
     )
-    assert obs["ip_ports"] == {"206.238.115.58": 886, "43.156.77.97": 1234}
+    assert obs["ip_ports"] == {"206.238.115.58": [886], "43.156.77.97": [1234]}
 
 
 def test_extract_ip_port_no_mention():
@@ -104,6 +104,26 @@ def test_extract_ip_port_far_apart_not_associated():
         f"Uses TCP port 8443 for staging.{filler} Unrelated IP 185.220.101.47 mentioned later."
     )
     assert obs["ip_ports"] == {}
+
+
+def test_extract_ip_port_multiple_distinct_ports_same_ip():
+    """A genuinely multi-port C2: two separate, individually unambiguous
+    mentions of the same IP with different ports should both be kept,
+    not just the first one found."""
+    obs = report_ingest.extract_observables(
+        "Atlas RAT: TCP port 886 (IP: 206.238.115.58). "
+        "The same host also serves exfil on TCP port 4444 (IP: 206.238.115.58)."
+    )
+    assert obs["ip_ports"] == {"206.238.115.58": [886, 4444]}
+
+
+def test_extract_ip_port_direct_and_proximity_combine_without_duplicating():
+    obs = report_ingest.extract_observables(
+        "C2 beacon seen at 206.238.115.58:886 in traffic. "
+        "The same actor also runs TCP port 886 (IP: 206.238.115.58) for backup C2. "
+        "Exfil goes out over TCP port 9090 (IP: 206.238.115.58)."
+    )
+    assert obs["ip_ports"] == {"206.238.115.58": [886, 9090]}
 
 
 def test_defang_dot_and_at_variants():
