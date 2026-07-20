@@ -1,4 +1,4 @@
-"""Runs on the probe VM - a Windows 11 box at 10.20.0.9 in this lab,
+"""Runs on the probe VM - a Windows 11 box at 10.20.30.16 in this lab,
 sitting as an ordinary port on the same mirrored bridge as every other
 lab VM (not the Zeek sensor itself - see zeek_log_query.py's docstring
 for why that distinction matters). The active half of the fingerprinting
@@ -88,10 +88,18 @@ import sys
 import urllib.error
 import urllib.request
 
+import certifi
+
 # --- adjust for your environment --------------------------------------------
 JARM_CMD = ["python", r"C:\tools\jarm\jarm.py"]  # salesforce/jarm CLI; swap for yours
 HTTP_TIMEOUT = 20
 # -----------------------------------------------------------------------------
+
+# Pinned to certifi's CA bundle rather than relying on urllib's platform
+# default context - on Windows that walks the OS root store, which lazily
+# fetches unseen roots from Windows Update on first use and fails closed
+# if this box's egress doesn't reach ctldl.windowsupdate.com.
+HTTPS_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
 
 def is_ip_literal(value: str) -> bool:
@@ -134,7 +142,7 @@ def run_tls_handshake(target: str, resolved_ip: str, port: int) -> None:
 def run_http_fetch(url: str, method: str, headers: dict[str, str]) -> dict[str, object]:
     req = urllib.request.Request(url, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=HTTPS_CONTEXT) as resp:
             body = resp.read().decode("utf-8", errors="replace")
             return {"status": resp.status, "body": body, "error": None}
     except urllib.error.HTTPError as e:

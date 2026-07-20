@@ -4,7 +4,7 @@ the threat-cluster-tracking skill's "Automating the handoff" section.
 
 One remote hop and one HTTPS query per target now, not two SSH hops:
 
-  1. win_probe_helper.py on the Win11 probe VM (10.20.0.9) - generates
+  1. win_probe_helper.py on the Win11 probe VM (10.20.30.16) - generates
      a JARM scan and one ordinary TLS handshake against the target.
   2. An OpenSearch query against the Arkime VM (10.20.0.14:9200) -
      reads back whatever that handshake produced in ssl.log/conn.log,
