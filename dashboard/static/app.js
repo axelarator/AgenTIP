@@ -82,10 +82,13 @@ function clusterChip(name) {
   return h("a", { class: "chip chip--neutral", style: "text-decoration:none;", href: match ? `#/cluster/${match.slug}` : "#" }, name);
 }
 
-function sourceLink(url) {
-  let host = url;
-  try { host = new URL(url).hostname.replace(/^www\./, ""); } catch (_) { /* not a URL, show raw text */ }
-  return h("a", { class: "source-link", href: url, target: "_blank", rel: "noopener noreferrer" }, host);
+function sourceLink(source) {
+  let parsed = null;
+  try { parsed = new URL(source); } catch (_) { /* provenance note (e.g. a pivot record), not a URL */ }
+  if (parsed && (parsed.protocol === "http:" || parsed.protocol === "https:")) {
+    return h("a", { class: "source-link", href: source, target: "_blank", rel: "noopener noreferrer" }, parsed.hostname.replace(/^www\./, ""));
+  }
+  return h("span", { class: "source-link", style: "cursor:default;", title: source }, truncate(source, 42));
 }
 
 /* ---------- sidebar ---------- */
