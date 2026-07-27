@@ -8,7 +8,7 @@ concurrently rather than one at a time (see below):
 
   1. win_probe_helper.py on the Win11 probe VM (10.20.30.16) - generates
      a JARM scan and one ordinary TLS handshake against the target.
-  2. An OpenSearch query against the Arkime VM (10.20.0.14:9200) -
+  2. An OpenSearch query against the Arkime VM (10.20.0.18:9200) -
      reads back whatever that handshake produced in ssl.log/conn.log,
      which a separate ingestion pipeline already ships there reliably.
 
@@ -86,23 +86,18 @@ access. To check access on its own, without draining the queue:
     python3 probe_pending_fingerprints.py --check-access
 
 Requires: cti_tools importable (run from within the mcp-server venv/repo
-checkout); an SSH keypair authorized to reach the Win11 probe VM; and
-CTI_OPENSEARCH_PASSWORD set in the environment. The password is
-deliberately not a constant in this file - this script lives in a
-git-tracked repo, and a plaintext credential written here would end up
-in git history the same way the SSH private keys never do (they're
-referenced by local file path instead, never embedded).
+checkout); an SSH keypair authorized to reach the Win11 probe VM. No
+OpenSearch credential is required - the Arkime VM's OpenSearch (as of
+the 10.20.0.18 move) sits on plain HTTP with no login in front of it,
+lab-internal only.
 """
 from __future__ import annotations
 
-import base64
 import concurrent.futures
 import datetime
 import http.client
 import json
-import os
 import re
-import ssl
 import sys
 import time
 from pathlib import Path
@@ -119,9 +114,8 @@ from cti_tools import core, vm_proxy  # noqa: E402
 # also routes through, so there's one source of truth for how this
 # process reaches the VM instead of two copies drifting apart.
 
-OPENSEARCH_URL = "https://10.20.0.14:9200"
+OPENSEARCH_URL = "http://10.20.0.18:9200"
 OPENSEARCH_INDEX = "zeek-*"
-OPENSEARCH_USER = "admin"
 # Field this lab's ingestion pipeline maps Zeek's `id.resp_p` to.
 # Confirmed live (2026-07-20) by sampling real documents across
 # ssh.log/ssl.log/conn.log/dns.log/notice.log/files.log via this same
@@ -133,12 +127,6 @@ OPENSEARCH_USER = "admin"
 # index/pipeline, re-verify with the same kind of sample query before
 # trusting multi-port results.
 _DST_PORT_FIELD = "dst_port"
-OPENSEARCH_PASSWORD_ENV = "CTI_OPENSEARCH_PASSWORD"  # not a constant - see module docstring
-# Self-signed cert in this lab (the same as passing -k to curl). Point this
-# at a real CA bundle instead if you put a real cert in front of OpenSearch.
-_OPENSEARCH_TLS_CONTEXT = ssl.create_default_context()
-_OPENSEARCH_TLS_CONTEXT.check_hostname = False
-_OPENSEARCH_TLS_CONTEXT.verify_mode = ssl.CERT_NONE
 
 SOURCE_LABEL = "Win11 probe VM"
 
@@ -245,32 +233,25 @@ def probe_win(target: str, port: int) -> dict[str, object]:
         raise ProbeError(str(e)) from e
 
 
-def _opensearch_password() -> str:
-    password = os.environ.get(OPENSEARCH_PASSWORD_ENV)
-    if not password:
-        raise ProbeError(f"{OPENSEARCH_PASSWORD_ENV} is not set in the environment")
-    return password
-
-
 _opensearch_host = urlsplit(OPENSEARCH_URL).hostname
 _opensearch_port = urlsplit(OPENSEARCH_URL).port or 9200
 _opensearch_path = f"/{OPENSEARCH_INDEX}/_search"
-# One HTTPS connection reused for every OpenSearch query in a run, instead
-# of a fresh urllib.request.urlopen (and so a fresh TCP+TLS handshake) per
+# One HTTP connection reused for every OpenSearch query in a run, instead
+# of a fresh urllib.request.urlopen (and so a fresh TCP handshake) per
 # call - previously paid up to ~9 times per target (one _current_max_ts
 # snapshot plus up to 8 poll attempts), which added up across a real
 # multi-target run to dozens of redundant handshakes to the same host in
 # a tight loop. Batching the poll loop itself (collect_zeek_fingerprints_batch)
 # already cut the call count from O(targets) to O(poll attempts) for a
 # whole run; this cuts the remaining per-call setup cost on top of that.
-_opensearch_conn: http.client.HTTPSConnection | None = None
+_opensearch_conn: http.client.HTTPConnection | None = None
 
 
-def _opensearch_connection() -> http.client.HTTPSConnection:
+def _opensearch_connection() -> http.client.HTTPConnection:
     global _opensearch_conn
     if _opensearch_conn is None:
-        _opensearch_conn = http.client.HTTPSConnection(
-            _opensearch_host, _opensearch_port, timeout=15, context=_OPENSEARCH_TLS_CONTEXT)
+        _opensearch_conn = http.client.HTTPConnection(
+            _opensearch_host, _opensearch_port, timeout=15)
     return _opensearch_conn
 
 
@@ -287,8 +268,8 @@ def _reset_opensearch_connection() -> None:
 def _opensearch_search(query: dict[str, object], size: int = 50) -> list[dict[str, object]]:
     """POST a query to OpenSearch's _search endpoint, sorted newest-first,
     and return the list of _source documents. Raises ProbeError on any
-    auth/transport/HTTP failure - callers treat that the same as the SSH
-    hop failing.
+    transport/HTTP failure - callers treat that the same as the SSH hop
+    failing. No auth - this VM's OpenSearch has no login in front of it.
 
     Retries once over a fresh connection if the reused one was dropped
     from under us (an idle keep-alive connection closed server-side, or
@@ -297,8 +278,7 @@ def _opensearch_search(query: dict[str, object], size: int = 50) -> list[dict[st
     never concurrent with each other), so there's no concurrent access to
     guard against, just a connection that can go stale between calls."""
     body = json.dumps({"size": size, "sort": [{"ts": "desc"}], "query": query}).encode()
-    auth = base64.b64encode(f"{OPENSEARCH_USER}:{_opensearch_password()}".encode()).decode()
-    headers = {"Content-Type": "application/json", "Authorization": f"Basic {auth}"}
+    headers = {"Content-Type": "application/json"}
 
     last_error: Exception | None = None
     for attempt in range(2):

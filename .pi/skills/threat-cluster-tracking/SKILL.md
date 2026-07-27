@@ -143,19 +143,40 @@ as "the malware checks connectivity against 8.8.8.8", or a vendor's own
 site named in passing) and `add_observable` trusts whatever it's handed
 verbatim, so without this gate a false match drives a live JARM scan /
 SSH round-trip exactly like a real IOC would. The gate rejects
-private/reserved/loopback/link-local IPs, a short curated list of
-well-known public DNS resolver IPs, and a short curated list of
-known-non-actor apex domains (major vendors, CDNs, sinkhole operators —
-exact-match only, not subdomains, since a subdomain of e.g. `github.io`
-or `amazonaws.com` is routine attacker-controlled shared hosting, not a
-false positive). It does **not** affect whether the value gets tracked
-as an observable — that stays exactly as permissive as before, it only
-gates the active-probing queue. A skip is visible on the caller's
-return value (and, for `ingest_report`, persisted on that ingest's
-`report_sources` entry) as `fingerprint_queue_skipped`:
-`[{category, value, reason}, ...]`. If a skip turns out to be wrong for
-a specific case, `requeue_fingerprint()` forces that value back onto
-the queue.
+private/reserved/loopback/link-local IPs, IPv6 IPs (the probe VM has no
+IPv6 route out — see below), a short curated list of well-known public
+DNS resolver IPs, and a short curated list of known-non-actor apex
+domains (major vendors, CDNs, sinkhole operators — exact-match only, not
+subdomains, since a subdomain of e.g. `github.io` or `amazonaws.com` is
+routine attacker-controlled shared hosting, not a false positive). It
+does **not** affect whether the value gets tracked as an observable —
+that stays exactly as permissive as before, it only gates the
+active-probing queue. A skip is visible on the caller's return value
+(and, for `ingest_report`, persisted on that ingest's `report_sources`
+entry) as `fingerprint_queue_skipped`: `[{category, value, reason}, ...]`.
+If a skip turns out to be wrong for a specific case, `requeue_fingerprint()`
+forces that value back onto the queue — except for IPv6, which it also
+refuses (raises `ValueError`), since that skip is never wrong on this
+network.
+
+**Functional rule: ignore IPv6 for pivoting and probing.** The probe VM
+has no IPv6 route, so an IPv6 target can only ever time out — confirmed
+directly (every IPv6 target in a real probe run failed with `WinError
+10051`/"network unreachable", while the same run's IPv4 targets and
+DNS-driven pivot lookups worked fine). This is enforced in three places,
+not just left to the caller's discipline: `_is_probe_worthy` rejects
+IPv6 IPs from the fingerprint queue (as above); `pivot_and_expand`
+filters IPv6 addresses out of VirusTotal resolution-history results
+before filing them as new `ips` observables, and short-circuits entirely
+(no VT lookup at all) when called directly on an IPv6 target; and
+`requeue_fingerprint` refuses to force an IPv6 IP back onto the queue.
+`pivot_cluster`'s per-IP RIPEstat lifecycle check is unaffected and still
+runs on tracked IPv6 IPs — it's a third-party API query keyed on the IP
+as a parameter, not a direct connection to it, so it doesn't hit the
+routing problem and stays informative. IPv6 addresses appearing in a
+domain's own DNS resolution (e.g. an AAAA record in `pivot_cluster`'s
+`resolved` list) are left alone for the same reason — that's descriptive
+DNS footprint, not a queued probe/pivot target.
 
 That queue only tells you *what* needs probing — moving it to and from
 wherever you actually do the probing is outside this tool's scope, but
@@ -171,7 +192,7 @@ cti host always initiates outbound, in — never the reverse.
 
 Generating the probe traffic and reading back what it produced are two
 different things happening on two different machines, but as of this
-design they're one SSH hop plus one HTTPS query, not two SSH hops.
+design they're one SSH hop plus one HTTP query, not two SSH hops.
 Earlier versions SSHed into a second VM (the Zeek sensor itself) and
 read `ssl.log`/`conn.log` directly off disk there — that's `mcp-server/scripts/zeek_log_query.py`,
 still present but **retired from the automated pipeline** (kept only
@@ -205,43 +226,84 @@ at the source rather than working around them. And if that queryable
 store is reachable directly from wherever this script runs (as
 OpenSearch was here, over the same Tailscale/home-LAN routes as the
 lab VMs, not proxied through any of them), there's no reason to keep a
-second SSH hop just to ask "what did Zeek see" — a plain outbound HTTPS
+second SSH hop just to ask "what did Zeek see" — a plain outbound HTTP
 call does it with one fewer moving part.
 
 - `probe_pending_fingerprints.py` runs on the cti host itself (it
   imports `core.py` directly — no listener, nothing accepts inbound
-  connections here). It pops the queue locally, then per entry: SSHes
-  into the probe VM piping `{"target": value}` as JSON on stdin
-  (avoiding shell-quoting an IOC value that traces back to report
-  text), then queries OpenSearch for whatever landed in Zeek's logs for
-  the resolved IP, filing whatever comes back from either step with
-  `add_observable`.
+  connections here). It pops the queue locally, then for every entry
+  looks up every port worth probing (`_lookup_ports` — see below) and
+  fans it out into one job per (target, port) pair, since a target with
+  more than one known port should get each of them probed, not just the
+  first. All of those jobs are then dispatched **concurrently** — a
+  `ThreadPoolExecutor` (`PROBE_WORKERS`, same worker-count convention as
+  `pivot_cluster`'s `_PIVOT_CLUSTER_WORKERS`) fires the SSH round-trip to
+  the probe VM for every job at once, multiplexed over the one shared
+  `ControlMaster` connection (`vm_proxy.py`) instead of waiting out one
+  job's whole probe before even starting the next one's. Each SSH call
+  still pipes `{"target": value, "port": ...}` as JSON on stdin (avoiding
+  shell-quoting an IOC value that traces back to report text). Once
+  every dispatched job in the batch has returned, one shared OpenSearch
+  poll (see below) reads back whatever landed in Zeek's logs for every
+  (resolved IP, port) pair at once, and everything found either step is
+  filed with `add_observable`. This replaced an earlier version that
+  processed the queue one target at a time, one port each — one target's
+  JARM scan and Zeek poll had to finish before the next target's SSH
+  round-trip even began, despite the targets having no dependency on
+  each other; a real 17-target run under that design took close to 15
+  minutes.
+
+  `_lookup_ports` returns every port it can find for a target — the
+  `ports` list report_ingest._extract_ip_ports stamped onto an IP's own
+  observable entry (checked first, since it's the most direct signal a
+  report gives about that specific IP), then every tracked URL whose
+  host matches the target (the only source for domain targets), falling
+  back to `[443]` only if neither source found anything. A genuinely
+  multi-port C2 (several listeners on the same IP) now gets each of its
+  known ports probed instead of only the first one ever recorded.
 
   The freshness filter for that OpenSearch query is worth calling out
   since it's the fix for the clock-skew bug above, done properly this
-  time: right *before* dispatching each target's probe,
-  `_current_max_ts()` snapshots the newest `ts` already indexed for
-  *anything* in OpenSearch. After the probe returns with a resolved IP,
-  `collect_zeek_fingerprints()` only accepts documents for that IP
-  newer than that snapshot. Every timestamp compared here came from the
-  same clock (Zeek's, via whichever document OpenSearch indexed it as)
-  — never a wall-clock reading taken on the cti host or the probe VM.
-  That's what actually breaks when you compare across hosts; a fixed
-  offset or a bigger window wouldn't have been a real fix, only a
-  bigger unreliable guess. Taking the snapshot before the probe fires
-  (not right before querying, after the probe already finished) also
-  means the window naturally covers the probe's whole actual duration —
-  DNS resolution, JARM, the handshake — instead of a fixed guess that
-  could be too short for a slow probe.
+  time: `_current_max_ts()` snapshots the newest `ts` already indexed for
+  *anything* in OpenSearch **once, before the whole batch is dispatched**
+  — not per job — since every job in the batch fires at essentially the
+  same time anyway once dispatch is concurrent, and one snapshot ahead of
+  all of them satisfies the same freshness requirement a per-job snapshot
+  did. After every dispatched job returns with a resolved IP,
+  `collect_zeek_fingerprints_batch()` polls all of those (IP, port) pairs
+  in one shared `terms` query per attempt (filtered on IP; the port split
+  happens locally against `_DST_PORT_FIELD` — `dst_port`, confirmed
+  2026-07-20 by sampling real documents across ssh.log/ssl.log/conn.log/
+  dns.log/notice.log/files.log the same way `dst_ip` was, and only
+  load-bearing when an IP genuinely has more than one port queued) and
+  only accepts documents newer than that snapshot,
+  shrinking the set of (IP, port) pairs still being waited on as each
+  one's fields fill in. Every timestamp compared here came from the same
+  clock (Zeek's, via whichever document OpenSearch indexed it as) — never
+  a wall-clock reading taken on the cti host or the probe VM. That's what
+  actually breaks when you compare across hosts; a fixed offset or a
+  bigger window wouldn't have been a real fix, only a bigger unreliable
+  guess. Taking the snapshot before any probe fires (not right before
+  querying, after the probes already finished) also means the window
+  naturally covers the whole batch's actual duration — DNS resolution,
+  JARM, the handshakes — instead of a fixed guess that could be too short
+  for a slow probe.
 
-  The OpenSearch password is deliberately **not** a constant in the
-  script — it's read from `CTI_OPENSEARCH_PASSWORD` in the environment.
-  This file lives in a git-tracked repo; a plaintext credential written
-  into it would land in git history the same way the SSH private keys
-  never do (they're referenced by local file path, never embedded). Set
-  the env var before running:
+  The OpenSearch queries themselves also reuse one HTTP connection for
+  the life of a run (`_opensearch_connection()`, an `http.client.HTTPConnection`
+  kept open and only reset on a transport failure) rather than paying a
+  fresh TCP handshake per query — previously every one of
+  `_current_max_ts()`'s and the poll loop's calls opened its own
+  connection, which used to add up across a per-target poll loop into
+  dozens of redundant handshakes to the same host in a tight loop. This
+  is safe without extra locking because dispatch (concurrent, SSH-only)
+  and OpenSearch access (sequential, before and after the dispatch phase)
+  never overlap in time within a single run.
 
-      export CTI_OPENSEARCH_PASSWORD='...'
+  The Arkime VM moved to 10.20.0.18 as of 2026-07-27, and its OpenSearch
+  no longer sits behind a login — it's plain HTTP, lab-internal only, no
+  credential to set. Just run:
+
       python3 mcp-server/scripts/probe_pending_fingerprints.py
 
   Every run validates both the SSH hop and OpenSearch reachability
@@ -264,23 +326,47 @@ call does it with one fewer moving part.
   file's presence on disk.
 - `win_probe_helper.py` runs on the probe VM (needs nothing from this
   repo — standalone, pure standard library so it doesn't matter if
-  it's Windows or Linux). Per target it: resolves the target to an IP
-  once (Zeek's logs only ever key on the resolved address, never a
-  hostname string) and reuses that same IP for the handshake rather
-  than letting the connection call re-resolve it — found live-testing
-  against a CDN-fronted domain that a second, separate lookup moments
-  later can come back with a different edge IP than the first,
-  silently pointing the OpenSearch query at an address nothing was
-  ever sent to. Then it runs a JARM scan (the one value nothing passive
-  produces) and fires one ordinary TLS handshake — via Python's own
-  `ssl`/`socket` modules rather than shelling out to `openssl`, so
-  nothing extra needs installing — purely to give the target something
-  real to respond to. The handshake's own result is discarded; Zeek's
-  log (read back via OpenSearch) is the source of truth for what it
-  produced.
+  it's Windows or Linux). Per job (one target/port pair — see below) it:
+  resolves the target to an IP once (Zeek's logs only ever key on the
+  resolved address, never a hostname string) and reuses that same IP for
+  the handshake rather than letting the connection call re-resolve it —
+  found live-testing against a CDN-fronted domain that a second, separate
+  lookup moments later can come back with a different edge IP than the
+  first, silently pointing the OpenSearch query at an address nothing
+  was ever sent to. Then, if `tcp_precheck()` (a bare TCP connect test
+  against the resolved IP and requested port, a few seconds' timeout)
+  finds something actually listening, it runs a JARM scan (the one value
+  nothing passive produces) and fires one ordinary TLS handshake — via
+  Python's own `ssl`/`socket` modules rather than shelling out to
+  `openssl`, so nothing extra needs installing — purely to give the
+  target something real to respond to. The handshake's own result is
+  discarded; Zeek's log (read back via OpenSearch) is the source of
+  truth for what it produced.
 
-`collect_zeek_fingerprints()` takes the most recent *non-empty* value
-per field, not just whichever document is chronologically last — a
+  The pre-check exists because a wrong port guess is not a rare edge
+  case here — `_lookup_ports` (below) falls back to 443 whenever a
+  target's real port isn't recorded, and that guess is simply wrong for
+  any C2 on a nonstandard port. Before the pre-check, a wrong guess paid
+  JARM's full multi-attempt timeout budget (each of its ~10
+  malformed-ClientHello attempts independently re-discovering that the
+  same port refuses connections) before giving up; now a closed/filtered
+  port fails in `TCP_PRECHECK_TIMEOUT` seconds and both the JARM scan and
+  the throwaway handshake are skipped outright, with `error` explaining
+  why. This is the main reason a real run's total time is sensitive to
+  how many of its targets have a confirmed port versus a blind 443
+  fallback — get the port right (see `_lookup_ports`) and this pre-check
+  barely matters; get it wrong across many targets and it's what keeps a
+  batch of dead guesses from each burning JARM's full budget.
+
+  Probing more than one port for the same target — a target with
+  several recorded ports (see `_lookup_ports` below) — means more than
+  one request to this script, each independently resolving, pre-checking,
+  and (if reachable) JARM-scanning + handshaking its own port. Nothing in
+  this script needs to know a target has other ports in flight; each
+  request is self-contained.
+
+`collect_zeek_fingerprints_batch()` takes the most recent *non-empty*
+value per field, not just whichever document is chronologically last — a
 single probe can produce several `ssl.log` rows for the same target
 (JARM's malformed-ClientHello attempts included, which show up with an
 empty `ja4s` and an alert like `illegal_parameter`/`handshake_failure`),

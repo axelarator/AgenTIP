@@ -192,7 +192,7 @@ cti host always initiates outbound, in — never the reverse.
 
 Generating the probe traffic and reading back what it produced are two
 different things happening on two different machines, but as of this
-design they're one SSH hop plus one HTTPS query, not two SSH hops.
+design they're one SSH hop plus one HTTP query, not two SSH hops.
 Earlier versions SSHed into a second VM (the Zeek sensor itself) and
 read `ssl.log`/`conn.log` directly off disk there — that's `mcp-server/scripts/zeek_log_query.py`,
 still present but **retired from the automated pipeline** (kept only
@@ -226,7 +226,7 @@ at the source rather than working around them. And if that queryable
 store is reachable directly from wherever this script runs (as
 OpenSearch was here, over the same Tailscale/home-LAN routes as the
 lab VMs, not proxied through any of them), there's no reason to keep a
-second SSH hop just to ask "what did Zeek see" — a plain outbound HTTPS
+second SSH hop just to ask "what did Zeek see" — a plain outbound HTTP
 call does it with one fewer moving part.
 
 - `probe_pending_fingerprints.py` runs on the cti host itself (it
@@ -289,10 +289,10 @@ call does it with one fewer moving part.
   JARM, the handshakes — instead of a fixed guess that could be too short
   for a slow probe.
 
-  The OpenSearch queries themselves also reuse one HTTPS connection for
-  the life of a run (`_opensearch_connection()`, an `http.client.HTTPSConnection`
+  The OpenSearch queries themselves also reuse one HTTP connection for
+  the life of a run (`_opensearch_connection()`, an `http.client.HTTPConnection`
   kept open and only reset on a transport failure) rather than paying a
-  fresh TCP+TLS handshake per query — previously every one of
+  fresh TCP handshake per query — previously every one of
   `_current_max_ts()`'s and the poll loop's calls opened its own
   connection, which used to add up across a per-target poll loop into
   dozens of redundant handshakes to the same host in a tight loop. This
@@ -300,14 +300,10 @@ call does it with one fewer moving part.
   and OpenSearch access (sequential, before and after the dispatch phase)
   never overlap in time within a single run.
 
-  The OpenSearch password is deliberately **not** a constant in the
-  script — it's read from `CTI_OPENSEARCH_PASSWORD` in the environment.
-  This file lives in a git-tracked repo; a plaintext credential written
-  into it would land in git history the same way the SSH private keys
-  never do (they're referenced by local file path, never embedded). Set
-  the env var before running:
+  The Arkime VM moved to 10.20.0.18 as of 2026-07-27, and its OpenSearch
+  no longer sits behind a login — it's plain HTTP, lab-internal only, no
+  credential to set. Just run:
 
-      export CTI_OPENSEARCH_PASSWORD='...'
       python3 mcp-server/scripts/probe_pending_fingerprints.py
 
   Every run validates both the SSH hop and OpenSearch reachability
