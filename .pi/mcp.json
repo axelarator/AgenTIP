@@ -4,6 +4,8 @@
       "transport": "stdio",
       "command": "/home/agent/cti-agent/mcp-server/.venv/bin/python",
       "args": ["-m", "cti_tools.server"],
+      "cwd": "/home/agent/cti-agent/mcp-server",
+      "env": {"VT_API_KEY": "${VT_API_KEY}"},
       "lifecycle": "lazy"
     }
   }

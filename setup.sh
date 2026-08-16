@@ -26,17 +26,36 @@ cat > "$ROOT/.mcp.json" <<EOF
       "command": "$ROOT/mcp-server/.venv/bin/python",
       "args": ["-m", "cti_tools.server"],
       "cwd": "$ROOT/mcp-server",
-      "env": {}
+      "env": {"VT_API_KEY": "\${VT_API_KEY}"}
+    }
+  }
+}
+EOF
+
+# .pi/mcp.json is the same server, wired for MCP-capable Pi forks
+# (oh-my-pi etc.) — keep it in sync with .mcp.json above so it doesn't
+# go stale/lose the VT_API_KEY passthrough on a clone or move.
+cat > "$ROOT/.pi/mcp.json" <<EOF
+{
+  "mcpServers": {
+    "cti-tools": {
+      "transport": "stdio",
+      "command": "$ROOT/mcp-server/.venv/bin/python",
+      "args": ["-m", "cti_tools.server"],
+      "cwd": "$ROOT/mcp-server",
+      "env": {"VT_API_KEY": "\${VT_API_KEY}"},
+      "lifecycle": "lazy"
     }
   }
 }
 EOF
 
 echo "Installed cti_tools into $ROOT/mcp-server/.venv"
-echo "Wrote $ROOT/.mcp.json"
+echo "Wrote $ROOT/.mcp.json and $ROOT/.pi/mcp.json"
 echo
 echo "Sanity check:"
 python -m cti_tools.cli list-clusters
 echo
 echo "Next: point your harness at skills/threat-cluster-tracking/ and,"
-echo "for MCP-capable harnesses, at .mcp.json. See mcp-server/README.md."
+echo "for MCP-capable harnesses, at .mcp.json (or .pi/mcp.json for Pi)."
+echo "See mcp-server/README.md."
