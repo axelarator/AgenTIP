@@ -895,7 +895,9 @@ def pivot_observable(value: str) -> dict[str, Any]:
     run for the observable types they apply to. Certificate-transparency
     history (Cert Spotter, for domains) and reverse-IP co-hosting
     (Hackertarget, for IPs) are also keyless and surface sibling
-    infrastructure as new pivot leads.
+    infrastructure as new pivot leads. HoneyLabs honeypot-fleet
+    telemetry (IPs only, HONEYLABS_API_KEY) is likewise skipped with a
+    note when unconfigured; see summarize_honeylabs for how to read it.
     """
     kind = pivot.classify(value)
     result: dict[str, Any] = {"value": value, "kind": kind}
@@ -906,6 +908,7 @@ def pivot_observable(value: str) -> dict[str, Any]:
         result["ripestat"] = _cached_pivot("ripestat", value, lambda: pivot.ripestat_lookup(value))
         result["reverse_ip"] = _cached_pivot(
             "reverse_ip", value, lambda: pivot.hackertarget_reverse_ip(value))
+        result["honeylabs"] = honeylabs_context(value)
     if kind == "domain":
         result["certspotter"] = _cached_pivot(
             "certspotter", value, lambda: pivot.certspotter_lookup(value))
@@ -922,6 +925,58 @@ def pivot_observable(value: str) -> dict[str, Any]:
             result["virustotal"] = {"error": str(e)}
 
     return result
+
+
+def honeylabs_context(ip: str) -> dict[str, Any]:
+    """Cached HoneyLabs honeypot-telemetry lookup for an IP. Returns the
+    normalized lookup dict, a {"skipped": ...} note if HONEYLABS_API_KEY
+    is unset, or {"error": ...} on lookup failure - never raises, so
+    pipeline callers can enrich opportunistically without wrapping it."""
+    api_key = os.environ.get(pivot.HONEYLABS_API_KEY_ENV)
+    if not api_key:
+        return {"skipped":
+                f"set {pivot.HONEYLABS_API_KEY_ENV} to enable HoneyLabs honeypot-telemetry lookups"}
+    try:
+        return _cached_pivot("honeylabs", ip, lambda: pivot.honeylabs_lookup(ip, api_key))
+    except pivot.PivotError as e:
+        return {"error": str(e)}
+
+
+def summarize_honeylabs(result: dict[str, Any]) -> str | None:
+    """One-line, provenance-ready reading of a honeylabs_context result,
+    or None for skipped/error results (so callers write nothing).
+
+    The interpretation cuts both ways, and the line should keep that
+    legible to whoever reads the provenance list later: heavy presence
+    in honeypot telemetry usually means a mass scanner / opportunistic
+    background noise (a counter-signal for "dedicated C2"), while
+    absence on an otherwise-active IP is the quiet-infrastructure
+    signal."""
+    if not isinstance(result, dict) or "skipped" in result or "error" in result:
+        return None
+    today = datetime.now(timezone.utc).date().isoformat()
+    events = result.get("events")
+    if not events:
+        return (f"HoneyLabs telemetry {today}: no honeypot activity on record - "
+                "quiet infrastructure, not a known mass scanner")
+    parts = [f"{events} honeypot events"]
+    detail = []
+    if result.get("events_24h"):
+        detail.append(f"{result['events_24h']} in 24h")
+    if result.get("days_active"):
+        detail.append(f"active {result['days_active']}d")
+    if detail:
+        parts[0] += f" ({', '.join(detail)})"
+    ports = [str(p.get("port")) for p in (result.get("ports") or [])[:3]
+             if isinstance(p, dict) and p.get("port") is not None]
+    if ports:
+        parts.append(f"top ports {','.join(ports)}")
+    cves = [c.get("id") for c in (result.get("cves") or [])[:3]
+            if isinstance(c, dict) and c.get("id")]
+    if cves:
+        parts.append(f"probing {', '.join(cves)}")
+    return (f"HoneyLabs telemetry {today}: {', '.join(parts)} - "
+            "opportunistic scanner profile, weigh against dedicated-C2 hypotheses")
 
 
 _PIVOT_CLUSTER_WORKERS = 6

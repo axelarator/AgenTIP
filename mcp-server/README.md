@@ -299,9 +299,26 @@ Sources, all implemented in `pivot.py`:
   and known filenames; URL lookups return detection verdicts. Skipped
   with a note (not an error) if `VT_API_KEY` isn't set — RDAP/RIPEstat
   still run.
+- **HoneyLabs** (honeylabs.net) — requires your own API key
+  (`HONEYLABS_API_KEY` env var; mint one from the HoneyLabs dashboard).
+  IP lookups only: honeypot-fleet telemetry — event volume/recency and
+  the ports, client fingerprints, and CVEs their sensors saw the IP
+  probing. Heavy presence reads as mass-scanner/opportunistic noise (a
+  counter-signal for dedicated C2); absence on an active IP is the
+  quiet-infrastructure signal. Credits are metered (1 credit per row;
+  free tier 500/day, 10 req/min), so cached lookups matter — honeypot
+  totals move slowly, so a longer `CTI_PIVOT_CACHE_TTL` (e.g. 86400) is
+  sensible if HoneyLabs becomes the dominant source. Skipped with a
+  note if the key isn't set; deliberately no keyless fallback. The same
+  lookup also backs `core.honeylabs_context`/`core.summarize_honeylabs`,
+  which `scripts/probe_pending_fingerprints.py` uses to stamp a one-line
+  telemetry summary onto queued IPs as provenance. For interactive
+  queries beyond per-IP lookups, the `honeylabs` remote MCP server in
+  `.mcp.json` exposes HoneyLabs' own tools directly.
 
 Which sources run depends on the observable's type (`pivot.classify`):
-domain → RDAP + VT; ip → RDAP + RIPEstat + VT; hash/url → VT only. A
+domain → RDAP + VT; ip → RDAP + RIPEstat + HoneyLabs + VT; hash/url →
+VT only. A
 failure in one source doesn't kill the whole lookup — RIPEstat's three
 sub-calls and RDAP each record their own failure independently, and a
 VirusTotal failure surfaces as `{"error": ...}` in its own section

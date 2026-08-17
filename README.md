@@ -28,6 +28,12 @@ configs need real paths — see `mcp-server/README.md` for why
 `${workspaceFolder}`-style variables aren't relied on here). Re-run it
 after cloning to a new machine or moving the repo.
 
+Optional API keys, passed through as env vars (missing keys degrade to
+a skip note, never an error): `VT_API_KEY` (VirusTotal pivots) and
+`HONEYLABS_API_KEY` (HoneyLabs honeypot telemetry — both the per-IP
+pivot enrichment and the `honeylabs` remote MCP server that `.mcp.json`
+wires up).
+
 Then, per harness:
 
 - **Claude Code / GitHub Copilot** — native MCP support. `.mcp.json` is

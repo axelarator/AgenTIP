@@ -271,6 +271,55 @@ def test_hackertarget_reverse_ip_no_records_message_is_error(monkeypatch):
     assert "domains" not in result
 
 
+def test_honeylabs_lookup_url_auth_and_normalization(monkeypatch):
+    seen = {}
+
+    def fake_get_json(url, headers=None):
+        seen["url"] = url
+        seen["headers"] = headers
+        return {
+            "ip": "203.0.113.5",
+            "country": "NL",
+            "asn": 202425,
+            "totals": {"events": 481223, "events_24h": 1842, "days_active": 87},
+            "ports": [{"port": 22, "count": 124091}],
+            "fingerprints": {"tls": [{"ja4": "t13d1516h2_x", "count": 12}]},
+            "cves": [{"id": "CVE-2024-4577", "count": 12}],
+        }
+    monkeypatch.setattr(pivot, "_get_json", fake_get_json)
+    result = pivot.honeylabs_lookup("203.0.113.5", "hlk_fake")
+    assert seen["url"] == "https://honeylabs.net/lookup/203.0.113.5?format=json"
+    assert seen["headers"] == {"Authorization": "Bearer hlk_fake"}
+    assert result["events"] == 481223
+    assert result["events_24h"] == 1842
+    assert result["days_active"] == 87
+    assert result["country"] == "NL"
+    assert result["asn"] == 202425
+    assert result["ports"] == [{"port": 22, "count": 124091}]
+    assert result["cves"] == [{"id": "CVE-2024-4577", "count": 12}]
+
+
+def test_honeylabs_lookup_tolerates_missing_totals(monkeypatch):
+    monkeypatch.setattr(pivot, "_get_json", lambda url, headers=None: {"ip": "203.0.113.5"})
+    result = pivot.honeylabs_lookup("203.0.113.5", "hlk_fake")
+    assert result["events"] is None
+    assert result["events_24h"] is None
+
+
+def test_honeylabs_lookup_http_error_propagates(monkeypatch):
+    def raise_error(url, headers=None):
+        raise pivot.PivotError("HTTP 429")
+    monkeypatch.setattr(pivot, "_get_json", raise_error)
+    with pytest.raises(pivot.PivotError):
+        pivot.honeylabs_lookup("203.0.113.5", "hlk_fake")
+
+
+def test_honeylabs_lookup_unexpected_shape_raises(monkeypatch):
+    monkeypatch.setattr(pivot, "_get_json", lambda url, headers=None: ["not", "a", "dict"])
+    with pytest.raises(pivot.PivotError):
+        pivot.honeylabs_lookup("203.0.113.5", "hlk_fake")
+
+
 def test_resolve_host_distinguishes_dead_from_inconclusive(monkeypatch):
     # Resolution now happens on the Win11 VM via vm_proxy.resolve_dns;
     # resolve_host layers its own null-route/loopback filtering on top of

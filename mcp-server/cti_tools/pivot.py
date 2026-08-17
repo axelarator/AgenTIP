@@ -24,6 +24,15 @@ Sources, none of which require a paid plan:
   tied to a tracked C2 IP when the source report only gave you the
   infrastructure, not per-sample coverage. Skipped gracefully if no
   key is configured - RDAP/RIPEstat still work without one.
+- HoneyLabs (honeylabs.net) - honeypot-fleet telemetry for an IP:
+  how often, how recently, and against which ports/CVEs their sensors
+  have seen it scanning. Free tier needs your own API key
+  (HONEYLABS_API_KEY env var; 500 credits/day, 10 req/min). Presence
+  here usually reads as mass-scanner/opportunistic background noise -
+  a counter-signal for "dedicated C2" - while absence on an otherwise
+  active IP is the quiet-infrastructure signal. Skipped gracefully if
+  no key is configured; deliberately no keyless fallback (keyless
+  lookups would burn the probe VM egress IP's shared 60/hr allowance).
 
 Every one of these lookups names a tracked indicator to a third party
 (the domain/IP/hash being pivoted on), so - same as active
@@ -44,6 +53,7 @@ from . import vm_proxy
 
 USER_AGENT = "cti-agent-pivot/1.0 (+local analysis tool, on-demand only)"
 VT_API_KEY_ENV = "VT_API_KEY"
+HONEYLABS_API_KEY_ENV = "HONEYLABS_API_KEY"
 
 # Nameserver substrings that indicate a domain has been sinkholed/taken
 # down rather than being live adversary infrastructure. Extend as you
@@ -284,6 +294,30 @@ def virustotal_lookup(value: str, kind: str, api_key: str) -> dict[str, Any]:
         }
 
     raise PivotError(f"unsupported kind for VirusTotal lookup: {kind}")
+
+
+def honeylabs_lookup(ip: str, api_key: str) -> dict[str, Any]:
+    """Honeypot-fleet telemetry for an IP via HoneyLabs' lookup API:
+    event volume/recency across their sensors plus the ports,
+    client fingerprints, and CVEs it was seen probing. Raises PivotError
+    on request failure (including HTTP 429/402 when the rate limit or
+    daily credit budget is exhausted) - the caller decides whether
+    that's fatal or just a missing section in a larger result."""
+    data = _get_json(f"https://honeylabs.net/lookup/{ip}?format=json",
+                     {"Authorization": f"Bearer {api_key}"})
+    if not isinstance(data, dict):
+        raise PivotError("unexpected HoneyLabs response shape")
+    totals = data.get("totals") or {}
+    return {
+        "country": data.get("country"),
+        "asn": data.get("asn"),
+        "events": totals.get("events"),
+        "events_24h": totals.get("events_24h"),
+        "days_active": totals.get("days_active"),
+        "ports": data.get("ports"),
+        "fingerprints": data.get("fingerprints"),
+        "cves": data.get("cves"),
+    }
 
 
 def certspotter_lookup(domain: str) -> dict[str, Any]:

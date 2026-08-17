@@ -412,8 +412,9 @@ result, writing nothing. Sources: RDAP registration data; RIPEstat
 ASN/network context (IPs); Cert Spotter certificate-transparency
 history (domains — sibling subdomains as pivot leads, the keyless
 stand-in for crt.sh, which is no longer reachable); Hackertarget
-reverse-IP co-hosting (IPs); and VirusTotal reputation + resolution
-history if `VT_API_KEY` is set. Reach for it when:
+reverse-IP co-hosting (IPs); VirusTotal reputation + resolution
+history if `VT_API_KEY` is set; and HoneyLabs honeypot-fleet telemetry
+(IPs) if `HONEYLABS_API_KEY` is set. Reach for it when:
 
 - you want to know if a tracked domain/IP is still active or has been
   sinkholed/taken down (RDAP nameservers/status — a domain suddenly
@@ -423,7 +424,25 @@ history if `VT_API_KEY` is set. Reach for it when:
   worth its own observable entry vs. shared hosting noise,
 - you want sibling infrastructure the same operator stood up (Cert
   Spotter subdomains, VirusTotal resolution history, reverse-IP
-  co-hosting) as new pivot leads.
+  co-hosting) as new pivot leads,
+- you want to know whether a tracked IP is opportunistic background
+  noise or something quieter (HoneyLabs). Read it both ways: heavy
+  presence in honeypot telemetry — thousands of events, dozens of
+  ports, CVE spraying — is a mass-scanner profile and a *counter-signal*
+  for "dedicated C2"; **absence** on an otherwise-active IP is the
+  quiet-infrastructure signal worth noting. The probe pipeline
+  (`probe_pending_fingerprints.py`) stamps this same summary onto
+  queued IPs automatically as provenance on the `ips` observable.
+
+For deeper interactive HoneyLabs work — CVE exploitation timelines,
+payload/path searches, attacker leaderboards, fingerprint population
+lookups — use the `honeylabs` MCP server's own tools (`ioc_lookup`,
+`cve_lookup`, `top_attackers`, `search_events`, `payload_search`,
+`attack_timeline`, `asn_enrich`, `fingerprint_search`,
+`fingerprint_population`) rather than round-tripping through
+`pivot_observable`; they query the same telemetry with real filters.
+Credits are metered (1 credit per row returned), so prefer tight
+filters and small limits over broad sweeps.
 
 Display-only: nothing is written. If it surfaces something worth
 keeping, record it yourself with `append_hunt_log`, `add_gap`, or

@@ -535,6 +535,10 @@ def stub_pivot_net(monkeypatch):
     monkeypatch.setattr(core.pivot, "ripestat_lookup", lambda ip: {"asn": [999]})
     monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {"hostnames": []})
     monkeypatch.setattr(core.pivot, "hackertarget_reverse_ip", lambda ip: {"domains": []})
+    # Unset by default so honeylabs_context short-circuits to its skip
+    # note instead of reaching pivot.honeylabs_lookup; tests that want
+    # the lookup set the env var and stub the function themselves.
+    monkeypatch.delenv("HONEYLABS_API_KEY", raising=False)
     return monkeypatch
 
 
@@ -603,6 +607,65 @@ def test_pivot_observable_does_not_write_to_any_cluster(stub_pivot_net):
     core.pivot_observable("example.com")
     after = core.get_cluster("Pivot Side Effect Test")
     assert before == after
+
+
+# --- HoneyLabs enrichment ----------------------------------------------------
+
+def test_pivot_observable_ip_honeylabs_skipped_without_key(stub_pivot_net):
+    stub_pivot_net.delenv("VT_API_KEY", raising=False)
+    result = core.pivot_observable("1.2.3.4")
+    assert "skipped" in result["honeylabs"]
+    assert "HONEYLABS_API_KEY" in result["honeylabs"]["skipped"]
+
+
+def test_pivot_observable_domain_has_no_honeylabs_section(stub_pivot_net):
+    stub_pivot_net.delenv("VT_API_KEY", raising=False)
+    result = core.pivot_observable("example.com")
+    assert "honeylabs" not in result
+
+
+def test_honeylabs_context_used_with_key(stub_pivot_net):
+    stub_pivot_net.setenv("HONEYLABS_API_KEY", "hlk_fake")
+    stub_pivot_net.setattr(core.pivot, "honeylabs_lookup",
+                           lambda ip, api_key: {"events": 5, "key_used": api_key})
+    assert core.honeylabs_context("1.2.3.4") == {"events": 5, "key_used": "hlk_fake"}
+
+
+def test_honeylabs_context_error_is_contained(stub_pivot_net):
+    stub_pivot_net.setenv("HONEYLABS_API_KEY", "hlk_fake")
+
+    def raise_error(ip, api_key):
+        raise core.pivot.PivotError("credits exhausted: HTTP 402")
+    stub_pivot_net.setattr(core.pivot, "honeylabs_lookup", raise_error)
+    result = core.honeylabs_context("1.2.3.4")
+    assert "credits exhausted" in result["error"]
+
+
+def test_summarize_honeylabs_none_for_skip_and_error():
+    assert core.summarize_honeylabs({"skipped": "set HONEYLABS_API_KEY ..."}) is None
+    assert core.summarize_honeylabs({"error": "HTTP 429"}) is None
+
+
+def test_summarize_honeylabs_no_activity_line():
+    line = core.summarize_honeylabs({"events": 0, "ports": None, "cves": None})
+    assert line is not None
+    assert "no honeypot activity" in line
+    assert "quiet infrastructure" in line
+
+
+def test_summarize_honeylabs_scanner_line():
+    line = core.summarize_honeylabs({
+        "events": 481223, "events_24h": 1842, "days_active": 87,
+        "ports": [{"port": 22, "count": 124091}, {"port": 23, "count": 5}],
+        "cves": [{"id": "CVE-2024-4577", "count": 12}],
+    })
+    assert line is not None
+    assert "481223 honeypot events" in line
+    assert "1842 in 24h" in line
+    assert "active 87d" in line
+    assert "top ports 22,23" in line
+    assert "CVE-2024-4577" in line
+    assert "opportunistic scanner" in line
 
 
 # --- manual observable entry -------------------------------------------------

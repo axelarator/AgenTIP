@@ -96,7 +96,9 @@ from __future__ import annotations
 import concurrent.futures
 import datetime
 import http.client
+import ipaddress
 import json
+import os
 import re
 import sys
 import time
@@ -445,6 +447,34 @@ def _dispatch_one(job: dict[str, object]) -> dict[str, object]:
             "probe_result": probe_result, "probe_error": None}
 
 
+def _enrich_with_honeylabs(pairs: set[tuple[str, str]]) -> None:
+    """Annotate each (cluster, ip) with a one-line HoneyLabs
+    honeypot-telemetry summary as extra provenance on the ips observable
+    (core.add_observable's merge appends the source line to an
+    already-tracked value rather than duplicating it). The lookup is
+    passive and independent of probe success, so queued IP targets get
+    enriched even when their TLS probe failed. Deliberately does NOT
+    auto-file HoneyLabs' per-IP CVEs/fingerprints as their own
+    observables - those describe attacker-client tooling seen against
+    honeypots and would pollute clusters with mass-scanner noise; the
+    summary line carries them for the analyst to file by hand.
+
+    Credit frugality: only queue-gated IPs reach this (already filtered
+    by _is_probe_worthy), lookups are cached (CTI_PIVOT_CACHE_TTL), and
+    they run sequentially - a typical batch stays well under HoneyLabs'
+    free-tier 10 calls/min."""
+    if not pairs:
+        return
+    if not os.environ.get(core.pivot.HONEYLABS_API_KEY_ENV):
+        print("HoneyLabs enrichment skipped: set HONEYLABS_API_KEY to enable it",
+              file=sys.stderr)
+        return
+    for cluster, ip in sorted(pairs):
+        note = core.summarize_honeylabs(core.honeylabs_context(ip))
+        if note:
+            core.add_observable(cluster, "ips", ip, note)
+
+
 def check_access() -> list[str]:
     """Validates both the Win11 SSH hop and OpenSearch reachability before
     any probing starts - probing/pivoting shouldn't start without
@@ -533,6 +563,21 @@ def main() -> None:
         resolved_ip = probe_result.get("resolved_ip")
         if resolved_ip:
             resolved_by_ip_port.setdefault((resolved_ip, port), []).append(d)
+
+    # HoneyLabs enrichment targets: every queued IP target (probe success
+    # or not - the lookup is passive) plus every IP a domain target
+    # resolved to, deduped per (cluster, ip).
+    honeylabs_pairs: set[tuple[str, str]] = set()
+    for entry in queue:
+        try:
+            ipaddress.ip_address(entry["value"])
+        except ValueError:
+            continue
+        honeylabs_pairs.add((entry["cluster"], entry["value"]))
+    for (resolved_ip, _port), entries in resolved_by_ip_port.items():
+        for d in entries:
+            honeylabs_pairs.add((d["cluster"], resolved_ip))
+    _enrich_with_honeylabs(honeylabs_pairs)
 
     if not resolved_by_ip_port:
         return

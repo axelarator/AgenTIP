@@ -26,7 +26,13 @@ cat > "$ROOT/.mcp.json" <<EOF
       "command": "$ROOT/mcp-server/.venv/bin/python",
       "args": ["-m", "cti_tools.server"],
       "cwd": "$ROOT/mcp-server",
-      "env": {"VT_API_KEY": "\${VT_API_KEY}"}
+      "env": {"VT_API_KEY": "\${VT_API_KEY}",
+              "HONEYLABS_API_KEY": "\${HONEYLABS_API_KEY}"}
+    },
+    "honeylabs": {
+      "type": "http",
+      "url": "https://mcp.honeylabs.net/mcp",
+      "headers": {"Authorization": "Bearer \${HONEYLABS_API_KEY}"}
     }
   }
 }
@@ -34,7 +40,9 @@ EOF
 
 # .pi/mcp.json is the same server, wired for MCP-capable Pi forks
 # (oh-my-pi etc.) — keep it in sync with .mcp.json above so it doesn't
-# go stale/lose the VT_API_KEY passthrough on a clone or move.
+# go stale/lose the API-key passthroughs on a clone or move. The remote
+# honeylabs server is deliberately NOT mirrored here: remote-HTTP MCP
+# support in the Pi forks is unverified — add it once confirmed.
 cat > "$ROOT/.pi/mcp.json" <<EOF
 {
   "mcpServers": {
@@ -43,7 +51,8 @@ cat > "$ROOT/.pi/mcp.json" <<EOF
       "command": "$ROOT/mcp-server/.venv/bin/python",
       "args": ["-m", "cti_tools.server"],
       "cwd": "$ROOT/mcp-server",
-      "env": {"VT_API_KEY": "\${VT_API_KEY}"},
+      "env": {"VT_API_KEY": "\${VT_API_KEY}",
+              "HONEYLABS_API_KEY": "\${HONEYLABS_API_KEY}"},
       "lifecycle": "lazy"
     }
   }
