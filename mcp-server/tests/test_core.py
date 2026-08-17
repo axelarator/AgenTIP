@@ -653,19 +653,36 @@ def test_summarize_honeylabs_no_activity_line():
     assert "quiet infrastructure" in line
 
 
-def test_summarize_honeylabs_scanner_line():
+def test_summarize_honeylabs_verdict_line():
     line = core.summarize_honeylabs({
-        "events": 481223, "events_24h": 1842, "days_active": 87,
-        "ports": [{"port": 22, "count": 124091}, {"port": 23, "count": 5}],
-        "cves": [{"id": "CVE-2024-4577", "count": 12}],
+        "events": 3872, "events_24h": 22,
+        "first_seen": "2026-02-16T14:23:04", "last_seen": "2026-08-17T10:42:23",
+        "verdict": "scanner", "verdict_label": "Recognized scanner",
+        "verdict_detail": "shodan", "verdict_confidence": "high",
+        "ports": [{"port": 8443, "count": 68}, {"port": 9443, "count": 59}],
+        "cves": [],
     })
     assert line is not None
-    assert "481223 honeypot events" in line
-    assert "1842 in 24h" in line
-    assert "active 87d" in line
-    assert "top ports 22,23" in line
-    assert "CVE-2024-4577" in line
-    assert "opportunistic scanner" in line
+    assert "3872 honeypot events" in line
+    assert "22 in 24h" in line
+    assert "seen 2026-02-16 to 2026-08-17" in line
+    assert "top ports 8443,9443" in line
+    assert "verdict: Recognized scanner (shodan, high)" in line
+    # HoneyLabs' own verdict replaces our generic interpretation line
+    assert "opportunistic scanner profile" not in line
+
+
+def test_summarize_honeylabs_generic_line_without_verdict():
+    line = core.summarize_honeylabs({
+        "events": 500, "events_24h": 10,
+        "ports": [{"port": 22, "count": 400}],
+        "cves": ["CVE-2024-4577"],
+    })
+    assert line is not None
+    assert "500 honeypot events" in line
+    assert "top ports 22" in line
+    assert "probing CVE-2024-4577" in line
+    assert "opportunistic scanner profile" in line
 
 
 # --- manual observable entry -------------------------------------------------

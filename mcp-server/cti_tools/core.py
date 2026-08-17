@@ -963,18 +963,29 @@ def summarize_honeylabs(result: dict[str, Any]) -> str | None:
     detail = []
     if result.get("events_24h"):
         detail.append(f"{result['events_24h']} in 24h")
-    if result.get("days_active"):
-        detail.append(f"active {result['days_active']}d")
+    first_seen, last_seen = result.get("first_seen"), result.get("last_seen")
+    if first_seen and last_seen:
+        detail.append(f"seen {first_seen[:10]} to {last_seen[:10]}")
     if detail:
         parts[0] += f" ({', '.join(detail)})"
     ports = [str(p.get("port")) for p in (result.get("ports") or [])[:3]
              if isinstance(p, dict) and p.get("port") is not None]
     if ports:
         parts.append(f"top ports {','.join(ports)}")
-    cves = [c.get("id") for c in (result.get("cves") or [])[:3]
-            if isinstance(c, dict) and c.get("id")]
+    # cve_matches item shape unconfirmed (always empty on live samples so
+    # far) - accept either bare strings or dicts carrying an id.
+    cves = [c if isinstance(c, str) else c.get("id")
+            for c in (result.get("cves") or [])[:3]]
+    cves = [c for c in cves if c]
     if cves:
         parts.append(f"probing {', '.join(cves)}")
+    if result.get("verdict"):
+        label = result.get("verdict_label") or result["verdict"]
+        qualifiers = ", ".join(q for q in (result.get("verdict_detail"),
+                                            result.get("verdict_confidence"))
+                               if q)
+        parts.append(f"verdict: {label}" + (f" ({qualifiers})" if qualifiers else ""))
+        return f"HoneyLabs telemetry {today}: {', '.join(parts)}"
     return (f"HoneyLabs telemetry {today}: {', '.join(parts)} - "
             "opportunistic scanner profile, weigh against dedicated-C2 hypotheses")
 

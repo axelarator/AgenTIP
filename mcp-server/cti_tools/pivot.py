@@ -298,25 +298,44 @@ def virustotal_lookup(value: str, kind: str, api_key: str) -> dict[str, Any]:
 
 def honeylabs_lookup(ip: str, api_key: str) -> dict[str, Any]:
     """Honeypot-fleet telemetry for an IP via HoneyLabs' lookup API:
-    event volume/recency across their sensors plus the ports,
-    client fingerprints, and CVEs it was seen probing. Raises PivotError
-    on request failure (including HTTP 429/402 when the rate limit or
+    event volume/recency across their sensors, their own verdict
+    (recognized scanner / threat labeling), plus the ports, client
+    fingerprints, and CVEs it was seen probing. Raises PivotError on
+    request failure (including HTTP 429/402 when the rate limit or
     daily credit budget is exhausted) - the caller decides whether
-    that's fatal or just a missing section in a larger result."""
+    that's fatal or just a missing section in a larger result.
+
+    Response shapes confirmed against the live endpoint (2026-08-17):
+    an unobserved IP returns a compact {"observed": false,
+    "total_events": 0, "message": ...}; an observed one returns rich
+    top-level fields (total_events, events_24h/7d, first/last_seen,
+    verdict{...}, geo{...}, known_scanners, top_ports, fingerprints,
+    cve_matches, malware, ...) - NOT the "totals" wrapper the public
+    docs sketch."""
     data = _get_json(f"https://honeylabs.net/lookup/{ip}?format=json",
                      {"Authorization": f"Bearer {api_key}"})
     if not isinstance(data, dict):
         raise PivotError("unexpected HoneyLabs response shape")
-    totals = data.get("totals") or {}
+    geo = data.get("geo") or {}
+    verdict = data.get("verdict") or {}
     return {
-        "country": data.get("country"),
-        "asn": data.get("asn"),
-        "events": totals.get("events"),
-        "events_24h": totals.get("events_24h"),
-        "days_active": totals.get("days_active"),
-        "ports": data.get("ports"),
+        "events": data.get("total_events"),
+        "events_24h": data.get("events_24h"),
+        "events_7d": data.get("events_7d"),
+        "first_seen": data.get("first_seen"),
+        "last_seen": data.get("last_seen"),
+        "country": geo.get("country_code"),
+        "asn": geo.get("asn"),
+        "as_org": geo.get("org"),
+        "verdict": verdict.get("verdict"),
+        "verdict_label": verdict.get("label"),
+        "verdict_detail": verdict.get("detail"),
+        "verdict_confidence": verdict.get("confidence"),
+        "known_scanners": data.get("known_scanners"),
+        "ports": data.get("top_ports"),
         "fingerprints": data.get("fingerprints"),
-        "cves": data.get("cves"),
+        "cves": data.get("cve_matches"),
+        "malware": data.get("malware"),
     }
 
 

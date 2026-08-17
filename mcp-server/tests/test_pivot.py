@@ -272,6 +272,9 @@ def test_hackertarget_reverse_ip_no_records_message_is_error(monkeypatch):
 
 
 def test_honeylabs_lookup_url_auth_and_normalization(monkeypatch):
+    # Field names mirror a real observed-IP response captured 2026-08-17
+    # (shodan census IP), not the "totals"-wrapper shape the public docs
+    # sketch - see honeylabs_lookup's docstring.
     seen = {}
 
     def fake_get_json(url, headers=None):
@@ -279,31 +282,47 @@ def test_honeylabs_lookup_url_auth_and_normalization(monkeypatch):
         seen["headers"] = headers
         return {
             "ip": "203.0.113.5",
-            "country": "NL",
-            "asn": 202425,
-            "totals": {"events": 481223, "events_24h": 1842, "days_active": 87},
-            "ports": [{"port": 22, "count": 124091}],
-            "fingerprints": {"tls": [{"ja4": "t13d1516h2_x", "count": 12}]},
-            "cves": [{"id": "CVE-2024-4577", "count": 12}],
+            "total_events": 3872,
+            "events_24h": 22,
+            "events_7d": 140,
+            "first_seen": "2026-02-16T14:23:04",
+            "last_seen": "2026-08-17T10:42:23",
+            "geo": {"country_code": "US", "asn": 10439, "org": "CariNet, Inc."},
+            "verdict": {"verdict": "scanner", "label": "Recognized scanner",
+                        "detail": "shodan", "confidence": "high"},
+            "known_scanners": ["shodan"],
+            "top_ports": [{"port": 8443, "proto": "tcp", "count": 68}],
+            "fingerprints": {"ssh_hassh": ["a704be05"], "tls_ja4": ["t12i570500_x"]},
+            "cve_matches": [],
+            "malware": [],
         }
     monkeypatch.setattr(pivot, "_get_json", fake_get_json)
     result = pivot.honeylabs_lookup("203.0.113.5", "hlk_fake")
     assert seen["url"] == "https://honeylabs.net/lookup/203.0.113.5?format=json"
     assert seen["headers"] == {"Authorization": "Bearer hlk_fake"}
-    assert result["events"] == 481223
-    assert result["events_24h"] == 1842
-    assert result["days_active"] == 87
-    assert result["country"] == "NL"
-    assert result["asn"] == 202425
-    assert result["ports"] == [{"port": 22, "count": 124091}]
-    assert result["cves"] == [{"id": "CVE-2024-4577", "count": 12}]
+    assert result["events"] == 3872
+    assert result["events_24h"] == 22
+    assert result["first_seen"] == "2026-02-16T14:23:04"
+    assert result["country"] == "US"
+    assert result["asn"] == 10439
+    assert result["as_org"] == "CariNet, Inc."
+    assert result["verdict"] == "scanner"
+    assert result["verdict_label"] == "Recognized scanner"
+    assert result["known_scanners"] == ["shodan"]
+    assert result["ports"] == [{"port": 8443, "proto": "tcp", "count": 68}]
+    assert result["cves"] == []
 
 
-def test_honeylabs_lookup_tolerates_missing_totals(monkeypatch):
-    monkeypatch.setattr(pivot, "_get_json", lambda url, headers=None: {"ip": "203.0.113.5"})
+def test_honeylabs_lookup_unobserved_ip_shape(monkeypatch):
+    # Live no-activity shape: compact, no geo/verdict/top_ports at all.
+    monkeypatch.setattr(pivot, "_get_json", lambda url, headers=None: {
+        "ip": "203.0.113.5", "observed": False, "total_events": 0,
+        "message": "No activity observed for this IP in our sensor network."})
     result = pivot.honeylabs_lookup("203.0.113.5", "hlk_fake")
-    assert result["events"] is None
+    assert result["events"] == 0
     assert result["events_24h"] is None
+    assert result["verdict"] is None
+    assert result["country"] is None
 
 
 def test_honeylabs_lookup_http_error_propagates(monkeypatch):
