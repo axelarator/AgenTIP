@@ -18,5 +18,11 @@ data/clusters/*
 # work state, not tracked intel.
 data/pending_fingerprints.json
 
+# Actor-tracking time-series layer (DuckDB store, report inbox/archive,
+# daily digests/narratives, cron logs) - same sensitivity rationale as
+# data/clusters/ above.
+data/tracking/*
+!data/tracking/.gitkeep
+
 # Harness-local state
 .claude/settings.local.json

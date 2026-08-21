@@ -5,6 +5,7 @@ description = "Self-hosted MCP server + CLI for threat cluster tracking"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.2.0",
+    "duckdb>=1.0",
 ]
 
 [project.optional-dependencies]
