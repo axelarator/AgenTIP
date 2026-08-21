@@ -1,13 +1,18 @@
 """Budgeted daily enrichment: HoneyLabs telemetry + registry ASN data,
 with ASN-change detection against prior observations.
 
-Budget model: HoneyLabs' free tier is ~500 credits/day at 10 req/min,
-and every call rides the Win11 VM SSH hop, so the loop is serial,
-paced, and capped (CTI_HL_BUDGET, default 400 - leaving headroom for
-interactive pivot_observable use). Registry lookups (RIPEstat +
-rdap.org, free/no-key but same SSH hop) get their own smaller cap.
-A 402/429 mid-loop stops further HoneyLabs calls but keeps everything
-already collected - enrichment degrades, never crashes.
+HoneyLabs telemetry comes over their hosted MCP server (see hl_mcp for
+why, and for the OPSEC exception it makes): one session per batch,
+back-to-back calls with light pacing, so the HoneyLabs phase runs in
+minutes rather than the half hour the direct 10 req/min API took. The
+MCP quota is not publicly documented, so the batch stays capped
+(CTI_HL_BUDGET, default 400); mid-batch 429s adaptively slow the pace
+with backoff retries, and a credit-exhausted (402) or persistently
+rate-limited response stops further HoneyLabs calls but keeps
+everything already collected - enrichment degrades, never crashes.
+
+Registry lookups (RIPEstat + rdap.org, free/no-key, still via the
+Win11 VM SSH hop) run as a second phase with their own smaller cap.
 
 Deliberately bypasses core.honeylabs_context: its TTL cache is sized
 for interactive pivots and would mask the staleness this pipeline
@@ -15,9 +20,9 @@ exists to measure.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -25,12 +30,17 @@ from typing import Any
 import duckdb
 
 from .. import pivot
-from . import store
+from . import hl_mcp, store
 
 log = logging.getLogger(__name__)
 
 HL_DAILY_BUDGET = int(os.environ.get("CTI_HL_BUDGET", "400"))
-HL_MIN_INTERVAL = float(os.environ.get("CTI_HL_MIN_INTERVAL", "6.5"))
+HL_MIN_INTERVAL = float(os.environ.get("CTI_HL_MIN_INTERVAL", "6.0"))
+HL_RATE_RETRY_SECS = float(os.environ.get("CTI_HL_RATE_RETRY_SECS", "30"))
+HL_RATE_MAX_RETRIES = 3
+HL_MAX_INTERVAL = 15.0
+HL_PREFILTER_CHUNK = 32
+HL_MAX_CONSECUTIVE_ERRORS = 5
 RDAP_DAILY_CAP = int(os.environ.get("CTI_RDAP_CAP", "150"))
 RECHECK_AFTER_DAYS = 7      # HoneyLabs re-check window
 RDAP_RECHECK_DAYS = 30      # registry data moves much slower
@@ -136,39 +146,121 @@ def _registry_lookup(ip: str) -> dict[str, Any]:
     return result
 
 
+async def _hl_phase(results: list[EnrichResult], api_key: str,
+                    notes: dict[str, Any]) -> None:
+    """Two passes over one MCP session, paced under the shared 10/min
+    limit: first prefilter the worklist in /32 cidr_set chunks (one
+    call per HL_PREFILTER_CHUNK IPs; a 0 count is an observed absence,
+    recorded without a per-IP call), then full lookups for just the
+    IPs with events. A 429 widens the inter-call interval for the rest
+    of the batch, backs off, and retries a few times; a
+    credit-exhausted (402) response, a still-limited call after all
+    retries, or a run of consecutive failures (dead session) ends the
+    phase early, keeping everything already collected."""
+    consecutive_errors = 0
+    interval = HL_MIN_INTERVAL
+    calls_made = 0
+
+    class _StopPhase(Exception):
+        pass
+
+    async def _paced(fn, *args, label=""):
+        """Pace, call, and retry-on-429; raises _StopPhase when the
+        phase should end (quota gone or the session looks dead)."""
+        nonlocal interval, calls_made, consecutive_errors
+        for attempt in range(HL_RATE_MAX_RETRIES + 1):
+            if calls_made:
+                await asyncio.sleep(interval)
+            try:
+                out = await fn(*args)
+                calls_made += 1
+                notes["hl_calls"] += 1
+                consecutive_errors = 0
+                return out
+            except pivot.PivotError as e:
+                calls_made += 1
+                rate, budget = hl_mcp.is_rate_or_budget(str(e))
+                if rate and not budget and attempt < HL_RATE_MAX_RETRIES:
+                    interval = min(max(interval * 2, 1.0), HL_MAX_INTERVAL)
+                    log.info("HoneyLabs MCP rate limit at %s; backing off "
+                             "%ss and slowing pace to %.1fs",
+                             label, HL_RATE_RETRY_SECS, interval)
+                    await asyncio.sleep(HL_RATE_RETRY_SECS)
+                    continue
+                notes["errors"] += 1
+                if rate or budget:
+                    notes["budget_exhausted"] = True
+                    log.warning("HoneyLabs budget/rate limit hit at %s; "
+                                "no further lookups today", label)
+                    raise _StopPhase from e
+                consecutive_errors += 1
+                if consecutive_errors >= HL_MAX_CONSECUTIVE_ERRORS:
+                    log.warning("%d consecutive HoneyLabs MCP failures at "
+                                "%s; abandoning telemetry for this run",
+                                consecutive_errors, label)
+                    raise _StopPhase from e
+                raise
+
+    pending: list[EnrichResult] = []
+    try:
+        async with hl_mcp.open_session(api_key) as session:
+            for start in range(0, len(results), HL_PREFILTER_CHUNK):
+                chunk = results[start:start + HL_PREFILTER_CHUNK]
+                ips = [r.ip for r in chunk]
+                try:
+                    counts = await _paced(hl_mcp.prefilter, session, ips,
+                                          label=f"prefilter[{ips[0]}..]")
+                except pivot.PivotError as e:
+                    # Chunk-shaped failure only; fall back to per-IP.
+                    log.warning("prefilter chunk failed (%s); falling back "
+                                "to per-IP lookups for %d IPs", e, len(ips))
+                    pending.extend(chunk)
+                    continue
+                for r in chunk:
+                    if counts.get(r.ip) == 0:
+                        r.honeylabs = hl_mcp.not_observed()
+                        notes["hl_prefiltered_absent"] += 1
+                    else:
+                        pending.append(r)
+            log.info("HoneyLabs prefilter: %d of %d IPs absent, "
+                     "%d full lookups to go",
+                     notes["hl_prefiltered_absent"], len(results),
+                     len(pending))
+            for res in pending:
+                try:
+                    res.honeylabs = await _paced(hl_mcp.lookup, session,
+                                                 res.ip, label=res.ip)
+                except pivot.PivotError as e:
+                    res.errors.append(f"honeylabs: {e}")
+    except _StopPhase:
+        return
+
+
 def enrich_ips(ips: list[str], rdap_due: set[str],
                api_key: str | None = None) -> tuple[list[EnrichResult], dict[str, Any]]:
     """Network phase - callers must NOT hold a DuckDB connection while
     this runs (it can take minutes at the paced rate)."""
     api_key = api_key or os.environ.get(pivot.HONEYLABS_API_KEY_ENV)
-    notes: dict[str, Any] = {"hl_calls": 0, "registry_calls": 0,
-                             "budget_exhausted": False,
+    notes: dict[str, Any] = {"hl_calls": 0, "hl_prefiltered_absent": 0,
+                             "registry_calls": 0, "budget_exhausted": False,
                              "hl_skipped": api_key is None, "errors": 0}
-    results: list[EnrichResult] = []
-    hl_available = api_key is not None
-    for i, ip in enumerate(ips):
-        res = EnrichResult(ip=ip)
-        if hl_available:
-            if i:
-                time.sleep(HL_MIN_INTERVAL)
-            try:
-                res.honeylabs = pivot.honeylabs_lookup(ip, api_key)
-                notes["hl_calls"] += 1
-            except pivot.PivotError as e:
-                msg = str(e)
-                res.errors.append(f"honeylabs: {msg}")
-                notes["errors"] += 1
-                if "402" in msg or "429" in msg:
-                    hl_available = False
-                    notes["budget_exhausted"] = True
-                    log.warning("HoneyLabs budget/rate limit hit at %s; "
-                                "no further lookups today", ip)
+    results = [EnrichResult(ip=ip) for ip in ips]
+    if api_key is not None and results:
+        try:
+            asyncio.run(_hl_phase(results, api_key, notes))
+        except pivot.PivotError as e:
+            # Session never came up (or died unrecoverably); registry
+            # phase still runs.
+            notes["errors"] += 1
+            notes["hl_session_error"] = str(e)
+            log.warning("HoneyLabs MCP session failed: %s", e)
+    for res in results:
         hl_asn = _as_int((res.honeylabs or {}).get("asn"))
-        want_registry = ip in rdap_due or (res.honeylabs is not None and hl_asn is None)
+        want_registry = (res.ip in rdap_due
+                         or (res.honeylabs is not None and hl_asn is None))
         if want_registry and notes["registry_calls"] < RDAP_DAILY_CAP:
-            res.registry = _registry_lookup(ip)
+            res.registry = _registry_lookup(res.ip)
             notes["registry_calls"] += 1
-        results.append(res)
     return results, notes
 
 

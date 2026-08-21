@@ -77,9 +77,16 @@ from the cluster store: `daily_tracking.py --seed`.
 
 ## Budget etiquette
 
-HoneyLabs is ~500 credits/day and 10 req/min, shared with interactive
-`pivot_observable` use. The daily loop caps itself at CTI_HL_BUDGET
-(default 400) and paces calls; don't burn the remainder on bulk
+HoneyLabs' free tier is ~500 credits/day at 10 req/min, shared across
+every surface - the daily loop, interactive `pivot_observable`, and
+the `honeylabs` MCP tools all draw on the same key. The daily loop
+queries HoneyLabs over their hosted MCP server (mcp.honeylabs.net,
+same `HONEYLABS_API_KEY`) and stays within the rate limit by
+prefiltering: each chunk of 32 tracked IPs is checked as one /32
+cidr_set call, and only IPs with events get a full lookup, so a
+300-IP day is ~10-40 calls instead of 300. It still caps itself at
+CTI_HL_BUDGET (default 400) and paces at CTI_HL_MIN_INTERVAL (default
+6s, self-slowing on 429s). Don't burn the remainder on bulk
 interactive lookups - for one-off "is this IP noisy" questions use
 `pivot_observable` (cached) rather than raw HoneyLabs lookups. Heavy
 HoneyLabs event counts on an IP usually mean mass-scanner noise, not

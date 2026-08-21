@@ -58,6 +58,8 @@ def main() -> int:
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # One httpx INFO line per MCP call would swamp the cron log.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     day: date = args.date
     sections: dict = {"status": {}}
 

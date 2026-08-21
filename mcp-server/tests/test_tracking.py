@@ -11,8 +11,10 @@ from datetime import date, datetime, timedelta
 import duckdb
 import pytest
 
+from contextlib import asynccontextmanager
+
 from cti_tools import pivot
-from cti_tools.tracking import analytics, digest, enrich, ingest, store
+from cti_tools.tracking import analytics, digest, enrich, hl_mcp, ingest, store
 from cti_tools.tracking import opensearch_xref
 
 
@@ -109,6 +111,27 @@ def test_ingest_json_and_rerun_is_idempotent(tmp_path):
 
 # ---------------------------------------------------------------- enrich
 
+def _fake_hl(monkeypatch, lookup_fn, counts_fn=None):
+    """Stand in for the HoneyLabs MCP session: open_session yields a
+    dummy, lookup delegates to a sync per-IP function (which may raise
+    PivotError, like the real one). By default the prefilter marks
+    every IP active so tests exercise the per-IP path; pass counts_fn
+    to control it."""
+    @asynccontextmanager
+    async def fake_session(api_key):
+        yield None
+
+    async def fake_lookup(session, ip):
+        return lookup_fn(ip)
+
+    async def fake_prefilter(session, ips):
+        return counts_fn(ips) if counts_fn else {ip: 1 for ip in ips}
+
+    monkeypatch.setattr(hl_mcp, "open_session", fake_session)
+    monkeypatch.setattr(hl_mcp, "lookup", fake_lookup)
+    monkeypatch.setattr(hl_mcp, "prefilter", fake_prefilter)
+
+
 @pytest.fixture
 def fake_net(monkeypatch):
     """Fake HoneyLabs/RIPEstat/RDAP in the live normalized shapes."""
@@ -122,7 +145,7 @@ def fake_net(monkeypatch):
           "known_scanners": None,
           "ports": [{"port": 22, "count": 9}, {"port": 445, "count": 2}],
           "fingerprints": [], "cves": [], "malware": []}
-    monkeypatch.setattr(pivot, "honeylabs_lookup", lambda ip, key: dict(hl))
+    _fake_hl(monkeypatch, lambda ip: dict(hl))
     monkeypatch.setattr(pivot, "ripestat_lookup",
                         lambda ip: {"asn": [64512], "as_holder": "TEST-HOLDER",
                                     "geolocation": {"country": "NL"}})
@@ -160,7 +183,8 @@ def test_enrich_writes_rows_and_first_seen(fake_net):
     with store.connect() as con:
         _seed_actor_ip(con)
     results, notes = enrich.enrich_ips(["203.0.113.7"], {"203.0.113.7"})
-    assert notes["hl_calls"] == 1 and notes["registry_calls"] == 1
+    # 2 = prefilter chunk + full lookup
+    assert notes["hl_calls"] == 2 and notes["registry_calls"] == 1
     with store.connect() as con:
         summary = enrich.apply_results(con, results, TODAY)
         sources = {r[0] for r in con.execute(
@@ -214,19 +238,102 @@ def test_netname_change(fake_net):
 def test_hl_budget_exhaustion_mid_loop(fake_net, monkeypatch):
     calls = []
 
-    def hl(ip, key):
+    def hl(ip):
         calls.append(ip)
         if len(calls) >= 2:
             raise pivot.PivotError("HTTP 402: credits exhausted")
         return {"events": 1, "asn": 64512, "ports": []}
 
-    monkeypatch.setattr(pivot, "honeylabs_lookup", hl)
+    _fake_hl(monkeypatch, hl)
     results, notes = enrich.enrich_ips(
         ["203.0.113.1", "203.0.113.2", "203.0.113.3"], set())
     assert notes["budget_exhausted"] is True
     assert calls == ["203.0.113.1", "203.0.113.2"]  # third never attempted
     assert results[0].honeylabs is not None
     assert results[2].honeylabs is None
+
+
+def test_hl_rate_limit_retries_once(fake_net, monkeypatch):
+    monkeypatch.setattr(enrich, "HL_RATE_RETRY_SECS", 0.0)
+    calls = []
+
+    def hl(ip):
+        calls.append(ip)
+        if len(calls) == 1:
+            raise pivot.PivotError("HTTP 429: rate limited")
+        return {"events": 1, "asn": 64512, "ports": []}
+
+    _fake_hl(monkeypatch, hl)
+    results, notes = enrich.enrich_ips(["203.0.113.1", "203.0.113.2"], set())
+    # 3 = one prefilter chunk + two per-IP lookups (the 429'd attempt
+    # doesn't count)
+    assert notes["hl_calls"] == 3 and notes["budget_exhausted"] is False
+    assert calls == ["203.0.113.1"] * 2 + ["203.0.113.2"]
+    assert results[0].honeylabs is not None
+
+
+def test_hl_prefilter_skips_absent_ips(fake_net, monkeypatch):
+    calls = []
+
+    def hl(ip):
+        calls.append(ip)
+        return {"events": 5, "asn": 64512, "ports": []}
+
+    _fake_hl(monkeypatch, hl,
+             counts_fn=lambda ips: {ip: (5 if ip == "203.0.113.2" else 0)
+                                    for ip in ips})
+    results, notes = enrich.enrich_ips(
+        ["203.0.113.1", "203.0.113.2", "203.0.113.3"], set())
+    assert calls == ["203.0.113.2"]  # absent IPs never looked up
+    assert notes["hl_prefiltered_absent"] == 2
+    assert notes["hl_calls"] == 2  # one prefilter + one full lookup
+    assert results[0].honeylabs["events"] == 0
+    assert results[0].honeylabs["verdict"] is None
+    assert results[1].honeylabs["events"] == 5
+
+
+def test_hl_session_failure_still_does_registry(monkeypatch):
+    monkeypatch.setenv("HONEYLABS_API_KEY", "k")
+
+    @asynccontextmanager
+    async def broken_session(api_key):
+        raise pivot.PivotError("honeylabs mcp session failed: boom")
+        yield None
+
+    monkeypatch.setattr(hl_mcp, "open_session", broken_session)
+    monkeypatch.setattr(pivot, "ripestat_lookup",
+                        lambda ip: {"asn": [65001], "as_holder": "X"})
+    monkeypatch.setattr(pivot, "rdap_lookup",
+                        lambda v, k: {"name": "N", "handle": "H"})
+    results, notes = enrich.enrich_ips(["203.0.113.1"], {"203.0.113.1"})
+    assert "hl_session_error" in notes and notes["hl_calls"] == 0
+    assert results[0].honeylabs is None
+    assert results[0].registry["asn"] == 65001
+
+
+def test_hl_mcp_normalize_observed_and_not():
+    raw = {"total_events": 28, "first_seen": "2026-07-20T17:24:39",
+           "last_seen": "2026-07-21T00:29:47", "asn_number": 213790,
+           "asn_org": "Limited Network LTD", "country_code": "IR",
+           "ports_targeted": [1000], "scanner": None,
+           "verdict": "Low-level probing", "verdict_key": "probing",
+           "verdict_why": ["28 event(s)", "no exploit payloads"],
+           "verdict_confidence": "low", "cve_probes": []}
+    norm = hl_mcp.normalize(raw)
+    assert norm["events"] == 28 and norm["asn"] == 213790
+    assert norm["as_org"] == "Limited Network LTD" and norm["country"] == "IR"
+    assert norm["verdict"] == "probing"
+    assert norm["verdict_label"] == "Low-level probing"
+    assert norm["ports"] == [1000] and norm["cves"] is None
+
+    empty = hl_mcp.normalize(
+        {"total_events": 0, "first_seen": "1970-01-01T00:00:00",
+         "last_seen": "1970-01-01T00:00:00", "asn_number": 0, "asn_org": "",
+         "country_code": "", "ports_targeted": [], "scanner": None,
+         "verdict": "Not observed", "verdict_key": "none", "cve_probes": []})
+    assert empty["events"] == 0
+    assert empty["first_seen"] is None and empty["last_seen"] is None
+    assert empty["asn"] is None and empty["verdict"] is None
 
 
 def test_enrich_without_key_skips_honeylabs(monkeypatch):
