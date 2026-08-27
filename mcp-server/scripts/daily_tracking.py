@@ -8,11 +8,14 @@ tokens. Run from cron (see setup.sh output) or manually:
     ... --skip-enrich   # no network calls (fast local re-run)
     ... --dry-run       # report what would be enriched, write nothing
 
-Sequence: init schema -> ingest inbox -> enrich (worklist, then the
-paced network loop with NO db connection held, then one write batch)
--> Zeek xref -> analytics -> digest. Every phase failure is recorded
-in the digest and the run continues; the exit code is nonzero only if
-the digest itself cannot be written, so cron mail stays meaningful.
+Sequence: init schema -> ingest inbox -> register new clusters (any
+data/clusters/*.json not yet tracked) -> pivot sweep (RDAP/RIPEstat/
+Shodan/ThreatFox lifecycle+port check for every cluster, via
+core.pivot_cluster) -> enrich (worklist, then the paced network loop
+with NO db connection held, then one write batch) -> Zeek xref ->
+analytics -> digest. Every phase failure is recorded in the digest and
+the run continues; the exit code is nonzero only if the digest itself
+cannot be written, so cron mail stays meaningful.
 """
 from __future__ import annotations
 
@@ -93,7 +96,26 @@ def main() -> int:
             return ingest.ingest_inbox(con)
     sections["ingest"] = phase("ingest", _ingest)
 
+    def _register():
+        with store.connect() as con:
+            return ingest.register_new_clusters(con)
+    sections["register"] = phase("register", _register)
+
     if not args.skip_enrich:
+        def _pivot_sweep():
+            from cti_tools import core  # deferred: pulls in the whole cluster stack
+            errors: dict[str, str] = {}
+            swept = 0
+            for slug in core.list_clusters():
+                try:
+                    core.pivot_cluster(slug)
+                except Exception as e:  # one bad cluster shouldn't sink the sweep
+                    errors[slug] = str(e)
+                else:
+                    swept += 1
+            return {"clusters_swept": swept, "errors": errors}
+        sections["pivot_sweep"] = phase("pivot_sweep", _pivot_sweep)
+
         def _enrich():
             with store.connect() as con:
                 worklist, rdap_due = enrich.build_worklist(con)

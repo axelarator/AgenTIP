@@ -59,11 +59,15 @@ def build_worklist(con: duckdb.DuckDBPyConnection,
                    budget: int = HL_DAILY_BUDGET) -> tuple[list[str], set[str]]:
     """(ips_to_enrich, rdap_due) - never-enriched tracked IPs first,
     then the stalest re-checks, truncated to budget."""
+    # HoneyLabs/RDAP/RIPEstat are IP-only sources - exclude domain
+    # observations (e.g. from pivot_cluster's Shodan/ThreatFox history
+    # logging) so they don't reach the IP-prefilter/CIDR logic below.
     fresh_cutoff = datetime.now() - timedelta(days=RECHECK_AFTER_DAYS)
     never = [r[0] for r in con.execute(
         """SELECT DISTINCT o.indicator_value FROM observations o
            JOIN actors a ON a.actor_name = o.actor
-           WHERE a.tracked AND NOT EXISTS (
+           WHERE a.tracked AND o.indicator_type IN ('ipv4', 'ipv6')
+             AND NOT EXISTS (
                SELECT 1 FROM observations e
                WHERE e.indicator_value = o.indicator_value
                  AND e.source = 'honeylabs')
@@ -73,6 +77,7 @@ def build_worklist(con: duckdb.DuckDBPyConnection,
            JOIN observations o ON o.indicator_value = e.indicator_value
            JOIN actors a ON a.actor_name = o.actor
            WHERE a.tracked AND e.source = 'honeylabs'
+             AND o.indicator_type IN ('ipv4', 'ipv6')
            GROUP BY e.indicator_value
            HAVING max(e.observed_at) < ?
            ORDER BY max(e.observed_at)""", [fresh_cutoff]).fetchall()]

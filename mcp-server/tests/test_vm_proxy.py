@@ -62,6 +62,31 @@ def test_http_fetch_raises_on_error_field(monkeypatch):
         vm_proxy.http_fetch("https://example.com")
 
 
+def test_http_fetch_passes_method_and_data_through(monkeypatch):
+    captured = {}
+
+    def fake_rpc(request):
+        captured.update(request)
+        return {"status": 200, "body": "{}", "error": None}
+
+    monkeypatch.setattr(vm_proxy, "_ssh_json_rpc", fake_rpc)
+    vm_proxy.http_fetch("https://example.com", method="POST", data='{"query": "search_ioc"}')
+    assert captured["method"] == "POST"
+    assert captured["data"] == '{"query": "search_ioc"}'
+
+
+def test_http_fetch_defaults_data_to_none(monkeypatch):
+    captured = {}
+
+    def fake_rpc(request):
+        captured.update(request)
+        return {"status": 200, "body": "hello", "error": None}
+
+    monkeypatch.setattr(vm_proxy, "_ssh_json_rpc", fake_rpc)
+    vm_proxy.http_fetch("https://example.com")
+    assert captured["data"] is None
+
+
 def test_resolve_dns_resolved(monkeypatch):
     monkeypatch.setattr(vm_proxy, "_ssh_json_rpc",
                         lambda request: {"status": "resolved", "addrs": ["1.2.3.4"]})

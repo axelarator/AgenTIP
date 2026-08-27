@@ -12,6 +12,7 @@ starlette/uvicorn as transitive deps of the `mcp` package:
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -20,8 +21,11 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from cti_tools import core
+from cti_tools.tracking import digest as tracking_digest
+from cti_tools.tracking import store as tracking_store
 
 STATIC_DIR = Path(__file__).parent / "static"
+_NARRATIVE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _cluster_summary(name: str) -> dict:
@@ -114,6 +118,39 @@ async def pending_fingerprints(request):
     return JSONResponse(core.list_pending_fingerprints())
 
 
+async def tracking_observables(request):
+    result = tracking_store.tracked_observables()
+    if "error" in result:
+        return JSONResponse(result, status_code=503)
+    return JSONResponse(result)
+
+
+async def tracking_observable_detail(request):
+    result = tracking_store.observable_history(request.path_params["ip"])
+    if "error" in result:
+        return JSONResponse(result, status_code=503)
+    return JSONResponse(result)
+
+
+async def tracking_narratives(request):
+    ndir = tracking_digest.narrative_dir()
+    if not ndir.is_dir():
+        return JSONResponse({"dates": []})
+    dates = sorted((p.stem for p in ndir.glob("*.md") if _NARRATIVE_DATE_RE.match(p.stem)),
+                   reverse=True)
+    return JSONResponse({"dates": dates})
+
+
+async def tracking_narrative_detail(request):
+    day = request.path_params["date"]
+    if not _NARRATIVE_DATE_RE.match(day):
+        return JSONResponse({"error": "invalid date"}, status_code=400)
+    path = tracking_digest.narrative_dir() / f"{day}.md"
+    if not path.is_file():
+        return JSONResponse({"error": f"no narrative for {day}"}, status_code=404)
+    return JSONResponse({"date": day, "content": path.read_text()})
+
+
 routes = [
     Route("/api/stats", stats),
     Route("/api/clusters", list_clusters),
@@ -122,6 +159,10 @@ routes = [
     Route("/api/techniques/{technique_id}", technique_detail),
     Route("/api/observables/search", observable_search),
     Route("/api/pending-fingerprints", pending_fingerprints),
+    Route("/api/tracking/observables", tracking_observables),
+    Route("/api/tracking/observables/{ip}", tracking_observable_detail),
+    Route("/api/tracking/narratives", tracking_narratives),
+    Route("/api/tracking/narratives/{date}", tracking_narrative_detail),
     Mount("/", app=StaticFiles(directory=str(STATIC_DIR), html=True), name="static"),
 ]
 

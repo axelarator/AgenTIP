@@ -26,6 +26,16 @@ def digest_dir() -> Path:
                                _REPO_ROOT / "data" / "tracking" / "digests"))
 
 
+def narrative_dir() -> Path:
+    """Where Stage B (scripts/daily_narrative.sh) writes its one
+    markdown file per day. That script hardcodes the same default path
+    rather than reading this env var - CTI_TRACKING_NARRATIVES exists
+    here for parity with digest_dir() (tests, dashboard) but isn't yet
+    plumbed into the shell script."""
+    return Path(os.environ.get("CTI_TRACKING_NARRATIVES",
+                               _REPO_ROOT / "data" / "tracking" / "narratives"))
+
+
 def _fmt(value: Any) -> str:
     if isinstance(value, (datetime, date)):
         return value.isoformat(sep=" ") if isinstance(value, datetime) else value.isoformat()
@@ -47,12 +57,14 @@ def _table(rows: list[dict[str, Any]], columns: list[str]) -> list[str]:
 def _has_signals(sections: dict[str, Any]) -> bool:
     ingest = sections.get("ingest") or {}
     enrich = sections.get("enrich") or {}
+    register = sections.get("register") or {}
     # first_seen rows are baselines, not events - a seed-backlog day of
     # nothing but baselines should not wake the Stage B agent.
     changes = [c for c in enrich.get("asn_changes") or []
                if c.get("change_type") != "first_seen"]
     return bool(
         ingest.get("rows_ingested")
+        or register.get("actors_registered")
         or changes
         or sections.get("zeek_matches")
         or sections.get("new_ips_in_known_asns")
@@ -63,9 +75,9 @@ def _has_signals(sections: dict[str, Any]) -> bool:
 def write(day: date, sections: dict[str, Any]) -> Path:
     """Render and write the digest for `day`. `sections` carries the
     phase results assembled by daily_tracking.py: status (per-phase
-    ok/failed), ingest, enrich, enrich_notes, zeek, plus the analytics
-    lists (asn_pivots, zeek_matches, new_ips_in_known_asns,
-    temporal_clusters, recent_actor_activity)."""
+    ok/failed), ingest, register, pivot_sweep, enrich, enrich_notes,
+    zeek, plus the analytics lists (asn_pivots, zeek_matches,
+    new_ips_in_known_asns, temporal_clusters, recent_actor_activity)."""
     out_dir = digest_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
     md_path = out_dir / f"{day.isoformat()}.md"
@@ -80,6 +92,12 @@ def write(day: date, sections: dict[str, Any]) -> Path:
         lines += [f"- {phase}: {result}" for phase, result in failed.items()]
         lines.append("")
 
+    sweep_errors = (sections.get("pivot_sweep") or {}).get("errors") or {}
+    if sweep_errors:
+        lines += ["## Pivot sweep issues", ""]
+        lines += [f"- {slug}: {err}" for slug, err in sweep_errors.items()]
+        lines.append("")
+
     if not _has_signals(sections):
         lines += [NO_ACTIVITY, ""]
         md_path.write_text("\n".join(lines))
@@ -91,6 +109,13 @@ def write(day: date, sections: dict[str, Any]) -> Path:
         lines += [f"- {f['file']}: {f['ingested']} rows"
                   + (f", {f['skipped']} skipped" if f.get("skipped") else "")
                   for f in ingest.get("files", [])]
+        lines.append("")
+
+    register = sections.get("register") or {}
+    if register.get("actors_registered"):
+        lines += ["## New clusters registered for tracking", ""]
+        lines += [f"- {actor}: {count} IPs"
+                  for actor, count in register.get("ips_by_actor", {}).items()]
         lines.append("")
 
     notes = sections.get("enrich_notes") or {}

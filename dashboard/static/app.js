@@ -29,6 +29,7 @@ const CATEGORY_LABELS = {
   cves: "CVEs", wallets: "Wallets", ja4: "JA4", ja4s: "JA4S", ja4h: "JA4H",
   ja4l: "JA4L", ja4x: "JA4X", ja4t: "JA4T", ja4ts: "JA4TS", ja4ssh: "JA4SSH", jarm: "JARM",
 };
+const FINGERPRINT_CATEGORIES = new Set(["ja4", "ja4s", "ja4h", "ja4l", "ja4x", "ja4t", "ja4ts", "ja4ssh", "jarm"]);
 const COVERAGE_LABELS = ["no coverage", "idea only", "built, unvalidated", "validated, in production", "validated + tuned"];
 const DETECTION_STATUS = { draft: ["det-draft", "Draft"], unvalidated: ["det-unvalidated", "Unvalidated"], published: ["det-published", "Published"] };
 
@@ -39,6 +40,22 @@ function formatDate(iso) {
   if (!iso) return "—";
   const m = String(iso).match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
   return m ? `${m[1]} ${m[2]}` : String(iso);
+}
+
+// Date-only variant for first_seen/last_seen fields specifically: those
+// are shown alongside each other in several places and should always
+// read as plain YYYY-MM-DD, never a mix of date-only/datetime/month-only/
+// free-text (cluster-level first_seen/last_seen come from update_profile's
+// free-text params, and real data includes e.g. "2025-09" and
+// "2022-12-01T00:00:00Z" alongside plain dates - see core.py's _date_only,
+// which this mirrors). A day-less YYYY-MM value is padded to its 1st, the
+// conventional stand-in for "day unknown". Returns null (not "—") for
+// blank so callers can pick their own fallback text; anything without at
+// least YYYY-MM passes through unmangled.
+function formatDateOnly(iso) {
+  if (!iso) return null;
+  const m = String(iso).match(/^(\d{4})-(\d{2})(?:-(\d{2}))?/);
+  return m ? `${m[1]}-${m[2]}-${m[3] || "01"}` : String(iso);
 }
 
 function truncate(text, n) {
@@ -77,28 +94,137 @@ function detStatusChip(status) {
   return h("span", { class: "chip", style: `background:var(--${key}-bg);color:var(--${key}-ink)` }, label);
 }
 
+const TRACKING_STATUS = {
+  "in-network": ["track-in-network", "In network"],
+  active: ["track-active", "Active"],
+  moved: ["track-moved", "Moved"],
+  quiet: ["track-quiet", "Quiet"],
+  absent: ["track-absent", "Absent"],
+};
+function trackingStatusChip(status) {
+  const [key, label] = TRACKING_STATUS[status] || ["track-quiet", status || "never enriched"];
+  return h("span", { class: "chip", style: `background:var(--${key}-bg);color:var(--${key}-ink)` }, label);
+}
+
 function clusterChip(name) {
   const match = state.clusters.find((c) => c.name === name);
   return h("a", { class: "chip chip--neutral", style: "text-decoration:none;", href: match ? `#/cluster/${match.slug}` : "#" }, name);
 }
 
-function sourceLink(source) {
+function trackingIpChip(ip) {
+  return h("a", { class: "chip chip--mono chip--neutral", style: "text-decoration:none;",
+    href: `#/tracking/${encodeURIComponent(ip)}` }, ip);
+}
+
+// probe_pending_fingerprints.py's own provenance strings (core.py's
+// pending-fingerprint entries are filed with these two exact formats -
+// see JARM/Zeek add_observable calls): the source names the resolved IP
+// and port, so an Arkime session-viewer deep link can be rebuilt from the
+// text alone. Field names (`ip`, `port`) and query syntax confirmed live
+// against this lab's Arkime instance (10.20.0.18:8005/api/fields).
+const JARM_SOURCE_RE = /^JARM against (.+):(\d+) via .+, (\d{4}-\d{2}-\d{2})$/;
+const ZEEK_SOURCE_RE = /^Zeek passive \(tap107, via OpenSearch\) handshake against (.+):(\d+) \(([\d.]+)\), (\d{4}-\d{2}-\d{2})$/;
+const ARKIME_BASE = "http://10.20.0.18:8005/sessions";
+
+// Both probe_pending_fingerprints.py source formats name the resolved IP
+// and port the probe/Zeek capture actually hit, plus the day it ran - see
+// the JARM/Zeek add_observable calls in that script. Parsed once here and
+// reused both for the Arkime deep link and for the fingerprint table's
+// Target/Checked columns, so a JARM/JA4+ value doesn't require hovering a
+// truncated link label to see what it relates to.
+function parseProbeSource(source) {
+  const zeek = source.match(ZEEK_SOURCE_RE);
+  if (zeek) return { target: zeek[1], port: zeek[2], ip: zeek[3], date: zeek[4] };
+  const jarm = source.match(JARM_SOURCE_RE);
+  if (jarm) {
+    // A JARM probe fires straight at the tracked domain/IP, before any
+    // Zeek-side DNS resolution is recorded - so `target` is only known to
+    // be an IP (and therefore Arkime-queryable) when it already looks
+    // like one; a domain target still shows in the table, just without a
+    // session link.
+    const isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(jarm[1]);
+    return { target: jarm[1], port: jarm[2], ip: isIp ? jarm[1] : null, date: jarm[3] };
+  }
+  return null;
+}
+
+// Query syntax (`ip`, `port` fields) and startTime/stopTime semantics
+// confirmed live against this lab's Arkime instance (10.20.0.18:8005).
+function arkimeSessionUrl(source) {
+  const p = parseProbeSource(source);
+  if (!p || !p.ip) return null;
+  const start = Date.parse(`${p.date}T00:00:00Z`) / 1000;
+  const params = new URLSearchParams({
+    expression: `ip == ${p.ip} && port == ${p.port}`,
+    startTime: String(start), stopTime: String(start + 86400),
+  });
+  return { url: `${ARKIME_BASE}?${params.toString()}`, label: "Arkime" };
+}
+
+// Tracking observations have structured columns (ip, ports, timestamp),
+// not free-text provenance to regex-parse - build the Arkime deep link
+// directly rather than routing through parseProbeSource.
+function trackingArkimeUrl(ip, ports, observedAtIso) {
+  if (!ip || !ports || !ports.length || !observedAtIso) return null;
+  const day = String(observedAtIso).slice(0, 10);
+  const start = Date.parse(`${day}T00:00:00Z`) / 1000;
+  const params = new URLSearchParams({
+    expression: `ip == ${ip} && port == ${ports[0]}`,
+    startTime: String(start), stopTime: String(start + 86400),
+  });
+  return { url: `${ARKIME_BASE}?${params.toString()}`, label: "Arkime" };
+}
+
+// pivot_and_expand's provenance notes (core.py) name the exact lookup
+// service verbatim ("... via VirusTotal resolution history", "... via
+// Hackertarget reverse-IP") - matched here to rebuild a link to that
+// service's own public page for the observable in question, since the
+// note itself is free text, not a URL. (Cert Spotter CT log notes used to
+// link to crt.sh, which has since shut down - no replacement public
+// CT-log search is linked here until one is confirmed working.)
+function pivotSourceUrl(source, category, value) {
+  if (/VirusTotal/i.test(source)) {
+    const bare = category === "hashes" && value.includes(":") ? value.split(":", 2)[1] : value;
+    return { url: `https://www.virustotal.com/gui/search/${encodeURIComponent(bare)}`, label: "VirusTotal" };
+  }
+  const arkime = arkimeSessionUrl(source);
+  if (arkime) return arkime;
+  // Hackertarget's reverse-IP tool has no confirmed deep-link-by-IP query
+  // param - left as plain text below. Credentials for Arkime/OpenSearch are
+  // never embedded here; the browser's own auth challenge handles login.
+  return null;
+}
+
+function sourceLink(source, category, value) {
   let parsed = null;
   try { parsed = new URL(source); } catch (_) { /* provenance note (e.g. a pivot record), not a URL */ }
   if (parsed && (parsed.protocol === "http:" || parsed.protocol === "https:")) {
     return h("a", { class: "source-link", href: source, target: "_blank", rel: "noopener noreferrer" }, parsed.hostname.replace(/^www\./, ""));
   }
-  return h("span", { class: "source-link", style: "cursor:default;", title: source }, truncate(source, 42));
+  const pivot = pivotSourceUrl(source, category, value);
+  if (pivot) {
+    return h("a", { class: "source-link", href: pivot.url, target: "_blank", rel: "noopener noreferrer", title: source }, pivot.label);
+  }
+  return h("span", { class: "source-note", title: source }, truncate(source, 42));
 }
 
 /* ---------- sidebar ---------- */
 async function initSidebar() {
-  const [clusters, pending] = await Promise.all([api("/api/clusters"), api("/api/pending-fingerprints")]);
+  // Tracking DB can be transiently 503 (daily job holding the write
+  // lock) - that badge failing to load shouldn't take the rest of the
+  // sidebar (cluster nav) down with it.
+  const [clusters, pending, tracking] = await Promise.all([
+    api("/api/clusters"), api("/api/pending-fingerprints"),
+    api("/api/tracking/observables").catch(() => ({ observables: [] })),
+  ]);
   state.clusters = clusters;
   document.getElementById("cluster-count").textContent = clusters.length;
   renderClusterList(clusters);
   const badge = document.getElementById("queue-badge");
   if (pending.length) { badge.textContent = String(pending.length); badge.hidden = false; }
+  const inNetworkCount = tracking.observables.filter((o) => o.status === "in-network").length;
+  const trackBadge = document.getElementById("tracking-badge");
+  if (inNetworkCount) { trackBadge.textContent = String(inNetworkCount); trackBadge.hidden = false; }
 }
 
 function renderClusterList(clusters, filter = "") {
@@ -111,11 +237,12 @@ function renderClusterList(clusters, filter = "") {
     || (c.aliases || []).some((a) => a.toLowerCase().includes(f)));
   if (!filtered.length) { list.appendChild(h("div", { class: "empty-state" }, "No clusters match.")); return; }
   for (const c of filtered) {
+    const lastSeen = formatDateOnly(c.last_seen);
     list.appendChild(h("a", { class: "cluster-row", href: `#/cluster/${c.slug}`, "data-slug": c.slug },
       h("div", { class: "cluster-row__top" },
         h("span", { class: "cluster-row__dot", style: `background:${confidenceColor(c.confidence)}` }),
         h("span", { class: "cluster-row__name" }, c.name)),
-      h("div", { class: "cluster-row__meta" }, c.last_seen ? `last seen ${c.last_seen}` : "no activity logged")));
+      h("div", { class: "cluster-row__meta" }, lastSeen ? `last seen ${lastSeen}` : "no activity logged")));
   }
 }
 
@@ -199,15 +326,135 @@ function renderTtps(data) {
   return container;
 }
 
-function renderObservables(data) {
+// JA4+/JARM values are opaque fingerprints - what an analyst actually
+// wants to know at a glance is which IP:port they were captured against
+// and when, not the fingerprint's own first/last-seen bookkeeping. One row
+// per (value, source) pair, since a probe can reproduce the same
+// fingerprint against the same or a different target on a later date.
+function renderFingerprintTable(items) {
+  const rows = [];
+  for (const o of items) {
+    const sources = o.sources && o.sources.length ? o.sources : [null];
+    for (const s of sources) {
+      const p = s ? parseProbeSource(s) : null;
+      rows.push({ value: o.value, target: p ? `${p.target}:${p.port}` : null, date: p ? p.date : null, raw: s, arkime: s ? arkimeSessionUrl(s) : null });
+    }
+  }
+  return h("table", { class: "data-table" },
+    h("thead", {}, h("tr", {}, h("th", {}, "Value"), h("th", {}, "Target"), h("th", {}, "Checked"), h("th", {}, "Session"))),
+    h("tbody", {}, ...rows.map((r) => h("tr", {},
+      h("td", { class: "mono" }, r.value),
+      h("td", { class: "mono" }, r.target || (r.raw ? truncate(r.raw, 40) : "—")),
+      h("td", { class: "mono" }, r.date ? formatDate(r.date) : "—"),
+      h("td", {}, r.arkime ? h("a", { class: "source-link", href: r.arkime.url, target: "_blank", rel: "noopener noreferrer" }, "View in Arkime →") : "—")))));
+}
+
+// ip/domain observables get a profile card (key identifiers + an
+// expandable history timeline) instead of a flat table row - hashes/urls
+// have no ports/ASN/history story, so they keep the plain table.
+const PROFILE_CATEGORIES = new Set(["ips", "domains"]);
+
+const LIFECYCLE_STATUS = {
+  active: "track-active", routed: "track-active",
+  dead: "track-absent", sinkholed: "track-absent",
+  expired: "track-absent", unrouted: "track-absent",
+};
+function lifecycleStatusChip(status) {
+  const key = LIFECYCLE_STATUS[status] || "track-quiet";
+  return h("span", { class: "chip", style: `background:var(--${key}-bg);color:var(--${key}-ink)` },
+    status || "unchecked");
+}
+
+// One dated event per observation/asn-change row, oldest-affecting-last -
+// same shape viewTrackingDetail builds, reused here so a cluster's
+// per-observable profile and the standalone Live Tracking page render
+// history identically from one function.
+function buildProfileTimeline(profile) {
+  if (!profile || profile.error) return [];
+  const events = [
+    ...profile.observations.map((o) => ({ date: o.observed_at, kind: "observation", data: o })),
+    ...profile.asn_changes.map((c) => ({ date: c.detected_at, kind: "asn_change", data: c })),
+  ].sort((a, b) => b.date.localeCompare(a.date));
+  return events.map((e) => trackingEventItem(profile.ip, e));
+}
+
+function latestObservationBySource(profile, source) {
+  if (!profile || profile.error) return null;
+  for (let i = profile.observations.length - 1; i >= 0; i--) {
+    if (profile.observations[i].source === source) return profile.observations[i];
+  }
+  return null;
+}
+
+function renderObservableProfileCard(o, category, profile) {
+  const d = o.status_detail || {};
+  const chips = [];
+  if (category === "ips") {
+    const asn = (d.asn || [])[0];
+    if (asn != null) chips.push(h("span", { class: "chip chip--neutral" }, `AS${asn}` + (d.as_holder ? ` ${d.as_holder}` : "")));
+    if (d.prefix) chips.push(h("span", { class: "chip chip--neutral chip--mono" }, d.prefix));
+    const shodan = latestObservationBySource(profile, "shodan");
+    if (shodan && (shodan.shodan_ports || []).length) {
+      chips.push(h("span", { class: "chip chip--neutral chip--mono" }, `ports: ${shodan.shodan_ports.join(", ")}`));
+    }
+    if (shodan && (shodan.shodan_tags || []).length) {
+      chips.push(...shodan.shodan_tags.map((t) => h("span", { class: "chip chip--neutral" }, t)));
+    }
+  } else if (category === "domains") {
+    if ((d.nameservers || []).length) chips.push(h("span", { class: "chip chip--neutral chip--mono" }, d.nameservers[0]));
+    for (const ip of (d.resolved || [])) chips.push(h("span", { class: "chip chip--neutral chip--mono" }, ip));
+  }
+  const threatfox = latestObservationBySource(profile, "threatfox");
+  for (const m of (threatfox ? threatfox.threatfox_matches || [] : []).slice(0, 3)) {
+    chips.push(h("span", { class: "chip", style: "background:var(--track-in-network-bg);color:var(--track-in-network-ink)" },
+      m.malware || m.threat_type || "IOC match"));
+  }
+
+  const header = h("div", { class: "view-header" },
+    h("div", { class: "view-title mono" }, o.value),
+    h("div", { class: "view-sub" },
+      lifecycleStatusChip(o.status), " ",
+      `first seen ${formatDateOnly(o.first_seen) || "—"} · last seen ${formatDateOnly(o.last_seen) || "—"}`));
+
+  const timelineWrap = h("div", {});
+  let expanded = false;
+  const toggle = h("button", { class: "category-pill", onclick: () => {
+    expanded = !expanded;
+    toggle.textContent = expanded ? "Hide history" : "Show history";
+    timelineWrap.textContent = "";
+    if (expanded) {
+      const events = buildProfileTimeline(profile);
+      timelineWrap.appendChild(events.length
+        ? h("div", { class: "card" }, ...events)
+        : h("div", { class: "empty-state" }, "No history yet — run pivot_cluster to start tracking this indicator."));
+    }
+  } }, "Show history");
+
+  return h("div", { class: "card" }, header,
+    chips.length ? h("div", { class: "link-list" }, ...chips) : null,
+    h("div", { class: "filter-row" }, toggle), timelineWrap);
+}
+
+async function renderObservables(data) {
   const cats = Object.entries(data.observables).filter(([, v]) => v.length > 0);
   if (!cats.length) return h("div", { class: "empty-state" }, "No observables tracked yet.");
   let active = cats[0][0];
   const pillsRow = h("div", { class: "filter-row" });
   const searchInput = h("input", { type: "search", placeholder: "Filter values…", oninput: () => draw() });
   const tableWrap = h("div", { class: "table-wrap" });
+  const profileCache = new Map(); // observable value -> tracking-history fetch (once per value)
+  let drawToken = 0;
 
-  function draw() {
+  function fetchProfile(value) {
+    if (!profileCache.has(value)) {
+      profileCache.set(value, api(`/api/tracking/observables/${encodeURIComponent(value)}`)
+        .catch((e) => ({ error: String(e) })));
+    }
+    return profileCache.get(value);
+  }
+
+  async function draw() {
+    const myToken = ++drawToken;
     pillsRow.textContent = "";
     pillsRow.appendChild(h("div", { class: "category-pills" }, ...cats.map(([cat, items]) =>
       h("button", { class: "category-pill" + (cat === active ? " is-active" : ""), onclick: () => { active = cat; draw(); } },
@@ -216,16 +463,25 @@ function renderObservables(data) {
     const items = cats.find(([c]) => c === active)[1].filter((o) => !f || o.value.toLowerCase().includes(f));
     tableWrap.textContent = "";
     if (!items.length) { tableWrap.appendChild(h("div", { class: "empty-state" }, "No matching values.")); return; }
+    if (FINGERPRINT_CATEGORIES.has(active)) { tableWrap.appendChild(renderFingerprintTable(items)); return; }
+    if (PROFILE_CATEGORIES.has(active)) {
+      tableWrap.appendChild(h("div", { class: "empty-state" }, "Loading profiles…"));
+      const profiles = await Promise.all(items.map((o) => fetchProfile(o.value)));
+      if (myToken !== drawToken) return; // a newer draw (search/pill switch) superseded this one
+      tableWrap.textContent = "";
+      tableWrap.appendChild(h("div", {}, ...items.map((o, i) => renderObservableProfileCard(o, active, profiles[i]))));
+      return;
+    }
     tableWrap.appendChild(h("table", { class: "data-table" },
       h("thead", {}, h("tr", {}, h("th", {}, "Value"), h("th", {}, "First seen"), h("th", {}, "Last seen"), h("th", {}, "Sources"))),
       h("tbody", {}, ...items.map((o) => h("tr", {},
         h("td", { class: "mono" }, o.value),
-        h("td", { class: "mono" }, formatDate(o.first_seen)),
-        h("td", { class: "mono" }, formatDate(o.last_seen)),
-        h("td", {}, h("div", { class: "link-list" }, ...(o.sources || []).slice(0, 3).map(sourceLink))))))));
+        h("td", { class: "mono" }, formatDateOnly(o.first_seen) || "—"),
+        h("td", { class: "mono" }, formatDateOnly(o.last_seen) || "—"),
+        h("td", {}, h("div", { class: "link-list" }, ...(o.sources || []).slice(0, 3).map((s) => sourceLink(s, active, o.value)))))))));
   }
   const container = h("div", {}, pillsRow, h("div", { class: "filter-row" }, searchInput), tableWrap);
-  draw();
+  await draw();
   return container;
 }
 
@@ -261,6 +517,85 @@ function renderHuntLog(data) {
     h("div", { class: "timeline-item__body" }, e.entry))));
 }
 
+function reportSourceCell(source) {
+  let parsed = null;
+  try { parsed = new URL(source); } catch (_) { /* local path (e.g. from a file-based ingest_report call), not a URL */ }
+  if (parsed && (parsed.protocol === "http:" || parsed.protocol === "https:")) {
+    return h("a", { class: "source-link", href: source, target: "_blank", rel: "noopener noreferrer" }, source);
+  }
+  return h("span", { class: "source-note" }, source);
+}
+
+function techniqueChip(id) {
+  return h("a", { class: "chip chip--mono chip--neutral", style: "text-decoration:none;", href: `#/techniques/${encodeURIComponent(id)}` }, id);
+}
+
+// report_sources is one entry per ingest_report call against this cluster
+// (core.py appends, never overwrites) - re-running ingest_report on a
+// source already fully merged just files another entry with all-zero
+// counts (see _merge_observables: `added` only counts values not already
+// tracked). Grouping by source here keeps that repeat-ingest history
+// (visible via the "x N" badge's tooltip) without showing N near-identical
+// rows for what's operationally a single report.
+function groupReportSources(reports) {
+  const bySource = new Map();
+  for (const r of reports) {
+    if (!bySource.has(r.source)) bySource.set(r.source, []);
+    bySource.get(r.source).push(r);
+  }
+  return [...bySource.values()].map((entries) => {
+    const attempts = [...entries].sort((a, b) => (a.ingested || "").localeCompare(b.ingested || ""));
+    const counts = {};
+    for (const a of attempts) {
+      for (const [cat, v] of Object.entries(a.observables_found || {})) counts[cat] = (counts[cat] || 0) + v;
+    }
+    const ttps = [...new Set(attempts.flatMap((a) => a.ttps_found || []))];
+    const skippedByKey = new Map();
+    for (const a of attempts) {
+      for (const s of a.fingerprint_queue_skipped || []) skippedByKey.set(`${s.category}:${s.value}`, s);
+    }
+    return {
+      source: attempts[0].source, attempts, observableCounts: counts, ttps,
+      skipped: [...skippedByKey.values()],
+      lastIngested: attempts[attempts.length - 1].ingested,
+    };
+  });
+}
+
+function renderReports(data) {
+  const reports = data.report_sources || [];
+  if (!reports.length) return h("div", { class: "empty-state" }, "No reports ingested into this cluster yet.");
+  const grouped = groupReportSources(reports).sort((a, b) => (b.lastIngested || "").localeCompare(a.lastIngested || ""));
+  return h("div", { class: "table-wrap" }, h("table", { class: "data-table" },
+    h("thead", {}, h("tr", {},
+      h("th", {}, "Ingested"), h("th", {}, "Source"), h("th", {}, "Times"),
+      h("th", {}, "Observables found"), h("th", {}, "TTPs found"), h("th", {}, "Skipped"))),
+    h("tbody", {}, ...grouped.map((g) => {
+      const total = Object.values(g.observableCounts).reduce((a, v) => a + v, 0);
+      const breakdown = Object.entries(g.observableCounts).filter(([, v]) => v > 0)
+        .map(([cat, v]) => `${CATEGORY_LABELS[cat] || cat} ${v}`).join(", ");
+      return h("tr", {},
+        h("td", { class: "mono" }, formatDate(g.attempts[0].ingested)),
+        h("td", {}, reportSourceCell(g.source)),
+        h("td", {}, g.attempts.length > 1
+          ? h("span", {
+              class: "chip chip--neutral", title: g.attempts.map((a) => {
+                const n = Object.values(a.observables_found || {}).reduce((x, v) => x + v, 0);
+                return `${formatDate(a.ingested)} — ${n} observables, ${(a.ttps_found || []).length} ttps`;
+              }).join("\n"),
+            }, `×${g.attempts.length}`)
+          : "—"),
+        h("td", { title: breakdown || undefined }, String(total)),
+        h("td", {}, g.ttps.length
+          ? h("div", { class: "link-list" }, ...g.ttps.slice(0, 6).map(techniqueChip),
+              g.ttps.length > 6 ? h("span", { class: "chip chip--neutral" }, `+${g.ttps.length - 6}`) : null)
+          : h("span", { class: "source-note" }, "none")),
+        h("td", {}, g.skipped.length
+          ? h("span", { class: "chip chip--neutral", title: g.skipped.map((s) => `${s.value}: ${s.reason}`).join("\n") }, String(g.skipped.length))
+          : "—"));
+    }))));
+}
+
 function renderRelationships(data) {
   const rels = data.relationships || [];
   if (!rels.length) return h("div", { class: "empty-state" }, "No relationships recorded.");
@@ -273,6 +608,7 @@ async function viewCluster(slug, tab) {
   const data = await api(`/api/clusters/${encodeURIComponent(slug)}`);
   const tabs = [
     ["diamond", "Diamond", null],
+    ["reports", "Reports", groupReportSources(data.report_sources || []).length],
     ["ttps", "TTPs", data.ttps.length],
     ["observables", "Observables", Object.values(data.observables).reduce((a, v) => a + v.length, 0)],
     ["detections", "Detections", data.detections.length],
@@ -287,8 +623,8 @@ async function viewCluster(slug, tab) {
     data.aliases.length ? h("div", { class: "cluster-header__aliases" }, ...data.aliases.map((a) => h("span", { class: "chip chip--neutral" }, a))) : null,
     h("div", { class: "cluster-header__desc" }, data.description),
     h("div", { class: "cluster-header__meta" },
-      h("span", {}, "First seen ", h("b", {}, data.first_seen || "—")),
-      h("span", {}, "Last seen ", h("b", {}, data.last_seen || "—")),
+      h("span", {}, "First seen ", h("b", {}, formatDateOnly(data.first_seen) || "—")),
+      h("span", {}, "Last seen ", h("b", {}, formatDateOnly(data.last_seen) || "—")),
       h("span", {}, "STIX ID ", h("b", { style: "font-family:var(--font-mono);font-size:11.5px;font-weight:500;" }, data.stix_id))));
 
   const tabStrip = h("div", { class: "tabs" }, ...tabs.map(([key, label, count]) =>
@@ -296,10 +632,11 @@ async function viewCluster(slug, tab) {
       label, count != null ? h("span", { class: "tab__count" }, count) : null)));
 
   const renderers = {
-    diamond: renderDiamond, ttps: renderTtps, observables: renderObservables,
+    diamond: renderDiamond, reports: renderReports, ttps: renderTtps, observables: renderObservables,
     detections: renderDetections, gaps: renderGaps, hunt_log: renderHuntLog, relationships: renderRelationships,
   };
-  return h("div", {}, header, tabStrip, renderers[activeTab](data));
+  const body = await renderers[activeTab](data); // renderObservables is async; await is a no-op for the rest
+  return h("div", {}, header, tabStrip, body);
 }
 
 /* ---------- technique matrix ---------- */
@@ -369,6 +706,192 @@ async function viewQueue() {
       h("td", { class: "mono" }, formatDate(i.queued_at))))))));
 }
 
+/* ---------- live tracking ---------- */
+const TRACKING_STATUS_ORDER = { "in-network": 0, active: 1, moved: 2, quiet: 3, absent: 4, "never-enriched": 5 };
+
+function trackingRefreshButton() {
+  return h("button", {
+    style: "background:none;border:none;padding:0;font:inherit;font-weight:600;color:var(--accent);cursor:pointer;text-decoration:underline;",
+    onclick: () => render(),
+  }, "Refresh");
+}
+
+async function viewTracking() {
+  const res = await api("/api/tracking/observables");
+  const header = h("div", { class: "view-header" },
+    h("div", { class: "view-title" }, "Live tracking"),
+    h("div", { class: "view-sub" },
+      `${res.count} tracked indicator${res.count === 1 ? "" : "s"} — status derived from the daily enrichment pipeline. `,
+      trackingRefreshButton()));
+  if (!res.observables.length) return h("div", {}, header, h("div", { class: "empty-state" }, "No tracked indicators yet."));
+
+  const rows = [...res.observables].sort((a, b) =>
+    (TRACKING_STATUS_ORDER[a.status] ?? 9) - (TRACKING_STATUS_ORDER[b.status] ?? 9)
+    || a.indicator_value.localeCompare(b.indicator_value));
+
+  const tableWrap = h("div", { class: "table-wrap" }, h("table", { class: "data-table" },
+    h("thead", {}, h("tr", {},
+      h("th", {}, "Indicator"), h("th", {}, "Status"), h("th", {}, "Actor"),
+      h("th", {}, "Latest honeylabs"), h("th", {}, "ASN"), h("th", {}, "Last Zeek match"))),
+    h("tbody", {}, ...rows.map((r) => h("tr", {},
+      h("td", {}, trackingIpChip(r.indicator_value)),
+      h("td", {}, trackingStatusChip(r.status)),
+      h("td", {}, r.actor || "—"),
+      h("td", { class: "mono" }, r.hl_observed_at ? `${formatDate(r.hl_observed_at)} (${r.hl_events ?? 0} events)` : "—"),
+      h("td", { class: "mono" }, r.asn != null ? `AS${r.asn} ${r.netname || ""}` : "—"),
+      h("td", { class: "mono" }, r.zeek_day ? `${r.zeek_day} (${r.zeek_direction}, ${r.zeek_hit_count} hits)` : "—"))))));
+  return h("div", {}, header, tableWrap);
+}
+
+function trackingEventItem(ip, e) {
+  if (e.kind === "asn_change") {
+    const c = e.data;
+    return h("div", { class: "timeline-item" },
+      h("div", { class: "timeline-item__head" },
+        h("span", { class: "timeline-item__date" }, formatDate(e.date)),
+        h("span", { class: "chip chip--neutral" }, c.change_type),
+        h("span", { class: "chip chip--neutral" }, c.confidence)),
+      h("div", { class: "timeline-item__body" },
+        `AS${c.old_asn ?? "?"} (${c.old_netname || "—"}) → AS${c.new_asn ?? "?"} (${c.new_netname || "—"})`));
+  }
+  const o = e.data;
+  // hl_ports/hl_tags (HoneyLabs) and shodan_ports/shodan_tags (Shodan
+  // InternetDB) are mutually exclusive per row (one source per
+  // observation) - show whichever this row actually carries.
+  const ports = (o.hl_ports && o.hl_ports.length) ? o.hl_ports : (o.shodan_ports || []);
+  const tags = (o.hl_tags && o.hl_tags.length) ? o.hl_tags : (o.shodan_tags || []);
+  const arkime = ports.length ? trackingArkimeUrl(ip, ports, o.observed_at) : null;
+  const matches = (o.threatfox_matches || []).map((m) => m.malware || m.threat_type).filter(Boolean);
+  const detail = [o.asn != null ? `AS${o.asn} ${o.netname || ""}` : null, o.country_code,
+    ports.length ? `ports: ${ports.join(", ")}` : null,
+    tags.length ? `tags: ${tags.join(", ")}` : null,
+    matches.length ? `threatfox: ${matches.join(", ")}` : null].filter(Boolean).join(" · ");
+  // Most sources' checks come back empty most days (e.g. "no ThreatFox
+  // match today") - skip the row entirely rather than render a dash-only
+  // timeline item; the daily pivot sweep would otherwise pile these up
+  // indefinitely. hl_events is checked separately since it renders as a
+  // head chip, not part of `detail`.
+  if (!detail && o.hl_events == null) return null;
+  return h("div", { class: "timeline-item" },
+    h("div", { class: "timeline-item__head" },
+      h("span", { class: "timeline-item__date" }, formatDate(e.date)),
+      h("span", { class: "chip chip--neutral" }, o.source),
+      o.hl_events != null ? h("span", { class: "chip chip--neutral" }, `${o.hl_events} events`) : null,
+      arkime ? h("a", { class: "source-link", href: arkime.url, target: "_blank", rel: "noopener noreferrer" }, "View in Arkime →") : null),
+    h("div", { class: "timeline-item__body" }, detail || "—"));
+}
+
+function trackingZeekTable(zeekMatches) {
+  if (!zeekMatches.length) return null;
+  return h("div", { class: "table-wrap" }, h("table", { class: "data-table" },
+    h("thead", {}, h("tr", {}, h("th", {}, "Day"), h("th", {}, "Direction"), h("th", {}, "Hits"), h("th", {}, "Ports"))),
+    h("tbody", {}, ...[...zeekMatches].reverse().map((z) => h("tr", {},
+      h("td", { class: "mono" }, z.day),
+      h("td", {}, z.direction),
+      h("td", { class: "mono" }, String(z.hit_count)),
+      h("td", { class: "mono" }, (z.ports || []).join(", ") || "—"))))));
+}
+
+async function viewTrackingDetail(ip) {
+  const data = await api(`/api/tracking/observables/${encodeURIComponent(ip)}`);
+  const header = h("div", { class: "view-header" },
+    h("div", { class: "view-title" }, data.ip),
+    h("div", { class: "view-sub" },
+      trackingStatusChip(data.status), " ",
+      h("a", { href: "#/tracking", style: "color:var(--accent);margin-left:8px;" }, "← back to live tracking"),
+      " ", trackingRefreshButton()));
+
+  const events = [
+    ...data.observations.map((o) => ({ date: o.observed_at, kind: "observation", data: o })),
+    ...data.asn_changes.map((c) => ({ date: c.detected_at, kind: "asn_change", data: c })),
+  ].sort((a, b) => b.date.localeCompare(a.date));
+
+  const items = events.map((e) => trackingEventItem(ip, e)).filter(Boolean);
+  const hiddenCount = events.length - items.length;
+
+  const hiddenNote = items.length && hiddenCount ? h("div", { class: "view-sub" },
+    `${hiddenCount} check${hiddenCount === 1 ? "" : "s"} with no findings hidden.`) : null;
+
+  const timeline = items.length
+    ? h("div", { class: "card" }, ...items)
+    : events.length
+      ? h("div", { class: "empty-state" },
+          `${events.length} check${events.length === 1 ? "" : "s"} completed with nothing to report.`)
+      : h("div", { class: "empty-state" }, "No observation history yet — this indicator is tracked but not yet enriched.");
+
+  const zeekTable = trackingZeekTable(data.zeek_matches);
+  const zeekCard = zeekTable ? h("div", { class: "card" },
+    h("div", { class: "card__title" }, "Zeek matches"), zeekTable) : null;
+
+  return h("div", {}, header, hiddenNote, timeline, zeekCard);
+}
+
+/* ---------- daily narrative ---------- */
+// Stage B's narrative is Claude-authored markdown over ingested,
+// sometimes adversary-influenced, report content - same "never
+// innerHTML on data-derived text" rule as the rest of this file (see
+// the h() comment up top). This renders a small markdown subset
+// (##/### headers, -/* and N. lists, **bold** inline) directly to DOM
+// nodes via h(), so there is no HTML string ever parsed from the file.
+function renderInline(text) {
+  return text.split(/(\*\*[^*]+\*\*)/g).map((part) => {
+    const m = part.match(/^\*\*([^*]+)\*\*$/);
+    return m ? h("strong", {}, m[1]) : part;
+  });
+}
+
+function renderMarkdownLite(text) {
+  const container = h("div", { class: "narrative-body" });
+  let list = null;
+  let listOrdered = false;
+  for (const raw of text.split("\n")) {
+    const line = raw.trimEnd();
+    if (!line.trim()) { list = null; continue; }
+    const heading = line.match(/^#{1,3}\s+(.*)$/);
+    if (heading) { list = null; container.appendChild(h("div", { class: "card__title" }, heading[1])); continue; }
+    const bullet = line.match(/^[-*]\s+(.*)$/);
+    const numbered = line.match(/^\d+\.\s+(.*)$/);
+    if (bullet || numbered) {
+      const ordered = !!numbered;
+      if (!list || listOrdered !== ordered) {
+        list = h(ordered ? "ol" : "ul", { class: "narrative-list" });
+        listOrdered = ordered;
+        container.appendChild(list);
+      }
+      list.appendChild(h("li", {}, ...renderInline((bullet || numbered)[1])));
+      continue;
+    }
+    list = null;
+    container.appendChild(h("p", { class: "narrative-p" }, ...renderInline(line)));
+  }
+  return container;
+}
+
+async function viewNarratives() {
+  const res = await api("/api/tracking/narratives");
+  const header = h("div", { class: "view-header" },
+    h("div", { class: "view-title" }, "Daily narrative"),
+    h("div", { class: "view-sub" }, "Stage B's analyst writeup over each day's tracking digest — skipped on quiet days."));
+  if (!res.dates.length) return h("div", {}, header, h("div", { class: "empty-state" }, "No narratives written yet."));
+  return h("div", {}, header, h("div", { class: "card" },
+    ...res.dates.map((d) => h("div", { class: "timeline-item" },
+      h("div", { class: "timeline-item__head" },
+        h("a", { href: `#/narratives/${d}`, style: "color:var(--accent);font-weight:600;text-decoration:none;" }, d))))));
+}
+
+async function viewNarrativeDetail(day) {
+  const header = h("div", { class: "view-header" },
+    h("div", { class: "view-title" }, `Narrative — ${day}`),
+    h("div", { class: "view-sub" }, h("a", { href: "#/narratives", style: "color:var(--accent);" }, "← back to daily narrative")));
+  let res;
+  try {
+    res = await api(`/api/tracking/narratives/${encodeURIComponent(day)}`);
+  } catch (err) {
+    return h("div", {}, header, h("div", { class: "empty-state" }, `No narrative found for ${day}.`));
+  }
+  return h("div", {}, header, h("div", { class: "card" }, renderMarkdownLite(res.content)));
+}
+
 /* ---------- observable search ---------- */
 function observableGroup(title, items) {
   return h("div", { class: "search-group" },
@@ -379,8 +902,8 @@ function observableGroup(title, items) {
         h("td", { class: "mono" }, o.value),
         h("td", {}, CATEGORY_LABELS[o.category] || o.category),
         h("td", {}, clusterChip(o.cluster)),
-        h("td", { class: "mono" }, formatDate(o.first_seen)),
-        h("td", { class: "mono" }, formatDate(o.last_seen))))))));
+        h("td", { class: "mono" }, formatDateOnly(o.first_seen) || "—"),
+        h("td", { class: "mono" }, formatDateOnly(o.last_seen) || "—")))))));
 }
 
 async function viewSearch(query) {
@@ -404,6 +927,8 @@ function parseHash() {
   if (parts[0] === "cluster") return { name: "cluster", slug: parts[1], tab: parts[2] || "diamond" };
   if (parts[0] === "techniques") return { name: "techniques", id: parts[1] };
   if (parts[0] === "queue") return { name: "queue" };
+  if (parts[0] === "tracking") return { name: "tracking", ip: parts[1] };
+  if (parts[0] === "narratives") return { name: "narratives", date: parts[1] };
   if (parts[0] === "search") return { name: "search", query: parts.slice(1).join("/") };
   return { name: "overview" };
 }
@@ -420,6 +945,8 @@ async function render() {
     else if (route.name === "cluster") node = await viewCluster(route.slug, route.tab);
     else if (route.name === "techniques") node = route.id ? await viewTechniqueDetail(route.id) : await viewTechniques();
     else if (route.name === "queue") node = await viewQueue();
+    else if (route.name === "tracking") node = route.ip ? await viewTrackingDetail(route.ip) : await viewTracking();
+    else if (route.name === "narratives") node = route.date ? await viewNarrativeDetail(route.date) : await viewNarratives();
     else if (route.name === "search") node = await viewSearch(route.query);
     else node = h("div", { class: "empty-state" }, "Not found.");
     view.textContent = "";

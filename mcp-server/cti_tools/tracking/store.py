@@ -14,7 +14,7 @@ import json
 import os
 import time
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS observations (
     hl_ports        JSON,
     hl_tags         JSON,
     hl_threat_level TEXT,
+    shodan_ports    JSON,
+    shodan_tags     JSON,
+    threatfox_matches JSON,
     asn             INTEGER,
     netname         TEXT,
     country_code    TEXT,
@@ -173,8 +176,20 @@ def _connect_retry(read_only: bool, attempts: int = 4,
         con.close()
 
 
+# Additive migrations for columns introduced after a database already
+# exists on disk - CREATE TABLE IF NOT EXISTS above only creates the table
+# on a fresh file, so a preexisting one needs these run explicitly. Each
+# statement is idempotent (IF NOT EXISTS), safe to re-run every connect.
+_MIGRATIONS = """
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS shodan_ports JSON;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS shodan_tags JSON;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS threatfox_matches JSON;
+"""
+
+
 def init_schema(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(SCHEMA)
+    con.execute(_MIGRATIONS)
 
 
 def _json(value: Any) -> str | None:
@@ -187,9 +202,11 @@ _OBS_COLUMNS = (
     "observed_at", "indicator_type", "indicator_value", "actor", "campaign",
     "source", "source_url", "hl_events", "hl_events_7d", "hl_first_seen",
     "hl_last_seen", "hl_ports", "hl_tags", "hl_threat_level",
+    "shodan_ports", "shodan_tags", "threatfox_matches",
     "asn", "netname", "country_code", "abuse_contact", "metadata",
 )
-_OBS_JSON_COLUMNS = {"hl_ports", "hl_tags", "metadata"}
+_OBS_JSON_COLUMNS = {"hl_ports", "hl_tags", "shodan_ports", "shodan_tags",
+                     "threatfox_matches", "metadata"}
 
 
 def upsert_observation(con: duckdb.DuckDBPyConnection, *, observed_at,
@@ -306,6 +323,13 @@ def upsert_zeek_match(con: duckdb.DuckDBPyConnection, *, day, indicator_value: s
                last_ts = excluded.last_ts, log_files = excluded.log_files""",
         [day, indicator_value, actor, direction, hit_count, _json(ports),
          first_ts, last_ts, _json(log_files)])
+
+
+def _rows(con: duckdb.DuckDBPyConnection, sql: str,
+         params: list[Any] | None = None) -> list[dict[str, Any]]:
+    cur = con.execute(sql, params or [])
+    columns = [d[0] for d in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
 
 
 def _cell(value: Any) -> Any:
@@ -441,3 +465,232 @@ def actor_summary(actor: str) -> dict[str, Any]:
             for d, ip, dr, h in zeek],
         "correlation_count": corr[0],
     }
+
+
+_TRACKED_OBSERVABLES_SQL = """
+WITH tracked_ips AS (
+    SELECT DISTINCT o.indicator_value
+    FROM observations o
+    JOIN actors a ON a.actor_name = o.actor
+    WHERE a.tracked = TRUE
+),
+latest_actor AS (
+    SELECT indicator_value, actor FROM (
+        SELECT indicator_value, actor,
+               row_number() OVER (PARTITION BY indicator_value
+                                  ORDER BY observed_at DESC) AS rn
+        FROM observations WHERE actor IS NOT NULL
+    ) WHERE rn = 1
+),
+latest_hl AS (
+    SELECT indicator_value, observed_at AS hl_observed_at, hl_events,
+           hl_last_seen, hl_ports, hl_tags, hl_threat_level
+    FROM (
+        SELECT *, row_number() OVER (PARTITION BY indicator_value
+                                      ORDER BY observed_at DESC) AS rn
+        FROM observations WHERE source = 'honeylabs'
+    ) WHERE rn = 1
+),
+latest_asn AS (
+    -- Current ASN/netname from whichever source last reported one -
+    -- RDAP is authoritative when present (see enrich.apply_results:
+    -- new_asn = reg.get("asn") or hl_asn), but honeylabs' own asn/
+    -- as_org is the only thing available for a quiet/absent IP RDAP
+    -- was never re-checked for. Deliberately NOT scoped to
+    -- source='honeylabs' - see latest_hl above, which stays
+    -- honeylabs-only for the "active" freshness signal.
+    SELECT indicator_value, asn, netname, country_code FROM (
+        SELECT indicator_value, asn, netname, country_code,
+               row_number() OVER (PARTITION BY indicator_value
+                                  ORDER BY observed_at DESC) AS rn
+        FROM observations WHERE asn IS NOT NULL
+    ) WHERE rn = 1
+),
+latest_asn_change AS (
+    -- change_type='first_seen' fires on an indicator's first-ever
+    -- enrichment (enrich.apply_results: baseline is None), not an
+    -- actual infrastructure pivot - excluded so "moved" means the ASN
+    -- genuinely changed, not "we checked it for the first time today".
+    SELECT indicator_value, detected_at AS asn_change_at, old_asn, new_asn,
+           old_netname, new_netname, change_type, confidence
+    FROM (
+        SELECT *, row_number() OVER (PARTITION BY indicator_value
+                                      ORDER BY detected_at DESC) AS rn
+        FROM asn_changes WHERE change_type != 'first_seen'
+    ) WHERE rn = 1
+),
+latest_zeek AS (
+    SELECT indicator_value, day AS zeek_day, direction AS zeek_direction,
+           hit_count AS zeek_hit_count, last_ts AS zeek_last_ts
+    FROM (
+        SELECT *, row_number() OVER (PARTITION BY indicator_value
+               ORDER BY day DESC, last_ts DESC NULLS LAST) AS rn
+        FROM zeek_matches
+    ) WHERE rn = 1
+),
+latest_shodan AS (
+    SELECT indicator_value, observed_at AS shodan_observed_at,
+           shodan_ports, shodan_tags
+    FROM (
+        SELECT *, row_number() OVER (PARTITION BY indicator_value
+                                      ORDER BY observed_at DESC) AS rn
+        FROM observations WHERE source = 'shodan'
+    ) WHERE rn = 1
+),
+latest_threatfox AS (
+    SELECT indicator_value, observed_at AS threatfox_observed_at,
+           threatfox_matches
+    FROM (
+        SELECT *, row_number() OVER (PARTITION BY indicator_value
+                                      ORDER BY observed_at DESC) AS rn
+        FROM observations WHERE source = 'threatfox'
+    ) WHERE rn = 1
+)
+SELECT t.indicator_value, la.actor,
+       h.hl_observed_at, h.hl_events, h.hl_last_seen, h.hl_ports, h.hl_tags,
+       h.hl_threat_level, na.asn, na.netname, na.country_code,
+       c.asn_change_at, c.old_asn, c.new_asn, c.old_netname, c.new_netname,
+       c.change_type, c.confidence AS asn_change_confidence,
+       z.zeek_day, z.zeek_direction, z.zeek_hit_count, z.zeek_last_ts,
+       s.shodan_observed_at, s.shodan_ports, s.shodan_tags,
+       tf.threatfox_observed_at, tf.threatfox_matches
+FROM tracked_ips t
+LEFT JOIN latest_actor la ON la.indicator_value = t.indicator_value
+LEFT JOIN latest_hl h ON h.indicator_value = t.indicator_value
+LEFT JOIN latest_asn na ON na.indicator_value = t.indicator_value
+LEFT JOIN latest_asn_change c ON c.indicator_value = t.indicator_value
+LEFT JOIN latest_zeek z ON z.indicator_value = t.indicator_value
+LEFT JOIN latest_shodan s ON s.indicator_value = t.indicator_value
+LEFT JOIN latest_threatfox tf ON tf.indicator_value = t.indicator_value
+ORDER BY t.indicator_value
+"""
+
+
+def _tracking_status(now: datetime, row: dict[str, Any]) -> str:
+    """Derived dashboard status for one indicator, in precedence order:
+    in-network (touched our own traffic recently) beats active
+    (HoneyLabs sensors saw it recently) beats moved (its ASN just
+    changed) beats quiet/absent (no recent signal - the latter is a
+    real observed-absence row, not a missing one) beats never-enriched
+    (no honeylabs observation exists at all).
+
+    Freshness uses hl_last_seen - HoneyLabs' own last-seen timestamp
+    for the IP - not hl_events_7d: the HoneyLabs MCP switch normalizes
+    hl_events_7d to NULL on every new row (the MCP ioc_lookup_tool
+    exposes only a cumulative total, no rolling 7-day count), so that
+    field is dead going forward. hl_last_seen also means the right
+    thing - "a sensor actually saw this IP within N days" - where
+    observed_at only means "we happened to check on this date"."""
+    zeek_recent = False
+    if row["zeek_last_ts"] is not None:
+        zeek_recent = (now - row["zeek_last_ts"]) <= timedelta(days=1)
+    elif row["zeek_day"] is not None:
+        zeek_recent = (now.date() - row["zeek_day"]) <= timedelta(days=1)
+    if zeek_recent:
+        return "in-network"
+    if row["hl_last_seen"] is not None and (now - row["hl_last_seen"]) <= timedelta(days=7):
+        return "active"
+    if row["asn_change_at"] is not None and (now - row["asn_change_at"]) <= timedelta(days=30):
+        return "moved"
+    if row["hl_observed_at"] is not None:
+        return "quiet" if row["hl_events"] else "absent"
+    return "never-enriched"
+
+
+def tracked_observables() -> dict[str, Any]:
+    """Dashboard-facing snapshot: every indicator in scope for tracking
+    (mirrors enrich.build_worklist's own definition - any observation
+    row carries an actor whose actors.tracked is true) with its latest
+    honeylabs observation, ASN change, and Zeek match, plus a derived
+    status. Not wired as an MCP tool: output is unbounded (unlike
+    run_readonly_query/actor_summary, which are sized for agent
+    context) and the status labels are dashboard presentation, not a
+    generic query result."""
+    now = datetime.now()
+    try:
+        with _connect_retry(read_only=True) as con:
+            rows = _rows(con, _TRACKED_OBSERVABLES_SQL)
+    except TrackingBusy:
+        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
+    except duckdb.IOException as e:
+        return {"error": f"tracking DB unavailable: {e}"}
+    for r in rows:
+        # Status first, while timestamps are still real datetime/date
+        # objects fresh off the connection - _cell() below turns them
+        # into ISO strings for JSON, which _tracking_status can't diff.
+        r["status"] = _tracking_status(now, r)
+        for k in ("hl_observed_at", "hl_last_seen", "asn_change_at", "zeek_day", "zeek_last_ts",
+                 "shodan_observed_at", "threatfox_observed_at"):
+            r[k] = _cell(r[k])
+        for k in ("hl_ports", "hl_tags", "shodan_ports", "shodan_tags", "threatfox_matches"):
+            r[k] = json.loads(r[k]) if r[k] is not None else []
+    return {"observables": rows, "count": len(rows)}
+
+
+def observable_history(ip: str) -> dict[str, Any]:
+    """Full time series for one indicator - every observation, ASN
+    change, and Zeek match on record, oldest first. No row cap (unlike
+    run_readonly_query): one indicator's history is bounded by how long
+    it's been tracked, at most ~1 row/day from the daily cron. An IP
+    with no rows at all still returns 200 with empty lists and
+    "never-enriched" - a tracked-but-unenriched IP is a legitimate
+    state, and this doesn't require the IP to already be in the
+    "tracked" scope tracked_observables() uses."""
+    try:
+        with _connect_retry(read_only=True) as con:
+            observations = _rows(con,
+                """SELECT observed_at, source, source_url, actor, campaign,
+                          hl_events, hl_events_7d, hl_first_seen, hl_last_seen,
+                          hl_ports, hl_tags, hl_threat_level,
+                          shodan_ports, shodan_tags, threatfox_matches,
+                          asn, netname, country_code, abuse_contact, metadata
+                   FROM observations WHERE indicator_value = ?
+                   ORDER BY observed_at ASC""", [ip])
+            asn_changes = _rows(con,
+                """SELECT detected_at, old_asn, old_netname, new_asn,
+                          new_netname, change_type, confidence
+                   FROM asn_changes WHERE indicator_value = ?
+                   ORDER BY detected_at ASC""", [ip])
+            zeek_matches = _rows(con,
+                """SELECT day, direction, hit_count, ports, first_ts, last_ts
+                   FROM zeek_matches WHERE indicator_value = ?
+                   ORDER BY day ASC""", [ip])
+    except TrackingBusy:
+        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
+    except duckdb.IOException as e:
+        return {"error": f"tracking DB unavailable: {e}"}
+
+    now = datetime.now()
+    # Status first, from raw datetime/date objects, before the loops
+    # below stringify everything below for JSON (see the same ordering
+    # note in tracked_observables()).
+    latest_hl = next((o for o in reversed(observations) if o["source"] == "honeylabs"), None)
+    # Exclude 'first_seen' rows for the same reason tracked_observables()'s
+    # SQL does: they fire on an indicator's first-ever enrichment, not an
+    # actual pivot, and shouldn't make "moved" fire on a fresh IP.
+    latest_change = next((c for c in reversed(asn_changes) if c["change_type"] != "first_seen"), None)
+    latest_zeek = zeek_matches[-1] if zeek_matches else None
+    status = _tracking_status(now, {
+        "hl_observed_at": latest_hl["observed_at"] if latest_hl else None,
+        "hl_events": latest_hl["hl_events"] if latest_hl else None,
+        "hl_last_seen": latest_hl["hl_last_seen"] if latest_hl else None,
+        "asn_change_at": latest_change["detected_at"] if latest_change else None,
+        "zeek_day": latest_zeek["day"] if latest_zeek else None,
+        "zeek_last_ts": latest_zeek["last_ts"] if latest_zeek else None,
+    })
+
+    for o in observations:
+        for k in ("observed_at", "hl_first_seen", "hl_last_seen"):
+            o[k] = _cell(o[k])
+        for k in ("hl_ports", "hl_tags", "shodan_ports", "shodan_tags", "threatfox_matches"):
+            o[k] = json.loads(o[k]) if o[k] is not None else []
+        o["metadata"] = json.loads(o["metadata"]) if o["metadata"] is not None else {}
+    for c in asn_changes:
+        c["detected_at"] = _cell(c["detected_at"])
+    for z in zeek_matches:
+        for k in ("day", "first_ts", "last_ts"):
+            z[k] = _cell(z[k])
+        z["ports"] = json.loads(z["ports"]) if z["ports"] is not None else []
+
+    return {"ip": ip, "status": status, "observations": observations,
+            "asn_changes": asn_changes, "zeek_matches": zeek_matches}

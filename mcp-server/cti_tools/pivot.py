@@ -4,10 +4,13 @@ public data sources.
 This is a deliberate, narrow exception to this tool's "no external API
 calls" design: report_ingest.py already fetches a URL you explicitly
 hand it, but this module reaches out to third-party enrichment
-services to ask "what else is tied to this indicator" - only when a
-caller calls pivot_observable for a specific value, never automatically
-or on a schedule. See SKILL.md's "Infrastructure pivoting" section for
-when to reach for it.
+services to ask "what else is tied to this indicator". pivot_observable
+is strictly on-demand - only when a caller names a specific value.
+pivot_cluster (core.py) sweeps a whole cluster and IS run on a
+schedule: the daily cron (scripts/daily_tracking.py) calls it once per
+tracked cluster so lifecycle status and open ports don't go stale
+between manual pivots. See SKILL.md's "Infrastructure pivoting" section
+for when to reach for either by hand.
 
 Sources, none of which require a paid plan:
 - RDAP (WHOIS's standardized successor) via the public rdap.org
@@ -24,6 +27,18 @@ Sources, none of which require a paid plan:
   tied to a tracked C2 IP when the source report only gave you the
   infrastructure, not per-sample coverage. Skipped gracefully if no
   key is configured - RDAP/RIPEstat still work without one.
+- Shodan InternetDB (internetdb.shodan.io) - no API key, no published
+  rate limit; open ports, hostnames, CPEs, vulns, and tags Shodan has
+  observed for an IP. IP only.
+- ThreatFox (abuse.ch) - free IOC-matching API; checks a domain/ip/
+  url/hash against abuse.ch's own malware-C2 IOC database and returns
+  any matching threat/malware-family tags. Covers every observable
+  kind through one query endpoint. Requires your own free Auth-Key
+  (THREATFOX_API_KEY env var; register at https://auth.abuse.ch/) -
+  abuse.ch's unified Auth Portal requires this header on every
+  ThreatFox call now, including search_ioc, despite the query API
+  historically being keyless. Skipped gracefully if no key is
+  configured.
 - HoneyLabs (honeylabs.net) - honeypot-fleet telemetry for an IP:
   how often, how recently, and against which ports/CVEs their sensors
   have seen it scanning. Free tier needs your own API key
@@ -54,6 +69,7 @@ from . import vm_proxy
 USER_AGENT = "cti-agent-pivot/1.0 (+local analysis tool, on-demand only)"
 VT_API_KEY_ENV = "VT_API_KEY"
 HONEYLABS_API_KEY_ENV = "HONEYLABS_API_KEY"
+THREATFOX_API_KEY_ENV = "THREATFOX_API_KEY"
 
 # Nameserver substrings that indicate a domain has been sinkholed/taken
 # down rather than being live adversary infrastructure. Extend as you
@@ -89,6 +105,36 @@ def _get_text(url: str, headers: dict[str, str] | None = None) -> str:
     if status is not None and status >= 400:
         raise PivotError(f"{url} returned HTTP {status}")
     return str(result.get("body") or "")
+
+
+def _post_json(url: str, payload: dict[str, Any],
+                headers: dict[str, str] | None = None) -> Any:
+    """POST a JSON body and parse a JSON response - the ThreatFox-shaped
+    counterpart to _get_json. Proxied through the Win11 VM like every
+    other pivot call; see the module docstring."""
+    try:
+        result = vm_proxy.http_fetch(
+            url, headers={"User-Agent": USER_AGENT, "Content-Type": "application/json",
+                          **(headers or {})},
+            method="POST", data=json.dumps(payload))
+    except vm_proxy.VMProxyError as e:
+        raise PivotError(f"failed to reach {url}: {e}") from e
+    status = result.get("status")
+    body = str(result.get("body") or "")
+    if status is not None and status >= 400:
+        # Error responses here (e.g. ThreatFox's {"query_status":
+        # "unknown_auth_key"}) are themselves small JSON documents whose
+        # detail is far more actionable than the bare status code - surface
+        # it when present instead of just "returned HTTP 403".
+        try:
+            detail = json.loads(body)
+        except ValueError:
+            detail = body or None
+        raise PivotError(f"{url} returned HTTP {status}" + (f": {detail}" if detail else ""))
+    try:
+        return json.loads(body)
+    except ValueError as e:
+        raise PivotError(f"{url} returned an unparseable response: {e}") from e
 
 
 def resolve_host(host: str) -> list[str] | None:
@@ -405,6 +451,76 @@ def hackertarget_reverse_ip(ip: str) -> dict[str, Any]:
     if not domains:
         return {"error": text or "no domains returned"}
     return {"domains": domains}
+
+
+def shodan_internetdb_lookup(ip: str) -> dict[str, Any]:
+    """Open ports, hostnames, CPEs, vulns, and tags Shodan has observed
+    for an IP, via their free, keyless InternetDB endpoint. Called
+    directly (not via _get_json) because InternetDB signals "nothing on
+    record for this IP" as an HTTP 404 rather than an empty body - a
+    routine, expected outcome for infrastructure Shodan hasn't scanned,
+    not a failure - so it's normalized to the same empty shape a hit
+    would have rather than surfacing as {"error": ...}. Any other >=400
+    status is a real failure and does become {"error": ...}."""
+    url = f"https://internetdb.shodan.io/{ip}"
+    try:
+        result = vm_proxy.http_fetch(url, headers={"User-Agent": USER_AGENT})
+    except vm_proxy.VMProxyError as e:
+        return {"error": f"failed to reach {url}: {e}"}
+    status = result.get("status")
+    if status == 404:
+        return {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []}
+    if status is not None and status >= 400:
+        return {"error": f"{url} returned HTTP {status}"}
+    try:
+        data = json.loads(str(result.get("body") or ""))
+    except ValueError as e:
+        return {"error": f"{url} returned an unparseable response: {e}"}
+    return {
+        "ports": data.get("ports", []),
+        "hostnames": data.get("hostnames", []),
+        "cpes": data.get("cpes", []),
+        "tags": data.get("tags", []),
+        "vulns": data.get("vulns", []),
+    }
+
+
+def threatfox_lookup(value: str, api_key: str) -> dict[str, Any]:
+    """Check a domain/ip/url/hash against abuse.ch's ThreatFox database
+    of known malware C2/infrastructure IOCs - a free POST-JSON query API
+    (requires an Auth-Key from https://auth.abuse.ch/, THREATFOX_API_KEY
+    env var) that matches on the literal IOC value regardless of kind,
+    so it applies to every observable type pivot_observable handles.
+    query_status "no_result" is a legitimate "not a known IOC" outcome
+    (returned as {"matches": []}, not an error); anything else
+    unexpected becomes {"error": ...}."""
+    try:
+        data = _post_json("https://threatfox-api.abuse.ch/api/v1/",
+                          {"query": "search_ioc", "search_term": value},
+                          headers={"Auth-Key": api_key})
+    except PivotError as e:
+        return {"error": str(e)}
+    if not isinstance(data, dict):
+        return {"error": "unexpected ThreatFox response shape"}
+    status = data.get("query_status")
+    if status == "no_result":
+        return {"matches": []}
+    if status != "ok":
+        return {"error": f"ThreatFox query_status={status!r}"}
+    matches = [
+        {
+            "ioc": m.get("ioc"),
+            "threat_type": m.get("threat_type"),
+            "malware": m.get("malware_printable") or m.get("malware"),
+            "confidence_level": m.get("confidence_level"),
+            "first_seen": m.get("first_seen_utc"),
+            "last_seen": m.get("last_seen_utc"),
+            "tags": m.get("tags"),
+        }
+        for m in (data.get("data") or [])
+        if isinstance(m, dict)
+    ]
+    return {"matches": matches}
 
 
 def _is_past(date_str: str | None) -> bool:

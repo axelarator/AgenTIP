@@ -115,35 +115,73 @@ def ingest_inbox(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
     }
 
 
-def seed_from_clusters(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
-    """One-time bridge: import ipv4/ipv6 observables from the JSON
-    cluster store as observations, creating one tracked actor per
-    cluster with cluster_slug set. That slug string is the entire
+def _import_cluster(con: duckdb.DuckDBPyConnection, slug: str,
+                    observed_at: datetime) -> tuple[str, int]:
+    """Import one cluster's ipv4/ipv6 observables as observations and
+    upsert its tracked-actor row (cluster_slug set - the entire
     actor<->cluster linkage; the JSON store stays canonical for
-    cluster/TTP/diamond data and there is no reverse sync."""
+    cluster/TTP/diamond data and there is no reverse sync). Shared by
+    seed_from_clusters (all clusters, one-time) and
+    register_new_clusters (only clusters not yet tracked, daily)."""
+    from .. import core  # deferred: pulls in the whole cluster stack
+
+    cluster = core.load_cluster(slug)
+    name = cluster.get("name") or slug
+    entries = (cluster.get("observables") or {}).get("ips") or []
+    count = 0
+    for entry in entries:
+        value = entry.get("value")
+        if not value:
+            continue
+        try:
+            addr = ipaddress.ip_address(value)
+        except ValueError:
+            continue
+        store.upsert_observation(
+            con, observed_at=observed_at, indicator_value=str(addr),
+            source=f"cluster:{slug}", indicator_type=f"ipv{addr.version}",
+            actor=name,
+            metadata={"cluster_sources": entry.get("sources", [])[:5]})
+        count += 1
+    store.upsert_actor(con, name, observed_at, cluster_slug=slug)
+    return name, count
+
+
+def seed_from_clusters(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
+    """One-time bridge: import every cluster in the JSON store, creating
+    one tracked actor per cluster. Widens first/last_observed on every
+    actor to today regardless of real new activity, so it's meant for
+    the initial import only - see register_new_clusters for the
+    daily-safe version that leaves already-tracked actors untouched."""
     from .. import core  # deferred: pulls in the whole cluster stack
 
     today = datetime.combine(date.today(), datetime.min.time())
     seeded: dict[str, int] = {}
     for slug in core.list_clusters():
-        cluster = core.load_cluster(slug)
-        name = cluster.get("name") or slug
-        entries = (cluster.get("observables") or {}).get("ips") or []
-        count = 0
-        for entry in entries:
-            value = entry.get("value")
-            if not value:
-                continue
-            try:
-                addr = ipaddress.ip_address(value)
-            except ValueError:
-                continue
-            store.upsert_observation(
-                con, observed_at=today, indicator_value=str(addr),
-                source=f"cluster:{slug}", indicator_type=f"ipv{addr.version}",
-                actor=name,
-                metadata={"cluster_sources": entry.get("sources", [])[:5]})
-            count += 1
-        store.upsert_actor(con, name, today, cluster_slug=slug)
+        name, count = _import_cluster(con, slug, today)
         seeded[name] = count
     return {"actors_seeded": len(seeded), "ips_by_actor": seeded}
+
+
+def register_new_clusters(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
+    """Daily-safe complement to seed_from_clusters: picks up any cluster
+    added to the JSON store since the last run (no actors row references
+    its slug yet) without touching first/last_observed on clusters
+    already tracked. Meant to run every Stage A pass so a cluster
+    created mid-cycle (e.g. via ingest_report/pivot_cluster) enters the
+    daily loop - zeek xref, HoneyLabs/registry enrichment, pivot sweep -
+    the same day instead of silently going stale until someone remembers
+    to reseed."""
+    from .. import core  # deferred: pulls in the whole cluster stack
+
+    known_slugs = {r[0] for r in con.execute(
+        "SELECT cluster_slug FROM actors WHERE cluster_slug IS NOT NULL"
+    ).fetchall()}
+    today = datetime.combine(date.today(), datetime.min.time())
+    registered: dict[str, int] = {}
+    for slug in core.list_clusters():
+        if slug in known_slugs:
+            continue
+        name, count = _import_cluster(con, slug, today)
+        registered[name] = count
+    return {"actors_registered": len(registered), "ips_by_actor": registered}

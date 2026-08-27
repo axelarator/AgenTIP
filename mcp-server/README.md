@@ -1,16 +1,16 @@
 # cti-tools
 
-Self-hosted MCP server + CLI for threat cluster tracking. Cluster
-tracking itself makes no external API calls — everything is local JSON
-under `../data/clusters/` (shared at the repo root so every harness
-surface sees the same store), with a regenerated markdown view
-alongside each. `core.py` is the single source of truth; `stix.py`,
-`server.py`, and `cli.py` are thin surfaces over it, which is what makes
-the same tool behave identically whether it's called over MCP, over
-Bash, or exported as STIX. `attack.py` bundles a static, offline MITRE
-ATT&CK technique lookup (see "MITRE ATT&CK technique validation" below)
-— the one static reference dataset in the repo, refreshed occasionally
-and offline, not fetched per call.
+Self-hosted MCP server for threat cluster tracking. Cluster tracking
+itself makes no external API calls — everything is local JSON under
+`../data/clusters/` (shared at the repo root so every harness surface
+sees the same store), with a regenerated markdown view alongside each.
+`core.py` is the single source of truth; `stix.py` and `server.py` are
+thin surfaces over it, which is what makes the same tool behave
+identically whether it's called over MCP or exported as STIX.
+`attack.py` bundles a static, offline MITRE ATT&CK technique lookup
+(see "MITRE ATT&CK technique validation" below) — the one static
+reference dataset in the repo, refreshed occasionally and offline, not
+fetched per call.
 
 The one deliberate exception is `pivot_observable` (see "Infrastructure
 pivoting" below): an opt-in, per-call lookup against free third-party
@@ -49,11 +49,7 @@ pytest
 ## Run standalone (sanity check)
 
 ```bash
-python -m cti_tools.cli create-cluster "Fox Tempest" --description "..."
-python -m cti_tools.cli update-profile "Fox Tempest" --adversary "unattributed" --confidence 40
-python -m cti_tools.cli update-ttp "Fox Tempest" T1553.002 "Subvert Trust Controls: Code Signing" 3 --notes "..."
-python -m cti_tools.cli export-navigator "Fox Tempest"
-python -m cti_tools.cli export-stix "Fox Tempest"
+python -c "from cti_tools import core; print(core.list_clusters())"
 ```
 
 ## Wiring into each harness
@@ -70,16 +66,12 @@ interpreter/args as `.mcp.json` uses. Skills go wherever your VS Code
 Copilot build reads Agent Skills from — check `docs.github.com` for the
 current path, it's moved a couple of times.
 
-**Pi** — core Pi's loop is deliberately Read/Write/Edit/Bash only, no
-built-in MCP client. Two options:
-
-1. If you're on `oh-my-pi` or another fork/extension with MCP support,
-   wire it the same way as above.
-2. Otherwise, skip MCP entirely for Pi and let the skill drive the CLI
-   directly through the Bash tool — that's why `cli.py` exists as a
-   parallel surface, not an afterthought. `.pi/skills/threat-cluster-tracking/`
-   is already populated; Pi reads the CLI usage straight out of its
-   `SKILL.md`.
+**Pi** — core Pi's loop is Read/Write/Edit/Bash plus the
+`pi-mcp-adapter` package (https://pi.dev/packages/pi-mcp-adapter),
+which gives it a native MCP client (the `mcp`/`mcpScript` tools). Wire
+it the same way as above via `.pi/mcp.json` (already written by
+`setup.sh`). `.pi/skills/threat-cluster-tracking/` is already
+populated.
 
 ### Why `.mcp.json` uses absolute paths, not `${workspaceFolder}`
 
@@ -299,6 +291,20 @@ Sources, all implemented in `pivot.py`:
   and known filenames; URL lookups return detection verdicts. Skipped
   with a note (not an error) if `VT_API_KEY` isn't set — RDAP/RIPEstat
   still run.
+- **Shodan InternetDB** (internetdb.shodan.io) — no API key, no
+  published rate limit. IP lookups only: open ports, hostnames, CPEs,
+  vulns, and tags Shodan has observed for the IP. A 404 (nothing on
+  record) is treated as a legitimate empty result, not an error.
+- **ThreatFox** (abuse.ch) — free POST-JSON query API, requires your
+  own Auth-Key (`THREATFOX_API_KEY` env var; register at
+  https://auth.abuse.ch/ — abuse.ch's unified Auth Portal requires this
+  header on every ThreatFox call, including `search_ioc`, despite the
+  query API historically being keyless). Applies to every observable
+  kind: checks the literal value against abuse.ch's own malware-C2 IOC
+  database and returns any matching threat/malware-family tags.
+  `query_status: "no_result"` (not a known IOC) comes back as an empty
+  match list, not an error. Skipped with a note (not an error) if
+  `THREATFOX_API_KEY` isn't set.
 - **HoneyLabs** (honeylabs.net) — requires your own API key
   (`HONEYLABS_API_KEY` env var; mint one from the HoneyLabs dashboard).
   IP lookups only: honeypot-fleet telemetry — event volume/recency and
@@ -317,12 +323,13 @@ Sources, all implemented in `pivot.py`:
   `.mcp.json` exposes HoneyLabs' own tools directly.
 
 Which sources run depends on the observable's type (`pivot.classify`):
-domain → RDAP + VT; ip → RDAP + RIPEstat + HoneyLabs + VT; hash/url →
-VT only. A
-failure in one source doesn't kill the whole lookup — RIPEstat's three
-sub-calls and RDAP each record their own failure independently, and a
-VirusTotal failure surfaces as `{"error": ...}` in its own section
-rather than raising.
+ThreatFox runs for every kind if `THREATFOX_API_KEY` is set; domain →
+RDAP + Cert Spotter + VT; ip → RDAP + RIPEstat + Hackertarget + Shodan
+InternetDB + HoneyLabs + VT; hash/url → VT only. A failure in one
+source doesn't kill the whole lookup — RIPEstat's three sub-calls and
+RDAP each record their own failure independently, and a VirusTotal
+failure surfaces as `{"error": ...}` in its own section rather than
+raising.
 
 If a pivot turns up something worth keeping as a tracked indicator (not
 just narrative), use `add_observable` to file it in with a source
@@ -331,19 +338,48 @@ via VirusTotal resolution history, checked 2026-07-02"`), rather than a
 bare local file path — `add_observable` doesn't require the source to
 look like a report URL the way `ingest_report`'s sources do.
 
-This was deliberately scoped to display-only, on-demand lookups for now
-— no caching, no scheduled re-checking of already-tracked observables
-for infrastructure changes. That's a real next step (see the project's
-own notes) but needs a diff/cache store designed first; don't add one
-speculatively.
+This was deliberately scoped to display-only, on-demand lookups —
+pivoting itself still never runs on a schedule. The diff store that
+scheduled re-checking needed now exists as the actor-tracking layer
+below; that subsystem is the one contained exception to the
+no-scheduled-rechecks rule.
+
+## Actor tracking (DuckDB time-series layer)
+
+`cti_tools/tracking/` keeps per-day observation rows in DuckDB at
+`data/tracking/tracking.duckdb` so infrastructure changes on tracked
+actors (ASN moves, port shifts, activity gaps) are visible over time —
+the cluster JSON store stays canonical for cluster/TTP/diamond data,
+linked only by `actors.cluster_slug`.
+
+Daily loop (cron lines printed by `setup.sh`): Stage A
+(`scripts/daily_tracking.py`, pure Python) ingests threat-report
+CSV/JSON from `data/tracking/inbox/`, runs budgeted HoneyLabs +
+RIPEstat/RDAP enrichment — HoneyLabs over their hosted MCP server
+(`cti_tools/tracking/hl_mcp.py`), prefiltering each chunk of 32 IPs
+as one /32 cidr_set call so only IPs with events cost a full lookup;
+the free tier's 500 credits/day at 10 req/min is shared with
+interactive pivots, and the loop stays capped at CTI_HL_BUDGET
+(default 400) and self-slows on 429s — detects ASN/netname changes,
+cross-references tracked IPs against the lab's Zeek logs in
+OpenSearch, and writes a bounded digest to `data/tracking/digests/`.
+Stage B (`scripts/daily_narrative.sh`) makes one headless `claude -p`
+pass over that digest — a `NO ACTIVITY` digest skips the agent
+entirely, so quiet days cost zero tokens.
+
+MCP tools: `query_duckdb` (read-only, row-capped), `get_actor_summary`
+(canned per-actor aggregate), `save_correlation` (persist a finding).
+See `skills/actor-tracking/SKILL.md` for the schema cheat-sheet and
+usage etiquette. One-time seeding from the cluster store:
+`scripts/daily_tracking.py --seed`.
 
 ## Extending toward Censys / hunt.io / Validin
 
 If you do want a paid source later (better bulk/pivot throughput than
 the free stack above), the pattern is the same one `pivot.py` follows:
 add new functions to `core.py` (e.g. `censys_query(cert_hash)`), mirror
-them as a tool in `server.py` and a subcommand in `cli.py`, and mention
-them in the skill's "Tool availability" section. Keep API keys out of
+them as a tool in `server.py`, and mention them in the skill's "Tool
+availability" section. Keep API keys out of
 this repo — read them from environment variables in `core.py`, never
 hardcode them, and don't let a skill or MCP tool description reference a
 literal key value.

@@ -271,6 +271,49 @@ def test_hackertarget_reverse_ip_no_records_message_is_error(monkeypatch):
     assert "domains" not in result
 
 
+def test_shodan_internetdb_lookup_parses_fields(monkeypatch):
+    monkeypatch.setattr(
+        pivot.vm_proxy, "http_fetch",
+        lambda url, headers=None: {
+            "status": 200,
+            "body": '{"ports": [22, 443], "hostnames": ["a.example"], '
+                    '"cpes": ["cpe:/a:foo"], "tags": ["cloud"], "vulns": ["CVE-2020-1"]}',
+            "error": None,
+        })
+    result = pivot.shodan_internetdb_lookup("1.2.3.4")
+    assert result["ports"] == [22, 443]
+    assert result["hostnames"] == ["a.example"]
+    assert result["cpes"] == ["cpe:/a:foo"]
+    assert result["tags"] == ["cloud"]
+    assert result["vulns"] == ["CVE-2020-1"]
+
+
+def test_shodan_internetdb_lookup_404_is_empty_not_error(monkeypatch):
+    monkeypatch.setattr(
+        pivot.vm_proxy, "http_fetch",
+        lambda url, headers=None: {
+            "status": 404, "body": '{"detail": "No information available"}', "error": None})
+    result = pivot.shodan_internetdb_lookup("9.9.9.9")
+    assert result == {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []}
+    assert "error" not in result
+
+
+def test_shodan_internetdb_lookup_real_error_is_contained(monkeypatch):
+    monkeypatch.setattr(
+        pivot.vm_proxy, "http_fetch",
+        lambda url, headers=None: {"status": 503, "body": "", "error": None})
+    result = pivot.shodan_internetdb_lookup("1.2.3.4")
+    assert "error" in result
+
+
+def test_shodan_internetdb_lookup_transport_failure_is_contained(monkeypatch):
+    def boom(url, headers=None):
+        raise pivot.vm_proxy.VMProxyError("ssh failed")
+    monkeypatch.setattr(pivot.vm_proxy, "http_fetch", boom)
+    result = pivot.shodan_internetdb_lookup("1.2.3.4")
+    assert "error" in result
+
+
 def test_honeylabs_lookup_url_auth_and_normalization(monkeypatch):
     # Field names mirror a real observed-IP response captured 2026-08-17
     # (shodan census IP), not the "totals"-wrapper shape the public docs
@@ -356,3 +399,109 @@ def test_resolve_host_distinguishes_dead_from_inconclusive(monkeypatch):
         raise pivot.vm_proxy.VMProxyError("ssh transport failed")
     monkeypatch.setattr(pivot.vm_proxy, "resolve_dns", boom)
     assert pivot.resolve_host("nope.invalid") is None  # transport failure -> inconclusive
+
+
+def test_post_json_sends_post_with_json_body(monkeypatch):
+    captured = {}
+
+    def fake_http_fetch(url, headers=None, method="GET", data=None):
+        captured["url"], captured["headers"], captured["method"], captured["data"] = (
+            url, headers, method, data)
+        return {"status": 200, "body": '{"ok": true}', "error": None}
+
+    monkeypatch.setattr(pivot.vm_proxy, "http_fetch", fake_http_fetch)
+    result = pivot._post_json("https://example.com/api", {"query": "search_ioc", "search_term": "x"})
+    assert result == {"ok": True}
+    assert captured["method"] == "POST"
+    assert captured["data"] == '{"query": "search_ioc", "search_term": "x"}'
+    assert captured["headers"]["Content-Type"] == "application/json"
+
+
+def test_post_json_transport_failure_becomes_pivoterror(monkeypatch):
+    def boom(url, headers=None, method="GET", data=None):
+        raise pivot.vm_proxy.VMProxyError("ssh failed")
+    monkeypatch.setattr(pivot.vm_proxy, "http_fetch", boom)
+    with pytest.raises(pivot.PivotError):
+        pivot._post_json("https://example.com/api", {"query": "search_ioc"})
+
+
+def test_post_json_error_status_surfaces_json_body_detail(monkeypatch):
+    # A real observed case: ThreatFox returns 403 with a small JSON body
+    # naming the actual problem ("unknown_auth_key") - that's far more
+    # actionable than a bare "returned HTTP 403", so it should end up in
+    # the raised error's message.
+    monkeypatch.setattr(
+        pivot.vm_proxy, "http_fetch",
+        lambda url, headers=None, method="GET", data=None: {
+            "status": 403, "body": '{"query_status": "unknown_auth_key"}', "error": None})
+    with pytest.raises(pivot.PivotError, match="unknown_auth_key"):
+        pivot._post_json("https://example.com/api", {"query": "search_ioc"})
+
+
+def test_post_json_error_status_with_non_json_body_still_raises(monkeypatch):
+    monkeypatch.setattr(
+        pivot.vm_proxy, "http_fetch",
+        lambda url, headers=None, method="GET", data=None: {
+            "status": 500, "body": "internal server error", "error": None})
+    with pytest.raises(pivot.PivotError, match="internal server error"):
+        pivot._post_json("https://example.com/api", {"query": "search_ioc"})
+
+
+def test_threatfox_lookup_sends_auth_key_header(monkeypatch):
+    captured = {}
+
+    def fake_post_json(url, payload, headers=None):
+        captured["headers"] = headers
+        return {"query_status": "no_result"}
+    monkeypatch.setattr(pivot, "_post_json", fake_post_json)
+    pivot.threatfox_lookup("1.2.3.4", "fake-tf-key")
+    assert captured["headers"] == {"Auth-Key": "fake-tf-key"}
+
+
+def test_threatfox_lookup_ok_status_parses_matches(monkeypatch):
+    monkeypatch.setattr(pivot, "_post_json", lambda url, payload, headers=None: {
+        "query_status": "ok",
+        "data": [
+            {
+                "ioc": "1.2.3.4:443",
+                "threat_type": "botnet_cc",
+                "malware_printable": "Cobalt Strike",
+                "confidence_level": 80,
+                "first_seen_utc": "2026-01-01 00:00:00",
+                "last_seen_utc": "2026-08-01 00:00:00",
+                "tags": ["cobaltstrike"],
+            }
+        ],
+    })
+    result = pivot.threatfox_lookup("1.2.3.4", "fake-tf-key")
+    assert result["matches"] == [{
+        "ioc": "1.2.3.4:443",
+        "threat_type": "botnet_cc",
+        "malware": "Cobalt Strike",
+        "confidence_level": 80,
+        "first_seen": "2026-01-01 00:00:00",
+        "last_seen": "2026-08-01 00:00:00",
+        "tags": ["cobaltstrike"],
+    }]
+
+
+def test_threatfox_lookup_no_result_is_empty_not_error(monkeypatch):
+    monkeypatch.setattr(pivot, "_post_json",
+                        lambda url, payload, headers=None: {"query_status": "no_result"})
+    result = pivot.threatfox_lookup("benign.example", "fake-tf-key")
+    assert result == {"matches": []}
+
+
+def test_threatfox_lookup_unexpected_status_is_error(monkeypatch):
+    monkeypatch.setattr(pivot, "_post_json",
+                        lambda url, payload, headers=None: {"query_status": "illegal_search_term"})
+    result = pivot.threatfox_lookup("bad value", "fake-tf-key")
+    assert "error" in result
+
+
+def test_threatfox_lookup_transport_failure_is_contained(monkeypatch):
+    def boom(url, payload, headers=None):
+        raise pivot.PivotError("failed to reach threatfox")
+    monkeypatch.setattr(pivot, "_post_json", boom)
+    result = pivot.threatfox_lookup("1.2.3.4", "fake-tf-key")
+    assert "error" in result

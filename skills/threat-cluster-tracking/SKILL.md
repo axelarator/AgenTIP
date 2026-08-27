@@ -1,16 +1,16 @@
 ---
 name: threat-cluster-tracking
-description: Use when the user is investigating, naming, or updating a threat actor cluster; asks to log a hunt, update ATT&CK/TTP coverage, record a detection, or note a gap; or mentions tracking infrastructure/campaign activity over time. Provides the workflow and data model for maintaining persistent cluster profiles instead of one-off notes.
+description: Use when the user is investigating, naming, or updating a threat actor cluster; asks to log a hunt, update ATT&CK/TTP coverage, record a detection, or note a gap; mentions tracking infrastructure/campaign activity over time; or asks to "probe" a cluster's indicators/infrastructure, get JARM/JA4+ fingerprints, or otherwise actively fingerprint a target — "probe" is a defined term here (active traffic via the Win11 VM, only when explicitly asked) distinct from "pivot" (passive third-party lookups, run automatically); see "Pivoting vs. probing" below before treating the two as interchangeable. Provides the workflow and data model for maintaining persistent cluster profiles instead of one-off notes.
 ---
 
 # Threat cluster tracking
 
 This skill maintains durable, structured cluster profiles instead of
 disposable investigation notes. Each cluster is a JSON record with a
-rendered markdown view, backed by the `cti-tools` MCP server (or its CLI
-equivalent — see "Tool availability" below). Clusters are modeled so
-they can be losslessly exported as STIX 2.1 (Intrusion Set + Attack
-Pattern + Relationship + Note objects) for sharing outside this tool.
+rendered markdown view, backed by the `cti-tools` MCP server — see
+"Tool availability" below. Clusters are modeled so they can be
+losslessly exported as STIX 2.1 (Intrusion Set + Attack Pattern +
+Relationship + Note objects) for sharing outside this tool.
 
 ## When to create vs. update a cluster
 
@@ -402,6 +402,34 @@ alongside it.
 
 ## Infrastructure pivoting
 
+**Read this before touching any tool in this section.** "Pivoting" and
+"probing" are two different, non-interchangeable operations, and a
+request's wording doesn't always distinguish them the way you'd expect:
+
+- **"Probe"** (a request to "probe the indicators," "get
+  fingerprints/JARM/JA4," "actively check this infra," or naming the
+  Win11 VM/vantage point specifically) means **active** traffic that
+  actually reaches the adversary's infrastructure — a live TLS
+  handshake or JARM scan — routed exclusively through the Win11 probe
+  VM pipeline (see "Automating the handoff" below). **Only run this
+  when explicitly asked, and never as a default follow-up to a pivot.**
+- **"Pivot"** (`pivot_observable`, `pivot_cluster`, `pivot_and_expand`)
+  means passive third-party lookups (RDAP, RIPEstat, Cert Spotter,
+  Shodan InternetDB, ThreatFox if `THREATFOX_API_KEY` is set,
+  VirusTotal) — no crafted traffic reaches the target itself. Safe and
+  expected to run automatically as part of working a report, no need to
+  wait for a separate ask.
+
+If a request says "probe" without other cluster-tracking context, that
+alone is enough to mean the active JARM/JA4 pipeline — don't downgrade
+it to a pivot/lookup just because a pivot is faster or doesn't need the
+VM hop. Conversely, if a request says "pivot on infrastructure" but
+clearly means fingerprinting (JARM/JA4 named, a specific vantage point
+named), treat it as a probing request instead. Confirm with the user
+only if genuinely ambiguous after applying this rule — see "Pivoting
+vs. probing — when each runs" further below for the full detail on
+what each tool actually touches.
+
 Tracked observables are a static record until you actually check
 whether they're still live. Three tools cover this, from lightest to
 heaviest:
@@ -412,9 +440,12 @@ result, writing nothing. Sources: RDAP registration data; RIPEstat
 ASN/network context (IPs); Cert Spotter certificate-transparency
 history (domains — sibling subdomains as pivot leads, the keyless
 stand-in for crt.sh, which is no longer reachable); Hackertarget
-reverse-IP co-hosting (IPs); VirusTotal reputation + resolution
-history if `VT_API_KEY` is set; and HoneyLabs honeypot-fleet telemetry
-(IPs) if `HONEYLABS_API_KEY` is set. Reach for it when:
+reverse-IP co-hosting (IPs); Shodan InternetDB open ports/hostnames/
+CPEs/vulns/tags (IPs, keyless); ThreatFox known-malware-C2 IOC match
+(every kind) if `THREATFOX_API_KEY` is set (register a free Auth-Key at
+https://auth.abuse.ch/); VirusTotal reputation + resolution history if
+`VT_API_KEY` is set; and HoneyLabs honeypot-fleet telemetry (IPs) if
+`HONEYLABS_API_KEY` is set. Reach for it when:
 
 - you want to know if a tracked domain/IP is still active or has been
   sinkholed/taken down (RDAP nameservers/status — a domain suddenly
@@ -425,6 +456,10 @@ history if `VT_API_KEY` is set; and HoneyLabs honeypot-fleet telemetry
 - you want sibling infrastructure the same operator stood up (Cert
   Spotter subdomains, VirusTotal resolution history, reverse-IP
   co-hosting) as new pivot leads,
+- you want a quick read on what's actually running on a tracked IP
+  (Shodan InternetDB's open ports/CPEs/vulns) without a live probe,
+- you want to check a tracked indicator against known malware-C2 IOCs
+  (ThreatFox) — a hit names the associated malware family directly,
 - you want to know whether a tracked IP is opportunistic background
   noise or something quieter (HoneyLabs). Read it both ways: heavy
   presence in honeypot telemetry — thousands of events, dozens of
@@ -456,8 +491,26 @@ onto each: domains become `active` / `dead` / `sinkholed` / `expired` /
 `unknown` (RDAP + a live DNS resolution), IPs `routed` / `unrouted` /
 `unknown` (RIPEstat). Unlike `pivot_observable`, this **writes** the
 status (and when it was checked) back onto the observables, so the
-cluster's markdown shows at a glance what's still up. Run it to
-re-validate a cluster's infrastructure periodically.
+cluster's markdown shows at a glance what's still up. The daily cron
+(`scripts/daily_tracking.py`, 06:15) now runs this for every tracked
+cluster automatically, so `status`/`status_checked`/ports stay fresh
+without a manual call - run it by hand only when you want an
+out-of-band check sooner than the next cron pass (e.g. right after
+adding a cluster mid-day).
+
+Each sweep also enriches ips via Shodan InternetDB (keyless) and, for
+both ips and domains, ThreatFox if `THREATFOX_API_KEY` is set (domains
+additionally get Cert Spotter, surfaced in the returned summary only —
+its sibling hostnames are pivot leads, not a field worth tracking over
+time). A dated snapshot of that enrichment is logged to the
+tracking-store history (`cti_tools/tracking/store.py`'s `observations`
+table — the same store behind the dashboard's "Live tracking" pages) so
+the dashboard's per-observable profile can show a timeline of when
+ports/tags/matches were seen or changed, rather than each sweep silently
+overwriting the last one. This is best-effort: a tracking-store hiccup
+(e.g. the daily cron running concurrently) surfaces as a `history_note`
+in the returned summary, not a failed sweep — the cluster-JSON status
+write above always lands regardless.
 
 **`pivot_and_expand(value, cluster_name)`** / `cti pivot-and-expand
 <value> <cluster_name>` — pivot a domain/IP and **file** the
@@ -672,7 +725,10 @@ STIX Note objects tied to the cluster's Intrusion Set.
 
 ## Tool availability
 
-Prefer the MCP tools if the harness exposes them: `list_clusters`,
+Use the MCP tools directly — every harness in this repo (Claude Code,
+GitHub Copilot, Pi via `pi-mcp-adapter`) has an MCP client wired to
+`.mcp.json` / `.pi/mcp.json` (run `./setup.sh` once from the repo root
+first, to create the venv and wire those files): `list_clusters`,
 `get_cluster`, `create_cluster`, `update_profile`, `update_ttp`,
 `remove_ttp`,
 `append_hunt_log`, `add_detection`, `get_technique_usage`,
@@ -683,39 +739,6 @@ Prefer the MCP tools if the harness exposes them: `list_clusters`,
 `pop_pending_fingerprints`, `pivot_observable`, `pivot_cluster`,
 `pivot_and_expand`, `analyze_report`, `ingest_report`.
 
-If MCP tools are not available in this harness, use the CLI directly via
-the shell/bash tool from the `mcp-server` directory (or run `./setup.sh`
-once from the repo root first, to create the venv and wire `.mcp.json`):
-
-```
-python -m cti_tools.cli list-clusters
-python -m cti_tools.cli get-cluster <name>
-python -m cti_tools.cli create-cluster <name> --description "..."
-python -m cti_tools.cli update-profile <name> --adversary "..." --confidence 60 --aliases "Alias A,Alias B"
-python -m cti_tools.cli update-ttp <name> <technique_id> <technique_name> <status> --notes "..."
-python -m cti_tools.cli remove-ttp <name> <technique_id>
-python -m cti_tools.cli append-hunt-log <name> "<entry>"
-python -m cti_tools.cli add-detection <detection_id> "<description>" <technique_ids> <status> --cluster <name>
-python -m cti_tools.cli get-technique-usage [<technique_id>]
-python -m cti_tools.cli add-relationship <name> <relationship_type> <target_cluster> --description "..." --source "..."
-python -m cti_tools.cli add-gap <name> "<description>" <priority>
-python -m cti_tools.cli export-navigator <name>
-python -m cti_tools.cli export-stix <name>
-python -m cti_tools.cli export-stix-ecosystem <name>
-python -m cti_tools.cli import-stix <bundle.json | -> [--name "..."] [--overwrite]
-python -m cti_tools.cli get-observables <name>
-python -m cti_tools.cli find-observable <value>
-python -m cti_tools.cli add-observable <name> <hashes|domains|ips|urls> <value> <source>
-python -m cti_tools.cli remove-observable <name> <category> <value>
-python -m cti_tools.cli list-pending-fingerprints
-python -m cti_tools.cli pop-pending-fingerprints
-python -m cti_tools.cli pivot-observable <value>
-python -m cti_tools.cli pivot-cluster <name>
-python -m cti_tools.cli pivot-and-expand <value> <cluster_name> [--include-cohosted]
-python -m cti_tools.cli analyze-report <url-or-file>
-python -m cti_tools.cli ingest-report <url-or-file> [--name "..."] [--no-create]
-```
-
-Both paths write to the same JSON store, so the data is identical
-regardless of which harness you're running in — this is what makes the
-harness comparison meaningful.
+All harnesses write to the same JSON store via the same `cti-tools` MCP
+server, so the data is identical regardless of which harness you're
+running in — this is what makes the harness comparison meaningful.

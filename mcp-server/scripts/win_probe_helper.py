@@ -49,10 +49,13 @@ the analyst's desktop):
    exactly the case this exists for).
 
 2. "http_fetch" - fetch a URL from this VM on the caller's behalf
-   (RDAP/RIPEstat/VirusTotal/etc. pivot lookups run through this
-   instead of reaching out directly from the cti host):
+   (RDAP/RIPEstat/VirusTotal/ThreatFox/etc. pivot lookups run through
+   this instead of reaching out directly from the cti host):
 
-       {"action": "http_fetch", "url": "...", "method": "GET", "headers": {...}}
+       {"action": "http_fetch", "url": "...", "method": "GET", "headers": {...}, "data": null}
+
+   "data", when not null, is sent as the request body (e.g. ThreatFox's
+   POST JSON query API) - omit or leave null for a plain GET.
 
    Responds with:
 
@@ -191,8 +194,10 @@ def run_tls_handshake(target: str, resolved_ip: str, port: int) -> None:
             pass
 
 
-def run_http_fetch(url: str, method: str, headers: dict[str, str]) -> dict[str, object]:
-    req = urllib.request.Request(url, method=method, headers=headers)
+def run_http_fetch(url: str, method: str, headers: dict[str, str],
+                    data: str | None = None) -> dict[str, object]:
+    body_bytes = data.encode("utf-8") if data is not None else None
+    req = urllib.request.Request(url, data=body_bytes, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=HTTPS_CONTEXT) as resp:
             body = resp.read().decode("utf-8", errors="replace")
@@ -226,7 +231,8 @@ def main() -> int:
 
     if action == "http_fetch":
         try:
-            result = run_http_fetch(request["url"], request.get("method", "GET"), request.get("headers") or {})
+            result = run_http_fetch(request["url"], request.get("method", "GET"),
+                                     request.get("headers") or {}, request.get("data"))
         except Exception as e:
             result = {"status": None, "body": None, "error": f"bad request: {e}"}
         json.dump(result, sys.stdout)

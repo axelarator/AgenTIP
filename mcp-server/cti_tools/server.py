@@ -1,10 +1,8 @@
 """MCP server for threat cluster tracking.
 
-Wraps core.py behind the MCP protocol so harnesses with native MCP
-support (Claude Code, GitHub Copilot / VS Code) can call these as
-structured tools. Pi's core loop doesn't speak MCP directly — use
-cli.py via the Bash tool there instead, or an MCP-capable Pi extension
-if you've installed one. Both surfaces hit the same JSON store.
+Wraps core.py behind the MCP protocol so any harness with an MCP
+client (Claude Code, GitHub Copilot / VS Code, Pi via pi-mcp-adapter)
+can call these as structured tools.
 
 Run:
     python -m cti_tools.server
@@ -15,7 +13,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from . import core
+from . import core, tracking
 
 mcp = FastMCP("cti-tools")
 
@@ -222,10 +220,13 @@ def requeue_fingerprint(name: str, category: str, value: str) -> list[dict]:
 def pivot_observable(value: str) -> dict:
     """On-demand infrastructure pivot for a hash/domain/ip/url against
     free public sources: RDAP (registration data), RIPEstat (ASN/
-    network, IP only), and VirusTotal (reputation + resolution
-    history, if VT_API_KEY is set - skipped gracefully otherwise).
-    Display only - nothing is written to any cluster; record anything
-    worth keeping yourself via append_hunt_log/add_gap/etc."""
+    network, IP only), Shodan InternetDB (open ports/CPEs/tags, IP
+    only), ThreatFox (known malware-C2 IOC match, every kind, if
+    THREATFOX_API_KEY is set), and VirusTotal (reputation + resolution
+    history, if VT_API_KEY is set) - both keyed sources skipped
+    gracefully otherwise. Display only - nothing is written to any
+    cluster; record anything worth keeping yourself via
+    append_hunt_log/add_gap/etc."""
     return core.pivot_observable(value)
 
 
@@ -235,8 +236,13 @@ def pivot_cluster(name: str) -> dict:
     sources and stamp a lifecycle status onto each observable: domains
     become active/dead/sinkholed/expired/unknown (RDAP + live
     resolution), ips routed/unrouted/unknown (RIPEstat). Unlike
-    pivot_observable, this WRITES the status back onto the cluster.
-    Returns a per-observable summary."""
+    pivot_observable, this WRITES the status back onto the cluster. Ips
+    are also enriched via Shodan InternetDB, and both ips and domains via
+    ThreatFox if THREATFOX_API_KEY is set - a dated snapshot of that
+    enrichment is logged to the tracking-store history (best-effort; a
+    tracking-store hiccup surfaces as a "history_note" in the summary,
+    not a failure) so the dashboard can show a timeline of when ports/
+    tags/matches were seen or changed. Returns a per-observable summary."""
     return core.pivot_cluster(name)
 
 
@@ -298,6 +304,35 @@ def import_stix_bundle(bundle: dict[str, Any], name: str | None = None,
     containing an Intrusion Set. Set overwrite=True to merge into an
     existing cluster of the same name instead of failing."""
     return core.import_stix_bundle(bundle, name, overwrite)
+
+
+@mcp.tool()
+def query_duckdb(sql: str) -> dict:
+    """Run a read-only SQL query against the actor-tracking DuckDB
+    (tables: observations, asn_changes, actors, correlations,
+    zeek_matches). Writes are rejected; output is capped at 200 rows -
+    aggregate or filter instead of paging through raw tables."""
+    return tracking.run_readonly_query(sql)
+
+
+@mcp.tool()
+def save_correlation(actor: str, correlation_type: str, indicators: list[str],
+                     narrative: str, confidence: str = "medium",
+                     suggested_opensearch_query: str | None = None) -> dict:
+    """Persist a correlation finding for a tracked actor.
+    correlation_type: asn_pivot | port_pattern | temporal_cluster |
+    new_infrastructure | zeek_hit. confidence: high | medium | low."""
+    return tracking.save_correlation(actor, correlation_type, indicators,
+                                     narrative, confidence,
+                                     suggested_opensearch_query)
+
+
+@mcp.tool()
+def get_actor_summary(actor: str) -> dict:
+    """Compact aggregate for one tracked actor: observation counts,
+    known ASNs/ports, recent ASN changes and Zeek matches, correlation
+    count. Prefer this over composing the same via query_duckdb."""
+    return tracking.actor_summary(actor)
 
 
 if __name__ == "__main__":

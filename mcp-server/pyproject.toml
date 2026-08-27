@@ -1,7 +1,7 @@
 [project]
 name = "cti-tools"
 version = "0.1.0"
-description = "Self-hosted MCP server + CLI for threat cluster tracking"
+description = "Self-hosted MCP server for threat cluster tracking"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.2.0",

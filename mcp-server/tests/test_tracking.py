@@ -13,13 +13,18 @@ import pytest
 
 from contextlib import asynccontextmanager
 
-from cti_tools import pivot
+from cti_tools import core, pivot
 from cti_tools.tracking import analytics, digest, enrich, hl_mcp, ingest, store
 from cti_tools.tracking import opensearch_xref
 
 
-TODAY = date(2026, 8, 21)
-NOW = datetime(2026, 8, 21)
+# Anchored to the real clock, not a hardcoded date: several tests below
+# (see the NOW/TODAY-tracks-real-clock note further down) compare stored
+# timestamps against a real datetime.now()/current_date inside
+# store.py/analytics.py, so a fixed literal here would silently drift out
+# of every freshness window as real time passes.
+TODAY = date.today()
+NOW = datetime.combine(TODAY, datetime.min.time())
 
 
 @pytest.fixture(autouse=True)
@@ -109,6 +114,44 @@ def test_ingest_json_and_rerun_is_idempotent(tmp_path):
     assert count == 1  # same (observed_at, ip, source) key upserts
 
 
+def test_register_new_clusters_adds_only_untracked(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "DATA_DIR", tmp_path / "clusters")
+    core.DATA_DIR.mkdir()
+    core.create_cluster("Existing Actor")
+    core.add_observable("Existing Actor", "ips", "203.0.113.9", "test")
+    core.create_cluster("New Actor")
+    core.add_observable("New Actor", "ips", "198.51.100.10", "test")
+
+    with store.connect() as con:
+        # "Existing Actor" is already tracked from an earlier run/seed.
+        store.upsert_actor(con, "Existing Actor", datetime(2026, 1, 1),
+                           cluster_slug="existing-actor")
+        result = ingest.register_new_clusters(con)
+        rows = {r[0]: r for r in con.execute(
+            "SELECT actor_name, first_observed, last_observed FROM actors").fetchall()}
+
+    assert result == {"actors_registered": 1, "ips_by_actor": {"New Actor": 1}}
+    assert set(rows) == {"Existing Actor", "New Actor"}
+    # Untouched: register_new_clusters must not widen an already-tracked
+    # actor's window just because the sweep ran today.
+    assert rows["Existing Actor"][1] == datetime(2026, 1, 1)
+    assert rows["Existing Actor"][2] == datetime(2026, 1, 1)
+
+
+def test_register_new_clusters_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "DATA_DIR", tmp_path / "clusters")
+    core.DATA_DIR.mkdir()
+    core.create_cluster("Solo Actor")
+    core.add_observable("Solo Actor", "ips", "203.0.113.20", "test")
+
+    with store.connect() as con:
+        first = ingest.register_new_clusters(con)
+        second = ingest.register_new_clusters(con)
+
+    assert first["actors_registered"] == 1
+    assert second == {"actors_registered": 0, "ips_by_actor": {}}
+
+
 # ---------------------------------------------------------------- enrich
 
 def _fake_hl(monkeypatch, lookup_fn, counts_fn=None):
@@ -177,6 +220,21 @@ def test_build_worklist_prioritizes_never_enriched():
                     [NOW - timedelta(days=30)])
         worklist, _ = enrich.build_worklist(con)
         assert worklist == ["203.0.113.7", "203.0.113.8"]
+
+
+def test_build_worklist_excludes_domain_observations():
+    # pivot_cluster's Shodan/ThreatFox history logging writes domain
+    # rows under the same actor as its IPs (indicator_type='domain');
+    # HoneyLabs/RDAP/RIPEstat are IP-only, so a domain reaching the
+    # worklist would blow up the HoneyLabs CIDR prefilter.
+    with store.connect() as con:
+        _seed_actor_ip(con, "203.0.113.7")
+        _obs(con, "evil.example", TODAY, source="shodan",
+             indicator_type="domain", actor="APT-X")
+        worklist, rdap_due = enrich.build_worklist(con)
+    assert worklist == ["203.0.113.7"]
+    assert "evil.example" not in worklist
+    assert rdap_due == {"203.0.113.7"}
 
 
 def test_enrich_writes_rows_and_first_seen(fake_net):
@@ -401,7 +459,31 @@ def test_daily_xref_unreachable_is_skip():
 def test_digest_no_activity(tmp_path):
     path = digest.write(TODAY, {"status": {"ingest": "ok"}})
     assert digest.NO_ACTIVITY in path.read_text()
-    assert (tmp_path / "digests" / "2026-08-21.json").exists()
+    assert (tmp_path / "digests" / f"{TODAY.isoformat()}.json").exists()
+
+
+def test_digest_new_cluster_is_a_signal_and_pivot_errors_surface():
+    path = digest.write(TODAY, {
+        "status": {"pivot_sweep": "ok"},
+        "register": {"actors_registered": 1,
+                     "ips_by_actor": {"Mustang Panda": 6}},
+        "pivot_sweep": {"clusters_swept": 27,
+                        "errors": {"turla": "failed to reach rdap.org: timeout"}}})
+    text = path.read_text()
+    assert digest.NO_ACTIVITY not in text
+    assert "New clusters registered for tracking" in text
+    assert "Mustang Panda: 6 IPs" in text
+    assert "Pivot sweep issues" in text
+    assert "turla: failed to reach rdap.org: timeout" in text
+
+
+def test_digest_quiet_pivot_sweep_stays_no_activity():
+    # A routine day - every cluster swept clean, nothing else changed -
+    # must not wake Stage B just because the sweep phase ran.
+    path = digest.write(TODAY, {
+        "status": {"pivot_sweep": "ok"},
+        "pivot_sweep": {"clusters_swept": 27, "errors": {}}})
+    assert digest.NO_ACTIVITY in path.read_text()
 
 
 def test_digest_caps_rows_and_notes_failures():
@@ -488,3 +570,117 @@ def test_analytics_on_seeded_data(fake_net):
         new_ips = analytics.new_ips_in_known_asns(con, days=1)
     assert activity[0]["actor"] == "APT-X"
     assert [r["indicator_value"] for r in new_ips] == ["203.0.113.99"]
+
+
+# --------------------------------------------------------- dashboard view
+# These lean on the same NOW/TODAY-tracks-real-clock convention already
+# used by test_build_worklist_prioritizes_never_enriched: status
+# derivation compares stored timestamps against a real datetime.now()
+# inside store.py, so freshness windows here are expressed as offsets
+# from NOW rather than a mocked clock.
+
+def _status_for(observables, ip):
+    return next(o["status"] for o in observables if o["indicator_value"] == ip)
+
+
+def test_tracked_observables_status_never_enriched():
+    with store.connect() as con:
+        _seed_actor_ip(con, "203.0.113.7")  # report-only observation, no honeylabs row
+    result = store.tracked_observables()
+    assert _status_for(result["observables"], "203.0.113.7") == "never-enriched"
+
+
+def test_tracked_observables_status_absent():
+    with store.connect() as con:
+        _seed_actor_ip(con, "203.0.113.7")
+        _obs(con, "203.0.113.7", TODAY, source="honeylabs", hl_events=0)
+    result = store.tracked_observables()
+    assert _status_for(result["observables"], "203.0.113.7") == "absent"
+
+
+def test_tracked_observables_status_quiet():
+    with store.connect() as con:
+        _seed_actor_ip(con, "203.0.113.7")
+        _obs(con, "203.0.113.7", TODAY, source="honeylabs", hl_events=5,
+             hl_last_seen=NOW - timedelta(days=20))
+    result = store.tracked_observables()
+    assert _status_for(result["observables"], "203.0.113.7") == "quiet"
+
+
+def test_tracked_observables_status_active():
+    with store.connect() as con:
+        _seed_actor_ip(con, "203.0.113.7")
+        _obs(con, "203.0.113.7", TODAY, source="honeylabs", hl_events=5,
+             hl_last_seen=NOW - timedelta(days=3))
+    result = store.tracked_observables()
+    assert _status_for(result["observables"], "203.0.113.7") == "active"
+
+
+def test_tracked_observables_status_moved():
+    with store.connect() as con:
+        _seed_actor_ip(con, "203.0.113.7")
+        store.record_asn_change(
+            con, detected_at=NOW - timedelta(days=10), indicator_value="203.0.113.7",
+            actor="APT-X", change_type="asn_change", confidence="medium",
+            old_asn=1, new_asn=2)
+    result = store.tracked_observables()
+    assert _status_for(result["observables"], "203.0.113.7") == "moved"
+
+
+def test_tracked_observables_status_in_network_precedence():
+    with store.connect() as con:
+        _seed_actor_ip(con, "203.0.113.7")
+        _obs(con, "203.0.113.7", TODAY, source="honeylabs", hl_events=5,
+             hl_last_seen=NOW - timedelta(days=3))  # would be "active" alone
+        store.upsert_zeek_match(
+            con, day=TODAY, indicator_value="203.0.113.7", direction="inbound",
+            hit_count=3, actor="APT-X", last_ts=NOW - timedelta(hours=2))
+    result = store.tracked_observables()
+    assert _status_for(result["observables"], "203.0.113.7") == "in-network"
+
+
+def test_tracked_observables_excludes_untracked_actor():
+    with store.connect() as con:
+        store.upsert_actor(con, "APT-Z", NOW)
+        con.execute("UPDATE actors SET tracked = FALSE WHERE actor_name = 'APT-Z'")
+        _obs(con, "198.51.100.9", TODAY, source="report:x.csv", actor="APT-Z")
+    result = store.tracked_observables()
+    assert "198.51.100.9" not in {o["indicator_value"] for o in result["observables"]}
+
+
+def test_observable_history_status_matches_tracked_observables():
+    # A first_seen row (fired on the indicator's first-ever enrichment,
+    # see enrich.apply_results) must not make the detail view disagree
+    # with the list view about status - both must ignore it the same way.
+    with store.connect() as con:
+        _seed_actor_ip(con, "203.0.113.7")
+        _obs(con, "203.0.113.7", TODAY, source="honeylabs", hl_events=4,
+             hl_last_seen=NOW - timedelta(days=20))
+        store.record_asn_change(
+            con, detected_at=NOW, indicator_value="203.0.113.7",
+            actor="APT-X", change_type="first_seen", confidence="medium",
+            new_asn=64512)
+    list_status = _status_for(store.tracked_observables()["observables"], "203.0.113.7")
+    detail_status = store.observable_history("203.0.113.7")["status"]
+    assert list_status == detail_status == "quiet"
+
+
+def test_observable_history_orders_by_time_and_includes_asn_changes():
+    with store.connect() as con:
+        _seed_actor_ip(con, "203.0.113.7")
+        _obs(con, "203.0.113.7", TODAY, source="honeylabs", hl_events=5,
+             hl_last_seen=NOW - timedelta(days=1))
+        _obs(con, "203.0.113.7", TODAY - timedelta(days=5), source="honeylabs", hl_events=2)
+        store.record_asn_change(
+            con, detected_at=NOW - timedelta(days=3), indicator_value="203.0.113.7",
+            actor="APT-X", change_type="asn_change", confidence="medium",
+            old_asn=1, new_asn=2)
+    result = store.observable_history("203.0.113.7")
+    obs_dates = [o["observed_at"] for o in result["observations"]]
+    assert obs_dates == sorted(obs_dates)
+    assert len(result["asn_changes"]) == 1
+    assert result["status"] == "active"
+
+    empty = store.observable_history("203.0.113.250")
+    assert empty == {"ip": "203.0.113.250", "status": "never-enriched",
+                     "observations": [], "asn_changes": [], "zeek_matches": []}

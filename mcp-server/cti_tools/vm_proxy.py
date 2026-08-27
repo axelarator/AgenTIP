@@ -15,8 +15,10 @@ full request/response shapes per action). Three actions:
   active TLS/JARM fingerprinting - see probe_win().
 - "http_fetch": fetch a URL from the VM and return status/body - see
   http_fetch(). What pivot.py's RDAP/RIPEstat/VirusTotal/Cert
-  Spotter/Hackertarget lookups now run through instead of calling
-  urllib.request.urlopen directly from this host.
+  Spotter/Hackertarget/ThreatFox lookups now run through instead of
+  calling urllib.request.urlopen directly from this host. Accepts an
+  optional "data" body for POST requests (e.g. ThreatFox's JSON query
+  API), passed through as-is to urllib.request.Request.
 - "resolve_dns": DNS resolution performed from the VM - see
   resolve_dns(). What pivot.resolve_host now runs through instead of
   calling socket.getaddrinfo directly from this host.
@@ -91,11 +93,15 @@ def probe_win(target: str, port: int) -> dict[str, object]:
     return _ssh_json_rpc({"action": "jarm_probe", "target": target, "port": port})
 
 
-def http_fetch(url: str, headers: dict[str, str] | None = None, method: str = "GET") -> dict[str, object]:
+def http_fetch(url: str, headers: dict[str, str] | None = None, method: str = "GET",
+                data: str | None = None) -> dict[str, object]:
     """Fetch url from the VM. Returns {"status": int, "body": str,
-    "error": str|None} - status/body are None if error is set."""
+    "error": str|None} - status/body are None if error is set. `data`,
+    when given, is sent as the request body (e.g. a POST endpoint like
+    ThreatFox's JSON query API) - omit it for a plain GET."""
     response = _ssh_json_rpc({
         "action": "http_fetch", "url": url, "method": method, "headers": headers or {},
+        "data": data,
     })
     if response.get("error"):
         raise VMProxyError(str(response["error"]))

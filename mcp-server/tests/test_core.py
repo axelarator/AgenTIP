@@ -19,6 +19,14 @@ def isolated_data_dir(tmp_path, monkeypatch):
     yield tmp_path
 
 
+@pytest.fixture(autouse=True)
+def isolated_tracking_db(tmp_path, monkeypatch):
+    """Never touch the real data/tracking/tracking.duckdb from tests -
+    pivot_cluster now writes Shodan/ThreatFox history there. Same
+    CTI_DUCKDB_PATH override test_tracking.py uses."""
+    monkeypatch.setenv("CTI_DUCKDB_PATH", str(tmp_path / "tracking-test.duckdb"))
+
+
 def test_create_and_get_cluster():
     core.create_cluster("Test Cluster", description="desc")
     data = core.get_cluster("Test Cluster")
@@ -535,9 +543,13 @@ def stub_pivot_net(monkeypatch):
     monkeypatch.setattr(core.pivot, "ripestat_lookup", lambda ip: {"asn": [999]})
     monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {"hostnames": []})
     monkeypatch.setattr(core.pivot, "hackertarget_reverse_ip", lambda ip: {"domains": []})
-    # Unset by default so honeylabs_context short-circuits to its skip
-    # note instead of reaching pivot.honeylabs_lookup; tests that want
-    # the lookup set the env var and stub the function themselves.
+    monkeypatch.setattr(core.pivot, "shodan_internetdb_lookup",
+                        lambda ip: {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []})
+    # Unset by default so pivot_observable's ThreatFox/HoneyLabs branches
+    # short-circuit to their skip notes instead of reaching the real
+    # lookup functions; tests that want the lookup set the env var and
+    # stub the function themselves.
+    monkeypatch.delenv("THREATFOX_API_KEY", raising=False)
     monkeypatch.delenv("HONEYLABS_API_KEY", raising=False)
     return monkeypatch
 
@@ -550,6 +562,8 @@ def test_pivot_observable_domain_calls_rdap_and_certspotter_not_ripestat(stub_pi
     assert result["certspotter"] == {"hostnames": []}
     assert "ripestat" not in result
     assert "reverse_ip" not in result  # domain, not ip
+    assert "shodan" not in result  # domain, not ip
+    assert "skipped" in result["threatfox"]
     assert "skipped" in result["virustotal"]
 
 
@@ -557,23 +571,57 @@ def test_pivot_observable_ip_calls_rdap_ripestat_and_reverse_ip(stub_pivot_net):
     stub_pivot_net.delenv("VT_API_KEY", raising=False)
     stub_pivot_net.setattr(core.pivot, "hackertarget_reverse_ip",
                            lambda ip: {"domains": ["co-hosted.example"]})
+    stub_pivot_net.setattr(core.pivot, "shodan_internetdb_lookup",
+                           lambda ip: {"ports": [22, 443], "hostnames": [], "cpes": [],
+                                       "tags": [], "vulns": []})
     result = core.pivot_observable("1.2.3.4")
     assert result["kind"] == "ip"
     assert result["rdap"] == {"handle": "H"}
     assert result["ripestat"] == {"asn": [999]}
     assert result["reverse_ip"] == {"domains": ["co-hosted.example"]}
+    assert result["shodan"]["ports"] == [22, 443]
     assert "certspotter" not in result  # ip, not domain
 
 
-def test_pivot_observable_hash_skips_network_sources(monkeypatch):
-    monkeypatch.delenv("VT_API_KEY", raising=False)
+def test_pivot_observable_hash_skips_network_sources(stub_pivot_net):
+    stub_pivot_net.delenv("VT_API_KEY", raising=False)
     result = core.pivot_observable("098f6bcd4621d373cade4e832627b4f6")
     assert result["kind"] == "hash"
     assert "rdap" not in result
     assert "ripestat" not in result
     assert "certspotter" not in result
     assert "reverse_ip" not in result
+    assert "shodan" not in result
+    assert "skipped" in result["threatfox"]
     assert "skipped" in result["virustotal"]
+
+
+def test_pivot_observable_threatfox_skipped_without_key(stub_pivot_net):
+    result = core.pivot_observable("1.2.3.4")
+    assert "skipped" in result["threatfox"]
+    assert "THREATFOX_API_KEY" in result["threatfox"]["skipped"]
+
+
+def test_pivot_observable_threatfox_used_with_key(stub_pivot_net):
+    stub_pivot_net.setenv("THREATFOX_API_KEY", "fake-tf-key")
+    stub_pivot_net.setattr(core.pivot, "threatfox_lookup",
+                           lambda value, api_key: {"matches": [{"malware": "Cobalt Strike"}],
+                                                    "key_used": api_key})
+    result = core.pivot_observable("098f6bcd4621d373cade4e832627b4f6")
+    assert result["threatfox"]["matches"] == [{"malware": "Cobalt Strike"}]
+    assert result["threatfox"]["key_used"] == "fake-tf-key"
+
+
+def test_pivot_observable_threatfox_lookup_error_passes_through(stub_pivot_net):
+    # threatfox_lookup itself never raises (it catches PivotError
+    # internally, same contract as rdap_lookup/ripestat_lookup), so
+    # pivot_observable doesn't need its own try/except around it - an
+    # {"error": ...} result from the lookup should just pass through.
+    stub_pivot_net.setenv("THREATFOX_API_KEY", "fake-tf-key")
+    stub_pivot_net.setattr(core.pivot, "threatfox_lookup",
+                           lambda value, api_key: {"error": "threatfox down"})
+    result = core.pivot_observable("1.2.3.4")
+    assert result["threatfox"] == {"error": "threatfox down"}
 
 
 def test_pivot_observable_virustotal_skipped_without_key(stub_pivot_net):
@@ -1074,16 +1122,29 @@ def test_classify_ip_lifecycle():
 
 # --- pivot_cluster sweep -----------------------------------------------------
 
-def test_pivot_cluster_stamps_lifecycle_status(monkeypatch):
-    core.create_cluster("Sweep")
-    core.add_observable("Sweep", "domains", "dead-c2.example", "r")
-    core.add_observable("Sweep", "ips", "185.10.10.10", "r")
-
+@pytest.fixture
+def stub_cluster_sweep_net(monkeypatch):
+    """Stub every network source pivot_cluster's sweep now touches
+    (lifecycle sources plus the Shodan/Cert Spotter enrichment added
+    alongside them), so sweep tests are hermetic. THREATFOX_API_KEY is
+    left unset by default - tests that want ThreatFox set it and stub
+    pivot.threatfox_lookup themselves."""
     monkeypatch.setattr(core.pivot, "rdap_lookup",
                         lambda value, kind: {"nameservers": [], "status": [], "events": []})
     monkeypatch.setattr(core.pivot, "resolve_host", lambda host: [])  # NXDOMAIN -> dead
     monkeypatch.setattr(core.pivot, "ripestat_lookup",
                         lambda ip: {"prefix": "185.10.0.0/16", "asn": [64500]})
+    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {"hostnames": []})
+    monkeypatch.setattr(core.pivot, "shodan_internetdb_lookup",
+                        lambda ip: {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []})
+    monkeypatch.delenv("THREATFOX_API_KEY", raising=False)
+    return monkeypatch
+
+
+def test_pivot_cluster_stamps_lifecycle_status(stub_cluster_sweep_net):
+    core.create_cluster("Sweep")
+    core.add_observable("Sweep", "domains", "dead-c2.example", "r")
+    core.add_observable("Sweep", "ips", "185.10.10.10", "r")
 
     summary = core.pivot_cluster("Sweep")
     assert summary["domains"][0]["status"] == "dead"
@@ -1094,6 +1155,73 @@ def test_pivot_cluster_stamps_lifecycle_status(monkeypatch):
     dom = next(o for o in data["observables"]["domains"] if o["value"] == "dead-c2.example")
     assert dom["status"] == "dead"
     assert dom["status_checked"]
+
+
+def test_pivot_cluster_logs_shodan_history(stub_cluster_sweep_net):
+    core.create_cluster("Shodan Sweep")
+    core.add_observable("Shodan Sweep", "ips", "185.10.10.10", "r")
+    stub_cluster_sweep_net.setattr(
+        core.pivot, "shodan_internetdb_lookup",
+        lambda ip: {"ports": [22, 443], "hostnames": ["h.example"], "cpes": [],
+                   "tags": ["cloud"], "vulns": []})
+
+    summary = core.pivot_cluster("Shodan Sweep")
+    assert summary["ips"][0]["ports"] == [22, 443]
+    assert "history_note" not in summary
+
+    from cti_tools.tracking import store as tracking_store
+    history = tracking_store.observable_history("185.10.10.10")
+    shodan_rows = [o for o in history["observations"] if o["source"] == "shodan"]
+    assert len(shodan_rows) == 1
+    assert shodan_rows[0]["shodan_ports"] == [22, 443]
+    assert shodan_rows[0]["shodan_tags"] == ["cloud"]
+    assert shodan_rows[0]["metadata"]["hostnames"] == ["h.example"]
+
+
+def test_pivot_cluster_logs_threatfox_history_when_keyed(stub_cluster_sweep_net):
+    core.create_cluster("TF Sweep")
+    core.add_observable("TF Sweep", "ips", "185.10.10.10", "r")
+    stub_cluster_sweep_net.setenv("THREATFOX_API_KEY", "fake-tf-key")
+    stub_cluster_sweep_net.setattr(
+        core.pivot, "threatfox_lookup",
+        lambda value, api_key: {"matches": [{"malware": "Cobalt Strike"}]})
+
+    summary = core.pivot_cluster("TF Sweep")
+    assert summary["ips"][0]["threatfox_matches"] == 1
+
+    from cti_tools.tracking import store as tracking_store
+    history = tracking_store.observable_history("185.10.10.10")
+    tf_rows = [o for o in history["observations"] if o["source"] == "threatfox"]
+    assert len(tf_rows) == 1
+    assert tf_rows[0]["threatfox_matches"] == [{"malware": "Cobalt Strike"}]
+
+
+def test_pivot_cluster_skips_threatfox_history_without_key(stub_cluster_sweep_net):
+    core.create_cluster("No TF Sweep")
+    core.add_observable("No TF Sweep", "ips", "185.10.10.10", "r")
+
+    summary = core.pivot_cluster("No TF Sweep")
+    assert "threatfox_matches" not in summary["ips"][0]
+
+    from cti_tools.tracking import store as tracking_store
+    history = tracking_store.observable_history("185.10.10.10")
+    assert not [o for o in history["observations"] if o["source"] == "threatfox"]
+
+
+def test_pivot_cluster_survives_tracking_store_failure(stub_cluster_sweep_net, monkeypatch):
+    core.create_cluster("Busy Sweep")
+    core.add_observable("Busy Sweep", "ips", "185.10.10.10", "r")
+
+    def boom(actor, observed_at, results):
+        return "enrichment history not recorded: simulated failure"
+    monkeypatch.setattr(core, "_log_cluster_enrichment_history", boom)
+
+    summary = core.pivot_cluster("Busy Sweep")
+    # the cluster-JSON write still succeeded despite the tracking-store note
+    assert summary["ips"][0]["status"] == "routed"
+    assert "history_note" in summary
+    data = core.get_cluster("Busy Sweep")
+    assert data["observables"]["ips"][0]["status"] == "routed"
 
 
 # --- pivot_and_expand filing loop -------------------------------------------

@@ -1,8 +1,7 @@
 """Core business logic for threat cluster tracking.
 
-Protocol-agnostic on purpose: server.py (MCP) and cli.py (Pi / any Bash
-tool) both call these same functions so the two invocation surfaces stay
-identical. No MCP or argparse imports belong in this file.
+Protocol-agnostic on purpose: server.py (MCP) calls these same
+functions for every harness. No MCP imports belong in this file.
 """
 from __future__ import annotations
 
@@ -10,6 +9,7 @@ import concurrent.futures
 import ipaddress
 import json
 import os
+import re
 import tempfile
 import uuid
 from contextlib import contextmanager
@@ -17,7 +17,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+import duckdb
+
 from . import attack, pivot, report_ingest, stix
+from .tracking import store as tracking_store
 
 try:
     import fcntl  # POSIX-only; the lock degrades to a no-op elsewhere.
@@ -151,6 +154,11 @@ def _nothing_extracted(extracted: dict[str, list[str]]) -> bool:
 
 def _path(name: str) -> Path:
     safe = name.strip().lower().replace(" ", "-")
+    # Collapse anything that isn't filename-safe (notably "/" and "\", which
+    # would otherwise turn into a stray subdirectory - e.g. "ITG27 / Mustang
+    # Panda" silently landing at itg27-/-mustang-panda.json and never
+    # showing up in list_clusters(), which only globs the top-level dir).
+    safe = re.sub(r"[^a-z0-9._-]+", "-", safe).strip("-")
     return DATA_DIR / f"{safe}.json"
 
 
@@ -893,14 +901,27 @@ def pivot_observable(value: str) -> dict[str, Any]:
     VirusTotal is skipped (with a note, not an error) if VT_API_KEY
     isn't configured - RDAP and RIPEstat need no key at all and always
     run for the observable types they apply to. Certificate-transparency
-    history (Cert Spotter, for domains) and reverse-IP co-hosting
-    (Hackertarget, for IPs) are also keyless and surface sibling
-    infrastructure as new pivot leads. HoneyLabs honeypot-fleet
-    telemetry (IPs only, HONEYLABS_API_KEY) is likewise skipped with a
-    note when unconfigured; see summarize_honeylabs for how to read it.
+    history (Cert Spotter, for domains), reverse-IP co-hosting
+    (Hackertarget, for IPs), and open-port/CPE data (Shodan InternetDB,
+    for IPs) are also keyless and surface sibling infrastructure or
+    context as new pivot leads. ThreatFox (abuse.ch, THREATFOX_API_KEY)
+    checks every kind against known malware-C2 IOCs, and is likewise
+    skipped with a note when unconfigured - abuse.ch's Auth Portal now
+    requires a free Auth-Key on every ThreatFox call. HoneyLabs
+    honeypot-fleet telemetry (IPs only, HONEYLABS_API_KEY) is likewise
+    skipped with a note when unconfigured; see summarize_honeylabs for
+    how to read it.
     """
     kind = pivot.classify(value)
     result: dict[str, Any] = {"value": value, "kind": kind}
+
+    threatfox_key = os.environ.get(pivot.THREATFOX_API_KEY_ENV)
+    if not threatfox_key:
+        result["threatfox"] = {
+            "skipped": f"set {pivot.THREATFOX_API_KEY_ENV} to enable ThreatFox lookups"}
+    else:
+        result["threatfox"] = _cached_pivot(
+            "threatfox", value, lambda: pivot.threatfox_lookup(value, threatfox_key))
 
     if kind in ("domain", "ip"):
         result["rdap"] = _cached_pivot("rdap", value, lambda: pivot.rdap_lookup(value, kind))
@@ -908,6 +929,8 @@ def pivot_observable(value: str) -> dict[str, Any]:
         result["ripestat"] = _cached_pivot("ripestat", value, lambda: pivot.ripestat_lookup(value))
         result["reverse_ip"] = _cached_pivot(
             "reverse_ip", value, lambda: pivot.hackertarget_reverse_ip(value))
+        result["shodan"] = _cached_pivot(
+            "shodan", value, lambda: pivot.shodan_internetdb_lookup(value))
         result["honeylabs"] = honeylabs_context(value)
     if kind == "domain":
         result["certspotter"] = _cached_pivot(
@@ -993,19 +1016,83 @@ def summarize_honeylabs(result: dict[str, Any]) -> str | None:
 _PIVOT_CLUSTER_WORKERS = 6
 
 
-def _domain_lifecycle(value: str) -> tuple[str, dict[str, Any]]:
+def _threatfox_enrichment(value: str) -> dict[str, Any] | None:
+    """Cached ThreatFox lookup for pivot_cluster's sweep, or None if
+    THREATFOX_API_KEY isn't configured - mirrors pivot_observable's own
+    skip-gracefully behavior rather than raising or logging a skip note
+    per observable."""
+    api_key = os.environ.get(pivot.THREATFOX_API_KEY_ENV)
+    if not api_key:
+        return None
+    return _cached_pivot("threatfox", value, lambda: pivot.threatfox_lookup(value, api_key))
+
+
+def _domain_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     rdap = _cached_pivot("rdap", value, lambda: pivot.rdap_lookup(value, "domain"))
     resolved = pivot.resolve_host(value)  # live, not cached — liveness is the point
     status = pivot.classify_domain_lifecycle(rdap, resolved)
-    return status, {"resolved": resolved,
-                    "nameservers": rdap.get("nameservers") if isinstance(rdap, dict) else None}
+    detail = {"resolved": resolved,
+             "nameservers": rdap.get("nameservers") if isinstance(rdap, dict) else None}
+    # Cert Spotter here is ephemeral (surfaced in pivot_cluster's returned
+    # summary only, not logged to the tracking store) - its useful signal
+    # is sibling hostnames, which pivot_and_expand already files as new
+    # tracked domains; there's no "field that changes over time" here the
+    # way there is for an IP's ports/ASN.
+    enrichment: dict[str, Any] = {
+        "certspotter": _cached_pivot("certspotter", value, lambda: pivot.certspotter_lookup(value)),
+    }
+    threatfox = _threatfox_enrichment(value)
+    if threatfox is not None:
+        enrichment["threatfox"] = threatfox
+    return status, detail, enrichment
 
 
-def _ip_lifecycle(value: str) -> tuple[str, dict[str, Any]]:
+def _ip_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     ripe = _cached_pivot("ripestat", value, lambda: pivot.ripestat_lookup(value))
     status = pivot.classify_ip_lifecycle(ripe)
-    return status, {"asn": ripe.get("asn") if isinstance(ripe, dict) else None,
-                    "prefix": ripe.get("prefix") if isinstance(ripe, dict) else None}
+    detail = {"asn": ripe.get("asn") if isinstance(ripe, dict) else None,
+             "prefix": ripe.get("prefix") if isinstance(ripe, dict) else None,
+             "as_holder": ripe.get("as_holder") if isinstance(ripe, dict) else None}
+    enrichment: dict[str, Any] = {
+        "shodan": _cached_pivot("shodan", value, lambda: pivot.shodan_internetdb_lookup(value)),
+    }
+    threatfox = _threatfox_enrichment(value)
+    if threatfox is not None:
+        enrichment["threatfox"] = threatfox
+    return status, detail, enrichment
+
+
+def _log_cluster_enrichment_history(
+        actor: str, observed_at: datetime,
+        results: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]) -> str | None:
+    """Best-effort: write one dated observation row per ip/domain that got
+    fresh Shodan/ThreatFox data this sweep, so the dashboard's per-observable
+    timeline can show when these fields were seen or changed. Returns an
+    error note (never raises) on a tracking-store hiccup - pivot_cluster's
+    cluster-JSON write already happened and a separate store's outage
+    shouldn't undo or block reporting that success."""
+    try:
+        with tracking_store.connect(read_only=False) as con:
+            for (category, value), (_status, _detail, enrichment) in results.items():
+                indicator_type = "domain" if category == "domains" else "ipv4"
+                shodan = enrichment.get("shodan")
+                if isinstance(shodan, dict) and "error" not in shodan:
+                    tracking_store.upsert_observation(
+                        con, observed_at=observed_at, indicator_value=value,
+                        source="shodan", actor=actor, indicator_type=indicator_type,
+                        shodan_ports=shodan.get("ports") or None,
+                        shodan_tags=shodan.get("tags") or None,
+                        metadata={"hostnames": shodan.get("hostnames"),
+                                 "cpes": shodan.get("cpes"), "vulns": shodan.get("vulns")})
+                threatfox = enrichment.get("threatfox")
+                if isinstance(threatfox, dict) and "error" not in threatfox:
+                    tracking_store.upsert_observation(
+                        con, observed_at=observed_at, indicator_value=value,
+                        source="threatfox", actor=actor, indicator_type=indicator_type,
+                        threatfox_matches=threatfox.get("matches") or None)
+    except (tracking_store.TrackingBusy, duckdb.IOException) as e:
+        return f"enrichment history not recorded: {e}"
+    return None
 
 
 def pivot_cluster(name: str) -> dict[str, Any]:
@@ -1019,6 +1106,17 @@ def pivot_cluster(name: str) -> dict[str, Any]:
     display-only), and a summary is returned. Successful source lookups
     are cached (see CTI_PIVOT_CACHE_TTL) so re-sweeping is cheap.
 
+    Each ip is also enriched via Shodan InternetDB (keyless) and, for
+    both ips and domains, ThreatFox (if THREATFOX_API_KEY is set) -
+    domains additionally get Cert Spotter, though that's surfaced in the
+    summary only, not logged historically (see
+    _log_cluster_enrichment_history). Unlike the RDAP/RIPEstat lifecycle
+    check, a dated snapshot of this enrichment is recorded to the
+    tracking-store history (mcp_tools.tracking.store) so the dashboard's
+    per-observable profile can show a timeline of when ports/tags/matches
+    were seen or changed - see get_observables/the dashboard for how
+    that's read back.
+
     The network lookups run concurrently and, crucially, OUTSIDE the data
     lock - a cluster with dozens of domains would otherwise serialize
     into minutes of blocking I/O with the whole store locked. Only the
@@ -1029,7 +1127,7 @@ def pivot_cluster(name: str) -> dict[str, Any]:
     ips = [o["value"] for o in data["observables"]["ips"]]
 
     # Network phase: concurrent, no lock held.
-    results: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
+    results: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]] = {}
     jobs = ([("domains", v, _domain_lifecycle) for v in domains]
             + [("ips", v, _ip_lifecycle) for v in ips])
     if jobs:
@@ -1040,7 +1138,7 @@ def pivot_cluster(name: str) -> dict[str, Any]:
                 try:
                     results[(cat, v)] = fut.result()
                 except Exception as e:  # a single lookup blowing up shouldn't sink the sweep
-                    results[(cat, v)] = ("unknown", {"error": str(e)})
+                    results[(cat, v)] = ("unknown", {"error": str(e)}, {})
 
     # Write phase: brief lock, applied onto a fresh read of the cluster.
     now = _now()
@@ -1052,15 +1150,33 @@ def pivot_cluster(name: str) -> dict[str, Any]:
                 found = results.get((cat, o["value"]))
                 if not found:
                     continue
-                status, detail = found
+                status, detail, enrichment = found
                 o["status"] = status
                 o["status_checked"] = now
                 o["status_detail"] = detail
                 row = {"value": o["value"], "status": status}
+                shodan = enrichment.get("shodan")
+                if isinstance(shodan, dict) and "error" not in shodan:
+                    row["ports"] = shodan.get("ports")
+                certspotter = enrichment.get("certspotter")
+                if isinstance(certspotter, dict) and "error" not in certspotter:
+                    row["cert_sibling_count"] = len(certspotter.get("hostnames") or [])
+                threatfox = enrichment.get("threatfox")
+                if isinstance(threatfox, dict) and "error" not in threatfox:
+                    row["threatfox_matches"] = len(threatfox.get("matches") or [])
                 row["resolved" if cat == "domains" else "asn"] = \
                     detail.get("resolved") if cat == "domains" else detail.get("asn")
                 summary[cat].append(row)
         save_cluster(data)
+
+    # Best-effort history logging to the separate tracking store, outside
+    # the cluster-JSON lock above (a different store, its own locking) -
+    # done after that write succeeds so a tracking-store hiccup can't
+    # undo or block the cluster-JSON update that already landed.
+    observed_at = datetime.fromisoformat(now).replace(tzinfo=None)
+    history_error = _log_cluster_enrichment_history(data["name"], observed_at, results)
+    if history_error:
+        summary["history_note"] = history_error
     return summary
 
 
@@ -1575,6 +1691,30 @@ def import_stix_bundle(bundle: dict[str, Any], name: str | None = None,
     return data
 
 
+_DATE_ONLY_RE = re.compile(r"^(\d{4})-(\d{2})(?:-(\d{2}))?")
+
+
+def _date_only(value: str | None) -> str | None:
+    """Normalize an ISO-ish date/datetime/year-month string to plain
+    YYYY-MM-DD, or return the value unchanged if it doesn't start with
+    at least YYYY-MM. Observable-level first_seen/last_seen/
+    status_checked are always machine-generated via _now() so this is a
+    no-op slice for them, but cluster-level first_seen/last_seen
+    (update_profile's free-text params) show up in the wild as "2025-09"
+    (month precision only) or "2022-12-01T00:00:00Z" (full datetime) as
+    well as plain dates - a day-less value is padded to its 1st (the
+    conventional stand-in for "day unknown") so every first/last-seen
+    display in the app agrees on one format; anything that doesn't even
+    have YYYY-MM is passed through unmangled rather than corrupted."""
+    if not value:
+        return None
+    m = _DATE_ONLY_RE.match(value)
+    if not m:
+        return value
+    year, month, day = m.groups()
+    return f"{year}-{month}-{day or '01'}"
+
+
 def _write_markdown(data: dict[str, Any]) -> None:
     """Regenerate the human-readable view. Never hand-edit the .md file —
     it's derived from the .json, which is the source of truth."""
@@ -1588,8 +1728,8 @@ def _write_markdown(data: dict[str, Any]) -> None:
         f"- STIX ID: `{data.get('stix_id', 'unknown')}`",
         f"- Aliases: {', '.join(data.get('aliases') or []) or 'none'}",
         f"- Confidence: {data.get('confidence')}",
-        f"- First seen: {data.get('first_seen') or 'unknown'}",
-        f"- Last seen: {data.get('last_seen') or 'unknown'}",
+        f"- First seen: {_date_only(data.get('first_seen')) or 'unknown'}",
+        f"- Last seen: {_date_only(data.get('last_seen')) or 'unknown'}",
         "",
         "## Diamond model",
         f"- Adversary: {d['adversary']}",
@@ -1626,14 +1766,18 @@ def _write_markdown(data: dict[str, Any]) -> None:
         items = obs.get(category, [])
         lines.append(f"\n### {category.capitalize()} ({len(items)})")
         if items:
-            lines.append("| Value | Status | Sources | First seen | Last seen |")
-            lines.append("|---|---|---|---|---|")
+            lines.append("| Value | Status | Sources | First seen | Last seen | Last checked |")
+            lines.append("|---|---|---|---|---|---|")
             for o in items:
-                status = o.get("status", "")
-                if status and o.get("status_checked"):
-                    status = f"{status} ({o['status_checked'][:10]})"
-                lines.append(f"| {o['value']} | {status} | {', '.join(o['sources'])} | "
-                              f"{o['first_seen']} | {o['last_seen']} |")
+                # last_seen tracks provenance (last time a source re-filed
+                # this value), not liveness - status_checked (from
+                # pivot_cluster) is the "last actually re-verified" date,
+                # so it gets its own column rather than piggybacking on
+                # Status like it used to.
+                lines.append(f"| {o['value']} | {o.get('status') or ''} | {', '.join(o['sources'])} | "
+                              f"{_date_only(o.get('first_seen')) or ''} | "
+                              f"{_date_only(o.get('last_seen')) or ''} | "
+                              f"{_date_only(o.get('status_checked')) or ''} |")
         else:
             lines.append("none")
     lines += ["", "## Report sources"]

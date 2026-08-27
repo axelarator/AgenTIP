@@ -9,8 +9,7 @@ skills/threat-cluster-tracking/SKILL.md   # procedural knowledge, portable as-is
 mcp-server/                               # tools: core logic + MCP + CLI surfaces
   cti_tools/core.py                       # source of truth, no protocol code
   cti_tools/stix.py                       # STIX 2.1 bundle (de)serialization
-  cti_tools/server.py                     # MCP surface (Claude Code, Copilot)
-  cti_tools/cli.py                        # CLI surface (Pi via Bash, or any harness)
+  cti_tools/server.py                     # MCP surface (Claude Code, Copilot, Pi)
   tests/                                  # pytest against core.py
 data/clusters/                            # local JSON + generated markdown, gitignored
 setup.sh                                  # creates the venv, wires .mcp.json
@@ -36,12 +35,16 @@ wires up).
 
 Then, per harness:
 
-- **Claude Code / GitHub Copilot** — native MCP support. `.mcp.json` is
-  already wired by `setup.sh`; put `skills/threat-cluster-tracking/`
-  wherever your harness reads Agent Skills from (Claude Code:
-  `.claude/skills/`).
-- **Pi** — no built-in MCP client in the core loop, so the skill drives
-  `cti_tools/cli.py` through the Bash tool instead.
+- **Claude Code** — native MCP support. `.mcp.json` and
+  `.claude/skills/threat-cluster-tracking/` are both already wired by
+  `setup.sh` (the latter is a mirror of `skills/threat-cluster-tracking/`,
+  refreshed on every run).
+- **GitHub Copilot** — native MCP support via `.mcp.json` (already
+  wired by `setup.sh`); put `skills/threat-cluster-tracking/` wherever
+  its own Agent Skills loader reads from.
+- **Pi** — MCP support via the `pi-mcp-adapter` package
+  (https://pi.dev/packages/pi-mcp-adapter), wired up through
+  `.pi/mcp.json` (already written by `setup.sh`).
   `.pi/skills/threat-cluster-tracking/` is already in place.
 
 See `mcp-server/README.md` for full install/wiring details, provider
