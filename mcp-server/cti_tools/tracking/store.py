@@ -111,6 +111,29 @@ CREATE TABLE IF NOT EXISTS zeek_matches (
     log_files JSON,
     UNIQUE (day, indicator_value, direction)
 );
+
+-- Day-over-day port/certificate diffs from pivot_cluster's daily Shodan/
+-- Cert Spotter sweep - the same detected-change pattern as asn_changes,
+-- generalized. Deliberately a separate table rather than folding into
+-- asn_changes: ports (int array) and cert (issuer string + hostname
+-- array) don't share asn_changes' typed int/text columns, so old_value/
+-- new_value are JSON here. change_type 'first_seen' is a baseline (no
+-- prior observation to diff against), not an event - callers exclude it
+-- the same way asn_changes' own 'first_seen' rows are excluded.
+CREATE SEQUENCE IF NOT EXISTS attribute_changes_seq;
+CREATE TABLE IF NOT EXISTS attribute_changes (
+    id BIGINT PRIMARY KEY DEFAULT nextval('attribute_changes_seq'),
+    detected_at TIMESTAMP NOT NULL,
+    indicator_value TEXT NOT NULL,
+    actor TEXT,
+    attribute TEXT NOT NULL,        -- 'ports' | 'cert'
+    change_type TEXT NOT NULL,      -- 'first_seen' | 'ports_changed' |
+                                     -- 'cert_issuer_changed' | 'cert_sans_changed'
+    old_value JSON,
+    new_value JSON,
+    confidence TEXT NOT NULL,
+    UNIQUE (indicator_value, attribute, detected_at)
+);
 """
 
 # Row/byte caps for anything that flows back into an agent context.
@@ -184,6 +207,10 @@ _MIGRATIONS = """
 ALTER TABLE observations ADD COLUMN IF NOT EXISTS shodan_ports JSON;
 ALTER TABLE observations ADD COLUMN IF NOT EXISTS shodan_tags JSON;
 ALTER TABLE observations ADD COLUMN IF NOT EXISTS threatfox_matches JSON;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS cert_issuer TEXT;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS cert_not_before TIMESTAMP;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS cert_not_after TIMESTAMP;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS cert_sibling_hostnames JSON;
 """
 
 
@@ -203,10 +230,11 @@ _OBS_COLUMNS = (
     "source", "source_url", "hl_events", "hl_events_7d", "hl_first_seen",
     "hl_last_seen", "hl_ports", "hl_tags", "hl_threat_level",
     "shodan_ports", "shodan_tags", "threatfox_matches",
+    "cert_issuer", "cert_not_before", "cert_not_after", "cert_sibling_hostnames",
     "asn", "netname", "country_code", "abuse_contact", "metadata",
 )
 _OBS_JSON_COLUMNS = {"hl_ports", "hl_tags", "shodan_ports", "shodan_tags",
-                     "threatfox_matches", "metadata"}
+                     "threatfox_matches", "cert_sibling_hostnames", "metadata"}
 
 
 def upsert_observation(con: duckdb.DuckDBPyConnection, *, observed_at,
@@ -263,6 +291,53 @@ def record_asn_change(con: duckdb.DuckDBPyConnection, *, detected_at,
                confidence = excluded.confidence""",
         [detected_at, indicator_value, actor, old_asn, old_netname,
          new_asn, new_netname, change_type, confidence])
+
+
+def latest_ports_for(con: duckdb.DuckDBPyConnection, ip: str,
+                     before) -> dict[str, Any] | None:
+    """Most recent prior Shodan-sourced observation of `ip` that carried
+    a port list, strictly before `before` - the baseline for port-change
+    detection, mirroring latest_asn_for."""
+    row = con.execute(
+        """SELECT observed_at, shodan_ports FROM observations
+           WHERE indicator_value = ? AND source = 'shodan'
+             AND shodan_ports IS NOT NULL AND observed_at < ?
+           ORDER BY observed_at DESC LIMIT 1""", [ip, before]).fetchone()
+    if row is None:
+        return None
+    return {"observed_at": row[0], "ports": json.loads(row[1])}
+
+
+def latest_cert_for(con: duckdb.DuckDBPyConnection, domain: str,
+                    before) -> dict[str, Any] | None:
+    """Most recent prior Cert-Spotter-sourced observation of `domain`
+    that carried a cert issuer, strictly before `before` - the baseline
+    for certificate-change detection, mirroring latest_asn_for."""
+    row = con.execute(
+        """SELECT observed_at, cert_issuer, cert_sibling_hostnames FROM observations
+           WHERE indicator_value = ? AND source = 'certspotter'
+             AND cert_issuer IS NOT NULL AND observed_at < ?
+           ORDER BY observed_at DESC LIMIT 1""", [domain, before]).fetchone()
+    if row is None:
+        return None
+    return {"observed_at": row[0], "issuer": row[1],
+            "sibling_hostnames": json.loads(row[2]) if row[2] else []}
+
+
+def record_attribute_change(con: duckdb.DuckDBPyConnection, *, detected_at,
+                            indicator_value: str, attribute: str, change_type: str,
+                            confidence: str, actor: str | None = None,
+                            old_value: Any = None, new_value: Any = None) -> None:
+    con.execute(
+        """INSERT INTO attribute_changes (detected_at, indicator_value, actor, attribute,
+               change_type, old_value, new_value, confidence)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (indicator_value, attribute, detected_at) DO UPDATE SET
+               actor = excluded.actor, change_type = excluded.change_type,
+               old_value = excluded.old_value, new_value = excluded.new_value,
+               confidence = excluded.confidence""",
+        [detected_at, indicator_value, actor, attribute, change_type,
+         _json(old_value), _json(new_value), confidence])
 
 
 def upsert_actor(con: duckdb.DuckDBPyConnection, name: str, seen_at, *,

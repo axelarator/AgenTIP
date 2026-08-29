@@ -12,7 +12,10 @@ OpenSearch, and stored as per-day observation rows in DuckDB at
 `data/tracking/tracking.duckdb`. This is the temporal complement to
 the cluster JSON store (`skills/threat-cluster-tracking/`): clusters
 stay canonical for TTP/diamond/profile data, this layer answers "what
-changed, and when".
+changed, and when". A cluster observable's own asn/ports/cert/tags
+fields (see `skills/threat-cluster-tracking/`) are a live point-in-time
+snapshot for analyst display; the history of when those values changed
+lives only here, in DuckDB.
 
 An actor row's `cluster_slug` is the only link to a cluster
 (`data/clusters/<slug>.json`); there is no reverse sync.
@@ -24,13 +27,27 @@ a budgeted daily loop, confined to IPs of tracked actors.
 ## Tables
 
 - `observations` - one row per (day, IP, source). source is
-  `report:<file>`, `honeylabs`, `rdap`, or `cluster:<slug>`.
+  `report:<file>`, `honeylabs`, `rdap`, `shodan`, `certspotter`,
+  `threatfox`, or `cluster:<slug>`.
   HoneyLabs fields: hl_events, hl_events_7d, hl_first_seen,
   hl_last_seen, hl_ports (JSON int array), hl_tags, hl_threat_level.
-  Registry fields: asn, netname, country_code.
+  Registry fields: asn, netname, country_code. Shodan fields:
+  shodan_ports, shodan_tags. Cert Spotter fields (source=`certspotter`):
+  cert_issuer, cert_not_before, cert_not_after, cert_sibling_hostnames
+  (JSON array).
 - `asn_changes` - detected pivots: change_type is `asn_change`,
   `netname_change`, or `first_seen` (baseline, not an event);
   confidence high/medium/low.
+- `attribute_changes` - detected port/cert pivots from the daily
+  Shodan/Cert Spotter sweep (`pivot_cluster`, the same mechanism that
+  feeds `asn_changes`' RDAP/RIPEstat side, but this table is written
+  from a separate sweep - see `_log_cluster_enrichment_history` in
+  `core.py`). attribute is `ports` or `cert`; change_type is
+  `ports_changed`, `cert_issuer_changed`, `cert_sans_changed`, or
+  `first_seen` (baseline, not an event); old_value/new_value are JSON;
+  confidence high/medium/low, downgraded on a stale (>90d) baseline. A
+  same-issuer cert renewal with unchanged sibling hostnames is not
+  recorded at all (routine, not a signal).
 - `actors` - actor_name PK, first/last observed, known_asns,
   known_ports (JSON arrays), cluster_slug, tracked flag.
 - `correlations` - persisted findings (see save_correlation).
@@ -56,8 +73,13 @@ the daily job holds the write lock - wait a moment and retry.
 
 Named SQL constants in `mcp-server/cti_tools/tracking/analytics.py`,
 usable verbatim through query_duckdb: RECENT_ACTOR_ACTIVITY (30d),
-ASN_PIVOTS (7d), PORT_PATTERN_SUMMARY, NEW_IPS_IN_KNOWN_ASNS,
-TEMPORAL_CLUSTERS (weekly IP-count anomalies vs the actor's median).
+ASN_PIVOTS (7d), ATTRIBUTE_CHANGES (1d, port/cert pivots, excludes
+first_seen baselines), PORT_PATTERN_SUMMARY, NEW_INDICATORS_IN_KNOWN_ASNS
+(unattributed, first-seen-in-window only), CROSS_ACTOR_ASN_OVERLAP
+(already-attributed indicators whose ASN overlaps a different tracked
+actor - excludes large shared-hosting ASNs like AWS/Alibaba/Cloudflare
+by default), TEMPORAL_CLUSTERS (weekly IP-count anomalies vs the
+actor's median).
 
 ## Daily loop and files
 

@@ -13,7 +13,7 @@ import re
 import tempfile
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -21,6 +21,7 @@ import duckdb
 
 from . import attack, pivot, report_ingest, stix
 from .tracking import store as tracking_store
+from .tracking.enrich import STALE_BASELINE_DAYS as _ATTR_STALE_BASELINE_DAYS
 
 try:
     import fcntl  # POSIX-only; the lock degrades to a no-op elsewhere.
@@ -265,7 +266,10 @@ def _new_cluster(name: str, description: str) -> dict[str, Any]:
         "hunt_log": [],   # [{date, entry}] append-only
         "detections": [], # computed join onto the shared registry at load time, not stored
         "gaps": [],       # [{description, priority, created}]
-        # each entry: {value, sources: [...], first_seen, last_seen}
+        # each entry: {value, sources: [...], first_seen, last_seen}, plus
+        # for domains/ips: ports (ips), asn/netname (ips), cert (domains),
+        # tags (both) - see _apply_enrichment_snapshot for how these get
+        # populated, at add-time and on every pivot_cluster sweep.
         "observables": {c: [] for c in OBSERVABLE_CATEGORIES},
         "report_sources": [],  # [{source, ingested, observables_found, ttps_found}]
         "relationships": [],  # [{relationship_type, target_cluster, target_stix_id, description, source, created}]
@@ -765,7 +769,6 @@ def find_observable(value: str) -> dict[str, Any]:
     return {"value": value, "matches": matches}
 
 
-@_synchronized
 def add_observable(name: str, category: str, value: str, source: str) -> dict[str, Any]:
     """Manually file a single observable (category is one of
     OBSERVABLE_CATEGORIES: hashes, domains, ips, urls, emails, cves,
@@ -785,12 +788,33 @@ def add_observable(name: str, category: str, value: str, source: str) -> dict[st
     that function's docstring. If it's skipped, the returned dict
     carries a transient (not persisted) `fingerprint_queue_skipped`
     list of {category, value, reason}; use requeue_fingerprint if you
-    disagree with the call and want it probed anyway."""
+    disagree with the call and want it probed anyway.
+
+    A genuinely new domain/ip also gets a live asn/ports/cert/tags
+    enrichment lookup (see _apply_enrichment_snapshot) before it's filed
+    - deliberately run here, unlocked, rather than inside the
+    @_synchronized merge below (see _sweep_lifecycle's docstring for
+    why); re-touching an already-tracked value skips this and just
+    appends `source` as before."""
     if category not in OBSERVABLE_CATEGORIES:
         raise ValueError("category must be one of " + ", ".join(OBSERVABLE_CATEGORIES))
-    data = load_cluster(name)
+    data = load_cluster(name)  # existence check + snapshot to decide if this is genuinely new
+    enrichment: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]] = {}
+    already_tracked = value in {o["value"] for o in data["observables"][category]}
+    if category in _FINGERPRINTABLE_CATEGORIES and not already_tracked:
+        enrichment = _sweep_lifecycle(
+            domains=[value] if category == "domains" else [],
+            ips=[value] if category == "ips" else [])
+    return _add_observable_locked(name, category, value, source, enrichment)
+
+
+@_synchronized
+def _add_observable_locked(name: str, category: str, value: str, source: str,
+                           enrichment: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]
+                           ) -> dict[str, Any]:
+    data = load_cluster(name)  # re-read fresh; another writer may have raced in above
     extracted = {c: ([value] if c == category else []) for c in OBSERVABLE_CATEGORIES}
-    _, skipped = _merge_observables(data, extracted, source)
+    _, skipped = _merge_observables(data, extracted, source, enrichment=enrichment)
     save_cluster(data)
     if skipped:
         data = {**data, "fingerprint_queue_skipped": skipped}
@@ -1033,11 +1057,6 @@ def _domain_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     status = pivot.classify_domain_lifecycle(rdap, resolved)
     detail = {"resolved": resolved,
              "nameservers": rdap.get("nameservers") if isinstance(rdap, dict) else None}
-    # Cert Spotter here is ephemeral (surfaced in pivot_cluster's returned
-    # summary only, not logged to the tracking store) - its useful signal
-    # is sibling hostnames, which pivot_and_expand already files as new
-    # tracked domains; there's no "field that changes over time" here the
-    # way there is for an IP's ports/ASN.
     enrichment: dict[str, Any] = {
         "certspotter": _cached_pivot("certspotter", value, lambda: pivot.certspotter_lookup(value)),
     }
@@ -1062,13 +1081,176 @@ def _ip_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     return status, detail, enrichment
 
 
+def _sweep_lifecycle(domains: list[str], ips: list[str]
+                      ) -> dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]:
+    """Concurrent, lock-free lifecycle+enrichment sweep for a batch of
+    domains/ips - the network phase shared by pivot_cluster (rechecking
+    already-tracked observables) and the add-time enrichment path
+    (add_observable/ingest_report/pivot_and_expand, for genuinely new
+    ones). Never call this while holding _data_lock: a batch of RDAP/
+    RIPEstat/Shodan/Cert Spotter/ThreatFox round-trips can take a while,
+    and every other MCP tool call would block behind the lock for the
+    duration - see pivot_cluster's docstring for why its own network
+    phase already runs unlocked. A single lookup blowing up is recorded
+    as an ("unknown", {"error": ...}, {}) tuple rather than sinking the
+    whole batch."""
+    jobs = ([("domains", v, _domain_lifecycle) for v in domains]
+            + [("ips", v, _ip_lifecycle) for v in ips])
+    results: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]] = {}
+    if jobs:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_PIVOT_CLUSTER_WORKERS) as ex:
+            futures = {ex.submit(fn, v): (cat, v) for cat, v, fn in jobs}
+            for fut in concurrent.futures.as_completed(futures):
+                cat, v = futures[fut]
+                try:
+                    results[(cat, v)] = fut.result()
+                except Exception as e:  # a single lookup blowing up shouldn't sink the sweep
+                    results[(cat, v)] = ("unknown", {"error": str(e)}, {})
+    return results
+
+
+def _new_values(data: dict[str, Any], category: str, values: list[str]) -> list[str]:
+    """Values in `values` not already tracked on the cluster in `category`,
+    deduped, order-preserving - the "what actually needs an enrichment
+    lookup" filter shared by add_observable/ingest_report/pivot_and_expand,
+    kept in sync with _file_new_observables' own dedup logic."""
+    existing = {o["value"] for o in data["observables"][category]}
+    return [v for v in dict.fromkeys(values) if v and v not in existing]
+
+
+def _apply_enrichment_snapshot(entry: dict[str, Any], category: str,
+                                detail: dict[str, Any], enrichment: dict[str, Any]) -> None:
+    """Stamp the latest known asn/netname/ports/cert/tags snapshot onto an
+    observable entry from a (status, detail, enrichment) tuple - the shape
+    _domain_lifecycle/_ip_lifecycle/_sweep_lifecycle already produce.
+    Called both at add-time (for a genuinely new observable) and from
+    pivot_cluster's write phase (to keep an already-tracked observable's
+    snapshot current) - see _merge_observables and pivot_cluster.
+
+    asn/netname/cert are overwritten (this is a point-in-time snapshot,
+    not history - the history lives in the tracking-store attribute_changes
+    table, see _log_cluster_enrichment_history). ports and tags are
+    unioned, never dropped, mirroring tracking.store.upsert_actor's own
+    "known values only ever widen" convention - a port or tag seen once
+    stays recorded even if a later check doesn't re-see it."""
+    tags = set(entry.get("tags") or [])
+    if category == "ips":
+        # detail["asn"] comes straight from RIPEstat's "asns" field
+        # (see pivot.ripestat_lookup / _ip_lifecycle) - plural because a
+        # prefix can technically have more than one announcing origin -
+        # so it's a list here, not a bare int; take the first as the
+        # observable's own asn, matching enrich.py's _registry_lookup
+        # (_as_int(asns[0])) and the DuckDB observations.asn column.
+        asn_list = detail.get("asn")
+        if asn_list:
+            entry["asn"] = asn_list[0] if isinstance(asn_list, list) else asn_list
+        if detail.get("as_holder"):
+            entry["netname"] = detail["as_holder"]
+        shodan = enrichment.get("shodan")
+        if isinstance(shodan, dict) and "error" not in shodan:
+            new_ports = shodan.get("ports") or []
+            if new_ports:  # don't stamp an empty ports:[] where nothing was there before
+                ports = entry.setdefault("ports", [])
+                for p in new_ports:
+                    if p not in ports:
+                        ports.append(p)
+            tags |= {f"shodan:tag:{t}" for t in shodan.get("tags") or []}
+    elif category == "domains":
+        certspotter = enrichment.get("certspotter")
+        if isinstance(certspotter, dict) and "error" not in certspotter:
+            issuances = certspotter.get("issuances") or []
+            if issuances:  # nothing in CT logs yet - don't stamp an empty/None cert block
+                latest = issuances[0]
+                entry["cert"] = {"issuer": latest.get("issuer"),
+                                  "not_before": latest.get("not_before"),
+                                  "not_after": latest.get("not_after"),
+                                  "sibling_hostnames": certspotter.get("hostnames") or [],
+                                  "checked": _now()}
+    threatfox = enrichment.get("threatfox")
+    if isinstance(threatfox, dict) and "error" not in threatfox:
+        for m in threatfox.get("matches") or []:
+            if m.get("malware"):
+                tags.add(f"threatfox:malware:{m['malware']}")
+            tags |= {f"threatfox:tag:{t}" for t in (m.get("tags") or [])}
+    if tags:
+        entry["tags"] = sorted(tags)
+
+
+_ATTRIBUTE_CONFIDENCE_BASE = {
+    "cert_issuer_changed": "high", "ports_changed": "medium", "cert_sans_changed": "medium",
+}
+
+
+def _attribute_confidence(change_type: str, baseline_observed_at: datetime) -> str:
+    """Port/cert confidence, adapted from tracking.enrich._confidence's
+    shape: unlike ASN (which can be corroborated across RDAP+HoneyLabs),
+    ports/cert each have only one source, so there's no corroboration
+    branch - confidence starts from a per-change-type base and is
+    downgraded one step if the baseline is older than
+    _ATTR_STALE_BASELINE_DAYS, same staleness rule enrich.py uses for
+    ASN changes (an old baseline re-checked for the first time in months
+    shouldn't read as a confident 'changed since yesterday')."""
+    conf = _ATTRIBUTE_CONFIDENCE_BASE[change_type]
+    if datetime.now() - baseline_observed_at > timedelta(days=_ATTR_STALE_BASELINE_DAYS):
+        conf = {"high": "medium", "medium": "low"}[conf]
+    return conf
+
+
+def _record_port_change(con: duckdb.DuckDBPyConnection, ip: str, actor: str | None,
+                        observed_at: datetime, new_ports: list[int]) -> None:
+    baseline = tracking_store.latest_ports_for(con, ip, observed_at)
+    if baseline is None:
+        tracking_store.record_attribute_change(
+            con, detected_at=observed_at, indicator_value=ip, actor=actor,
+            attribute="ports", change_type="first_seen", confidence="medium",
+            old_value=None, new_value=new_ports)
+        return
+    if sorted(baseline["ports"]) == sorted(new_ports):
+        return  # no change - the common case, nothing recorded
+    tracking_store.record_attribute_change(
+        con, detected_at=observed_at, indicator_value=ip, actor=actor,
+        attribute="ports", change_type="ports_changed",
+        confidence=_attribute_confidence("ports_changed", baseline["observed_at"]),
+        old_value=baseline["ports"], new_value=new_ports)
+
+
+def _record_cert_change(con: duckdb.DuckDBPyConnection, domain: str, actor: str | None,
+                        observed_at: datetime, latest_issuance: dict[str, Any],
+                        hostnames: list[str]) -> None:
+    new_issuer = latest_issuance.get("issuer")
+    baseline = tracking_store.latest_cert_for(con, domain, observed_at)
+    if baseline is None:
+        if new_issuer is None:
+            return
+        tracking_store.record_attribute_change(
+            con, detected_at=observed_at, indicator_value=domain, actor=actor,
+            attribute="cert", change_type="first_seen", confidence="medium",
+            old_value=None, new_value={"issuer": new_issuer, "hostnames": hostnames})
+        return
+    if new_issuer and baseline["issuer"] and new_issuer != baseline["issuer"]:
+        change_type = "cert_issuer_changed"
+    elif set(hostnames) != set(baseline["sibling_hostnames"]):
+        change_type = "cert_sans_changed"
+    else:
+        return  # same issuer, same siblings - routine renewal, not recorded
+    tracking_store.record_attribute_change(
+        con, detected_at=observed_at, indicator_value=domain, actor=actor,
+        attribute="cert", change_type=change_type,
+        confidence=_attribute_confidence(change_type, baseline["observed_at"]),
+        old_value={"issuer": baseline["issuer"], "hostnames": baseline["sibling_hostnames"]},
+        new_value={"issuer": new_issuer, "hostnames": hostnames})
+
+
 def _log_cluster_enrichment_history(
         actor: str, observed_at: datetime,
         results: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]) -> str | None:
     """Best-effort: write one dated observation row per ip/domain that got
-    fresh Shodan/ThreatFox data this sweep, so the dashboard's per-observable
-    timeline can show when these fields were seen or changed. Returns an
-    error note (never raises) on a tracking-store hiccup - pivot_cluster's
+    fresh Shodan/Cert Spotter/ThreatFox data this sweep, so the dashboard's
+    per-observable timeline can show when these fields were seen or
+    changed - and, for ports/cert, diff the fresh value against the prior
+    baseline and record a change in attribute_changes when something
+    actually moved (see _record_port_change/_record_cert_change). Returns
+    an error note (never raises) on a tracking-store hiccup - pivot_cluster's
     cluster-JSON write already happened and a separate store's outage
     shouldn't undo or block reporting that success."""
     try:
@@ -1084,6 +1266,21 @@ def _log_cluster_enrichment_history(
                         shodan_tags=shodan.get("tags") or None,
                         metadata={"hostnames": shodan.get("hostnames"),
                                  "cpes": shodan.get("cpes"), "vulns": shodan.get("vulns")})
+                    _record_port_change(con, value, actor, observed_at,
+                                        shodan.get("ports") or [])
+                certspotter = enrichment.get("certspotter")
+                if isinstance(certspotter, dict) and "error" not in certspotter:
+                    issuances = certspotter.get("issuances") or []
+                    latest = issuances[0] if issuances else {}
+                    hostnames = certspotter.get("hostnames") or []
+                    tracking_store.upsert_observation(
+                        con, observed_at=observed_at, indicator_value=value,
+                        source="certspotter", actor=actor, indicator_type=indicator_type,
+                        cert_issuer=latest.get("issuer"),
+                        cert_not_before=latest.get("not_before"),
+                        cert_not_after=latest.get("not_after"),
+                        cert_sibling_hostnames=hostnames or None)
+                    _record_cert_change(con, value, actor, observed_at, latest, hostnames)
                 threatfox = enrichment.get("threatfox")
                 if isinstance(threatfox, dict) and "error" not in threatfox:
                     tracking_store.upsert_observation(
@@ -1108,14 +1305,14 @@ def pivot_cluster(name: str) -> dict[str, Any]:
 
     Each ip is also enriched via Shodan InternetDB (keyless) and, for
     both ips and domains, ThreatFox (if THREATFOX_API_KEY is set) -
-    domains additionally get Cert Spotter, though that's surfaced in the
-    summary only, not logged historically (see
-    _log_cluster_enrichment_history). Unlike the RDAP/RIPEstat lifecycle
-    check, a dated snapshot of this enrichment is recorded to the
-    tracking-store history (mcp_tools.tracking.store) so the dashboard's
-    per-observable profile can show a timeline of when ports/tags/matches
-    were seen or changed - see get_observables/the dashboard for how
-    that's read back.
+    domains additionally get Cert Spotter. This enrichment is stamped
+    onto each observable's asn/netname/ports/cert/tags fields (see
+    _apply_enrichment_snapshot) so the current-known-value snapshot stays
+    fresh, AND a dated snapshot is recorded to the tracking-store history
+    (mcp_tools.tracking.store), which also runs day-over-day diffing for
+    ports/cert and records a change when something moved - see
+    _log_cluster_enrichment_history. The dashboard's per-observable
+    profile reads that history back - see get_observables/the dashboard.
 
     The network lookups run concurrently and, crucially, OUTSIDE the data
     lock - a cluster with dozens of domains would otherwise serialize
@@ -1127,18 +1324,7 @@ def pivot_cluster(name: str) -> dict[str, Any]:
     ips = [o["value"] for o in data["observables"]["ips"]]
 
     # Network phase: concurrent, no lock held.
-    results: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]] = {}
-    jobs = ([("domains", v, _domain_lifecycle) for v in domains]
-            + [("ips", v, _ip_lifecycle) for v in ips])
-    if jobs:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=_PIVOT_CLUSTER_WORKERS) as ex:
-            futures = {ex.submit(fn, v): (cat, v) for cat, v, fn in jobs}
-            for fut in concurrent.futures.as_completed(futures):
-                cat, v = futures[fut]
-                try:
-                    results[(cat, v)] = fut.result()
-                except Exception as e:  # a single lookup blowing up shouldn't sink the sweep
-                    results[(cat, v)] = ("unknown", {"error": str(e)}, {})
+    results = _sweep_lifecycle(domains, ips)
 
     # Write phase: brief lock, applied onto a fresh read of the cluster.
     now = _now()
@@ -1154,6 +1340,7 @@ def pivot_cluster(name: str) -> dict[str, Any]:
                 o["status"] = status
                 o["status_checked"] = now
                 o["status_detail"] = detail
+                _apply_enrichment_snapshot(o, cat, detail, enrichment)
                 row = {"value": o["value"], "status": status}
                 shodan = enrichment.get("shodan")
                 if isinstance(shodan, dict) and "error" not in shodan:
@@ -1191,18 +1378,24 @@ def _safe_vt(value: str, kind: str, api_key: str) -> dict[str, Any]:
 
 
 def _file_new_observables(data: dict[str, Any], category: str, values: list[str],
-                           source: str) -> list[str]:
+                           source: str,
+                           enrichment: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]
+                           | None = None) -> list[str]:
     """Merge only values not already tracked on the cluster in `category`,
-    returning the ones actually added (deduped, order-preserving)."""
+    returning the ones actually added (deduped, order-preserving).
+    `enrichment`, if given, is a _sweep_lifecycle-shaped result keyed by
+    (category, value) - passed through to _merge_observables so a newly
+    filed indicator gets its own asn/ports/cert/tags snapshot, not just
+    whatever the parent pivot happened to fetch."""
     existing = {o["value"] for o in data["observables"][category]}
     new = [v for v in dict.fromkeys(values) if v and v not in existing]
     if new:
         extracted = {c: (new if c == category else []) for c in OBSERVABLE_CATEGORIES}
-        _merge_observables(data, extracted, source)  # skip list unused - caller's own confidence filter already applies
+        # skip list unused - caller's own confidence filter already applies
+        _merge_observables(data, extracted, source, enrichment=enrichment)
     return new
 
 
-@_synchronized
 def pivot_and_expand(value: str, cluster_name: str,
                      include_cohosted: bool = False) -> dict[str, Any]:
     """Pivot a domain or IP and file the high-confidence new indicators it
@@ -1220,7 +1413,13 @@ def pivot_and_expand(value: str, cluster_name: str,
     the returned `review` block and file the real ones yourself. Anything
     not filed (co-hosted domains, CT names outside the queried name) is
     returned under `review` for manual follow-up. Only genuinely new
-    indicators are filed; ones already tracked are left as-is."""
+    indicators are filed; ones already tracked are left as-is.
+
+    Each newly-filed indicator also gets its own live asn/ports/cert/tags
+    snapshot (see _apply_enrichment_snapshot) - a second, cheap (cached)
+    lookup on the newly-discovered value itself, run in the same unlocked
+    network phase as the rest of this pivot; see _sweep_lifecycle for why
+    that lookup must not run under _data_lock."""
     data = load_cluster(cluster_name)  # must already exist; expansion targets an investigation
     kind = pivot.classify(value)
     if kind not in ("domain", "ip"):
@@ -1230,20 +1429,12 @@ def pivot_and_expand(value: str, cluster_name: str,
         # Functional rule: ignore IPv6 for pivoting and probing - the probe
         # VM has no IPv6 route, so neither a VT lookup here nor anything
         # downstream (fingerprinting) can act on the result.
-        entry = f"pivot_and_expand on {value}: skipped (IPv6, not pivoted)"
-        data["hunt_log"].append({"date": _now(), "entry": entry})
-        save_cluster(data)
-        return {"value": value, "kind": kind, "cluster": cluster_name,
-                "filed": {}, "review": {}, "cluster_state": load_cluster(cluster_name)}
+        return _pivot_and_expand_ipv6_skip(value, cluster_name, kind)
+
     now = _now()
     api_key = os.environ.get(pivot.VT_API_KEY_ENV)
-    filed: dict[str, list[str]] = {}
+    candidates: list[tuple[str, list[str], str]] = []  # (category, values, source)
     review: dict[str, Any] = {}
-
-    def record(category: str, values: list[str], source: str) -> None:
-        added = _file_new_observables(data, category, values, source)
-        if added:
-            filed.setdefault(category, []).extend(added)
 
     if kind == "domain":
         ct = _cached_pivot("certspotter", value, lambda: pivot.certspotter_lookup(value))
@@ -1252,8 +1443,8 @@ def pivot_and_expand(value: str, cluster_name: str,
         elif isinstance(ct, dict):
             hostnames = ct.get("hostnames", [])
             siblings = [h for h in hostnames if h != value and h.endswith("." + value)]
-            record("domains", siblings,
-                   f"pivot_and_expand via Cert Spotter CT log, checked {now}")
+            candidates.append(("domains", siblings,
+                               f"pivot_and_expand via Cert Spotter CT log, checked {now}"))
             others = [h for h in hostnames if h != value and not h.endswith("." + value)]
             if others:
                 review["certspotter_other_hostnames"] = others
@@ -1262,22 +1453,57 @@ def pivot_and_expand(value: str, cluster_name: str,
             ips = [r["ip"] for r in (vt.get("resolutions") or []) if r.get("ip")] \
                 if isinstance(vt, dict) else []
             ips = [ip for ip in ips if _is_ipv4(ip)]  # ignore IPv6 for pivoting/probing - no route from the probe VM
-            record("ips", ips,
-                   f"pivot_and_expand via VirusTotal resolution history, checked {now}")
+            candidates.append(("ips", ips,
+                               f"pivot_and_expand via VirusTotal resolution history, checked {now}"))
     else:  # ip
         if api_key:
             vt = _cached_pivot("virustotal", value, lambda: _safe_vt(value, kind, api_key))
             domains = [r["domain"] for r in (vt.get("resolutions") or []) if r.get("domain")] \
                 if isinstance(vt, dict) else []
-            record("domains", domains,
-                   f"pivot_and_expand via VirusTotal resolution history, checked {now}")
+            candidates.append(("domains", domains,
+                               f"pivot_and_expand via VirusTotal resolution history, checked {now}"))
         rev = _cached_pivot("reverse_ip", value, lambda: pivot.hackertarget_reverse_ip(value))
         cohosted = rev.get("domains", []) if isinstance(rev, dict) and not rev.get("error") else []
         if include_cohosted:
-            record("domains", cohosted,
-                   f"pivot_and_expand via Hackertarget reverse-IP, checked {now}")
+            candidates.append(("domains", cohosted,
+                               f"pivot_and_expand via Hackertarget reverse-IP, checked {now}"))
         elif cohosted:
             review["cohosted_domains"] = cohosted
+
+    new_domains = _new_values(data, "domains",
+                              [v for cat, vs, _ in candidates if cat == "domains" for v in vs])
+    new_ips = _new_values(data, "ips",
+                          [v for cat, vs, _ in candidates if cat == "ips" for v in vs])
+    enrichment = _sweep_lifecycle(new_domains, new_ips)  # unlocked - see docstring
+
+    return _pivot_and_expand_merge(value, kind, cluster_name, now, candidates, review, enrichment)
+
+
+@_synchronized
+def _pivot_and_expand_ipv6_skip(value: str, cluster_name: str, kind: str) -> dict[str, Any]:
+    data = load_cluster(cluster_name)
+    entry = f"pivot_and_expand on {value}: skipped (IPv6, not pivoted)"
+    data["hunt_log"].append({"date": _now(), "entry": entry})
+    save_cluster(data)
+    return {"value": value, "kind": kind, "cluster": cluster_name,
+            "filed": {}, "review": {}, "cluster_state": load_cluster(cluster_name)}
+
+
+@_synchronized
+def _pivot_and_expand_merge(value: str, kind: str, cluster_name: str, now: str,
+                            candidates: list[tuple[str, list[str], str]],
+                            review: dict[str, Any],
+                            enrichment: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]
+                            ) -> dict[str, Any]:
+    """Locked write phase: re-read the cluster fresh (another writer may
+    have raced in while the network phase above ran unlocked) and file
+    everything in one go."""
+    data = load_cluster(cluster_name)
+    filed: dict[str, list[str]] = {}
+    for category, values, source in candidates:
+        added = _file_new_observables(data, category, values, source, enrichment=enrichment)
+        if added:
+            filed.setdefault(category, []).extend(added)
 
     filed = {c: sorted(set(v)) for c, v in filed.items() if v}
     total = sum(len(v) for v in filed.values())
@@ -1368,12 +1594,20 @@ def analyze_report(source: str) -> dict[str, Any]:
 def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                         source: str,
                         ip_ports: dict[str, list[int]] | None = None,
+                        enrichment: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]
+                        | None = None,
                         ) -> tuple[dict[str, int], list[dict[str, str]]]:
+    """enrichment, if given, is a _sweep_lifecycle-shaped result keyed by
+    (category, value) - applied via _apply_enrichment_snapshot only onto
+    entries genuinely new to this cluster (an already-tracked value just
+    gets `source` appended, as before; its snapshot is pivot_cluster's job
+    to refresh, not add-time's)."""
     now = _now()
     counts = {}
     newly_tracked: list[tuple[str, str]] = []  # (category, value), for the fingerprint queue
     skipped: list[dict[str, str]] = []  # entries tracked but not queued, with why
     ip_ports = ip_ports or {}
+    enrichment = enrichment or {}
     for category in OBSERVABLE_CATEGORIES:
         bucket = data["observables"][category]
         by_value = {o["value"]: o for o in bucket}
@@ -1387,6 +1621,10 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
             else:
                 entry = {"value": value, "sources": [source],
                           "first_seen": now, "last_seen": now}
+                found = enrichment.get((category, value))
+                if found:
+                    _, detail, enr = found
+                    _apply_enrichment_snapshot(entry, category, detail, enr)
                 bucket.append(entry)
                 added += 1
                 if category in _FINGERPRINTABLE_CATEGORIES:
@@ -1506,7 +1744,6 @@ def _merge_ttps(data: dict[str, Any], technique_ids: list[str], source: str) -> 
     return added
 
 
-@_synchronized
 def ingest_report(source: str, cluster_name: str | None = None,
                    create_if_missing: bool = True) -> dict[str, Any]:
     """Fetch a report, extract observables/TTPs, and file them into a
@@ -1544,7 +1781,28 @@ def ingest_report(source: str, cluster_name: str | None = None,
     Active fingerprinting checks that field first and only falls back to
     443 if nothing was extracted — see probe_pending_fingerprints.py's
     _lookup_ports, which probes every recorded port, not just the first.
+
+    Every genuinely new domain/ip extracted also gets a live asn/ports/
+    cert/tags enrichment lookup (see _apply_enrichment_snapshot), run in
+    an unlocked phase between the report fetch/extraction and the final
+    write - see _sweep_lifecycle's docstring for why that has to happen
+    outside _data_lock. The single report-URL fetch itself still runs
+    under the lock, unchanged from before.
     """
+    cluster_name, extracted, new_domains, new_ips = _ingest_report_phase1(
+        source, cluster_name, create_if_missing)
+    enrichment = _sweep_lifecycle(new_domains, new_ips)  # unlocked
+    return _ingest_report_phase2(cluster_name, source, extracted, enrichment, create_if_missing)
+
+
+@_synchronized
+def _ingest_report_phase1(source: str, cluster_name: str | None, create_if_missing: bool
+                          ) -> tuple[str, dict[str, Any], list[str], list[str]]:
+    """Locked: fetch the report (one bounded URL fetch, as before) and
+    extract/resolve the cluster name - no per-indicator network calls
+    happen in this phase. Returns what phase 2 needs to finish the write,
+    plus the genuinely-new domains/ips for the unlocked enrichment sweep
+    that runs between the two phases."""
     text = _fetch_report_text(source)
     text = report_ingest.defang_normalize(text)
     extracted = report_ingest.extract_observables(text)
@@ -1569,8 +1827,27 @@ def ingest_report(source: str, cluster_name: str | None = None,
     else:
         raise ClusterNotFound(f"No cluster named {cluster_name!r}")
 
+    new_domains = _new_values(data, "domains", extracted["domains"])
+    new_ips = _new_values(data, "ips", extracted["ips"])
+    return cluster_name, extracted, new_domains, new_ips
+
+
+@_synchronized
+def _ingest_report_phase2(cluster_name: str, source: str, extracted: dict[str, Any],
+                          enrichment: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]],
+                          create_if_missing: bool) -> dict[str, Any]:
+    """Locked: re-resolve the cluster fresh (another writer may have
+    raced in while the enrichment sweep ran unlocked between the two
+    phases) and file extraction + enrichment in one write."""
+    if _path(cluster_name).exists():
+        data = load_cluster(cluster_name)
+    elif create_if_missing:
+        data = _new_cluster(cluster_name, f"Auto-created from report ingestion: {source}")
+    else:
+        raise ClusterNotFound(f"No cluster named {cluster_name!r}")
+
     observable_counts, skipped = _merge_observables(
-        data, extracted, source, ip_ports=extracted.get("ip_ports"))
+        data, extracted, source, ip_ports=extracted.get("ip_ports"), enrichment=enrichment)
     _merge_ttps(data, extracted["ttps"], source)
     data["report_sources"].append({
         "source": source, "ingested": _now(),

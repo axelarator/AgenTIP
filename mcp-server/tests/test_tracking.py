@@ -37,6 +37,26 @@ def isolated_tracking(tmp_path, monkeypatch):
     yield tmp_path
 
 
+@pytest.fixture(autouse=True)
+def default_lifecycle_stubs(monkeypatch):
+    """core.add_observable now runs a live asn/ports/cert enrichment
+    sweep (core._sweep_lifecycle) for every genuinely new domain/ip it
+    files - a handful of tests here seed a cluster observable via
+    core.add_observable purely to exercise ingest/register logic, with
+    no interest in enrichment content. Stub the sweep's network sources
+    to fast, empty, no-network defaults so those stay hermetic; a test
+    that does care (none currently in this file) can override the
+    specific pivot.* function itself on top of this, same pattern as
+    test_core.py's identically-named fixture."""
+    monkeypatch.setattr(pivot, "rdap_lookup",
+                        lambda value, kind: {"nameservers": [], "status": [], "events": []})
+    monkeypatch.setattr(pivot, "resolve_host", lambda host: [])
+    monkeypatch.setattr(pivot, "ripestat_lookup", lambda ip: {"asn": []})
+    monkeypatch.setattr(pivot, "certspotter_lookup", lambda domain: {"hostnames": []})
+    monkeypatch.setattr(pivot, "shodan_internetdb_lookup",
+                        lambda ip: {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []})
+
+
 def _obs(con, ip, day, source="honeylabs", **kw):
     store.upsert_observation(
         con, observed_at=datetime.combine(day, datetime.min.time()),
@@ -293,6 +313,117 @@ def test_netname_change(fake_net):
     assert summary["asn_changes"][0]["change_type"] == "netname_change"
 
 
+# ---------------------------------------------------- attribute_changes
+# _record_port_change/_record_cert_change diff against the prior
+# observations row for the same (indicator, source) - see
+# store.latest_ports_for/latest_cert_for - so these helpers mirror the
+# real call order _log_cluster_enrichment_history uses: write the dated
+# shodan/certspotter observation first, then diff/record.
+
+def _sweep_ports(con, ip, actor, day, ports):
+    store.upsert_observation(con, observed_at=day, indicator_value=ip,
+                             source="shodan", actor=actor, shodan_ports=ports or None)
+    core._record_port_change(con, ip, actor, day, ports)
+
+
+def _sweep_cert(con, domain, actor, day, issuer, hostnames):
+    store.upsert_observation(con, observed_at=day, indicator_value=domain,
+                             source="certspotter", actor=actor, cert_issuer=issuer,
+                             cert_sibling_hostnames=hostnames or None)
+    core._record_cert_change(con, domain, actor, day, {"issuer": issuer}, hostnames)
+
+
+def test_record_port_change_first_seen_is_baseline_not_change():
+    with store.connect() as con:
+        _sweep_ports(con, "203.0.113.7", "APT-X", NOW, [22, 443])
+        row = con.execute(
+            "SELECT change_type, confidence FROM attribute_changes").fetchone()
+        recent = analytics.attribute_changes(con, days=1)
+    assert row == ("first_seen", "medium")
+    assert recent == []  # first_seen is excluded, like asn_changes'
+
+
+def test_record_port_change_no_change_when_ports_identical():
+    with store.connect() as con:
+        _sweep_ports(con, "203.0.113.7", "APT-X", NOW - timedelta(days=1), [22, 443])
+        # order-independent: same set, different order, one day later
+        _sweep_ports(con, "203.0.113.7", "APT-X", NOW, [443, 22])
+        count = con.execute("SELECT count(*) FROM attribute_changes").fetchone()[0]
+    assert count == 1  # only the first_seen baseline - no spurious "change"
+
+
+def test_record_port_change_detects_change():
+    with store.connect() as con:
+        _sweep_ports(con, "203.0.113.7", "APT-X", NOW - timedelta(days=1), [22, 443])
+        _sweep_ports(con, "203.0.113.7", "APT-X", NOW, [8080])
+        row = con.execute(
+            "SELECT change_type, old_value, new_value, confidence "
+            "FROM attribute_changes WHERE change_type = 'ports_changed'").fetchone()
+    assert row[0] == "ports_changed"
+    assert json.loads(row[1]) == [22, 443]
+    assert json.loads(row[2]) == [8080]
+    assert row[3] == "medium"
+
+
+def test_record_port_change_stale_baseline_downgrades_confidence():
+    with store.connect() as con:
+        _sweep_ports(con, "203.0.113.7", "APT-X", NOW - timedelta(days=120), [22])
+        _sweep_ports(con, "203.0.113.7", "APT-X", NOW, [8080])
+        confidence = con.execute(
+            "SELECT confidence FROM attribute_changes "
+            "WHERE change_type = 'ports_changed'").fetchone()[0]
+    assert confidence == "low"  # medium base, downgraded once for staleness
+
+
+def test_record_cert_change_same_issuer_renewal_is_not_recorded():
+    with store.connect() as con:
+        _sweep_cert(con, "evil.example", "APT-X", NOW - timedelta(days=1),
+                   "Let's Encrypt", ["evil.example", "www.evil.example"])
+        # same issuer, same siblings, just a later validity window - routine
+        _sweep_cert(con, "evil.example", "APT-X", NOW,
+                   "Let's Encrypt", ["evil.example", "www.evil.example"])
+        count = con.execute(
+            "SELECT count(*) FROM attribute_changes WHERE attribute = 'cert'"
+            ).fetchone()[0]
+    assert count == 1  # only the first_seen baseline
+
+
+def test_record_cert_change_issuer_change_is_high_confidence():
+    with store.connect() as con:
+        _sweep_cert(con, "evil.example", "APT-X", NOW - timedelta(days=1),
+                   "Let's Encrypt", ["evil.example"])
+        _sweep_cert(con, "evil.example", "APT-X", NOW, "ZeroSSL", ["evil.example"])
+        row = con.execute(
+            "SELECT change_type, confidence FROM attribute_changes "
+            "WHERE attribute = 'cert' AND change_type <> 'first_seen'").fetchone()
+    assert row == ("cert_issuer_changed", "high")
+
+
+def test_record_cert_change_sans_changed_is_medium_confidence():
+    with store.connect() as con:
+        _sweep_cert(con, "evil.example", "APT-X", NOW - timedelta(days=1),
+                   "Let's Encrypt", ["evil.example"])
+        _sweep_cert(con, "evil.example", "APT-X", NOW,
+                   "Let's Encrypt", ["evil.example", "new.evil.example"])
+        row = con.execute(
+            "SELECT change_type, confidence FROM attribute_changes "
+            "WHERE attribute = 'cert' AND change_type <> 'first_seen'").fetchone()
+    assert row == ("cert_sans_changed", "medium")
+
+
+def test_attribute_changes_excludes_reenrichment_of_unchanged_indicator():
+    # Regression mirroring test_new_indicators_excludes_reenrichment_of_
+    # old_indicator: re-running the sweep with identical Shodan/Cert
+    # Spotter results on consecutive days must not produce a second
+    # change row just because a new dated observation was inserted.
+    with store.connect() as con:
+        _sweep_ports(con, "203.0.113.7", "APT-X", NOW - timedelta(days=2), [22])
+        _sweep_ports(con, "203.0.113.7", "APT-X", NOW - timedelta(days=1), [22])
+        _sweep_ports(con, "203.0.113.7", "APT-X", NOW, [22])
+        changes = analytics.attribute_changes(con, days=7)
+    assert changes == []
+
+
 def test_hl_budget_exhaustion_mid_loop(fake_net, monkeypatch):
     calls = []
 
@@ -500,6 +631,44 @@ def test_digest_caps_rows_and_notes_failures():
     assert text.count("203.0.113.") == digest.MAX_ROWS
 
 
+def test_digest_renders_attribute_changes_section():
+    changes = [{"detected_at": NOW, "indicator_value": "203.0.113.7",
+               "actor": "APT-X", "attribute": "ports", "change_type": "ports_changed",
+               "old_value": [22], "new_value": [8080], "confidence": "medium"}]
+    path = digest.write(TODAY, {"attribute_changes": changes})
+    text = path.read_text()
+    assert digest.NO_ACTIVITY not in text
+    assert "Indicator attribute changes" in text
+    assert "203.0.113.7" in text and "ports_changed" in text
+
+
+def test_digest_renders_port_patterns_section():
+    # port_pattern_summary is computed by analytics.run_all every day but
+    # was never actually rendered - regression for that gap.
+    patterns = [{"actor": "APT-X", "port": 445, "ip_count": 3, "last_seen": NOW}]
+    path = digest.write(TODAY, {
+        "status": {"pivot_sweep": "ok"},
+        "attribute_changes": [{"detected_at": NOW, "indicator_value": "x",
+                               "actor": "APT-X", "attribute": "ports",
+                               "change_type": "ports_changed", "old_value": [1],
+                               "new_value": [2], "confidence": "low"}],
+        "port_patterns": patterns})
+    text = path.read_text()
+    assert "Port scan patterns" in text
+    assert "445" in text
+
+
+def test_digest_attribute_change_alone_is_a_signal():
+    # A day with only a port/cert change (no ASN change) must not
+    # collapse to NO ACTIVITY.
+    changes = [{"detected_at": NOW, "indicator_value": "evil.example",
+               "actor": "APT-X", "attribute": "cert",
+               "change_type": "cert_issuer_changed", "old_value": {"issuer": "A"},
+               "new_value": {"issuer": "B"}, "confidence": "high"}]
+    path = digest.write(TODAY, {"attribute_changes": changes})
+    assert digest.NO_ACTIVITY not in path.read_text()
+
+
 # ------------------------------------------------------------- MCP surface
 
 def test_query_duckdb_read_only_and_truncation():
@@ -567,9 +736,55 @@ def test_analytics_on_seeded_data(fake_net):
     with store.connect() as con:
         enrich.apply_results(con, results, TODAY)
         activity = analytics.recent_actor_activity(con)
-        new_ips = analytics.new_ips_in_known_asns(con, days=1)
+        new_ips = analytics.new_indicators_in_known_asns(con, days=1)
     assert activity[0]["actor"] == "APT-X"
     assert [r["indicator_value"] for r in new_ips] == ["203.0.113.99"]
+
+
+def test_new_indicators_excludes_reenrichment_of_old_indicator():
+    # Regression for the 2026-08-27 Silver Fox/Alibaba false lead: a
+    # daily re-check re-inserts a dated row for an indicator that's
+    # been sitting there for days, which must not read as "new".
+    with store.connect() as con:
+        store.upsert_actor(con, "APT-X", NOW - timedelta(days=10), asns=[64512])
+        _obs(con, "203.0.113.60", TODAY - timedelta(days=5), source="rdap",
+             asn=64512)
+        _obs(con, "203.0.113.60", TODAY, source="rdap", asn=64512)
+        new_ips = analytics.new_indicators_in_known_asns(con, days=1)
+    assert new_ips == []
+
+
+def test_cross_actor_asn_overlap_flags_already_attributed_ip():
+    # An IP already attributed to APT-X, whose ASN also happens to be
+    # in APT-Y's known_asns, is a lead - never a "new IP" for either.
+    with store.connect() as con:
+        store.upsert_actor(con, "APT-X", NOW - timedelta(days=10), asns=[64512])
+        store.upsert_actor(con, "APT-Y", NOW - timedelta(days=10), asns=[64512])
+        _obs(con, "203.0.113.61", TODAY - timedelta(days=5),
+             source="report:r.csv", asn=64512, actor="APT-X")
+        _obs(con, "203.0.113.61", TODAY, source="rdap", asn=64512,
+             actor="APT-X")
+        overlap = analytics.cross_actor_asn_overlap(con, days=1)
+        new_ips = analytics.new_indicators_in_known_asns(con, days=1)
+    assert new_ips == []
+    assert len(overlap) == 1
+    assert overlap[0]["indicator_value"] == "203.0.113.61"
+    assert overlap[0]["attributed_to"] == "APT-X"
+    assert overlap[0]["matches_actor"] == "APT-Y"
+
+
+def test_cross_actor_asn_overlap_excludes_shared_hosting_asns():
+    # Same shape as above but on a shared-hosting ASN (Alibaba,
+    # 45102) - two unrelated actors both touching it is expected
+    # noise, not an overlap lead.
+    with store.connect() as con:
+        store.upsert_actor(con, "APT-X", NOW - timedelta(days=10), asns=[45102])
+        store.upsert_actor(con, "APT-Y", NOW - timedelta(days=10), asns=[45102])
+        _obs(con, "8.210.1.1", TODAY - timedelta(days=5),
+             source="report:r.csv", asn=45102, actor="APT-X")
+        _obs(con, "8.210.1.1", TODAY, source="rdap", asn=45102, actor="APT-X")
+        overlap = analytics.cross_actor_asn_overlap(con, days=1)
+    assert overlap == []
 
 
 # --------------------------------------------------------- dashboard view

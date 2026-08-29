@@ -165,7 +165,9 @@ def add_observable(name: str, category: str, value: str, source: str) -> dict:
     by actively probing a tracked domain/IP). category must be one of
     "hashes", "domains", "ips", "urls", "emails", "cves", "wallets",
     "ja4", "ja4s", "ja4h", "ja4l", "ja4x", "ja4t", "ja4ts", "ja4ssh",
-    "jarm". Dedupes by value like ingest_report does."""
+    "jarm". Dedupes by value like ingest_report does. A genuinely new
+    domain/ip also gets a live asn/ports/cert/tags enrichment lookup,
+    stamped onto the observable alongside `source`."""
     return core.add_observable(name, category, value, source)
 
 
@@ -238,11 +240,14 @@ def pivot_cluster(name: str) -> dict:
     resolution), ips routed/unrouted/unknown (RIPEstat). Unlike
     pivot_observable, this WRITES the status back onto the cluster. Ips
     are also enriched via Shodan InternetDB, and both ips and domains via
-    ThreatFox if THREATFOX_API_KEY is set - a dated snapshot of that
-    enrichment is logged to the tracking-store history (best-effort; a
+    ThreatFox if THREATFOX_API_KEY is set (domains additionally via Cert
+    Spotter) - the latest asn/ports/cert/tags snapshot is stamped onto
+    each observable, and a dated snapshot of that enrichment is logged to
+    the tracking-store history, which also diffs ports/cert against the
+    prior check and records a genuine change (best-effort; a
     tracking-store hiccup surfaces as a "history_note" in the summary,
-    not a failure) so the dashboard can show a timeline of when ports/
-    tags/matches were seen or changed. Returns a per-observable summary."""
+    not a failure) so the daily tracking narrative can call it out.
+    Returns a per-observable summary."""
     return core.pivot_cluster(name)
 
 
@@ -255,7 +260,8 @@ def pivot_and_expand(value: str, cluster_name: str,
     resolutions. Reverse-IP co-hosted domains are returned for review
     unless include_cohosted=True. Only genuinely new indicators are
     filed; the `review` block lists everything left for manual
-    follow-up."""
+    follow-up. Each newly-filed indicator also gets its own live
+    asn/ports/cert/tags enrichment snapshot."""
     return core.pivot_and_expand(value, cluster_name, include_cohosted)
 
 
@@ -275,7 +281,9 @@ def ingest_report(source: str, cluster_name: str | None = None,
     observables and ATT&CK TTPs, and file them into a cluster —
     creating it if needed. If cluster_name is omitted, tries to infer
     the threat actor/malware name from the report text and raises if
-    that's ambiguous (pass cluster_name explicitly in that case)."""
+    that's ambiguous (pass cluster_name explicitly in that case). Every
+    genuinely new domain/ip extracted also gets a live asn/ports/cert/
+    tags enrichment lookup before it's filed."""
     return core.ingest_report(source, cluster_name, create_if_missing)
 
 
@@ -309,9 +317,9 @@ def import_stix_bundle(bundle: dict[str, Any], name: str | None = None,
 @mcp.tool()
 def query_duckdb(sql: str) -> dict:
     """Run a read-only SQL query against the actor-tracking DuckDB
-    (tables: observations, asn_changes, actors, correlations,
-    zeek_matches). Writes are rejected; output is capped at 200 rows -
-    aggregate or filter instead of paging through raw tables."""
+    (tables: observations, asn_changes, attribute_changes, actors,
+    correlations, zeek_matches). Writes are rejected; output is capped at
+    200 rows - aggregate or filter instead of paging through raw tables."""
     return tracking.run_readonly_query(sql)
 
 

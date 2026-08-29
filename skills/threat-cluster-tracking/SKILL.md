@@ -500,17 +500,28 @@ adding a cluster mid-day).
 
 Each sweep also enriches ips via Shodan InternetDB (keyless) and, for
 both ips and domains, ThreatFox if `THREATFOX_API_KEY` is set (domains
-additionally get Cert Spotter, surfaced in the returned summary only —
-its sibling hostnames are pivot leads, not a field worth tracking over
-time). A dated snapshot of that enrichment is logged to the
+additionally get Cert Spotter). The latest snapshot of this enrichment
+is stamped directly onto each observable — `asn`/`netname`/`ports`
+(ips), `cert` (domains: issuer, validity window, sibling hostnames),
+and `tags` (both: malware-family names from ThreatFox, Shodan's own
+tags) — so `get_observables`/the cluster markdown always shows the
+current known values, not just lifecycle status. `ports`/`tags` are
+unioned (a value seen once stays recorded); `asn`/`netname`/`cert` are
+overwritten with the latest check.
+
+A dated snapshot of that same enrichment is also logged to the
 tracking-store history (`cti_tools/tracking/store.py`'s `observations`
-table — the same store behind the dashboard's "Live tracking" pages) so
-the dashboard's per-observable profile can show a timeline of when
-ports/tags/matches were seen or changed, rather than each sweep silently
-overwriting the last one. This is best-effort: a tracking-store hiccup
-(e.g. the daily cron running concurrently) surfaces as a `history_note`
-in the returned summary, not a failed sweep — the cluster-JSON status
-write above always lands regardless.
+table — the same store behind the dashboard's "Live tracking" pages),
+and the sweep diffs the fresh ports/cert values against the prior
+baseline: a genuine change (not just a re-check of an unchanged value)
+is recorded to the `attribute_changes` table and picked up by the next
+day's tracking digest/narrative (see `skills/actor-tracking/`). A
+same-issuer certificate renewal with unchanged sibling hostnames is
+routine and is not recorded as a change. This history/diffing is
+best-effort: a tracking-store hiccup (e.g. the daily cron running
+concurrently) surfaces as a `history_note` in the returned summary, not
+a failed sweep — the cluster-JSON status/snapshot write above always
+lands regardless.
 
 **`pivot_and_expand(value, cluster_name)`** / `cti pivot-and-expand
 <value> <cluster_name>` — pivot a domain/IP and **file** the
@@ -522,9 +533,12 @@ resolutions. Reverse-IP co-hosted domains are *not* filed by default
 (shared-hosting noise) — they come back in the result's `review` block,
 or pass `--include-cohosted` / `include_cohosted=True` to file them too.
 Only genuinely new indicators are filed; the `review` block lists
-everything left for you to judge. Use this once you trust a pivot
-enough to expand from it; use `pivot_observable` first when you just
-want to look.
+everything left for you to judge. Each newly-filed indicator also gets
+its own live asn/ports/cert/tags enrichment snapshot (its own fresh,
+cached lookup — not just whatever the parent pivot happened to fetch on
+the original queried value). Use this once you trust a pivot enough to
+expand from it; use `pivot_observable` first when you just want to
+look.
 
 ### Pivoting vs. probing — when each runs
 
@@ -582,6 +596,13 @@ them into a cluster:
 - Private/reserved IPs (RFC1918, loopback, link-local, etc.) are
   filtered out; they're essentially never useful as adversary
   infrastructure.
+- Every genuinely new domain/ip extracted also gets a live asn/ports/
+  cert/tags enrichment lookup (RDAP/RIPEstat, Shodan InternetDB, Cert
+  Spotter, ThreatFox — same sources `pivot_observable` uses) before
+  it's filed, stamped onto the observable alongside the report as its
+  `sources` entry. An already-tracked value mentioned again is not
+  re-enriched here — that's `pivot_cluster`'s job on the next daily
+  sweep.
 
 If you omit `cluster_name`, extraction tries to infer the threat
 actor/malware name from the report text (Microsoft weather-style,

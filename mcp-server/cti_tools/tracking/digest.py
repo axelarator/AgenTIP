@@ -66,8 +66,10 @@ def _has_signals(sections: dict[str, Any]) -> bool:
         ingest.get("rows_ingested")
         or register.get("actors_registered")
         or changes
+        or sections.get("attribute_changes")  # already excludes first_seen, see ATTRIBUTE_CHANGES
         or sections.get("zeek_matches")
-        or sections.get("new_ips_in_known_asns")
+        or sections.get("new_indicators_in_known_asns")
+        or sections.get("cross_actor_asn_overlap")
         or sections.get("temporal_clusters")
     )
 
@@ -76,8 +78,9 @@ def write(day: date, sections: dict[str, Any]) -> Path:
     """Render and write the digest for `day`. `sections` carries the
     phase results assembled by daily_tracking.py: status (per-phase
     ok/failed), ingest, register, pivot_sweep, enrich, enrich_notes,
-    zeek, plus the analytics lists (asn_pivots, zeek_matches,
-    new_ips_in_known_asns, temporal_clusters, recent_actor_activity)."""
+    zeek, plus the analytics lists (asn_pivots, attribute_changes,
+    port_patterns, zeek_matches, new_indicators_in_known_asns,
+    cross_actor_asn_overlap, temporal_clusters, recent_actor_activity)."""
     out_dir = digest_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
     md_path = out_dir / f"{day.isoformat()}.md"
@@ -139,6 +142,25 @@ def write(day: date, sections: dict[str, Any]) -> Path:
                          "new_netname", "confidence"])
         lines.append("")
 
+    attr_changes = sections.get("attribute_changes") or []
+    if attr_changes:
+        lines += ["## Indicator attribute changes (ports/certificates)", ""]
+        lines += _table(attr_changes,
+                        ["detected_at", "indicator_value", "actor", "attribute",
+                         "change_type", "old_value", "new_value", "confidence"])
+        lines.append("")
+
+    patterns = sections.get("port_patterns") or []
+    if patterns:
+        # HoneyLabs-observed scan/attack ports per actor - distinct from
+        # the attribute-changes table above, which tracks Shodan's *open
+        # service* ports on tracked infra. Keep the header explicit so
+        # Stage B doesn't conflate "actor gets scanned on port X" with
+        # "actor's C2 listens on port X".
+        lines += ["## Port scan patterns (HoneyLabs telemetry, per actor)", ""]
+        lines += _table(patterns, ["actor", "port", "ip_count", "last_seen"])
+        lines.append("")
+
     zeek = sections.get("zeek_matches") or []
     if zeek:
         lines += ["## Zeek log matches (tracked IPs seen in lab traffic)", ""]
@@ -149,11 +171,20 @@ def write(day: date, sections: dict[str, Any]) -> Path:
         lines += ["## Zeek log matches", "", "Zeek xref: unavailable "
                   f"({sections['zeek']['skipped']})", ""]
 
-    new_ips = sections.get("new_ips_in_known_asns") or []
+    new_ips = sections.get("new_indicators_in_known_asns") or []
     if new_ips:
-        lines += ["## New IPs in known-actor ASNs", ""]
+        lines += ["## New unattributed IPs in known-actor ASNs "
+                  "(first observation ever falls in this window)", ""]
         lines += _table(new_ips, ["observed_at", "indicator_value", "asn",
-                                  "matches_actor", "attributed_to"])
+                                  "matches_actor", "first_seen"])
+        lines.append("")
+
+    overlap = sections.get("cross_actor_asn_overlap") or []
+    if overlap:
+        lines += ["## Cross-actor ASN overlap "
+                  "(already attributed elsewhere - NOT new, lead only)", ""]
+        lines += _table(overlap, ["indicator_value", "asn", "matches_actor",
+                                  "attributed_to", "first_seen"])
         lines.append("")
 
     clusters = sections.get("temporal_clusters") or []

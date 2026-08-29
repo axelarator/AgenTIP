@@ -27,6 +27,26 @@ def isolated_tracking_db(tmp_path, monkeypatch):
     monkeypatch.setenv("CTI_DUCKDB_PATH", str(tmp_path / "tracking-test.duckdb"))
 
 
+@pytest.fixture(autouse=True)
+def default_lifecycle_stubs(monkeypatch):
+    """add_observable/ingest_report/pivot_and_expand now run a live
+    asn/ports/cert enrichment sweep (core._sweep_lifecycle) for every
+    genuinely new domain/ip they file - stub its network sources
+    (the same ones _domain_lifecycle/_ip_lifecycle call) to fast, empty,
+    no-network defaults by default so tests that don't care about
+    enrichment content stay hermetic and fast. A test that DOES care
+    about enrichment content overrides the specific pivot.* function
+    itself - monkeypatch layers fine on top of this, same as
+    stub_pivot_net/stub_cluster_sweep_net already do."""
+    monkeypatch.setattr(core.pivot, "rdap_lookup",
+                        lambda value, kind: {"nameservers": [], "status": [], "events": []})
+    monkeypatch.setattr(core.pivot, "resolve_host", lambda host: [])
+    monkeypatch.setattr(core.pivot, "ripestat_lookup", lambda ip: {"asn": []})
+    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {"hostnames": []})
+    monkeypatch.setattr(core.pivot, "shodan_internetdb_lookup",
+                        lambda ip: {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []})
+
+
 def test_create_and_get_cluster():
     core.create_cluster("Test Cluster", description="desc")
     data = core.get_cluster("Test Cluster")
@@ -758,6 +778,157 @@ def test_add_observable_bad_category_raises():
         core.add_observable("Bad Category Test", "bogus", "value", "source")
 
 
+# --- live enrichment at add-time --------------------------------------------
+
+def test_add_observable_new_ip_captures_asn_ports_tags_live(monkeypatch):
+    core.create_cluster("Live Enrich IP")
+    monkeypatch.setattr(core.pivot, "ripestat_lookup",
+                        lambda ip: {"asn": [64500], "as_holder": "EVIL-NET"})
+    monkeypatch.setattr(core.pivot, "shodan_internetdb_lookup",
+                        lambda ip: {"ports": [22, 443], "hostnames": [], "cpes": [],
+                                   "tags": ["iot"], "vulns": []})
+    monkeypatch.setenv("THREATFOX_API_KEY", "fake-tf-key")
+    monkeypatch.setattr(core.pivot, "threatfox_lookup",
+                        lambda value, api_key: {"matches": [{"malware": "AsyncRAT"}]})
+
+    data = core.add_observable("Live Enrich IP", "ips", "185.10.10.10", "report: r.pdf")
+    ip = next(o for o in data["observables"]["ips"] if o["value"] == "185.10.10.10")
+    assert ip["asn"] == 64500
+    assert ip["netname"] == "EVIL-NET"
+    assert ip["ports"] == [22, 443]
+    assert "shodan:tag:iot" in ip["tags"]
+    assert "threatfox:malware:AsyncRAT" in ip["tags"]
+
+
+def test_add_observable_new_domain_captures_cert_snapshot(monkeypatch):
+    core.create_cluster("Live Enrich Domain")
+    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {
+        "hostnames": ["evil.example", "mail.evil.example"],
+        "issuances": [{"issuer": "Let's Encrypt", "not_before": "2026-01-01T00:00:00Z",
+                      "not_after": "2026-04-01T00:00:00Z",
+                      "dns_names": ["evil.example", "mail.evil.example"]}]})
+
+    data = core.add_observable("Live Enrich Domain", "domains", "evil.example", "report: r.pdf")
+    domain = next(o for o in data["observables"]["domains"] if o["value"] == "evil.example")
+    assert domain["cert"]["issuer"] == "Let's Encrypt"
+    assert domain["cert"]["sibling_hostnames"] == ["evil.example", "mail.evil.example"]
+
+
+def test_add_observable_existing_value_does_not_re_enrich(monkeypatch):
+    core.create_cluster("No Re-enrich")
+    core.add_observable("No Re-enrich", "ips", "185.10.10.10", "first source")
+
+    calls = []
+    monkeypatch.setattr(core.pivot, "ripestat_lookup",
+                        lambda ip: calls.append(ip) or {"asn": [1]})
+    data = core.add_observable("No Re-enrich", "ips", "185.10.10.10", "second source")
+    assert calls == []  # already tracked - not re-swept at add-time
+    ip = next(o for o in data["observables"]["ips"] if o["value"] == "185.10.10.10")
+    assert ip["sources"] == ["first source", "second source"]
+
+
+def test_ingest_report_enriches_only_newly_extracted_indicators(tmp_path, monkeypatch):
+    core.create_cluster("Selective Enrich")
+    core.add_observable("Selective Enrich", "ips", "206.238.115.58", "seed")
+
+    calls = []
+    monkeypatch.setattr(core.pivot, "ripestat_lookup",
+                        lambda ip: calls.append(ip) or {"asn": []})
+    report = tmp_path / "report.txt"
+    report.write_text(
+        "Actor infra at 206.238.115.58 (already known) and 154.211.86.110 (new), "
+        "T1059.001."
+    )
+    core.ingest_report(str(report), cluster_name="Selective Enrich", create_if_missing=False)
+    assert calls == ["154.211.86.110"]  # only the genuinely new IP was swept
+
+
+def test_ingest_report_network_phase_does_not_hold_data_lock(tmp_path, monkeypatch):
+    """Regression for the locking hazard _sweep_lifecycle exists to avoid:
+    add_observable/ingest_report/pivot_and_expand's live enrichment lookups
+    must run outside _data_lock, or every other MCP tool call would block
+    behind a batch of network round-trips for the duration (see
+    _sweep_lifecycle's docstring). Verified by attempting a second,
+    independent non-blocking flock on the real lock file while
+    ingest_report's network phase is running - it must succeed."""
+    import fcntl
+    core.create_cluster("Lock Test")  # creates _registry/ so the lock file exists
+    lock_path = core.DATA_DIR / "_registry" / ".lock"
+
+    real_sweep = core._sweep_lifecycle
+    contended = []
+
+    def probing_sweep(domains, ips):
+        f = open(lock_path, "w")
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            contended.append(True)  # lock was free while the network phase ran
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            contended.append(False)  # lock was held - the hazard this test guards against
+        finally:
+            f.close()
+        return real_sweep(domains, ips)
+
+    monkeypatch.setattr(core, "_sweep_lifecycle", probing_sweep)
+    report = tmp_path / "report.txt"
+    report.write_text("New actor infra at c2-lock-test.xyz. T1059.001.")
+    core.ingest_report(str(report), cluster_name="Lock Test", create_if_missing=False)
+
+    assert contended == [True]
+
+
+def test_pivot_and_expand_new_sibling_captures_enrichment_snapshot(monkeypatch):
+    # certspotter_lookup is called twice with different arguments here:
+    # once (via pivot_and_expand's own pivot on "evil.example") to decide
+    # what siblings to file, and once more (via the enrichment sweep on
+    # the newly-filed sibling itself) to snapshot the sibling's own cert.
+    # Stubbed BEFORE seeding via add_observable, same reason as the
+    # tests above - that call's own enrichment sweep for "evil.example"
+    # would otherwise cache the autouse fixture's empty default first.
+    def certspotter(domain):
+        if domain == "evil.example":
+            return {"hostnames": ["mail.evil.example"]}
+        return {"hostnames": [domain],
+                "issuances": [{"issuer": "ZeroSSL", "dns_names": [domain]}]}
+    monkeypatch.setattr(core.pivot, "certspotter_lookup", certspotter)
+    core.create_cluster("Expand Enrich")
+    core.add_observable("Expand Enrich", "domains", "evil.example", "seed")
+    monkeypatch.delenv("VT_API_KEY", raising=False)
+
+    result = core.pivot_and_expand("evil.example", "Expand Enrich")
+    assert result["filed"]["domains"] == ["mail.evil.example"]
+    data = core.get_cluster("Expand Enrich")
+    sibling = next(o for o in data["observables"]["domains"] if o["value"] == "mail.evil.example")
+    assert sibling["cert"]["issuer"] == "ZeroSSL"
+
+
+def test_pivot_cluster_persists_ports_and_cert_snapshot_onto_observable(stub_cluster_sweep_net):
+    # Stub BEFORE seeding via add_observable, same reason as
+    # test_pivot_cluster_logs_shodan_history above: add_observable's own
+    # enrichment sweep would otherwise cache the fixture's empty defaults
+    # under these values before pivot_cluster gets to run.
+    stub_cluster_sweep_net.setattr(
+        core.pivot, "shodan_internetdb_lookup",
+        lambda ip: {"ports": [22, 443], "hostnames": [], "cpes": [], "tags": [], "vulns": []})
+    stub_cluster_sweep_net.setattr(
+        core.pivot, "certspotter_lookup",
+        lambda domain: {"hostnames": [domain],
+                        "issuances": [{"issuer": "Let's Encrypt", "dns_names": [domain]}]})
+    core.create_cluster("Persist Sweep")
+    core.add_observable("Persist Sweep", "ips", "185.10.10.10", "r")
+    core.add_observable("Persist Sweep", "domains", "evil-cert.example", "r")
+
+    core.pivot_cluster("Persist Sweep")
+
+    # persisted onto the observable itself, not just the transient summary
+    data = core.get_cluster("Persist Sweep")
+    ip = next(o for o in data["observables"]["ips"] if o["value"] == "185.10.10.10")
+    assert ip["ports"] == [22, 443]
+    domain = next(o for o in data["observables"]["domains"] if o["value"] == "evil-cert.example")
+    assert domain["cert"]["issuer"] == "Let's Encrypt"
+
+
 def test_remove_observable_drops_entry():
     core.create_cluster("Prune Test")
     core.add_observable("Prune Test", "domains", "keep.example", "r")
@@ -1158,12 +1329,16 @@ def test_pivot_cluster_stamps_lifecycle_status(stub_cluster_sweep_net):
 
 
 def test_pivot_cluster_logs_shodan_history(stub_cluster_sweep_net):
-    core.create_cluster("Shodan Sweep")
-    core.add_observable("Shodan Sweep", "ips", "185.10.10.10", "r")
+    # Stub the real return value BEFORE seeding via add_observable: that
+    # call now also runs a live lifecycle sweep for the new IP (see
+    # _sweep_lifecycle) and caches its shodan result (_cached_pivot) -
+    # overriding the stub afterward would just be shadowed by the cache.
     stub_cluster_sweep_net.setattr(
         core.pivot, "shodan_internetdb_lookup",
         lambda ip: {"ports": [22, 443], "hostnames": ["h.example"], "cpes": [],
                    "tags": ["cloud"], "vulns": []})
+    core.create_cluster("Shodan Sweep")
+    core.add_observable("Shodan Sweep", "ips", "185.10.10.10", "r")
 
     summary = core.pivot_cluster("Shodan Sweep")
     assert summary["ips"][0]["ports"] == [22, 443]
@@ -1227,13 +1402,17 @@ def test_pivot_cluster_survives_tracking_store_failure(stub_cluster_sweep_net, m
 # --- pivot_and_expand filing loop -------------------------------------------
 
 def test_pivot_and_expand_files_ct_subdomains_and_vt_resolutions(monkeypatch):
+    # Stub certspotter BEFORE seeding via add_observable: that call now
+    # also runs a live lifecycle sweep for the new domain (see
+    # _sweep_lifecycle) and caches its certspotter result (_cached_pivot)
+    # - stubbing afterward would just be shadowed by the cache.
+    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {
+        "hostnames": ["evil.example", "mail.evil.example", "vpn.evil.example",
+                      "unrelated.other.example"]})
     core.create_cluster("Expand")
     core.add_observable("Expand", "domains", "evil.example", "seed report")
 
     monkeypatch.setenv("VT_API_KEY", "fake-key")
-    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {
-        "hostnames": ["evil.example", "mail.evil.example", "vpn.evil.example",
-                      "unrelated.other.example"]})
     monkeypatch.setattr(core.pivot, "virustotal_lookup", lambda value, kind, api_key: {
         "resolutions": [{"ip": "185.55.55.55", "date": 1}, {"ip": "185.66.66.66", "date": 2}]})
 
@@ -1251,13 +1430,14 @@ def test_pivot_and_expand_files_ct_subdomains_and_vt_resolutions(monkeypatch):
 
 
 def test_pivot_and_expand_only_files_new_indicators(monkeypatch):
+    # Stub certspotter BEFORE seeding, same reason as the test above.
+    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {
+        "hostnames": ["mail.evil.example", "new.evil.example"]})
     core.create_cluster("Expand Dedup")
     core.add_observable("Expand Dedup", "domains", "evil.example", "seed")
     core.add_observable("Expand Dedup", "domains", "mail.evil.example", "already tracked")
 
     monkeypatch.delenv("VT_API_KEY", raising=False)
-    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {
-        "hostnames": ["mail.evil.example", "new.evil.example"]})
 
     result = core.pivot_and_expand("evil.example", "Expand Dedup")
     assert result["filed"]["domains"] == ["new.evil.example"]  # mail.* already tracked, not refiled
