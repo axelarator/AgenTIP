@@ -7,8 +7,9 @@ description: Use when the user asks about tracked threat actor activity over tim
 
 Tracks known threat actors over time: threat-report IPs are ingested,
 enriched daily via HoneyLabs honeypot telemetry + registry (RIPEstat/
-RDAP) data, cross-referenced against the lab's Zeek logs in
-OpenSearch, and stored as per-day observation rows in DuckDB at
+RDAP) data, optionally cross-referenced against the lab's Zeek logs
+in OpenSearch (on request only - see below), and stored as per-day
+observation rows in DuckDB at
 `data/tracking/tracking.duckdb`. This is the temporal complement to
 the cluster JSON store (`skills/threat-cluster-tracking/`): clusters
 stay canonical for TTP/diamond/profile data, this layer answers "what
@@ -21,8 +22,14 @@ An actor row's `cluster_slug` is the only link to a cluster
 (`data/clusters/<slug>.json`); there is no reverse sync.
 
 Note: the repo's usual rule is "no scheduled re-checking of tracked
-observables". This subsystem is the deliberate, contained exception -
-a budgeted daily loop, confined to IPs of tracked actors.
+observables". This subsystem's daily enrichment (HoneyLabs + registry
+lookups, ASN/attribute-change detection) is the deliberate, contained
+exception - a budgeted daily loop, confined to IPs of tracked actors.
+The Zeek/OpenSearch cross-reference is not part of that automatic
+loop: OpenSearch only has data when the lab VM originates traffic
+(probing indicators, or occasionally detonating malware), so checking
+it every day would mostly find nothing. Run it only when asked, via
+`daily_tracking.py --check-opensearch --date <day>`.
 
 ## Tables
 
@@ -86,8 +93,12 @@ actor's median).
 Stage A (cron 06:15, `mcp-server/scripts/daily_tracking.py`, pure
 Python): ingest `data/tracking/inbox/*.csv|json` (header
 `ip,actor,campaign,date_observed,source_url`; processed files move to
-`archive/`), budgeted enrichment, ASN-change detection, Zeek xref for
-yesterday, analytics, then writes `data/tracking/digests/<date>.md`.
+`archive/`), budgeted enrichment, ASN-change detection, analytics,
+then writes `data/tracking/digests/<date>.md`. The Zeek/OpenSearch
+xref for yesterday only runs when explicitly requested with
+`--check-opensearch` (not part of the automatic cron run) - useful
+right after probing a cluster's indicators or running malware that
+generated VM network traffic.
 Stage B (cron 06:45, `daily_narrative.sh`): one headless agent pass
 over the digest, saving correlations and
 `data/tracking/narratives/<date>.md`; a `NO ACTIVITY` digest skips

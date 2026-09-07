@@ -7,15 +7,21 @@ tokens. Run from cron (see setup.sh output) or manually:
     ... --date 2026-08-20   # backfill xref/analytics for a past day
     ... --skip-enrich   # no network calls (fast local re-run)
     ... --dry-run       # report what would be enriched, write nothing
+    ... --check-opensearch  # also cross-ref tracked IPs against Zeek/
+    ...                      # OpenSearch logs (off by default - only
+    ...                      # meaningful right after probing indicators
+    ...                      # or running malware that touched the VM's
+    ...                      # network)
 
 Sequence: init schema -> ingest inbox -> register new clusters (any
 data/clusters/*.json not yet tracked) -> pivot sweep (RDAP/RIPEstat/
 Shodan/ThreatFox lifecycle+port check for every cluster, via
 core.pivot_cluster) -> enrich (worklist, then the paced network loop
-with NO db connection held, then one write batch) -> Zeek xref ->
-analytics -> digest. Every phase failure is recorded in the digest and
-the run continues; the exit code is nonzero only if the digest itself
-cannot be written, so cron mail stays meaningful.
+with NO db connection held, then one write batch) -> Zeek xref (only
+if --check-opensearch) -> analytics -> digest. Every phase failure is
+recorded in the digest and the run continues; the exit code is
+nonzero only if the digest itself cannot be written, so cron mail
+stays meaningful.
 """
 from __future__ import annotations
 
@@ -57,6 +63,12 @@ def main() -> int:
                         help="import actors/IPs from the JSON cluster store")
     parser.add_argument("--skip-enrich", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--check-opensearch", action="store_true",
+                        help="cross-reference tracked IPs against the lab's "
+                             "Zeek logs in OpenSearch for the prior day (off "
+                             "by default - only meaningful right after "
+                             "probing indicators or running malware that "
+                             "generated VM network traffic)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -129,12 +141,15 @@ def main() -> int:
                 return enrich.apply_results(con, results, day)
         sections["enrich"] = phase("enrich", _enrich)
 
-    def _xref():
-        # Cross-reference *yesterday's* logs relative to the run date:
-        # the 6:15 run sees a complete day of traffic for day-1.
-        with store.connect() as con:
-            return run_daily_xref(con, day - timedelta(days=1))
-    sections["zeek"] = phase("zeek_xref", _xref)
+    if args.check_opensearch:
+        def _xref():
+            # Cross-reference *yesterday's* logs relative to the run date:
+            # the 6:15 run sees a complete day of traffic for day-1.
+            with store.connect() as con:
+                return run_daily_xref(con, day - timedelta(days=1))
+        sections["zeek"] = phase("zeek_xref", _xref)
+    else:
+        sections["zeek"] = {"skipped": "not requested (pass --check-opensearch)"}
 
     def _analytics():
         with store.connect() as con:

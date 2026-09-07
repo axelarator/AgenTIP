@@ -341,8 +341,11 @@ look like a report URL the way `ingest_report`'s sources do.
 This was deliberately scoped to display-only, on-demand lookups —
 pivoting itself still never runs on a schedule. The diff store that
 scheduled re-checking needed now exists as the actor-tracking layer
-below; that subsystem is the one contained exception to the
-no-scheduled-rechecks rule.
+below; that subsystem's daily enrichment (HoneyLabs + registry
+lookups, ASN/attribute-change detection) is the one contained
+exception to the no-scheduled-rechecks rule. The Zeek/OpenSearch
+cross-reference described there is not part of that exception — it
+stays on-demand.
 
 ## Actor tracking (DuckDB time-series layer)
 
@@ -361,8 +364,12 @@ as one /32 cidr_set call so only IPs with events cost a full lookup;
 the free tier's 500 credits/day at 10 req/min is shared with
 interactive pivots, and the loop stays capped at CTI_HL_BUDGET
 (default 400) and self-slows on 429s — detects ASN/netname changes,
-cross-references tracked IPs against the lab's Zeek logs in
-OpenSearch, and writes a bounded digest to `data/tracking/digests/`.
+and writes a bounded digest to `data/tracking/digests/`. Cross-
+referencing tracked IPs against the lab's Zeek logs in OpenSearch is
+opt-in (`--check-opensearch`), not part of the automatic run — those
+logs only have data when the VM originates traffic (probing, or
+occasionally detonating malware), so checking daily by default would
+mostly find nothing.
 Stage B (`scripts/daily_narrative.sh`) makes one headless `claude -p`
 pass over that digest — a `NO ACTIVITY` digest skips the agent
 entirely, so quiet days cost zero tokens.
