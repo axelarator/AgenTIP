@@ -390,9 +390,12 @@ def certspotter_lookup(domain: str) -> dict[str, Any]:
     Spotter API - the free, no-key stand-in for crt.sh (which is no longer
     reliably reachable). Returns every hostname seen in a CT-logged
     certificate for the domain and its subdomains (`hostnames`), plus a
-    per-issuance summary (issuer + validity window). Those sibling
-    hostnames are the pivot leads: infrastructure the same operator stood
-    up under the same name that you might not have observed directly.
+    per-issuance summary (issuer + validity window + the certificate's own
+    SHA256 fingerprint and revocation status). Those sibling hostnames are
+    the pivot leads: infrastructure the same operator stood up under the
+    same name that you might not have observed directly; `cert_sha256` is
+    itself a pivot value (query it on crt.sh/Censys/VT to find the same
+    cert reused elsewhere).
 
     The public endpoint is rate-limited without an API token; a 429/HTTP
     error comes back as {"error": ...} rather than raising, so a batch
@@ -418,6 +421,8 @@ def certspotter_lookup(domain: str) -> dict[str, Any]:
             "not_before": iss.get("not_before"),
             "not_after": iss.get("not_after"),
             "dns_names": names,
+            "cert_sha256": iss.get("cert_sha256"),
+            "revoked": iss.get("revoked"),
         })
     return {
         "issuance_count": len(issuances),

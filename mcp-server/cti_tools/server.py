@@ -157,7 +157,8 @@ def find_observable(value: str) -> dict:
 
 
 @mcp.tool()
-def add_observable(name: str, category: str, value: str, source: str) -> dict:
+def add_observable(name: str, category: str, value: str, source: str,
+                   metadata: dict | None = None) -> dict:
     """Manually file a single observable onto a cluster - the
     counterpart to ingest_report's automatic extraction, for an
     indicator from somewhere other than a parseable report (e.g. a
@@ -167,8 +168,15 @@ def add_observable(name: str, category: str, value: str, source: str) -> dict:
     "ja4", "ja4s", "ja4h", "ja4l", "ja4x", "ja4t", "ja4ts", "ja4ssh",
     "jarm". Dedupes by value like ingest_report does. A genuinely new
     domain/ip also gets a live asn/ports/cert/tags enrichment lookup,
-    stamped onto the observable alongside `source`."""
-    return core.add_observable(name, category, value, source)
+    stamped onto the observable alongside `source`.
+
+    metadata is stamped onto the entry only if it's genuinely new (an
+    already-tracked value only gets `source` appended) - use it to record
+    a file hash's filenames when filing one pivoted via VirusTotal, e.g.
+    metadata={"hash_kind": "file", "filenames": ["update.exe"]}, so that
+    detail isn't lost the way it is in a pivot_observable/pivot_cluster
+    finding that's never been manually filed."""
+    return core.add_observable(name, category, value, source, metadata)
 
 
 @mcp.tool()

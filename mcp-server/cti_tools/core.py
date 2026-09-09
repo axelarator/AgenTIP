@@ -769,7 +769,8 @@ def find_observable(value: str) -> dict[str, Any]:
     return {"value": value, "matches": matches}
 
 
-def add_observable(name: str, category: str, value: str, source: str) -> dict[str, Any]:
+def add_observable(name: str, category: str, value: str, source: str,
+                   metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     """Manually file a single observable (category is one of
     OBSERVABLE_CATEGORIES: hashes, domains, ips, urls, emails, cves,
     wallets, ja4, ja4s, ja4h, ja4l, ja4x, ja4t, ja4ts, ja4ssh, jarm) onto
@@ -780,6 +781,16 @@ def add_observable(name: str, category: str, value: str, source: str) -> dict[st
     the exact same dedup/provenance logic as ingest_report: a value
     already tracked just gets `source` appended to its provenance list
     rather than creating a duplicate entry.
+
+    metadata, if given, is stamped onto the entry only if it's genuinely
+    new (an already-tracked value only gets `source` appended, same as
+    always) - e.g. filing a VirusTotal-pivoted file hash with its
+    filenames: add_observable(cluster, "hashes", "sha256:<hex>", source,
+    metadata={"hash_kind": "file", "filenames": [...]}), so the filename
+    isn't lost the way it is when only reading pivot_observable's/
+    pivot_cluster's own flagged VT file-hash notes (see
+    core._record_vt_file_hashes) - those are display/digest-only and
+    never auto-filed.
 
     A new domain/ip is still always tracked as an observable, but only
     queued for active fingerprinting if it passes _is_probe_worthy (not
@@ -805,16 +816,17 @@ def add_observable(name: str, category: str, value: str, source: str) -> dict[st
         enrichment = _sweep_lifecycle(
             domains=[value] if category == "domains" else [],
             ips=[value] if category == "ips" else [])
-    return _add_observable_locked(name, category, value, source, enrichment)
+    return _add_observable_locked(name, category, value, source, enrichment, metadata)
 
 
 @_synchronized
 def _add_observable_locked(name: str, category: str, value: str, source: str,
-                           enrichment: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]
+                           enrichment: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]],
+                           metadata: dict[str, Any] | None = None,
                            ) -> dict[str, Any]:
     data = load_cluster(name)  # re-read fresh; another writer may have raced in above
     extracted = {c: ([value] if c == category else []) for c in OBSERVABLE_CATEGORIES}
-    _, skipped = _merge_observables(data, extracted, source, enrichment=enrichment)
+    _, skipped = _merge_observables(data, extracted, source, enrichment=enrichment, metadata=metadata)
     save_cluster(data)
     if skipped:
         data = {**data, "fingerprint_queue_skipped": skipped}
@@ -1051,6 +1063,21 @@ def _threatfox_enrichment(value: str) -> dict[str, Any] | None:
     return _cached_pivot("threatfox", value, lambda: pivot.threatfox_lookup(value, api_key))
 
 
+def _vt_files_enrichment(ip: str) -> dict[str, Any] | None:
+    """Cached VirusTotal ip-relationship lookup (communicating_files/
+    downloaded_files) for pivot_cluster's IP sweep, or None if VT_API_KEY
+    isn't configured - same skip-gracefully shape as _threatfox_enrichment.
+    Deliberately uncapped/uncached-per-day: file-hash pivots are the one
+    VT usage this pipeline runs automatically every sweep (see
+    _record_vt_file_hashes) - passive-DNS/resolution history is not
+    fetched here at all, by design (Shodan/Hackertarget cover domain
+    discovery for IPs instead - see _log_cluster_enrichment_history)."""
+    api_key = os.environ.get(pivot.VT_API_KEY_ENV)
+    if not api_key:
+        return None
+    return _cached_pivot("virustotal", ip, lambda: _safe_vt(ip, "ip", api_key))
+
+
 def _domain_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     rdap = _cached_pivot("rdap", value, lambda: pivot.rdap_lookup(value, "domain"))
     resolved = pivot.resolve_host(value)  # live, not cached — liveness is the point
@@ -1074,10 +1101,19 @@ def _ip_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
              "as_holder": ripe.get("as_holder") if isinstance(ripe, dict) else None}
     enrichment: dict[str, Any] = {
         "shodan": _cached_pivot("shodan", value, lambda: pivot.shodan_internetdb_lookup(value)),
+        # Free/keyless reverse-IP co-hosting - combined with Shodan's own
+        # "hostnames" field in _log_cluster_enrichment_history to build
+        # the day-over-day "new domain pointed at this IP" signal (the
+        # bgp.he.net cert-transparency-tab equivalent), without VT.
+        "hackertarget": _cached_pivot(
+            "reverse_ip", value, lambda: pivot.hackertarget_reverse_ip(value)),
     }
     threatfox = _threatfox_enrichment(value)
     if threatfox is not None:
         enrichment["threatfox"] = threatfox
+    vt_files = _vt_files_enrichment(value)
+    if vt_files is not None:
+        enrichment["virustotal"] = vt_files
     return status, detail, enrichment
 
 
@@ -1165,6 +1201,8 @@ def _apply_enrichment_snapshot(entry: dict[str, Any], category: str,
                                   "not_before": latest.get("not_before"),
                                   "not_after": latest.get("not_after"),
                                   "sibling_hostnames": certspotter.get("hostnames") or [],
+                                  "sha256": latest.get("cert_sha256"),
+                                  "revoked": latest.get("revoked"),
                                   "checked": _now()}
     threatfox = enrichment.get("threatfox")
     if isinstance(threatfox, dict) and "error" not in threatfox:
@@ -1178,6 +1216,7 @@ def _apply_enrichment_snapshot(entry: dict[str, Any], category: str,
 
 _ATTRIBUTE_CONFIDENCE_BASE = {
     "cert_issuer_changed": "high", "ports_changed": "medium", "cert_sans_changed": "medium",
+    "cert_new": "high", "hostnames_changed": "medium", "new_file_hash": "medium",
 }
 
 
@@ -1241,6 +1280,115 @@ def _record_cert_change(con: duckdb.DuckDBPyConnection, domain: str, actor: str 
         new_value={"issuer": new_issuer, "hostnames": hostnames})
 
 
+def _record_cert_hash_change(con: duckdb.DuckDBPyConnection, domain: str, actor: str | None,
+                             observed_at: datetime, latest_issuance: dict[str, Any]) -> None:
+    """A separate diff from _record_cert_change: that one tracks issuer/SAN
+    changes and deliberately treats a same-issuer/same-SANs renewal as
+    routine (not recorded), but a renewal always mints a brand new
+    certificate - and therefore a new cert_sha256 - so this tracks that
+    pivot value on its own timeline instead of conflating it with the
+    issuer/SANs signal."""
+    new_sha256 = latest_issuance.get("cert_sha256")
+    if not new_sha256:
+        return
+    baseline = tracking_store.latest_cert_for(con, domain, observed_at)
+    if baseline is None or not baseline.get("sha256"):
+        tracking_store.record_attribute_change(
+            con, detected_at=observed_at, indicator_value=domain, actor=actor,
+            attribute="cert_hash", change_type="first_seen", confidence="medium",
+            old_value=None,
+            new_value={"sha256": new_sha256, "revoked": latest_issuance.get("revoked")})
+        return
+    if new_sha256 == baseline["sha256"]:
+        return  # same cert as last check - nothing to record
+    tracking_store.record_attribute_change(
+        con, detected_at=observed_at, indicator_value=domain, actor=actor,
+        attribute="cert_hash", change_type="cert_new",
+        confidence=_attribute_confidence("cert_new", baseline["observed_at"]),
+        old_value={"sha256": baseline["sha256"], "revoked": baseline.get("revoked")},
+        new_value={"sha256": new_sha256, "revoked": latest_issuance.get("revoked")})
+
+
+def _record_hostname_change(con: duckdb.DuckDBPyConnection, ip: str, actor: str | None,
+                            observed_at: datetime, new_hostnames: list[str]) -> None:
+    """Day-over-day diff of domains discovered pointing at a tracked IP
+    (Shodan InternetDB's own hostnames field, unioned with Hackertarget's
+    reverse-IP lookup - see _log_cluster_enrichment_history) - the
+    bgp.he.net cert-transparency-tab equivalent for an IP, built from
+    free/keyless sources already in this module rather than VT passive-DNS
+    or a paid platform. Mirrors _record_port_change's shape. When new
+    hostnames actually appear, also runs a best-effort Cert Spotter lookup
+    on each (see _candidate_hostname_certs) so the flagged note carries the
+    same cert-transparency pivot info bgp.he.net's IP page shows - the
+    hostnames themselves are still never auto-filed as tracked
+    observables, per the flag-only-new-leads decision."""
+    baseline = tracking_store.latest_hostnames_for(con, ip, observed_at)
+    if baseline is None:
+        tracking_store.record_attribute_change(
+            con, detected_at=observed_at, indicator_value=ip, actor=actor,
+            attribute="hostnames", change_type="first_seen", confidence="medium",
+            old_value=None, new_value={"hostnames": new_hostnames})
+        return
+    if sorted(baseline["hostnames"]) == sorted(new_hostnames):
+        return  # no change - the common case, nothing recorded
+    new_only = sorted(set(new_hostnames) - set(baseline["hostnames"]))
+    tracking_store.record_attribute_change(
+        con, detected_at=observed_at, indicator_value=ip, actor=actor,
+        attribute="hostnames", change_type="hostnames_changed",
+        confidence=_attribute_confidence("hostnames_changed", baseline["observed_at"]),
+        old_value=baseline["hostnames"],
+        new_value={"hostnames": new_hostnames, "added": new_only,
+                  "certs": _candidate_hostname_certs(new_only) if new_only else []})
+
+
+def _candidate_hostname_certs(hostnames: list[str]) -> list[dict[str, Any]]:
+    """Best-effort Cert Spotter lookup for each newly-discovered (not yet
+    tracked) hostname found pointing at a monitored IP - gives the analyst
+    the same cert-transparency pivot info bgp.he.net's IP page shows,
+    without filing the hostname itself as a tracked observable (new leads
+    are flag-only, per the threat-cluster-tracking skill). Kept to a small
+    list since this only ever runs over genuinely new hostnames from one
+    sweep, and Cert Spotter's own error handling (rate-limited without a
+    token) already degrades a single failed lookup to {"error": ...}
+    rather than raising."""
+    out = []
+    for h in hostnames:
+        cs = _cached_pivot("certspotter", h, lambda h=h: pivot.certspotter_lookup(h))
+        if isinstance(cs, dict) and "error" not in cs and cs.get("issuances"):
+            latest = cs["issuances"][0]
+            out.append({"hostname": h, "cert_issuer": latest.get("issuer"),
+                       "cert_sha256": latest.get("cert_sha256"),
+                       "revoked": latest.get("revoked")})
+        else:
+            out.append({"hostname": h, "cert_issuer": None, "cert_sha256": None, "revoked": None})
+    return out
+
+
+def _record_vt_file_hashes(con: duckdb.DuckDBPyConnection, ip: str, actor: str | None,
+                           observed_at: datetime, files: list[dict[str, Any]]) -> None:
+    """Flags every VirusTotal-reported file hash (communicating_files/
+    downloaded_files) relating to a tracked IP that wasn't already known -
+    unlike ports/ASN/cert, which every IP always *has some* value for, a
+    file-hash relationship is itself the notable event, so this
+    deliberately never uses change_type='first_seen' (which digest/
+    analytics queries filter out everywhere else as a baseline, not an
+    event) - even the very first sha256 seen for an IP is worth flagging.
+    These are leads only: never auto-filed as a hash observable (see
+    add_observable's metadata= param for filing one by hand with its
+    filenames preserved)."""
+    baseline = tracking_store.latest_vt_file_hashes_for(con, ip, observed_at)
+    known = {f["sha256"] for f in (baseline["files"] if baseline else []) if f.get("sha256")}
+    for f in files:
+        sha256 = f.get("sha256")
+        if not sha256 or sha256 in known:
+            continue
+        tracking_store.record_attribute_change(
+            con, detected_at=observed_at, indicator_value=ip, actor=actor,
+            attribute="vt_files", change_type="new_file_hash",
+            confidence=_ATTRIBUTE_CONFIDENCE_BASE["new_file_hash"],
+            old_value=None, new_value=f)
+
+
 def _log_cluster_enrichment_history(
         actor: str, observed_at: datetime,
         results: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]) -> str | None:
@@ -1279,17 +1427,76 @@ def _log_cluster_enrichment_history(
                         cert_issuer=latest.get("issuer"),
                         cert_not_before=latest.get("not_before"),
                         cert_not_after=latest.get("not_after"),
-                        cert_sibling_hostnames=hostnames or None)
+                        cert_sibling_hostnames=hostnames or None,
+                        cert_sha256=latest.get("cert_sha256"),
+                        cert_revoked=latest.get("revoked"))
                     _record_cert_change(con, value, actor, observed_at, latest, hostnames)
+                    _record_cert_hash_change(con, value, actor, observed_at, latest)
                 threatfox = enrichment.get("threatfox")
                 if isinstance(threatfox, dict) and "error" not in threatfox:
                     tracking_store.upsert_observation(
                         con, observed_at=observed_at, indicator_value=value,
                         source="threatfox", actor=actor, indicator_type=indicator_type,
                         threatfox_matches=threatfox.get("matches") or None)
+                # Domain-on-IP discovery (free/keyless): union Shodan's own
+                # "hostnames" field with Hackertarget's reverse-IP domains -
+                # the bgp.he.net cert-transparency-tab equivalent for an IP,
+                # diffed day-over-day the same way ports are.
+                hackertarget = enrichment.get("hackertarget")
+                shodan_hostnames = (shodan.get("hostnames") or []) \
+                    if isinstance(shodan, dict) and "error" not in shodan else []
+                hackertarget_domains = (hackertarget.get("domains") or []) \
+                    if isinstance(hackertarget, dict) and "error" not in hackertarget else []
+                if shodan_hostnames or hackertarget_domains:
+                    discovered = sorted(set(shodan_hostnames) | set(hackertarget_domains))
+                    tracking_store.upsert_observation(
+                        con, observed_at=observed_at, indicator_value=value,
+                        source="hostdiscovery", actor=actor, indicator_type=indicator_type,
+                        discovered_hostnames=discovered)
+                    _record_hostname_change(con, value, actor, observed_at, discovered)
+                virustotal = enrichment.get("virustotal")
+                if isinstance(virustotal, dict) and "error" not in virustotal:
+                    files = ((virustotal.get("communicating_files") or [])
+                            + (virustotal.get("downloaded_files") or []))
+                    if files:
+                        tracking_store.upsert_observation(
+                            con, observed_at=observed_at, indicator_value=value,
+                            source="virustotal_files", actor=actor, indicator_type=indicator_type,
+                            vt_file_hashes=files)
+                        _record_vt_file_hashes(con, value, actor, observed_at, files)
     except (tracking_store.TrackingBusy, duckdb.IOException) as e:
         return f"enrichment history not recorded: {e}"
     return None
+
+
+def _file_cert_hash(data: dict[str, Any], domain: str, sha256: str,
+                    issuer: str | None, revoked: bool | None, now: str) -> None:
+    """Auto-file a certificate's own SHA256 fingerprint onto the cluster's
+    hashes list when pivot_cluster sees a new one for an already-tracked
+    domain - an attribute of infrastructure already being tracked (like
+    ASN/ports/cert issuer), not a new lead, so unlike a sibling hostname
+    or a VT file-hash candidate (see _record_hostname_change/
+    _record_vt_file_hashes, both flag-only) this auto-updates without
+    analyst confirmation. The `cert-sha256:` value prefix (distinct from
+    the existing `sha256:`/`sha1:`/`md5:` file-hash prefixes) plus the
+    explicit hash_kind field make this unambiguous as a certificate hash,
+    not a file hash; cert_for names the domain it belongs to."""
+    value = f"cert-sha256:{sha256}"
+    bucket = data["observables"]["hashes"]
+    source = f"Cert Spotter CT log for {domain}, seen {now[:10]}"
+    for entry in bucket:
+        if entry["value"] == value:
+            if source not in entry["sources"]:
+                entry["sources"].append(source)
+            entry["last_seen"] = now
+            entry["cert_issuer"] = issuer
+            entry["cert_revoked"] = revoked
+            return
+    bucket.append({
+        "value": value, "sources": [source], "first_seen": now, "last_seen": now,
+        "hash_kind": "certificate", "cert_for": domain,
+        "cert_issuer": issuer, "cert_revoked": revoked,
+    })
 
 
 def pivot_cluster(name: str) -> dict[str, Any]:
@@ -1341,6 +1548,23 @@ def pivot_cluster(name: str) -> dict[str, Any]:
                 o["status_checked"] = now
                 o["status_detail"] = detail
                 _apply_enrichment_snapshot(o, cat, detail, enrichment)
+                if cat == "domains":
+                    new_cert = o.get("cert") or {}
+                    new_sha256 = new_cert.get("sha256")
+                    if new_sha256:
+                        # Unconditional, not gated on "changed since last
+                        # sweep": _file_cert_hash's own bucket lookup
+                        # already dedupes by value (idempotent re-filing
+                        # just bumps last_seen/sources), and gating here
+                        # would miss the very first cert a domain ever
+                        # gets - add_observable's own add-time enrichment
+                        # sweep already stamps entry["cert"] before this
+                        # sweep ever runs (see _merge_observables), so a
+                        # "did it change from the cluster JSON's own
+                        # snapshot" check would never fire for that first
+                        # sighting.
+                        _file_cert_hash(data, o["value"], new_sha256, new_cert.get("issuer"),
+                                       new_cert.get("revoked"), now)
                 row = {"value": o["value"], "status": status}
                 shodan = enrichment.get("shodan")
                 if isinstance(shodan, dict) and "error" not in shodan:
@@ -1596,12 +1820,23 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                         ip_ports: dict[str, list[int]] | None = None,
                         enrichment: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]
                         | None = None,
+                        metadata: dict[str, Any] | None = None,
                         ) -> tuple[dict[str, int], list[dict[str, str]]]:
     """enrichment, if given, is a _sweep_lifecycle-shaped result keyed by
     (category, value) - applied via _apply_enrichment_snapshot only onto
     entries genuinely new to this cluster (an already-tracked value just
     gets `source` appended, as before; its snapshot is pivot_cluster's job
-    to refresh, not add-time's)."""
+    to refresh, not add-time's).
+
+    metadata, if given, is stamped (via dict.update) onto any newly-created
+    entry - e.g. add_observable's own metadata= param, for recording a
+    file hash's filenames (see mcp-server/cti_tools/pivot.py's VirusTotal
+    communicating/downloaded_files data, surfaced but never persisted
+    until an analyst manually files one this way). Only meaningful when
+    `extracted` names a single value (add_observable's own call shape) -
+    a bulk multi-value call (ingest_report, import_stix_bundle) never
+    passes this, since one metadata dict can't sensibly apply to every
+    value being filed at once."""
     now = _now()
     counts = {}
     newly_tracked: list[tuple[str, str]] = []  # (category, value), for the fingerprint queue
@@ -1621,10 +1856,24 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
             else:
                 entry = {"value": value, "sources": [source],
                           "first_seen": now, "last_seen": now}
+                if metadata:
+                    entry.update(metadata)
                 found = enrichment.get((category, value))
                 if found:
                     _, detail, enr = found
                     _apply_enrichment_snapshot(entry, category, detail, enr)
+                    if category == "domains":
+                        # A genuinely new domain's very first cert sighting
+                        # happens right here (this add-time sweep), not on
+                        # a later pivot_cluster pass - file it now so the
+                        # sha256 is pivotable from the moment the domain is
+                        # tracked (see pivot_cluster's own matching call for
+                        # why this is unconditional, not gated on "changed").
+                        new_cert = entry.get("cert") or {}
+                        new_sha256 = new_cert.get("sha256")
+                        if new_sha256:
+                            _file_cert_hash(data, value, new_sha256, new_cert.get("issuer"),
+                                           new_cert.get("revoked"), now)
                 bucket.append(entry)
                 added += 1
                 if category in _FINGERPRINTABLE_CATEGORIES:

@@ -364,12 +364,22 @@ as one /32 cidr_set call so only IPs with events cost a full lookup;
 the free tier's 500 credits/day at 10 req/min is shared with
 interactive pivots, and the loop stays capped at CTI_HL_BUDGET
 (default 400) and self-slows on 429s — detects ASN/netname changes,
-and writes a bounded digest to `data/tracking/digests/`. Cross-
-referencing tracked IPs against the lab's Zeek logs in OpenSearch is
-opt-in (`--check-opensearch`), not part of the automatic run — those
-logs only have data when the VM originates traffic (probing, or
-occasionally detonating malware), so checking daily by default would
-mostly find nothing.
+and writes a bounded digest to `data/tracking/digests/`. The daily
+`core.pivot_cluster` sweep also diffs new domains discovered on a
+tracked IP (Shodan InternetDB + Hackertarget reverse-IP, free/keyless),
+a tracked domain's certificate fingerprint (Cert Spotter's
+`cert_sha256`, auto-filed onto the cluster's own hash list), and
+VirusTotal communicating/downloaded-file hashes on a tracked IP (if
+`VT_API_KEY` is set) — all surfaced the same way ASN/port/cert-issuer
+changes already were. Zeek/OpenSearch/Arkime cross-referencing
+(`cti_tools.tracking.opensearch_xref.run_daily_xref`) is a separate,
+on-demand capability for correlating tracked infrastructure against
+this lab's own captured traffic right after a probe or malware-
+execution session — it is deliberately NOT part of this daily loop or
+its digest/narrative (those logs only have data when the VM originates
+traffic, so checking them daily by default would mostly find nothing
+and just add noise); run it by hand via `opensearch_xref.run_daily_xref`
+when it's actually relevant.
 Stage B (`scripts/daily_narrative.sh`) makes one headless `claude -p`
 pass over that digest — a `NO ACTIVITY` digest skips the agent
 entirely, so quiet days cost zero tokens.

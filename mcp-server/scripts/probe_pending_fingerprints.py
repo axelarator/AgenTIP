@@ -373,7 +373,7 @@ def collect_zeek_fingerprints_batch(resolved: list[tuple[str, int]], baseline_ts
         ports_by_ip.setdefault(ip, set()).add(port)
 
     wanted: dict[tuple[str, int], dict[str, str | None]] = {
-        (ip, port): {"ja4s": None, "ja4ts": None, "ja4l": None} for ip, port in resolved
+        (ip, port): {"ja4s": None, "ja4ts": None, "ja4l": None, "ts": None} for ip, port in resolved
     }
     remaining = set(wanted)
     for _ in range(attempts):
@@ -404,15 +404,28 @@ def collect_zeek_fingerprints_batch(resolved: list[tuple[str, int]], baseline_ts
             if entry is None:
                 continue
             log_file = hit.get("log_file", "")
+            # The Zeek document's own `ts` (its real capture time, not
+            # this script's wall clock) - captured from whichever hit
+            # first fills in a fingerprint field for this key, as the
+            # accurate anchor for the Arkime deep link (see
+            # probe_pending_fingerprints's own clock-skew rationale in
+            # the module docstring for why this, not a wall-clock
+            # reading, is the right timestamp to use downstream).
             if log_file.endswith("ssl.log"):
                 if hit.get("established") and hit.get("ja4s") and not entry["ja4s"]:
                     entry["ja4s"] = hit["ja4s"]
+                    entry["ts"] = entry["ts"] or hit.get("ts")
             elif log_file.endswith("conn.log"):
                 if hit.get("ja4ts") and not entry["ja4ts"]:
                     entry["ja4ts"] = hit["ja4ts"]
+                    entry["ts"] = entry["ts"] or hit.get("ts")
                 if hit.get("ja4l") and not entry["ja4l"]:
                     entry["ja4l"] = hit["ja4l"]
-        remaining = {key for key in remaining if not all(wanted[key].values())}
+                    entry["ts"] = entry["ts"] or hit.get("ts")
+        # `ts` isn't a fingerprint field to wait on - a key with every
+        # ja4s/ja4ts/ja4l value already filled is done regardless of it.
+        remaining = {key for key in remaining
+                    if not all(v for k, v in wanted[key].items() if k != "ts")}
         if not remaining:
             break
         time.sleep(interval)
@@ -435,15 +448,20 @@ def _dispatch_one(job: dict[str, object]) -> dict[str, object]:
     job's future in the same batch - the caller collects every future's
     result via as_completed regardless of whether it succeeded."""
     cluster, target, port = job["cluster"], job["target"], job["port"]
+    # Precise UTC timestamp for the point in time this probe actually
+    # fired - used downstream (main()) to anchor the JARM observable's
+    # Arkime deep link to a tight window around the real probe, instead
+    # of a whole-day guess (see dashboard/static/app.js's arkimeSessionUrl).
+    probe_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         probe_result = probe_win(target, port)
     except ProbeError as e:
-        return {"cluster": cluster, "target": target, "port": port,
+        return {"cluster": cluster, "target": target, "port": port, "probe_time": probe_time,
                 "probe_result": None, "probe_error": str(e)}
     except Exception as e:
-        return {"cluster": cluster, "target": target, "port": port,
+        return {"cluster": cluster, "target": target, "port": port, "probe_time": probe_time,
                 "probe_result": None, "probe_error": f"unexpected error: {e}"}
-    return {"cluster": cluster, "target": target, "port": port,
+    return {"cluster": cluster, "target": target, "port": port, "probe_time": probe_time,
             "probe_result": probe_result, "probe_error": None}
 
 
@@ -558,7 +576,7 @@ def main() -> None:
 
         if probe_result.get("jarm"):
             core.add_observable(cluster, "jarm", probe_result["jarm"],
-                                 f"JARM against {target}:{port} via {SOURCE_LABEL}, {today}")
+                                 f"JARM against {target}:{port} via {SOURCE_LABEL}, {d['probe_time']}")
 
         resolved_ip = probe_result.get("resolved_ip")
         if resolved_ip:
@@ -590,6 +608,15 @@ def main() -> None:
 
     for (resolved_ip, _port), entries in resolved_by_ip_port.items():
         zeek_result = zeek_results.get((resolved_ip, _port), {})
+        # The Zeek document's own capture time (see
+        # collect_zeek_fingerprints_batch's own "ts" field), not this
+        # script's wall clock - falls back to `today` if no matching hit
+        # ever carried a ts (shouldn't happen when a fingerprint was
+        # actually found, but the fingerprint categories below already
+        # guard on `if value`).
+        hit_ts = zeek_result.get("ts")
+        hit_time = (datetime.datetime.fromtimestamp(hit_ts, tz=datetime.timezone.utc)
+                   .strftime("%Y-%m-%dT%H:%M:%SZ")) if hit_ts else today
         for d in entries:
             cluster, target, port = d["cluster"], d["target"], d["port"]
             for category in ("ja4s", "ja4ts", "ja4l"):
@@ -597,7 +624,7 @@ def main() -> None:
                 if value:
                     core.add_observable(cluster, category, value,
                                          f"Zeek passive (tap107, via OpenSearch) handshake against "
-                                         f"{target}:{port} ({resolved_ip}), {today}")
+                                         f"{target}:{port} ({resolved_ip}), {hit_time}")
 
 
 if __name__ == "__main__":

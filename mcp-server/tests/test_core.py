@@ -45,6 +45,7 @@ def default_lifecycle_stubs(monkeypatch):
     monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {"hostnames": []})
     monkeypatch.setattr(core.pivot, "shodan_internetdb_lookup",
                         lambda ip: {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []})
+    monkeypatch.setattr(core.pivot, "hackertarget_reverse_ip", lambda ip: {"domains": []})
 
 
 def test_create_and_get_cluster():
@@ -1296,10 +1297,11 @@ def test_classify_ip_lifecycle():
 @pytest.fixture
 def stub_cluster_sweep_net(monkeypatch):
     """Stub every network source pivot_cluster's sweep now touches
-    (lifecycle sources plus the Shodan/Cert Spotter enrichment added
-    alongside them), so sweep tests are hermetic. THREATFOX_API_KEY is
-    left unset by default - tests that want ThreatFox set it and stub
-    pivot.threatfox_lookup themselves."""
+    (lifecycle sources plus the Shodan/Cert Spotter/Hackertarget
+    enrichment added alongside them), so sweep tests are hermetic.
+    THREATFOX_API_KEY/VT_API_KEY are left unset by default - tests that
+    want ThreatFox/VirusTotal set the key and stub the relevant
+    pivot.* function themselves."""
     monkeypatch.setattr(core.pivot, "rdap_lookup",
                         lambda value, kind: {"nameservers": [], "status": [], "events": []})
     monkeypatch.setattr(core.pivot, "resolve_host", lambda host: [])  # NXDOMAIN -> dead
@@ -1308,7 +1310,9 @@ def stub_cluster_sweep_net(monkeypatch):
     monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {"hostnames": []})
     monkeypatch.setattr(core.pivot, "shodan_internetdb_lookup",
                         lambda ip: {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []})
+    monkeypatch.setattr(core.pivot, "hackertarget_reverse_ip", lambda ip: {"domains": []})
     monkeypatch.delenv("THREATFOX_API_KEY", raising=False)
+    monkeypatch.delenv("VT_API_KEY", raising=False)
     return monkeypatch
 
 
@@ -1444,12 +1448,18 @@ def test_pivot_and_expand_only_files_new_indicators(monkeypatch):
 
 
 def test_pivot_and_expand_cohosted_gated(monkeypatch):
+    # Stubbed BEFORE seeding via add_observable, same reason as
+    # test_pivot_and_expand_new_sibling_captures_enrichment_snapshot above:
+    # add_observable's own enrichment sweep now calls hackertarget_reverse_ip
+    # too (see core._ip_lifecycle), under the same "reverse_ip" pivot-cache
+    # tag pivot_and_expand's own cohosted-domains lookup uses below - stubbing
+    # after seeding would let the autouse fixture's empty default get cached
+    # first, and pivot_and_expand would then read that stale cached value.
     core.create_cluster("Expand IP")
-    core.add_observable("Expand IP", "ips", "185.10.10.10", "seed")
-
     monkeypatch.delenv("VT_API_KEY", raising=False)
     monkeypatch.setattr(core.pivot, "hackertarget_reverse_ip",
                         lambda ip: {"domains": ["shared-a.example", "shared-b.example"]})
+    core.add_observable("Expand IP", "ips", "185.10.10.10", "seed")
 
     # default: co-hosted domains are surfaced for review, not filed
     result = core.pivot_and_expand("185.10.10.10", "Expand IP")

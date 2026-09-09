@@ -67,7 +67,6 @@ def _has_signals(sections: dict[str, Any]) -> bool:
         or register.get("actors_registered")
         or changes
         or sections.get("attribute_changes")  # already excludes first_seen, see ATTRIBUTE_CHANGES
-        or sections.get("zeek_matches")
         or sections.get("new_indicators_in_known_asns")
         or sections.get("cross_actor_asn_overlap")
         or sections.get("temporal_clusters")
@@ -78,9 +77,14 @@ def write(day: date, sections: dict[str, Any]) -> Path:
     """Render and write the digest for `day`. `sections` carries the
     phase results assembled by daily_tracking.py: status (per-phase
     ok/failed), ingest, register, pivot_sweep, enrich, enrich_notes,
-    zeek, plus the analytics lists (asn_pivots, attribute_changes,
-    port_patterns, zeek_matches, new_indicators_in_known_asns,
-    cross_actor_asn_overlap, temporal_clusters, recent_actor_activity)."""
+    plus the analytics lists (asn_pivots, attribute_changes,
+    port_patterns, new_indicators_in_known_asns,
+    cross_actor_asn_overlap, temporal_clusters, recent_actor_activity).
+
+    Deliberately excludes Zeek/OpenSearch/Arkime cross-referencing -
+    that's a separate, on-demand capability
+    (cti_tools.tracking.opensearch_xref.run_daily_xref), not part of
+    this routine daily narrative (see daily_tracking.py's own docstring)."""
     out_dir = digest_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
     md_path = out_dir / f"{day.isoformat()}.md"
@@ -160,16 +164,6 @@ def write(day: date, sections: dict[str, Any]) -> Path:
         lines += ["## Port scan patterns (HoneyLabs telemetry, per actor)", ""]
         lines += _table(patterns, ["actor", "port", "ip_count", "last_seen"])
         lines.append("")
-
-    zeek = sections.get("zeek_matches") or []
-    if zeek:
-        lines += ["## Zeek log matches (tracked IPs seen in lab traffic)", ""]
-        lines += _table(zeek, ["day", "indicator_value", "actor", "direction",
-                               "hit_count", "ports"])
-        lines.append("")
-    elif (sections.get("zeek") or {}).get("skipped"):
-        lines += ["## Zeek log matches", "", "Zeek xref: unavailable "
-                  f"({sections['zeek']['skipped']})", ""]
 
     new_ips = sections.get("new_indicators_in_known_asns") or []
     if new_ips:

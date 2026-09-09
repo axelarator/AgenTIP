@@ -211,6 +211,10 @@ ALTER TABLE observations ADD COLUMN IF NOT EXISTS cert_issuer TEXT;
 ALTER TABLE observations ADD COLUMN IF NOT EXISTS cert_not_before TIMESTAMP;
 ALTER TABLE observations ADD COLUMN IF NOT EXISTS cert_not_after TIMESTAMP;
 ALTER TABLE observations ADD COLUMN IF NOT EXISTS cert_sibling_hostnames JSON;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS cert_sha256 TEXT;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS cert_revoked BOOLEAN;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS discovered_hostnames JSON;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS vt_file_hashes JSON;
 """
 
 
@@ -231,10 +235,12 @@ _OBS_COLUMNS = (
     "hl_last_seen", "hl_ports", "hl_tags", "hl_threat_level",
     "shodan_ports", "shodan_tags", "threatfox_matches",
     "cert_issuer", "cert_not_before", "cert_not_after", "cert_sibling_hostnames",
+    "cert_sha256", "cert_revoked", "discovered_hostnames", "vt_file_hashes",
     "asn", "netname", "country_code", "abuse_contact", "metadata",
 )
 _OBS_JSON_COLUMNS = {"hl_ports", "hl_tags", "shodan_ports", "shodan_tags",
-                     "threatfox_matches", "cert_sibling_hostnames", "metadata"}
+                     "threatfox_matches", "cert_sibling_hostnames",
+                     "discovered_hostnames", "vt_file_hashes", "metadata"}
 
 
 def upsert_observation(con: duckdb.DuckDBPyConnection, *, observed_at,
@@ -312,16 +318,54 @@ def latest_cert_for(con: duckdb.DuckDBPyConnection, domain: str,
                     before) -> dict[str, Any] | None:
     """Most recent prior Cert-Spotter-sourced observation of `domain`
     that carried a cert issuer, strictly before `before` - the baseline
-    for certificate-change detection, mirroring latest_asn_for."""
+    for certificate-change detection, mirroring latest_asn_for. Includes
+    cert_sha256/cert_revoked too - the baseline for _record_cert_hash_change,
+    a separate diff from the issuer/SANs one this function was originally
+    written for (see core.py's _record_cert_change vs _record_cert_hash_change)."""
     row = con.execute(
-        """SELECT observed_at, cert_issuer, cert_sibling_hostnames FROM observations
+        """SELECT observed_at, cert_issuer, cert_sibling_hostnames, cert_sha256, cert_revoked
+           FROM observations
            WHERE indicator_value = ? AND source = 'certspotter'
              AND cert_issuer IS NOT NULL AND observed_at < ?
            ORDER BY observed_at DESC LIMIT 1""", [domain, before]).fetchone()
     if row is None:
         return None
     return {"observed_at": row[0], "issuer": row[1],
-            "sibling_hostnames": json.loads(row[2]) if row[2] else []}
+            "sibling_hostnames": json.loads(row[2]) if row[2] else [],
+            "sha256": row[3], "revoked": row[4]}
+
+
+def latest_hostnames_for(con: duckdb.DuckDBPyConnection, ip: str,
+                         before) -> dict[str, Any] | None:
+    """Most recent prior host-discovery observation of `ip` (Shodan
+    InternetDB hostnames unioned with Hackertarget reverse-IP domains,
+    see core.py's _log_cluster_enrichment_history), strictly before
+    `before` - the baseline for detecting a new domain pointed at a
+    tracked IP, mirroring latest_ports_for."""
+    row = con.execute(
+        """SELECT observed_at, discovered_hostnames FROM observations
+           WHERE indicator_value = ? AND source = 'hostdiscovery'
+             AND discovered_hostnames IS NOT NULL AND observed_at < ?
+           ORDER BY observed_at DESC LIMIT 1""", [ip, before]).fetchone()
+    if row is None:
+        return None
+    return {"observed_at": row[0], "hostnames": json.loads(row[1]) if row[1] else []}
+
+
+def latest_vt_file_hashes_for(con: duckdb.DuckDBPyConnection, ip: str,
+                              before) -> dict[str, Any] | None:
+    """Most recent prior VirusTotal communicating/downloaded-files
+    observation of `ip`, strictly before `before` - the baseline for
+    detecting a file hash not previously seen relating to this IP,
+    mirroring latest_ports_for."""
+    row = con.execute(
+        """SELECT observed_at, vt_file_hashes FROM observations
+           WHERE indicator_value = ? AND source = 'virustotal_files'
+             AND vt_file_hashes IS NOT NULL AND observed_at < ?
+           ORDER BY observed_at DESC LIMIT 1""", [ip, before]).fetchone()
+    if row is None:
+        return None
+    return {"observed_at": row[0], "files": json.loads(row[1]) if row[1] else []}
 
 
 def record_attribute_change(con: duckdb.DuckDBPyConnection, *, detected_at,

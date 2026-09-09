@@ -4,24 +4,28 @@ tokens. Run from cron (see setup.sh output) or manually:
 
     mcp-server/.venv/bin/python mcp-server/scripts/daily_tracking.py
     ... --seed          # one-time: import actors/IPs from the cluster store
-    ... --date 2026-08-20   # backfill xref/analytics for a past day
+    ... --date 2026-08-20   # backfill enrichment/analytics for a past day
     ... --skip-enrich   # no network calls (fast local re-run)
     ... --dry-run       # report what would be enriched, write nothing
-    ... --check-opensearch  # also cross-ref tracked IPs against Zeek/
-    ...                      # OpenSearch logs (off by default - only
-    ...                      # meaningful right after probing indicators
-    ...                      # or running malware that touched the VM's
-    ...                      # network)
 
 Sequence: init schema -> ingest inbox -> register new clusters (any
 data/clusters/*.json not yet tracked) -> pivot sweep (RDAP/RIPEstat/
-Shodan/ThreatFox lifecycle+port check for every cluster, via
+Shodan/Hackertarget/Cert Spotter/ThreatFox/VirusTotal lifecycle+DNS/
+port/cert-hash/file-hash check for every cluster, via
 core.pivot_cluster) -> enrich (worklist, then the paced network loop
-with NO db connection held, then one write batch) -> Zeek xref (only
-if --check-opensearch) -> analytics -> digest. Every phase failure is
-recorded in the digest and the run continues; the exit code is
-nonzero only if the digest itself cannot be written, so cron mail
-stays meaningful.
+with NO db connection held, then one write batch) -> analytics ->
+digest. Every phase failure is recorded in the digest and the run
+continues; the exit code is nonzero only if the digest itself cannot
+be written, so cron mail stays meaningful.
+
+Deliberately out of scope for this daily loop: Zeek/OpenSearch/Arkime
+cross-referencing. That's a separate, on-demand capability
+(cti_tools.tracking.opensearch_xref.run_daily_xref, invoked manually -
+see the threat-cluster-tracking skill's "probing" workflow) for
+correlating tracked infrastructure against this lab's own captured
+traffic right after a probe or malware-execution session; it doesn't
+belong in the routine daily narrative, which focuses on the passive
+DNS/port/cert/file-hash pivots above.
 """
 from __future__ import annotations
 
@@ -30,13 +34,12 @@ import logging
 import os
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cti_tools.tracking import analytics, digest, enrich, ingest, store  # noqa: E402
-from cti_tools.tracking.opensearch_xref import run_daily_xref  # noqa: E402
 
 log = logging.getLogger("daily_tracking")
 
@@ -63,12 +66,6 @@ def main() -> int:
                         help="import actors/IPs from the JSON cluster store")
     parser.add_argument("--skip-enrich", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--check-opensearch", action="store_true",
-                        help="cross-reference tracked IPs against the lab's "
-                             "Zeek logs in OpenSearch for the prior day (off "
-                             "by default - only meaningful right after "
-                             "probing indicators or running malware that "
-                             "generated VM network traffic)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -141,29 +138,9 @@ def main() -> int:
                 return enrich.apply_results(con, results, day)
         sections["enrich"] = phase("enrich", _enrich)
 
-    if args.check_opensearch:
-        def _xref():
-            # Cross-reference *yesterday's* logs relative to the run date:
-            # the 6:15 run sees a complete day of traffic for day-1.
-            with store.connect() as con:
-                return run_daily_xref(con, day - timedelta(days=1))
-        sections["zeek"] = phase("zeek_xref", _xref)
-    else:
-        sections["zeek"] = {"skipped": "not requested (pass --check-opensearch)"}
-
     def _analytics():
         with store.connect() as con:
-            results = analytics.run_all(con)
-            results["zeek_matches"] = [
-                dict(zip(("day", "indicator_value", "actor", "direction",
-                          "hit_count", "ports"), row))
-                for row in con.execute(
-                    """SELECT day, indicator_value, actor, direction,
-                              hit_count, ports
-                       FROM zeek_matches WHERE day >= ?
-                       ORDER BY hit_count DESC""",
-                    [day - timedelta(days=1)]).fetchall()]
-            return results
+            return analytics.run_all(con)
     analytics_result = phase("analytics", _analytics) or {}
     sections.update(analytics_result)
 

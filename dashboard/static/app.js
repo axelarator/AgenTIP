@@ -122,19 +122,35 @@ function trackingIpChip(ip) {
 // and port, so an Arkime session-viewer deep link can be rebuilt from the
 // text alone. Field names (`ip`, `port`) and query syntax confirmed live
 // against this lab's Arkime instance (10.20.0.18:8005/api/fields).
-const JARM_SOURCE_RE = /^JARM against (.+):(\d+) via .+, (\d{4}-\d{2}-\d{2})$/;
-const ZEEK_SOURCE_RE = /^Zeek passive \(tap107, via OpenSearch\) handshake against (.+):(\d+) \(([\d.]+)\), (\d{4}-\d{2}-\d{2})$/;
+//
+// An Arkime link is only ever built from one of these two provenance
+// formats - i.e. only for an IP that was actually sourced from a probe
+// (an active JARM probe, or its Zeek-passive corroboration of that same
+// probe's handshake) - never from HoneyLabs/Shodan enrichment data, which
+// has no relationship to this lab's own captured traffic and previously
+// produced a link that (correctly) usually showed nothing. The trailing
+// timestamp accepts either the newer full UTC timestamp (precise probe
+// time, giving a tight Arkime window - see arkimeSessionUrl) or the older
+// date-only form still present in provenance strings filed before that
+// precision was added (falls back to a full-day window).
+const JARM_SOURCE_RE = /^JARM against (.+):(\d+) via .+, (\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}Z)?)$/;
+const ZEEK_SOURCE_RE = /^Zeek passive \(tap107, via OpenSearch\) handshake against (.+):(\d+) \(([\d.]+)\), (\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}Z)?)$/;
 const ARKIME_BASE = "http://10.20.0.18:8005/sessions";
+// How wide a window to open around a precisely-known probe time - wide
+// enough to allow for a little clock/ingestion lag, tight enough that
+// the link points at "the point in time probing took place", not a
+// whole-day guess.
+const ARKIME_PROBE_WINDOW_SECS = 5 * 60;
 
 // Both probe_pending_fingerprints.py source formats name the resolved IP
-// and port the probe/Zeek capture actually hit, plus the day it ran - see
+// and port the probe/Zeek capture actually hit, plus when it ran - see
 // the JARM/Zeek add_observable calls in that script. Parsed once here and
 // reused both for the Arkime deep link and for the fingerprint table's
 // Target/Checked columns, so a JARM/JA4+ value doesn't require hovering a
 // truncated link label to see what it relates to.
 function parseProbeSource(source) {
   const zeek = source.match(ZEEK_SOURCE_RE);
-  if (zeek) return { target: zeek[1], port: zeek[2], ip: zeek[3], date: zeek[4] };
+  if (zeek) return { target: zeek[1], port: zeek[2], ip: zeek[3], when: zeek[4] };
   const jarm = source.match(JARM_SOURCE_RE);
   if (jarm) {
     // A JARM probe fires straight at the tracked domain/IP, before any
@@ -143,34 +159,26 @@ function parseProbeSource(source) {
     // like one; a domain target still shows in the table, just without a
     // session link.
     const isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(jarm[1]);
-    return { target: jarm[1], port: jarm[2], ip: isIp ? jarm[1] : null, date: jarm[3] };
+    return { target: jarm[1], port: jarm[2], ip: isIp ? jarm[1] : null, when: jarm[3] };
   }
   return null;
 }
 
 // Query syntax (`ip`, `port` fields) and startTime/stopTime semantics
 // confirmed live against this lab's Arkime instance (10.20.0.18:8005).
+// Windowed tightly around the actual point in time the probe ran when
+// that's known precisely (the common case now); a bare date (older
+// provenance strings) falls back to the full UTC day, as before.
 function arkimeSessionUrl(source) {
   const p = parseProbeSource(source);
   if (!p || !p.ip) return null;
-  const start = Date.parse(`${p.date}T00:00:00Z`) / 1000;
+  const precise = p.when.includes("T");
+  const ts = Date.parse(precise ? p.when : `${p.when}T00:00:00Z`) / 1000;
+  const start = precise ? ts - ARKIME_PROBE_WINDOW_SECS : ts;
+  const stop = precise ? ts + ARKIME_PROBE_WINDOW_SECS : ts + 86400;
   const params = new URLSearchParams({
     expression: `ip == ${p.ip} && port == ${p.port}`,
-    startTime: String(start), stopTime: String(start + 86400),
-  });
-  return { url: `${ARKIME_BASE}?${params.toString()}`, label: "Arkime" };
-}
-
-// Tracking observations have structured columns (ip, ports, timestamp),
-// not free-text provenance to regex-parse - build the Arkime deep link
-// directly rather than routing through parseProbeSource.
-function trackingArkimeUrl(ip, ports, observedAtIso) {
-  if (!ip || !ports || !ports.length || !observedAtIso) return null;
-  const day = String(observedAtIso).slice(0, 10);
-  const start = Date.parse(`${day}T00:00:00Z`) / 1000;
-  const params = new URLSearchParams({
-    expression: `ip == ${ip} && port == ${ports[0]}`,
-    startTime: String(start), stopTime: String(start + 86400),
+    startTime: String(start), stopTime: String(stop),
   });
   return { url: `${ARKIME_BASE}?${params.toString()}`, label: "Arkime" };
 }
@@ -337,7 +345,7 @@ function renderFingerprintTable(items) {
     const sources = o.sources && o.sources.length ? o.sources : [null];
     for (const s of sources) {
       const p = s ? parseProbeSource(s) : null;
-      rows.push({ value: o.value, target: p ? `${p.target}:${p.port}` : null, date: p ? p.date : null, raw: s, arkime: s ? arkimeSessionUrl(s) : null });
+      rows.push({ value: o.value, target: p ? `${p.target}:${p.port}` : null, date: p ? p.when : null, raw: s, arkime: s ? arkimeSessionUrl(s) : null });
     }
   }
   return h("table", { class: "data-table" },
@@ -435,6 +443,51 @@ function renderObservableProfileCard(o, category, profile) {
     h("div", { class: "filter-row" }, toggle), timelineWrap);
 }
 
+// Hashes are the one observable category with two genuinely different
+// kinds of value under one bucket: a certificate's own SHA256 fingerprint
+// (auto-filed by pivot_cluster from Cert Spotter for an already-tracked
+// domain - see core.py's _file_cert_hash) vs. an actual malware file hash
+// (added by hand, typically via add_observable's metadata= param after a
+// VirusTotal pivot - see core._record_vt_file_hashes). The `cert-sha256:`
+// value prefix already makes this unambiguous in the raw value, but the
+// explicit hash_kind field (when present) plus this dedicated table make
+// it visible without reading the value string closely - the user's own
+// ask: never let a certificate hash be mistaken for a file hash.
+function isCertHash(o) {
+  return o.hash_kind === "certificate" || o.value.startsWith("cert-sha256:");
+}
+
+function renderHashesTable(items) {
+  return h("div", { class: "table-wrap" }, h("table", { class: "data-table" },
+    h("thead", {}, h("tr", {}, h("th", {}, "Value"), h("th", {}, "Type"), h("th", {}, "Detail"),
+      h("th", {}, "First seen"), h("th", {}, "Last seen"), h("th", {}, "Sources"))),
+    h("tbody", {}, ...items.map((o) => {
+      const isCert = isCertHash(o);
+      const typeChip = isCert
+        ? h("span", { class: "chip", style: "background:var(--track-in-network-bg);color:var(--track-in-network-ink)" }, "Certificate hash")
+        : (o.filenames || []).length
+          ? h("span", { class: "chip chip--neutral" }, "File hash")
+          : h("span", { class: "chip chip--neutral" }, "Hash");
+      let detail;
+      if (isCert) {
+        detail = h("div", {},
+          o.cert_for ? h("span", { class: "chip chip--mono chip--neutral" }, o.cert_for) : "—",
+          o.cert_revoked ? h("span", { class: "chip", style: "background:var(--track-absent-bg);color:var(--track-absent-ink);margin-left:4px;" }, "revoked") : null);
+      } else if ((o.filenames || []).length) {
+        detail = h("div", { class: "mono" }, o.filenames.join(", "));
+      } else {
+        detail = "—";
+      }
+      return h("tr", {},
+        h("td", { class: "mono" }, o.value),
+        h("td", {}, typeChip),
+        h("td", {}, detail),
+        h("td", { class: "mono" }, formatDateOnly(o.first_seen) || "—"),
+        h("td", { class: "mono" }, formatDateOnly(o.last_seen) || "—"),
+        h("td", {}, h("div", { class: "link-list" }, ...(o.sources || []).slice(0, 3).map((s) => sourceLink(s, "hashes", o.value)))));
+    }))));
+}
+
 async function renderObservables(data) {
   const cats = Object.entries(data.observables).filter(([, v]) => v.length > 0);
   if (!cats.length) return h("div", { class: "empty-state" }, "No observables tracked yet.");
@@ -464,6 +517,7 @@ async function renderObservables(data) {
     tableWrap.textContent = "";
     if (!items.length) { tableWrap.appendChild(h("div", { class: "empty-state" }, "No matching values.")); return; }
     if (FINGERPRINT_CATEGORIES.has(active)) { tableWrap.appendChild(renderFingerprintTable(items)); return; }
+    if (active === "hashes") { tableWrap.appendChild(renderHashesTable(items)); return; }
     if (PROFILE_CATEGORIES.has(active)) {
       tableWrap.appendChild(h("div", { class: "empty-state" }, "Loading profiles…"));
       const profiles = await Promise.all(items.map((o) => fetchProfile(o.value)));
@@ -758,9 +812,14 @@ function trackingEventItem(ip, e) {
   // hl_ports/hl_tags (HoneyLabs) and shodan_ports/shodan_tags (Shodan
   // InternetDB) are mutually exclusive per row (one source per
   // observation) - show whichever this row actually carries.
+  //
+  // Deliberately no Arkime link here: this row's ports/tags come from
+  // HoneyLabs/Shodan enrichment, not from a probe this lab actually ran -
+  // there's no basis for expecting a local capture to exist for it (see
+  // arkimeSessionUrl, which only ever fires from a genuine probe/Zeek-
+  // passive provenance string).
   const ports = (o.hl_ports && o.hl_ports.length) ? o.hl_ports : (o.shodan_ports || []);
   const tags = (o.hl_tags && o.hl_tags.length) ? o.hl_tags : (o.shodan_tags || []);
-  const arkime = ports.length ? trackingArkimeUrl(ip, ports, o.observed_at) : null;
   const matches = (o.threatfox_matches || []).map((m) => m.malware || m.threat_type).filter(Boolean);
   const detail = [o.asn != null ? `AS${o.asn} ${o.netname || ""}` : null, o.country_code,
     ports.length ? `ports: ${ports.join(", ")}` : null,
@@ -776,8 +835,7 @@ function trackingEventItem(ip, e) {
     h("div", { class: "timeline-item__head" },
       h("span", { class: "timeline-item__date" }, formatDate(e.date)),
       h("span", { class: "chip chip--neutral" }, o.source),
-      o.hl_events != null ? h("span", { class: "chip chip--neutral" }, `${o.hl_events} events`) : null,
-      arkime ? h("a", { class: "source-link", href: arkime.url, target: "_blank", rel: "noopener noreferrer" }, "View in Arkime →") : null),
+      o.hl_events != null ? h("span", { class: "chip chip--neutral" }, `${o.hl_events} events`) : null),
     h("div", { class: "timeline-item__body" }, detail || "—"));
 }
 

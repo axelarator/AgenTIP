@@ -55,6 +55,7 @@ def default_lifecycle_stubs(monkeypatch):
     monkeypatch.setattr(pivot, "certspotter_lookup", lambda domain: {"hostnames": []})
     monkeypatch.setattr(pivot, "shodan_internetdb_lookup",
                         lambda ip: {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []})
+    monkeypatch.setattr(pivot, "hackertarget_reverse_ip", lambda ip: {"domains": []})
 
 
 def _obs(con, ip, day, source="honeylabs", **kw):
