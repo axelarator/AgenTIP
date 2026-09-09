@@ -23,11 +23,17 @@ An actor row's `cluster_slug` is the only link to a cluster
 
 Note: the repo's usual rule is "no scheduled re-checking of tracked
 observables". This subsystem's daily enrichment (HoneyLabs + registry
-lookups, ASN/DNS/port/cert/file-hash attribute-change detection) is
-the deliberate, contained exception - a budgeted daily loop, confined
-to IPs/domains of tracked actors, using only free/keyless sources plus
-VirusTotal for file-hash pivots (never for passive-DNS - see the
-`hostnames` attribute below for why). The Zeek/OpenSearch/Arkime
+lookups, ASN/DNS/port/cert attribute-change detection) is the
+deliberate, contained exception - a budgeted daily loop, confined to
+IPs/domains of tracked actors, using only free/keyless sources
+(Shodan InternetDB, Hackertarget, Cert Spotter, RDAP/RIPEstat).
+VirusTotal is deliberately NOT called by this daily loop - it was,
+briefly, for file-hash pivots on tracked IPs, but a single day's run
+against a modest number of tracked IPs exhausted the free tier's daily
+quota, so it was pulled back to on-demand only
+(`pivot_observable`/`pivot_and_expand`), same as passive-DNS (VT is
+never used for that either - see the `hostnames` attribute below for
+what does the DNS-discovery job instead). The Zeek/OpenSearch/Arkime
 cross-reference is a completely separate, on-demand capability, not
 part of this daily loop or its digest/narrative at all: OpenSearch
 only has data when the lab VM originates traffic (probing indicators,
@@ -40,7 +46,7 @@ directly (there is no `daily_tracking.py` flag for this).
 
 - `observations` - one row per (day, IP, source). source is
   `report:<file>`, `honeylabs`, `rdap`, `shodan`, `certspotter`,
-  `threatfox`, `hostdiscovery`, `virustotal_files`, or `cluster:<slug>`.
+  `threatfox`, `hostdiscovery`, or `cluster:<slug>`.
   HoneyLabs fields: hl_events, hl_events_7d, hl_first_seen,
   hl_last_seen, hl_ports (JSON int array), hl_tags, hl_threat_level.
   Registry fields: asn, netname, country_code. Shodan fields:
@@ -49,17 +55,17 @@ directly (there is no `daily_tracking.py` flag for this).
   (JSON array), cert_sha256, cert_revoked. Host-discovery fields
   (source=`hostdiscovery`, IPs only): discovered_hostnames (JSON array
   - Shodan InternetDB's own hostnames field unioned with Hackertarget's
-  free reverse-IP lookup; deliberately no VT passive-DNS here). VT
-  file-pivot fields (source=`virustotal_files`, IPs only, requires
-  VT_API_KEY): vt_file_hashes (JSON array of
-  {sha256, names, malicious, total_engines, first_submission_date}).
+  free reverse-IP lookup; deliberately no VT passive-DNS here). A
+  `vt_file_hashes` column and `virustotal_files` source still exist in
+  the schema from a short-lived automatic VT file-hash pivot that's
+  since been removed (see the note above) - unused going forward.
 - `asn_changes` - detected pivots: change_type is `asn_change`,
   `netname_change`, or `first_seen` (baseline, not an event);
   confidence high/medium/low.
 - `attribute_changes` - detected pivots from the daily
-  Shodan/Cert Spotter/Hackertarget/VirusTotal sweep (`pivot_cluster`,
-  the same mechanism that feeds `asn_changes`' RDAP/RIPEstat side, but
-  this table is written from a separate sweep - see
+  Shodan/Cert Spotter/Hackertarget sweep (`pivot_cluster`, the same
+  mechanism that feeds `asn_changes`' RDAP/RIPEstat side, but this
+  table is written from a separate sweep - see
   `_log_cluster_enrichment_history` in `core.py`). attribute is one of:
   - `ports` - change_type `ports_changed` or `first_seen`.
   - `cert` - issuer/SAN diff; change_type `cert_issuer_changed`,
@@ -78,13 +84,6 @@ directly (there is no `daily_tracking.py` flag for this).
     `first_seen`. new_value carries `{hostnames, added, certs}` where
     `certs` is a best-effort Cert Spotter lookup on each newly-added
     hostname. Flag-only: never auto-filed as a tracked observable.
-  - `vt_files` - a VirusTotal communicating/downloaded-file relationship
-    on a tracked IP; change_type is always `new_file_hash` (never
-    `first_seen` - unlike every other attribute, the very first sighting
-    is itself the notable event, so it's never filtered as a baseline).
-    Flag-only: deliberately never suggested/auto-filed as a hash
-    observable (a single IP's file list is often large and unvetted -
-    see stage_b_prompt.md's own rule against this).
   old_value/new_value are JSON; confidence high/medium/low, downgraded
   on a stale (>90d) baseline.
 - `actors` - actor_name PK, first/last observed, known_asns,
@@ -112,8 +111,8 @@ the daily job holds the write lock - wait a moment and retry.
 
 Named SQL constants in `mcp-server/cti_tools/tracking/analytics.py`,
 usable verbatim through query_duckdb: RECENT_ACTOR_ACTIVITY (30d),
-ASN_PIVOTS (7d), ATTRIBUTE_CHANGES (1d, ports/cert/cert_hash/hostnames/
-vt_files pivots, excludes first_seen baselines - see the `attribute_changes`
+ASN_PIVOTS (7d), ATTRIBUTE_CHANGES (1d, ports/cert/cert_hash/hostnames
+pivots, excludes first_seen baselines - see the `attribute_changes`
 table above for what each attribute means), PORT_PATTERN_SUMMARY, NEW_INDICATORS_IN_KNOWN_ASNS
 (unattributed, first-seen-in-window only), CROSS_ACTOR_ASN_OVERLAP
 (already-attributed indicators whose ASN overlaps a different tracked

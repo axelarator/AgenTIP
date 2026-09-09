@@ -33,7 +33,7 @@ Rules (token budget is the point of this design - stay inside it):
   An issuer change is the stronger signal (often an infrastructure
   refresh); new sibling hostnames on an existing cert are worth a
   new_infrastructure-flavored look, not an ASN-style pivot correlation.
-- Three more attribute types can appear in "Indicator attribute changes",
+- Two more attribute types can appear in "Indicator attribute changes",
   each an exception to the "never call an attribute-change row newly-
   discovered infrastructure" rule below (they genuinely are first-ever
   discoveries, not a changed value on already-known infra):
@@ -49,26 +49,10 @@ Rules (token budget is the point of this design - stay inside it):
     certificate rotated to a new SHA256 - already auto-filed onto the
     cluster's own hash list as `cert-sha256:<hash>`, so just note it's
     now tracked/pivotable. Flag prominently if `revoked` is true.
-  - attribute=vt_files (change_type=new_file_hash): a VirusTotal
-    communicating/downloaded-file relationship on a tracked IP that
-    wasn't previously known. Never dismiss one of these as routine or a
-    baseline - unlike ASN/ports/cert, this row is never a "first check"
-    artifact (see core.py's _record_vt_file_hashes), so every row here
-    is itself the notable event. Include the filenames, SHA256, and
-    malicious-engine count in the narrative and in save_correlation's
-    indicators/narrative fields - that's the record of the finding.
-    Deliberately do NOT suggest add_observable or otherwise recommend
-    filing the file hash as a tracked observable on the cluster: a
-    single IP's communicating-files list is often a large, unvetted
-    pile (dozens of generically-labeled samples), and listing one as a
-    cluster IOC without manual review risks mis-attributing unrelated
-    malware to this actor. Note the finding; leave filing it to the
-    operator's own judgment, done by hand later if ever.
 - Only call something "new" if it's in the digest's "New unattributed
-  IPs in known-actor ASNs" table, or one of the three attribute types
-  above - those are already filtered to first-observation-ever-in-window
-  (or, for vt_files, are inherently first-observation by design). Never
-  describe an indicator from the "Cross-actor ASN overlap" table as new:
+  IPs in known-actor ASNs" table, or one of the two attribute types
+  above - those are already filtered to first-observation-ever-in-window.
+  Never describe an indicator from the "Cross-actor ASN overlap" table as new:
   everything there is a pre-existing, already-attributed indicator whose
   ASN happens to overlap a different actor's known ASNs - note it as a
   lead or drop it, never as newly-discovered infrastructure. Same rule

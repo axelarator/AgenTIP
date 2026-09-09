@@ -784,13 +784,12 @@ def add_observable(name: str, category: str, value: str, source: str,
 
     metadata, if given, is stamped onto the entry only if it's genuinely
     new (an already-tracked value only gets `source` appended, same as
-    always) - e.g. filing a VirusTotal-pivoted file hash with its
-    filenames: add_observable(cluster, "hashes", "sha256:<hex>", source,
-    metadata={"hash_kind": "file", "filenames": [...]}), so the filename
-    isn't lost the way it is when only reading pivot_observable's/
-    pivot_cluster's own flagged VT file-hash notes (see
-    core._record_vt_file_hashes) - those are display/digest-only and
-    never auto-filed.
+    always) - e.g. filing a file hash pivoted via pivot_observable with
+    its filenames: add_observable(cluster, "hashes", "sha256:<hex>",
+    source, metadata={"hash_kind": "file", "filenames": [...]}), so the
+    filename isn't lost the way it is when only reading
+    pivot_observable's own VirusTotal result (display-only, never
+    auto-filed).
 
     A new domain/ip is still always tracked as an observable, but only
     queued for active fingerprinting if it passes _is_probe_worthy (not
@@ -1063,21 +1062,6 @@ def _threatfox_enrichment(value: str) -> dict[str, Any] | None:
     return _cached_pivot("threatfox", value, lambda: pivot.threatfox_lookup(value, api_key))
 
 
-def _vt_files_enrichment(ip: str) -> dict[str, Any] | None:
-    """Cached VirusTotal ip-relationship lookup (communicating_files/
-    downloaded_files) for pivot_cluster's IP sweep, or None if VT_API_KEY
-    isn't configured - same skip-gracefully shape as _threatfox_enrichment.
-    Deliberately uncapped/uncached-per-day: file-hash pivots are the one
-    VT usage this pipeline runs automatically every sweep (see
-    _record_vt_file_hashes) - passive-DNS/resolution history is not
-    fetched here at all, by design (Shodan/Hackertarget cover domain
-    discovery for IPs instead - see _log_cluster_enrichment_history)."""
-    api_key = os.environ.get(pivot.VT_API_KEY_ENV)
-    if not api_key:
-        return None
-    return _cached_pivot("virustotal", ip, lambda: _safe_vt(ip, "ip", api_key))
-
-
 def _domain_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     rdap = _cached_pivot("rdap", value, lambda: pivot.rdap_lookup(value, "domain"))
     resolved = pivot.resolve_host(value)  # live, not cached — liveness is the point
@@ -1111,9 +1095,6 @@ def _ip_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     threatfox = _threatfox_enrichment(value)
     if threatfox is not None:
         enrichment["threatfox"] = threatfox
-    vt_files = _vt_files_enrichment(value)
-    if vt_files is not None:
-        enrichment["virustotal"] = vt_files
     return status, detail, enrichment
 
 
@@ -1216,7 +1197,7 @@ def _apply_enrichment_snapshot(entry: dict[str, Any], category: str,
 
 _ATTRIBUTE_CONFIDENCE_BASE = {
     "cert_issuer_changed": "high", "ports_changed": "medium", "cert_sans_changed": "medium",
-    "cert_new": "high", "hostnames_changed": "medium", "new_file_hash": "medium",
+    "cert_new": "high", "hostnames_changed": "medium",
 }
 
 
@@ -1364,31 +1345,6 @@ def _candidate_hostname_certs(hostnames: list[str]) -> list[dict[str, Any]]:
     return out
 
 
-def _record_vt_file_hashes(con: duckdb.DuckDBPyConnection, ip: str, actor: str | None,
-                           observed_at: datetime, files: list[dict[str, Any]]) -> None:
-    """Flags every VirusTotal-reported file hash (communicating_files/
-    downloaded_files) relating to a tracked IP that wasn't already known -
-    unlike ports/ASN/cert, which every IP always *has some* value for, a
-    file-hash relationship is itself the notable event, so this
-    deliberately never uses change_type='first_seen' (which digest/
-    analytics queries filter out everywhere else as a baseline, not an
-    event) - even the very first sha256 seen for an IP is worth flagging.
-    These are leads only: never auto-filed as a hash observable (see
-    add_observable's metadata= param for filing one by hand with its
-    filenames preserved)."""
-    baseline = tracking_store.latest_vt_file_hashes_for(con, ip, observed_at)
-    known = {f["sha256"] for f in (baseline["files"] if baseline else []) if f.get("sha256")}
-    for f in files:
-        sha256 = f.get("sha256")
-        if not sha256 or sha256 in known:
-            continue
-        tracking_store.record_attribute_change(
-            con, detected_at=observed_at, indicator_value=ip, actor=actor,
-            attribute="vt_files", change_type="new_file_hash",
-            confidence=_ATTRIBUTE_CONFIDENCE_BASE["new_file_hash"],
-            old_value=None, new_value=f)
-
-
 def _log_cluster_enrichment_history(
         actor: str, observed_at: datetime,
         results: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]) -> str | None:
@@ -1454,16 +1410,6 @@ def _log_cluster_enrichment_history(
                         source="hostdiscovery", actor=actor, indicator_type=indicator_type,
                         discovered_hostnames=discovered)
                     _record_hostname_change(con, value, actor, observed_at, discovered)
-                virustotal = enrichment.get("virustotal")
-                if isinstance(virustotal, dict) and "error" not in virustotal:
-                    files = ((virustotal.get("communicating_files") or [])
-                            + (virustotal.get("downloaded_files") or []))
-                    if files:
-                        tracking_store.upsert_observation(
-                            con, observed_at=observed_at, indicator_value=value,
-                            source="virustotal_files", actor=actor, indicator_type=indicator_type,
-                            vt_file_hashes=files)
-                        _record_vt_file_hashes(con, value, actor, observed_at, files)
     except (tracking_store.TrackingBusy, duckdb.IOException) as e:
         return f"enrichment history not recorded: {e}"
     return None
@@ -1475,8 +1421,7 @@ def _file_cert_hash(data: dict[str, Any], domain: str, sha256: str,
     hashes list when pivot_cluster sees a new one for an already-tracked
     domain - an attribute of infrastructure already being tracked (like
     ASN/ports/cert issuer), not a new lead, so unlike a sibling hostname
-    or a VT file-hash candidate (see _record_hostname_change/
-    _record_vt_file_hashes, both flag-only) this auto-updates without
+    (see _record_hostname_change, flag-only) this auto-updates without
     analyst confirmation. The `cert-sha256:` value prefix (distinct from
     the existing `sha256:`/`sha1:`/`md5:` file-hash prefixes) plus the
     explicit hash_kind field make this unambiguous as a certificate hash,

@@ -366,12 +366,15 @@ interactive pivots, and the loop stays capped at CTI_HL_BUDGET
 (default 400) and self-slows on 429s — detects ASN/netname changes,
 and writes a bounded digest to `data/tracking/digests/`. The daily
 `core.pivot_cluster` sweep also diffs new domains discovered on a
-tracked IP (Shodan InternetDB + Hackertarget reverse-IP, free/keyless),
-a tracked domain's certificate fingerprint (Cert Spotter's
-`cert_sha256`, auto-filed onto the cluster's own hash list), and
-VirusTotal communicating/downloaded-file hashes on a tracked IP (if
-`VT_API_KEY` is set) — all surfaced the same way ASN/port/cert-issuer
-changes already were. Zeek/OpenSearch/Arkime cross-referencing
+tracked IP (Shodan InternetDB + Hackertarget reverse-IP, free/keyless)
+and a tracked domain's certificate fingerprint (Cert Spotter's
+`cert_sha256`, auto-filed onto the cluster's own hash list) — surfaced
+the same way ASN/port/cert-issuer changes already were. VirusTotal is
+deliberately NOT called automatically by this daily sweep (it was,
+briefly — pulled after a single day's run against a modest number of
+tracked IPs exhausted the free tier's daily quota); it stays an
+on-demand pivot only, via `pivot_observable`/`pivot_and_expand`.
+Zeek/OpenSearch/Arkime cross-referencing
 (`cti_tools.tracking.opensearch_xref.run_daily_xref`) is a separate,
 on-demand capability for correlating tracked infrastructure against
 this lab's own captured traffic right after a probe or malware-

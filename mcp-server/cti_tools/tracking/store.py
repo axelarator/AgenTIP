@@ -351,21 +351,13 @@ def latest_hostnames_for(con: duckdb.DuckDBPyConnection, ip: str,
         return None
     return {"observed_at": row[0], "hostnames": json.loads(row[1]) if row[1] else []}
 
-
-def latest_vt_file_hashes_for(con: duckdb.DuckDBPyConnection, ip: str,
-                              before) -> dict[str, Any] | None:
-    """Most recent prior VirusTotal communicating/downloaded-files
-    observation of `ip`, strictly before `before` - the baseline for
-    detecting a file hash not previously seen relating to this IP,
-    mirroring latest_ports_for."""
-    row = con.execute(
-        """SELECT observed_at, vt_file_hashes FROM observations
-           WHERE indicator_value = ? AND source = 'virustotal_files'
-             AND vt_file_hashes IS NOT NULL AND observed_at < ?
-           ORDER BY observed_at DESC LIMIT 1""", [ip, before]).fetchone()
-    if row is None:
-        return None
-    return {"observed_at": row[0], "files": json.loads(row[1]) if row[1] else []}
+# latest_vt_file_hashes_for (source='virustotal_files') was removed along
+# with the automatic VT file-hash pivot it backed - that sweep exhausted
+# the VT free tier's daily quota against a modest number of tracked IPs.
+# The vt_file_hashes column and 'virustotal_files' source stay in the
+# schema/migrations (never retroactively dropped, see _MIGRATIONS) but are
+# no longer written to. VirusTotal file-hash pivots are on-demand only now
+# (pivot_observable/pivot_and_expand).
 
 
 def record_attribute_change(con: duckdb.DuckDBPyConnection, *, detected_at,
