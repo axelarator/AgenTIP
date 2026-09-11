@@ -38,6 +38,7 @@ import hashlib
 import html
 import ipaddress
 import json
+import os
 import re
 import shutil
 import socket
@@ -567,8 +568,15 @@ _ACTIONS = {
 }
 
 
+def _tool_present(cmd: list[str]) -> bool:
+    # An interpreter + script command (JARM_CMD) needs the script on disk
+    # too - `which python3` alone would report jarm present when it isn't.
+    return bool(shutil.which(cmd[0])) and all(
+        os.path.exists(a) for a in cmd[1:] if a.startswith("/"))
+
+
 def check_access() -> dict:
-    tools = {name: bool(shutil.which(cmd[0])) for name, cmd in {
+    tools = {name: _tool_present(cmd) for name, cmd in {
         "jarm": JARM_CMD, "subfinder": SUBFINDER_CMD, "nmap": NMAP_CMD,
         "dirsearch": DIRSEARCH_CMD, "openssl": OPENSSL_CMD, "dig": DIG_CMD}.items()}
     return {"ok": True, "certifi": _CA_FILE is not None, "tools": tools}

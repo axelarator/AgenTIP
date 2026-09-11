@@ -395,6 +395,14 @@ analyst's host never originates that traffic and every packet is
 captured. The VM can be any OS that runs the helper; the current build
 is Linux (it replaced the Win11 VM — same role, simpler tooling).
 
+Steps 2–4 are automated for Debian/Ubuntu by
+`scripts/setup_probe_vm.sh` — copy it and `probe_helper.py` to the VM
+and run `sudo bash setup_probe_vm.sh --pubkey id_ed25519_probe.pub`
+(generate the key on the cti host first:
+`ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_probe -N ''`). It finishes
+with the helper's self-check and prints the host-key and env lines for
+step 5.
+
 1. **Network:** VPN egress only; NIC on the tapped/mirrored bridge so
    the Zeek sensor sees its traffic (Zeek → OpenSearch `zeek-*`,
    Arkime full packet capture). Firewall it so it can't initiate
