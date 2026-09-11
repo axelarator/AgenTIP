@@ -786,6 +786,17 @@ def test_digest_renders_attribute_changes_section():
     assert "203.0.113.7" in text and "ports_changed" in text
 
 
+def test_digest_renders_open_directories_section():
+    open_dirs = [{"first_seen": NOW, "indicator_value": "203.0.113.7", "actor": "APT-X",
+                  "url": "http://203.0.113.7/files/", "path": "http://203.0.113.7/files/b.exe",
+                  "size": "2M"}]
+    path = digest.write(TODAY, {"open_directories": open_dirs})
+    text = path.read_text()
+    assert digest.NO_ACTIVITY not in text  # an open-dir file alone is a signal
+    assert "Open-directory files" in text
+    assert "b.exe" in text
+
+
 def test_digest_caps_oversized_hostname_list_in_attribute_change():
     # Regression for the 2026-09-10 blowup: a reverse-IP pivot on a
     # shared-hosting IP can carry thousands of hostnames in new_value.

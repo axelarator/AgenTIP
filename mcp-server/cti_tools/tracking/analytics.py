@@ -42,6 +42,14 @@ WHERE detected_at >= current_date - INTERVAL (?) DAY
 ORDER BY detected_at DESC
 """
 
+OPEN_DIRECTORIES = """
+SELECT indicator_value, actor, url, path, size, first_seen
+FROM opendir_files
+WHERE first_seen >= current_date - INTERVAL (?) DAY
+  AND (is_dir IS NULL OR is_dir = FALSE)
+ORDER BY first_seen DESC, indicator_value, path
+"""
+
 PORT_PATTERN_SUMMARY = """
 SELECT actor, port,
        count(DISTINCT indicator_value) AS ip_count,
@@ -179,6 +187,14 @@ def temporal_clusters(con, weeks: int = 8) -> list[dict[str, Any]]:
     return _rows(con, TEMPORAL_CLUSTERS, [weeks * 7])
 
 
+def open_directories(con, days: int = 1) -> list[dict[str, Any]]:
+    """Files first seen in an open directory during an on-demand active
+    scan within the window - the file-level detail behind the digest's
+    open-directory section (the attribute_changes 'opendir_files' row only
+    carries the added paths)."""
+    return _rows(con, OPEN_DIRECTORIES, [days])
+
+
 def run_all(con) -> dict[str, list[dict[str, Any]]]:
     return {
         "recent_actor_activity": recent_actor_activity(con),
@@ -188,4 +204,5 @@ def run_all(con) -> dict[str, list[dict[str, Any]]]:
         "new_indicators_in_known_asns": new_indicators_in_known_asns(con),
         "cross_actor_asn_overlap": cross_actor_asn_overlap(con),
         "temporal_clusters": temporal_clusters(con),
+        "open_directories": open_directories(con),
     }

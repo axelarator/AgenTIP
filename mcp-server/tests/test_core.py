@@ -210,6 +210,15 @@ def test_stix_export_roundtrip():
     assert imported["hunt_log"][0]["entry"] == "beacon confirmed"
 
 
+def test_stix_cert_sha256_maps_to_x509_certificate():
+    from cti_tools import stix
+    # A certificate fingerprint (filed from the live TLS grab) is an
+    # x509-certificate SCO, not a file hash, and round-trips on import.
+    pattern = stix.observable_to_pattern("hashes", "cert-sha256:deadbeef")
+    assert pattern == "[x509-certificate:hashes.'SHA-256' = 'deadbeef']"
+    assert stix.pattern_to_observable(pattern) == ("hashes", "cert-sha256:deadbeef")
+
+
 def test_stix_attack_pattern_ids_are_deterministic():
     core.create_cluster("Determinism A")
     core.create_cluster("Determinism B")

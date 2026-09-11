@@ -172,7 +172,7 @@ QUERY_MAX_ROWS = 200
 QUERY_MAX_BYTES = 20_000
 
 CORRELATION_TYPES = {"asn_pivot", "port_pattern", "temporal_cluster",
-                     "new_infrastructure", "zeek_hit"}
+                     "new_infrastructure", "shared_fingerprint", "zeek_hit"}
 
 
 class TrackingBusy(Exception):

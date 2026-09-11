@@ -9,23 +9,24 @@ tokens. Run from cron (see setup.sh output) or manually:
     ... --dry-run       # report what would be enriched, write nothing
 
 Sequence: init schema -> ingest inbox -> register new clusters (any
-data/clusters/*.json not yet tracked) -> pivot sweep (RDAP/RIPEstat/
-Shodan/Hackertarget/Cert Spotter/ThreatFox/VirusTotal lifecycle+DNS/
-port/cert-hash/file-hash check for every cluster, via
+data/clusters/*.json not yet tracked) -> pivot sweep (RDAP/RIPEstat +
+the live probe-VM enrichment - current TLS cert, HTTP probe, Webamon
+scan/infostealers, passive subdomains - and ThreatFox, a DNS/cert/http/
+fingerprint/hosted-domain check for every cluster, via
 core.pivot_cluster) -> enrich (worklist, then the paced network loop
 with NO db connection held, then one write batch) -> analytics ->
 digest. Every phase failure is recorded in the digest and the run
 continues; the exit code is nonzero only if the digest itself cannot
 be written, so cron mail stays meaningful.
 
-Deliberately out of scope for this daily loop: Zeek/OpenSearch/Arkime
-cross-referencing. That's a separate, on-demand capability
-(cti_tools.tracking.opensearch_xref.run_daily_xref, invoked manually -
-see the threat-cluster-tracking skill's "probing" workflow) for
-correlating tracked infrastructure against this lab's own captured
-traffic right after a probe or malware-execution session; it doesn't
-belong in the routine daily narrative, which focuses on the passive
-DNS/port/cert/file-hash pivots above.
+Deliberately out of scope for this daily loop: open-port discovery
+(nmap) and open-directory listing (dirsearch), which are loud/active
+and run on demand via core.active_scan; and Zeek/OpenSearch/Arkime
+cross-referencing (cti_tools.tracking.opensearch_xref.run_daily_xref,
+invoked manually - see the threat-cluster-tracking skill's "probing"
+workflow), for correlating tracked infrastructure against this lab's
+own captured traffic right after a probe or malware-execution session.
+Neither belongs in the routine daily narrative.
 """
 from __future__ import annotations
 
