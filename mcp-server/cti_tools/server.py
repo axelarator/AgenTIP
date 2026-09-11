@@ -280,6 +280,22 @@ def pivot_and_expand(value: str, cluster_name: str,
 
 
 @mcp.tool()
+def active_scan(target: str, cluster: str | None = None,
+                tools: list[str] | None = None) -> dict:
+    """On-demand LOUD active scan of a domain/ip from the probe VM - nmap
+    (top-ports service scan) and/or dirsearch (web path map + recursive
+    open-directory file listing). Distinct from the automatic light-touch
+    enrichment sweep: this reaches the target's own infrastructure, so only
+    run it when explicitly asked. Open ports feed the port-change signal;
+    open-directory files are diffed day over day (new files flagged). If
+    `cluster` is given and the target is tracked there, results are stamped
+    onto its observable. The run is audited with the Zeek timestamp window
+    its traffic falls in, so the captured packets can be found in
+    OpenSearch/Arkime. `tools` defaults to both nmap and dirsearch."""
+    return core.active_scan(target, cluster, tools)
+
+
+@mcp.tool()
 def analyze_report(source: str) -> dict:
     """Fetch a threat report (URL or local file path) and extract
     observables/ATT&CK TTPs/candidate cluster names WITHOUT writing

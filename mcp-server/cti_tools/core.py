@@ -1962,6 +1962,170 @@ def _pivot_and_expand_merge(value: str, kind: str, cluster_name: str, now: str,
             "filed": filed, "review": review, "cluster_state": load_cluster(cluster_name)}
 
 
+# --------------------------------------------------------------------------- #
+# active_scan - on-demand loud probing (nmap + dirsearch/open-directory)
+# --------------------------------------------------------------------------- #
+_ACTIVE_SCAN_TOOLS = ("nmap", "dirsearch")
+
+
+def _opensearch_max_ts() -> float | None:
+    """Best-effort snapshot of the newest `ts` indexed in the lab's Zeek/
+    OpenSearch, used to bracket an active scan's captured traffic (the same
+    provenance anchor probe_pending_fingerprints uses). None if OpenSearch
+    isn't reachable - provenance is nice-to-have, never blocks the scan."""
+    try:
+        from .opensearch_client import OpenSearchClient
+        return OpenSearchClient().current_max_ts()
+    except Exception:
+        return None
+
+
+def _ts_to_dt(ts: float | None) -> datetime | None:
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
+
+
+def active_scan(target: str, cluster: str | None = None,
+                tools: list[str] | None = None) -> dict[str, Any]:
+    """On-demand, LOUD active scan of a domain/ip - explicitly separate
+    from the automatic light-touch enrichment sweep. Runs nmap (top-ports
+    -sV) and/or dirsearch (web path map + recursive open-directory file
+    listing) from the probe VM, so the target's own infrastructure
+    receives the traffic; only call when explicitly asked. Open ports feed
+    the port-change signal; open-directory files are diffed day over day
+    (new files flagged). Results are written to the tracking store (and,
+    if `cluster` is given and the target is tracked there, stamped onto its
+    observable), and the run is audited in active_scans with the Zeek
+    timestamp window its traffic falls in, so the captured packets can be
+    found later in OpenSearch/Arkime."""
+    kind = pivot.classify(target)
+    if kind not in ("domain", "ip"):
+        raise ValueError(f"active_scan supports domain/ip; got kind={kind!r} for {target!r}")
+    if kind == "ip" and ipaddress.ip_address(target).version == 6:
+        return {"target": target, "kind": kind, "skipped": "IPv6 (no route from the probe VM)"}
+    requested = list(tools) if tools else list(_ACTIVE_SCAN_TOOLS)
+    unknown = [t for t in requested if t not in _ACTIVE_SCAN_TOOLS]
+    if unknown:
+        raise ValueError(f"unknown active_scan tool(s): {unknown}; valid: {_ACTIVE_SCAN_TOOLS}")
+
+    ran_at = _now()
+    observed_at = datetime.fromisoformat(ran_at).replace(tzinfo=None)
+    before_ts = _opensearch_max_ts()
+
+    # Network phase - unlocked (nmap/dirsearch take minutes).
+    summary: dict[str, Any] = {"target": target, "kind": kind, "cluster": cluster,
+                               "tools": requested, "ran_at": ran_at}
+    nmap_ports: list[int] = []
+    if "nmap" in requested:
+        try:
+            nres = vm_proxy.nmap(target)
+        except vm_proxy.VMProxyError as e:
+            nres = {"error": str(e)}
+        if isinstance(nres, dict) and not nres.get("error"):
+            nmap_ports = sorted({p["port"] for p in (nres.get("ports") or []) if p.get("port")})
+            summary["nmap"] = {"ports": nres.get("ports") or [], "resolved_ip": nres.get("resolved_ip")}
+        else:
+            summary["nmap"] = {"error": nres.get("error")}
+
+    opendirs: list[dict[str, Any]] = []
+    if "dirsearch" in requested:
+        url = target if target.startswith(("http://", "https://")) else f"http://{target}/"
+        try:
+            dres = vm_proxy.dirsearch(url)
+        except vm_proxy.VMProxyError as e:
+            dres = {"error": str(e)}
+        if isinstance(dres, dict) and not dres.get("error"):
+            opendirs = dres.get("opendirs") or []
+            summary["dirsearch"] = {"hits": len(dres.get("hits") or []),
+                                    "opendirs": len(opendirs),
+                                    "baseline_404": dres.get("baseline_404")}
+        else:
+            summary["dirsearch"] = {"error": dres.get("error")}
+
+    after_ts = _opensearch_max_ts()
+
+    # Tracking-store write (own locking) - records observations, port/opendir
+    # diffs, and the active_scans audit row.
+    new_files: list[dict[str, Any]] = []
+    indicator_type = "domain" if kind == "domain" else ("ipv6" if ":" in target else "ipv4")
+    try:
+        with tracking_store.connect(read_only=False) as con:
+            if nmap_ports:
+                tracking_store.upsert_observation(
+                    con, observed_at=observed_at, indicator_value=target,
+                    source="nmap", actor=cluster, indicator_type=indicator_type,
+                    nmap_ports=nmap_ports)
+                _record_port_change(con, target, cluster, observed_at, nmap_ports)
+            for listing in opendirs:
+                url = listing.get("url")
+                files = listing.get("files") or []
+                if not url:
+                    continue
+                had_prior = con.execute(
+                    "SELECT 1 FROM opendir_files WHERE indicator_value = ? LIMIT 1",
+                    [target]).fetchone()
+                added = tracking_store.upsert_opendir_files(
+                    con, indicator_value=target, url=url, files=files,
+                    observed_at=observed_at, actor=cluster)
+                # First-ever scan is a baseline (every file is "new") - only
+                # flag genuinely new files against an existing baseline.
+                if had_prior and added:
+                    new_files.extend(added)
+                    tracking_store.record_attribute_change(
+                        con, detected_at=observed_at, indicator_value=target, actor=cluster,
+                        attribute="opendir_files", change_type="opendir_files",
+                        confidence="medium", old_value=None,
+                        new_value={"url": url, "added": [f["path"] for f in added]})
+            tracking_store.record_active_scan(
+                con, ran_at=observed_at, indicator_value=target, actor=cluster,
+                tools=requested, summary=summary,
+                zeek_first_ts=_ts_to_dt(before_ts), zeek_last_ts=_ts_to_dt(after_ts))
+    except (tracking_store.TrackingBusy, duckdb.IOException) as e:
+        summary["history_note"] = f"active-scan history not recorded: {e}"
+
+    summary["new_open_dir_files"] = new_files
+    if cluster is not None:
+        summary["cluster_state"] = _active_scan_file(target, kind, cluster, ran_at,
+                                                      nmap_ports, opendirs, new_files)
+    return summary
+
+
+@_synchronized
+def _active_scan_file(target: str, kind: str, cluster: str, now: str,
+                      nmap_ports: list[int], opendirs: list[dict[str, Any]],
+                      new_files: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Locked write phase: stamp nmap ports and any open-directory listing
+    onto the target's observable in `cluster` (if it's tracked there) and
+    log the scan to the hunt log. Returns the fresh cluster state, or None
+    if the cluster doesn't exist."""
+    try:
+        data = load_cluster(cluster)
+    except ClusterNotFound:
+        return None
+    category = "domains" if kind == "domain" else "ips"
+    entry = next((o for o in data["observables"][category] if o["value"] == target), None)
+    if entry is not None:
+        if nmap_ports:
+            ports = entry.setdefault("ports", [])
+            for p in nmap_ports:
+                if p not in ports:
+                    ports.append(p)
+        if opendirs:
+            entry["opendir"] = [{"url": d.get("url"), "file_count": len(d.get("files") or [])}
+                                for d in opendirs]
+    parts = []
+    if nmap_ports:
+        parts.append(f"nmap: {len(nmap_ports)} open port(s)")
+    if opendirs:
+        parts.append(f"{len(opendirs)} open director{'y' if len(opendirs) == 1 else 'ies'}"
+                     + (f", {len(new_files)} new file(s)" if new_files else ""))
+    if parts:
+        data["hunt_log"].append({"date": now, "entry": f"active_scan on {target}: " + "; ".join(parts)})
+    save_cluster(data)
+    return load_cluster(cluster)
+
+
 # Report-fetch cache. analyze_report (preview) and ingest_report (commit)
 # are routinely called back-to-back on the same source - analyze first to
 # pick a cluster_name, then ingest to file it - which would otherwise
