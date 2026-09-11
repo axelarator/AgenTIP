@@ -28,7 +28,7 @@ def test_ssh_json_rpc_round_trips_request_and_response(monkeypatch):
     result = vm_proxy._ssh_json_rpc({"action": "http_fetch", "url": "https://example.com"})
     assert result == {"ok": True}
     assert captured["input"]["action"] == "http_fetch"
-    assert f"{vm_proxy.WIN_PROBE_USER}@{vm_proxy.WIN_PROBE_HOST}" in captured["cmd"]
+    assert f"{vm_proxy.PROBE_USER}@{vm_proxy.PROBE_HOST}" in captured["cmd"]
 
 
 def test_ssh_json_rpc_transport_failure_raises_vmproxyerror(monkeypatch):
@@ -114,3 +114,74 @@ def test_probe_win_sends_jarm_probe_action(monkeypatch):
     result = vm_proxy.probe_win("example.com", 443)
     assert captured == {"action": "jarm_probe", "target": "example.com", "port": 443}
     assert result["jarm"] == "abc"
+
+
+def test_ssh_json_rpc_uses_default_timeout(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, input=None, capture_output=None, text=None, timeout=None):
+        captured["timeout"] = timeout
+        return _FakeCompletedProcess(stdout=json.dumps({"ok": True}))
+
+    monkeypatch.setattr(vm_proxy.subprocess, "run", fake_run)
+    vm_proxy._ssh_json_rpc({"action": "http_fetch"})
+    assert captured["timeout"] == vm_proxy.SSH_TIMEOUT
+
+
+def test_ssh_json_rpc_honors_per_call_timeout(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, input=None, capture_output=None, text=None, timeout=None):
+        captured["timeout"] = timeout
+        return _FakeCompletedProcess(stdout=json.dumps({"ok": True}))
+
+    monkeypatch.setattr(vm_proxy.subprocess, "run", fake_run)
+    vm_proxy._ssh_json_rpc({"action": "nmap"}, timeout=900)
+    assert captured["timeout"] == 900
+
+
+def test_nmap_and_dirsearch_pass_long_timeout(monkeypatch):
+    seen = []
+
+    def fake_rpc(request, timeout=None):
+        seen.append((request["action"], timeout))
+        return {"ports": [], "opendirs": [], "hits": [], "error": None}
+
+    monkeypatch.setattr(vm_proxy, "_ssh_json_rpc", fake_rpc)
+    vm_proxy.nmap("1.2.3.4")
+    vm_proxy.dirsearch("http://1.2.3.4/")
+    assert seen == [("nmap", vm_proxy.LONG_TIMEOUT),
+                    ("dirsearch", vm_proxy.LONG_TIMEOUT)]
+
+
+def test_tls_grab_and_http_probe_and_dns_lookup_actions(monkeypatch):
+    seen = []
+
+    def fake_rpc(request, timeout=None):
+        seen.append(request["action"])
+        return {"error": None}
+
+    monkeypatch.setattr(vm_proxy, "_ssh_json_rpc", fake_rpc)
+    vm_proxy.tls_grab("example.com")
+    vm_proxy.http_probe("https://example.com/")
+    vm_proxy.dns_lookup("example.com")
+    vm_proxy.subfinder("example.com")
+    vm_proxy.wayback_cdx("example.com")
+    assert seen == ["tls_grab", "http_probe", "dns_lookup", "subfinder", "wayback_cdx"]
+
+
+def test_probe_host_reads_environment(monkeypatch):
+    # The connection details come from the environment so the same code
+    # runs against whatever probe VM the lab currently uses.
+    import importlib
+    monkeypatch.setenv("CTI_PROBE_HOST", "10.99.0.5")
+    monkeypatch.setenv("CTI_PROBE_USER", "probe")
+    monkeypatch.setenv("CTI_PROBE_HELPER_CMD", "python3 /srv/helper.py")
+    reloaded = importlib.reload(vm_proxy)
+    try:
+        assert reloaded.PROBE_HOST == "10.99.0.5"
+        assert reloaded.PROBE_USER == "probe"
+        assert reloaded.PROBE_HELPER_CMD == ["python3", "/srv/helper.py"]
+    finally:
+        monkeypatch.undo()
+        importlib.reload(vm_proxy)
