@@ -27,11 +27,20 @@ configs need real paths — see `mcp-server/README.md` for why
 `${workspaceFolder}`-style variables aren't relied on here). Re-run it
 after cloning to a new machine or moving the repo.
 
-Optional API keys, passed through as env vars (missing keys degrade to
-a skip note, never an error): `VT_API_KEY` (VirusTotal pivots) and
-`HONEYLABS_API_KEY` (HoneyLabs honeypot telemetry — both the per-IP
-pivot enrichment and the `honeylabs` remote MCP server that `.mcp.json`
-wires up).
+API keys are passed through as env vars (keep them in `~/.bashrc`,
+which cron sources too — never in the repo; `.env` is gitignored):
+`WEBAMON_API_KEY` (Webamon scan-index/infostealer enrichment — the
+passive layer that replaced VirusTotal/Shodan/Hackertarget/Cert
+Spotter), `HONEYLABS_API_KEY` (HoneyLabs honeypot telemetry — both the
+per-IP pivot enrichment and the `honeylabs` remote MCP server that
+`.mcp.json` wires up), and optionally `THREATFOX_API_KEY`. A missing
+key degrades to a skip note or error dict, never a crash.
+
+Live interaction with an indicator (TLS grab, HTTP probe, DNS,
+subfinder/Wayback, and the on-demand nmap/dirsearch `active_scan`)
+runs from a lab probe VM over SSH, configured via `CTI_PROBE_HOST`,
+`CTI_PROBE_USER`, `CTI_PROBE_SSH_KEY`, `CTI_PROBE_KNOWN_HOSTS`, and
+`CTI_PROBE_HELPER_CMD` — see "Probe VM build" in `mcp-server/README.md`.
 
 Then, per harness:
 

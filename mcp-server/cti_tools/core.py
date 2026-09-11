@@ -788,9 +788,8 @@ def add_observable(name: str, category: str, value: str, source: str,
     always) - e.g. filing a file hash pivoted via pivot_observable with
     its filenames: add_observable(cluster, "hashes", "sha256:<hex>",
     source, metadata={"hash_kind": "file", "filenames": [...]}), so the
-    filename isn't lost the way it is when only reading
-    pivot_observable's own VirusTotal result (display-only, never
-    auto-filed).
+    filename isn't lost the way it is when only reading it off a
+    display-only lookup.
 
     A new domain/ip is still always tracked as an observable, but only
     queued for active fingerprinting if it passes _is_probe_worthy (not
@@ -863,13 +862,14 @@ def remove_observable(name: str, category: str, value: str) -> dict[str, Any]:
     return {**data, "removed": [o["value"] for o in removed]}
 
 
-# Pivot enrichment cache. VirusTotal's free tier is 4 req/min, 500/day,
-# so refetching the same indicator on every pivot burns straight through
-# it; RDAP/RIPEstat are also slow round-trips worth not repeating. This
-# caches each source's answer for a value for a short TTL. It is NOT
-# cluster data - just a transient enrichment cache under _registry -
-# and only successful lookups are cached (never errors or the VT skip
-# note). Set CTI_PIVOT_CACHE_TTL=0 to disable caching entirely.
+# Pivot enrichment cache. Webamon calls count against a daily budget and
+# HoneyLabs credits are metered, so refetching the same indicator on every
+# pivot burns through both; RDAP/RIPEstat and the probe-VM round-trips are
+# also slow and worth not repeating. This caches each source's answer for
+# a value for a short TTL. It is NOT cluster data - just a transient
+# enrichment cache under _registry - and only successful lookups are
+# cached (never errors or a missing-key skip note). Set
+# CTI_PIVOT_CACHE_TTL=0 to disable caching entirely.
 _PIVOT_CACHE_TTL_ENV = "CTI_PIVOT_CACHE_TTL"
 _PIVOT_CACHE_TTL_DEFAULT = 3600
 
@@ -1173,7 +1173,7 @@ def _sweep_lifecycle(domains: list[str], ips: list[str]
     already-tracked observables) and the add-time enrichment path
     (add_observable/ingest_report/pivot_and_expand, for genuinely new
     ones). Never call this while holding _data_lock: a batch of RDAP/
-    RIPEstat/Shodan/Cert Spotter/ThreatFox round-trips can take a while,
+    RIPEstat/Webamon/probe-VM/ThreatFox round-trips can take a while,
     and every other MCP tool call would block behind the lock for the
     duration - see pivot_cluster's docstring for why its own network
     phase already runs unlocked. A single lookup blowing up is recorded
@@ -1720,15 +1720,19 @@ def pivot_cluster(name: str) -> dict[str, Any]:
     display-only), and a summary is returned. Successful source lookups
     are cached (see CTI_PIVOT_CACHE_TTL) so re-sweeping is cheap.
 
-    Each ip is also enriched via Shodan InternetDB (keyless) and, for
-    both ips and domains, ThreatFox (if THREATFOX_API_KEY is set) -
-    domains additionally get Cert Spotter. This enrichment is stamped
-    onto each observable's asn/netname/ports/cert/tags fields (see
-    _apply_enrichment_snapshot) so the current-known-value snapshot stays
-    fresh, AND a dated snapshot is recorded to the tracking-store history
-    (mcp_tools.tracking.store), which also runs day-over-day diffing for
-    ports/cert and records a change when something moved - see
-    _log_cluster_enrichment_history. The dashboard's per-observable
+    Domains are also enriched via a live TLS grab + HTTP probe from the
+    probe VM, Webamon (latest scan, kit fingerprints, infostealer hits),
+    and subfinder/Wayback subdomain discovery (flag-only here); ips via
+    Webamon hosted-domains and PTR; both via ThreatFox (if
+    THREATFOX_API_KEY is set). This enrichment is stamped onto each
+    observable's asn/netname/cert/http/webamon/ip_hostnames/tags fields
+    (see _apply_enrichment_snapshot) so the current-known-value snapshot
+    stays fresh, AND a dated snapshot is recorded to the tracking-store
+    history (cti_tools.tracking.store), which also runs day-over-day
+    diffing and records a change when something moved - see
+    _log_cluster_enrichment_history. Open ports are not discovered here
+    (nothing passive replaced Shodan's); they come from report text and
+    the on-demand active_scan. The dashboard's per-observable
     profile reads that history back - see get_observables/the dashboard.
 
     The network lookups run concurrently and, crucially, OUTSIDE the data
@@ -2212,9 +2216,8 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
 
     metadata, if given, is stamped (via dict.update) onto any newly-created
     entry - e.g. add_observable's own metadata= param, for recording a
-    file hash's filenames (see mcp-server/cti_tools/pivot.py's VirusTotal
-    communicating/downloaded_files data, surfaced but never persisted
-    until an analyst manually files one this way). Only meaningful when
+    file hash's filenames when an analyst manually files one. Only
+    meaningful when
     `extracted` names a single value (add_observable's own call shape) -
     a bulk multi-value call (ingest_report, import_stix_bundle) never
     passes this, since one metadata dict can't sensibly apply to every

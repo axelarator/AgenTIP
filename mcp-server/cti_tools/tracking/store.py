@@ -112,8 +112,10 @@ CREATE TABLE IF NOT EXISTS zeek_matches (
     UNIQUE (day, indicator_value, direction)
 );
 
--- Day-over-day port/certificate diffs from pivot_cluster's daily Shodan/
--- Cert Spotter sweep - the same detected-change pattern as asn_changes,
+-- Day-over-day attribute diffs from pivot_cluster's daily sweep (live
+-- TLS/HTTP/DNS, Webamon, subdomain discovery) and the on-demand
+-- active_scan (ports, open-directory files) - the same detected-change
+-- pattern as asn_changes,
 -- generalized. Deliberately a separate table rather than folding into
 -- asn_changes: ports (int array) and cert (issuer string + hostname
 -- array) don't share asn_changes' typed int/text columns, so old_value/
@@ -126,9 +128,9 @@ CREATE TABLE IF NOT EXISTS attribute_changes (
     detected_at TIMESTAMP NOT NULL,
     indicator_value TEXT NOT NULL,
     actor TEXT,
-    attribute TEXT NOT NULL,        -- 'ports' | 'cert'
-    change_type TEXT NOT NULL,      -- 'first_seen' | 'ports_changed' |
-                                     -- 'cert_issuer_changed' | 'cert_sans_changed'
+    attribute TEXT NOT NULL,        -- 'ports' | 'cert' | 'cert_hash' | 'http' | ...
+                                     -- (see skills/actor-tracking/SKILL.md)
+    change_type TEXT NOT NULL,      -- 'first_seen' | '<attribute>_changed' | ...
     old_value JSON,
     new_value JSON,
     confidence TEXT NOT NULL,

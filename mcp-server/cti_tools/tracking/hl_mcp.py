@@ -2,12 +2,12 @@
 instead of the plain lookup API.
 
 Why this exists alongside pivot.honeylabs_lookup: pivot routes every
-call through the Win11 VM SSH hop and looks IPs up one at a time, so a
+call through the probe VM SSH hop and looks IPs up one at a time, so a
 300-IP batch took half an hour and a single transient 429 used to end
 telemetry for the day. The MCP endpoint authenticates with the same
 HONEYLABS_API_KEY and answers in ~0.6s per call over one session.
 
-OPSEC note: these calls go straight from this host, NOT via the Win11
+OPSEC note: these calls go straight from this host, NOT via the probe
 VM. That is a deliberate exception to pivot.py's "nothing originates
 from this host" rule: HoneyLabs is a threat-intel provider we already
 authenticate to (and query interactively over this same MCP endpoint),

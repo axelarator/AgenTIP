@@ -12,10 +12,11 @@ identically whether it's called over MCP or exported as STIX.
 reference dataset in the repo, refreshed occasionally and offline, not
 fetched per call.
 
-The one deliberate exception is `pivot_observable` (see "Infrastructure
-pivoting" below): an opt-in, per-call lookup against free third-party
-data sources, never automatic and never triggered by anything else in
-this tool.
+The deliberate exceptions are infrastructure enrichment (see
+"Infrastructure pivoting" below — third-party lookups plus light-touch
+live checks from a lab probe VM, run on demand and by the daily
+actor-tracking sweep) and the on-demand `active_scan` (nmap/dirsearch
+from the same VM, only when explicitly asked).
 
 ## Install
 
@@ -266,16 +267,24 @@ why those nine are never auto-extracted and have to be filed by hand.
 ## Infrastructure pivoting
 
 `pivot_observable(value)` / `cti pivot-observable <value>` is an
-on-demand "what else is tied to this indicator" lookup against free,
-no-recurring-cost public sources — deliberately *not* Censys/hunt.io/
-Validin, which are paid. It's the one place this tool makes an outbound
-call to a third party that isn't a report URL you handed it yourself,
-and it only ever runs when explicitly called — never automatically, never
-on a schedule. Nothing it returns is written anywhere; it's display-only.
-If a pivot surfaces something worth keeping, record it yourself
-(`append_hunt_log`, `add_gap`, or file the new indicator into a cluster).
+on-demand "what else is tied to this indicator" lookup. Nothing it
+returns is written anywhere; it's display-only. If a pivot surfaces
+something worth keeping, record it yourself (`append_hunt_log`,
+`add_gap`, or file the new indicator into a cluster). `pivot_cluster`
+runs the same enrichment over every tracked domain/ip of a cluster and
+*does* write the snapshot back (the daily tracking cron calls it);
+`pivot_and_expand` files what a pivot surfaces.
 
-Sources, all implemented in `pivot.py`:
+The design favors **live interaction over scan platforms**: accuracy
+and timeliness matter, and a scan platform's record of a host can be
+weeks old, while a TLS handshake or HTTP GET made right now can't be.
+So VirusTotal, Shodan InternetDB, Hackertarget, and Cert Spotter are
+retired (crt.sh is shut down), replaced by one passive index (Webamon)
+plus live checks from the lab probe VM. There is no passive open-port
+source any more; ports come from report text or `active_scan`.
+
+Registry/telemetry sources, implemented in `pivot.py` (all network I/O
+except HoneyLabs is proxied through the probe VM via `vm_proxy`):
 
 - **RDAP** (WHOIS's standardized successor) via the public `rdap.org`
   bootstrap redirector — no API key. Domain/IP lookups only: registrar/
@@ -283,18 +292,6 @@ Sources, all implemented in `pivot.py`:
 - **RIPEstat**'s free Data API — no API key. IP lookups only: ASN,
   routing prefix, AS holder name, geolocation. Despite the name, it
   covers globally routed space, not just the RIPE region.
-- **VirusTotal** public API v3 — requires your own free API key
-  (`VT_API_KEY` env var; get one at virustotal.com). Rate-limited (4
-  req/min, 500/day as of writing), so fine for on-demand single lookups,
-  not bulk sweeps. Domain/IP lookups include VT's resolution history
-  (its passive-DNS equivalent); hash lookups return detection verdicts
-  and known filenames; URL lookups return detection verdicts. Skipped
-  with a note (not an error) if `VT_API_KEY` isn't set — RDAP/RIPEstat
-  still run.
-- **Shodan InternetDB** (internetdb.shodan.io) — no API key, no
-  published rate limit. IP lookups only: open ports, hostnames, CPEs,
-  vulns, and tags Shodan has observed for the IP. A 404 (nothing on
-  record) is treated as a legitimate empty result, not an error.
 - **ThreatFox** (abuse.ch) — free POST-JSON query API, requires your
   own Auth-Key (`THREATFOX_API_KEY` env var; register at
   https://auth.abuse.ch/ — abuse.ch's unified Auth Portal requires this
@@ -322,30 +319,111 @@ Sources, all implemented in `pivot.py`:
   queries beyond per-IP lookups, the `honeylabs` remote MCP server in
   `.mcp.json` exposes HoneyLabs' own tools directly.
 
+Plus:
+
+- **Webamon** (`cti_tools/webamon.py`, `https://pro.webamon.com`) —
+  requires `WEBAMON_API_KEY` (keep it in `~/.bashrc`, never the repo);
+  called directly from this host, not via the VM, since it hits
+  Webamon's SaaS rather than the indicator's own infrastructure (same
+  exception as HoneyLabs). A domain's latest scan from Webamon's index
+  (certificate, DNS, ASN, tech stack, page title, DOM/SSL kit
+  fingerprints, risk score); its infostealer-log hits (the plaintext
+  `password` field is dropped at the client, only the masked peek is
+  kept); an IP's hosted domains (the reverse-IP replacement); and
+  fingerprint siblings (other scanned domains sharing a kit
+  fingerprint). A soft daily budget (`CTI_WEBAMON_DAILY_BUDGET`, default
+  1000 calls) is tracked in a small counter file next to the pivot
+  cache; 401/403/429 and an exhausted budget come back as
+  `{"error": ...}`, never raised.
+- **Live checks from the probe VM** (`vm_proxy` → `probe_helper.py`):
+  `tls_grab` (the current certificate — sha256/issuer/subject/SANs/
+  validity — replacing Cert Spotter's CT lookup), `http_probe` (status/
+  final URL/title/server, plus any autoindex listing), `dns_lookup`
+  (A/AAAA/MX/NS/TXT), PTR, and passive subdomain discovery via
+  `subfinder` and the Wayback Machine's CDX API.
+
 Which sources run depends on the observable's type (`pivot.classify`):
 ThreatFox runs for every kind if `THREATFOX_API_KEY` is set; domain →
-RDAP + Cert Spotter + VT; ip → RDAP + RIPEstat + Hackertarget + Shodan
-InternetDB + HoneyLabs + VT; hash/url → VT only. A failure in one
-source doesn't kill the whole lookup — RIPEstat's three sub-calls and
-RDAP each record their own failure independently, and a VirusTotal
-failure surfaces as `{"error": ...}` in its own section rather than
+RDAP + TLS grab + HTTP probe + Webamon scan + Webamon infostealers
+(`pivot_cluster` adds live DNS resolution and subdomain discovery); ip → RDAP + RIPEstat + PTR + Webamon hosted-domains +
+HoneyLabs. A failure in one source doesn't kill the whole lookup —
+each records its own `{"error": ...}` in its own section rather than
 raising.
 
 If a pivot turns up something worth keeping as a tracked indicator (not
 just narrative), use `add_observable` to file it in with a source
 citation describing the pivot (e.g. `"pivot_observable(signspace.cloud)
-via VirusTotal resolution history, checked 2026-07-02"`), rather than a
-bare local file path — `add_observable` doesn't require the source to
-look like a report URL the way `ingest_report`'s sources do.
+via Webamon hosted-domains, checked 2026-09-11"`), rather than a bare
+local file path — `add_observable` doesn't require the source to look
+like a report URL the way `ingest_report`'s sources do.
 
-This was deliberately scoped to display-only, on-demand lookups —
-pivoting itself still never runs on a schedule. The diff store that
-scheduled re-checking needed now exists as the actor-tracking layer
-below; that subsystem's daily enrichment (HoneyLabs + registry
-lookups, ASN/attribute-change detection) is the one contained
-exception to the no-scheduled-rechecks rule. The Zeek/OpenSearch
-cross-reference described there is not part of that exception — it
-stays on-demand.
+The daily actor-tracking sweep (below) is the one scheduled use of
+these sources; it runs only the light-touch checks. The Zeek/OpenSearch
+cross-reference described there stays on-demand.
+
+## Active scanning (`active_scan`)
+
+`active_scan(target, cluster=None, tools=None)` is the loud, on-demand
+counterpart to the enrichment above — **probing, not pivoting**, so
+only run it when explicitly asked. From the probe VM it runs:
+
+- **nmap** — `--top-ports 100 -sV -Pn`, parsed from XML into
+  `[{port, proto, service, product, version}]`. Ports are unioned onto
+  the observable and diffed (`ports_changed`) — the only automatic
+  source of port changes now that Shodan InternetDB is gone.
+- **dirsearch** — a web path map with 404-baseline suppression (a
+  catch-all server that 200s everything doesn't flood the results),
+  plus a recursive listing of every open directory found: each file's
+  path, size, and mtime, recorded in the tracking store's
+  `opendir_files` table and diffed day over day, so a newly-dropped
+  payload on a known open directory surfaces in the digest.
+
+`tools` defaults to both. If `cluster` is given and the target is
+tracked there, results are stamped onto its observable. Every run is
+audited in `active_scans` with the Zeek timestamp window its traffic
+falls in, so the captured packets can be pulled up in OpenSearch/
+Arkime afterwards. The call is synchronous and blocks for up to
+`CTI_PROBE_LONG_TIMEOUT` seconds (default 900) — there's deliberately no
+job server on the VM; an async queue would be the next step if scans
+ever need to outlive an MCP call.
+
+## Probe VM build
+
+Everything that touches an indicator's own infrastructure (and the
+registry lookups that name it) runs from a dedicated lab VM, so the
+analyst's host never originates that traffic and every packet is
+captured. The VM can be any OS that runs the helper; the current build
+is Linux (it replaced the Win11 VM — same role, simpler tooling).
+
+1. **Network:** VPN egress only; NIC on the tapped/mirrored bridge so
+   the Zeek sensor sees its traffic (Zeek → OpenSearch `zeek-*`,
+   Arkime full packet capture). Firewall it so it can't initiate
+   connections back to the cti host (the cti host always initiates,
+   over SSH).
+2. **Packages:** `python3`, `python3-certifi`, `dnsutils` (`dig`),
+   `openssl`, `curl`, `nmap`, `subfinder`, `dirsearch`, and Salesforce
+   `jarm` (cloned to `/opt/jarm/jarm.py` — adjust `JARM_CMD` in
+   `probe_helper.py` if elsewhere).
+3. **Helper:** copy `mcp-server/scripts/probe_helper.py` to
+   `/opt/cti/probe_helper.py` (check the tool-path constants at its
+   top).
+4. **SSH:** a dedicated user and key; pin the key in
+   `~/.ssh/authorized_keys` with a forced command and no forwarding:
+   `command="python3 /opt/cti/probe_helper.py",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA...`
+   Make sure no unrestricted line for the same key sits above it.
+5. **cti host env** (`~/.bashrc`, sourced by cron): `CTI_PROBE_HOST`,
+   `CTI_PROBE_USER`, `CTI_PROBE_SSH_KEY`, `CTI_PROBE_KNOWN_HOSTS`
+   (populate it with the VM's host key), and optionally
+   `CTI_PROBE_HELPER_CMD` (default `python3 /opt/cti/probe_helper.py`),
+   `CTI_PROBE_SSH_TIMEOUT` (default 60s), `CTI_PROBE_LONG_TIMEOUT`
+   (default 900s). Re-run `./setup.sh` so `.mcp.json` passes them
+   through.
+6. **Verify:** on the VM, `python3 /opt/cti/probe_helper.py
+   --check-access` reports tool availability; from the cti host,
+   `python3 mcp-server/scripts/probe_pending_fingerprints.py
+   --check-access` round-trips the SSH hop and OpenSearch. Then run a
+   `pivot_observable` on a domain you control and confirm the TLS/HTTP
+   request appears in OpenSearch `zeek-*`.
 
 ## Actor tracking (DuckDB time-series layer)
 
@@ -365,15 +443,14 @@ the free tier's 500 credits/day at 10 req/min is shared with
 interactive pivots, and the loop stays capped at CTI_HL_BUDGET
 (default 400) and self-slows on 429s — detects ASN/netname changes,
 and writes a bounded digest to `data/tracking/digests/`. The daily
-`core.pivot_cluster` sweep also diffs new domains discovered on a
-tracked IP (Shodan InternetDB + Hackertarget reverse-IP, free/keyless)
-and a tracked domain's certificate fingerprint (Cert Spotter's
-`cert_sha256`, auto-filed onto the cluster's own hash list) — surfaced
-the same way ASN/port/cert-issuer changes already were. VirusTotal is
-deliberately NOT called automatically by this daily sweep (it was,
-briefly — pulled after a single day's run against a modest number of
-tracked IPs exhausted the free tier's daily quota); it stays an
-on-demand pivot only, via `pivot_observable`/`pivot_and_expand`.
+`core.pivot_cluster` sweep also diffs each tracked domain's live
+certificate (issuer/SANs, and its sha256 — auto-filed onto the
+cluster's own hash list as `cert-sha256:`), live HTTP server/title,
+Webamon kit fingerprint, new subdomains (subfinder + Wayback,
+flag-only), and infostealer hits, plus new domains Webamon saw on a
+tracked IP — surfaced the same way ASN changes are. Open ports and
+open-directory files change only via the on-demand `active_scan`,
+which also records into the same `attribute_changes` table.
 Zeek/OpenSearch/Arkime cross-referencing
 (`cti_tools.tracking.opensearch_xref.run_daily_xref`) is a separate,
 on-demand capability for correlating tracked infrastructure against
