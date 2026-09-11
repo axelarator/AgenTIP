@@ -167,12 +167,12 @@ def add_observable(name: str, category: str, value: str, source: str,
     "hashes", "domains", "ips", "urls", "emails", "cves", "wallets",
     "ja4", "ja4s", "ja4h", "ja4l", "ja4x", "ja4t", "ja4ts", "ja4ssh",
     "jarm". Dedupes by value like ingest_report does. A genuinely new
-    domain/ip also gets a live asn/ports/cert/tags enrichment lookup,
-    stamped onto the observable alongside `source`.
+    domain/ip also gets a live asn/cert/http/webamon/tags enrichment
+    lookup, stamped onto the observable alongside `source`.
 
     metadata is stamped onto the entry only if it's genuinely new (an
     already-tracked value only gets `source` appended) - use it to record
-    a file hash's filenames when filing one pivoted via VirusTotal, e.g.
+    a file hash's filenames when filing one by hand, e.g.
     metadata={"hash_kind": "file", "filenames": ["update.exe"]}, so that
     detail isn't lost the way it is in a pivot_observable/pivot_cluster
     finding that's never been manually filed."""
@@ -228,13 +228,14 @@ def requeue_fingerprint(name: str, category: str, value: str) -> list[dict]:
 
 @mcp.tool()
 def pivot_observable(value: str) -> dict:
-    """On-demand infrastructure pivot for a hash/domain/ip/url against
-    free public sources: RDAP (registration data), RIPEstat (ASN/
-    network, IP only), Shodan InternetDB (open ports/CPEs/tags, IP
-    only), ThreatFox (known malware-C2 IOC match, every kind, if
-    THREATFOX_API_KEY is set), and VirusTotal (reputation + resolution
-    history, if VT_API_KEY is set) - both keyed sources skipped
-    gracefully otherwise. Display only - nothing is written to any
+    """On-demand infrastructure pivot for a hash/domain/ip/url: RDAP
+    (registration data), RIPEstat (ASN/network, IP only), Webamon (a
+    domain's latest scan - cert, DNS, ASN, tech, kit fingerprints - plus
+    its infostealer hits; an IP's hosted domains), a live TLS grab and
+    HTTP probe from the probe VM (a domain's current certificate and
+    liveness), PTR (IP), ThreatFox (known malware-C2 IOC match, if
+    THREATFOX_API_KEY is set), and HoneyLabs honeypot telemetry (IP, if
+    HONEYLABS_API_KEY is set). Display only - nothing is written to any
     cluster; record anything worth keeping yourself via
     append_hunt_log/add_gap/etc."""
     return core.pivot_observable(value)
@@ -246,13 +247,16 @@ def pivot_cluster(name: str) -> dict:
     sources and stamp a lifecycle status onto each observable: domains
     become active/dead/sinkholed/expired/unknown (RDAP + live
     resolution), ips routed/unrouted/unknown (RIPEstat). Unlike
-    pivot_observable, this WRITES the status back onto the cluster. Ips
-    are also enriched via Shodan InternetDB, and both ips and domains via
-    ThreatFox if THREATFOX_API_KEY is set (domains additionally via Cert
-    Spotter) - the latest asn/ports/cert/tags snapshot is stamped onto
-    each observable, and a dated snapshot of that enrichment is logged to
-    the tracking-store history, which also diffs ports/cert against the
-    prior check and records a genuine change (best-effort; a
+    pivot_observable, this WRITES the status back onto the cluster.
+    Domains are enriched via a live TLS grab (current certificate), a
+    live HTTP probe, and Webamon (kit fingerprints); ips via Webamon
+    hosted-domains; both via ThreatFox if THREATFOX_API_KEY is set - the
+    latest asn/cert/http/webamon/tags snapshot is stamped onto each
+    observable, and a dated snapshot of that enrichment is logged to
+    the tracking-store history, which also diffs cert/http/fingerprint/
+    hosted-domains against the prior check and records a genuine change
+    (open ports are tracked separately by the on-demand active_scan, not
+    here). Best-effort history logging (a
     tracking-store hiccup surfaces as a "history_note" in the summary,
     not a failure) so the daily tracking narrative can call it out.
     Returns a per-observable summary."""
@@ -264,12 +268,14 @@ def pivot_and_expand(value: str, cluster_name: str,
                      include_cohosted: bool = False) -> dict:
     """Pivot a domain/ip and file the high-confidence new indicators it
     surfaces onto an existing cluster (with provenance + a hunt-log
-    entry): CT-log sibling subdomains and VirusTotal historical
-    resolutions. Reverse-IP co-hosted domains are returned for review
-    unless include_cohosted=True. Only genuinely new indicators are
-    filed; the `review` block lists everything left for manual
-    follow-up. Each newly-filed indicator also gets its own live
-    asn/ports/cert/tags enrichment snapshot."""
+    entry): for a domain, sibling subdomains under it from subfinder +
+    Wayback (Webamon kit-fingerprint siblings go to `review`); for an ip,
+    the domains Webamon has scanned resolving to it. Co-hosted domains on
+    a shared-hosting ASN are suppressed; otherwise they are returned for
+    review unless include_cohosted=True. Only genuinely new indicators are
+    filed; the `review` block lists everything left for manual follow-up.
+    Each newly-filed indicator also gets its own live asn/cert/tags
+    enrichment snapshot."""
     return core.pivot_and_expand(value, cluster_name, include_cohosted)
 
 

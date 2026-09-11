@@ -42,11 +42,25 @@ def default_lifecycle_stubs(monkeypatch):
                         lambda value, kind: {"nameservers": [], "status": [], "events": []})
     monkeypatch.setattr(core.pivot, "resolve_host", lambda host: [])
     monkeypatch.setattr(core.pivot, "ripestat_lookup", lambda ip: {"asn": []})
-    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {"hostnames": []})
-    monkeypatch.setattr(core.pivot, "shodan_internetdb_lookup",
-                        lambda ip: {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []})
-    monkeypatch.setattr(core.pivot, "hackertarget_reverse_ip", lambda ip: {"domains": []})
     monkeypatch.setattr(core.pivot, "ptr_lookup", lambda ip: {"hostname": None})
+    # Live enrichment now flows through webamon.* (host-direct) and
+    # vm_proxy.* (probe VM) rather than the retired scan-platform pivots -
+    # stub both boundaries to empty, no-network defaults.
+    monkeypatch.setattr(core.vm_proxy, "tls_grab",
+                        lambda host, port=443: {"cert": None, "resolved_ip": None, "error": None})
+    monkeypatch.setattr(core.vm_proxy, "http_probe",
+                        lambda url, insecure=False: {"status": None, "final_url": url, "title": None,
+                                                     "server": None, "content_type": None,
+                                                     "body_sha256": None, "autoindex": None, "error": None})
+    monkeypatch.setattr(core.vm_proxy, "subfinder", lambda domain: {"subdomains": [], "error": None})
+    monkeypatch.setattr(core.vm_proxy, "wayback_cdx",
+                        lambda domain: {"urls": [], "subdomains": [], "error": None})
+    monkeypatch.setattr(core.webamon, "search_domain",
+                        lambda domain, size=5: {"total_hits": 0, "results": [], "latest": None})
+    monkeypatch.setattr(core.webamon, "search_ip",
+                        lambda ip, size=50: {"total_hits": 0, "domains": [], "results": []})
+    monkeypatch.setattr(core.webamon, "infostealers",
+                        lambda term, size=25: {"total_hits": 0, "results": []})
 
 
 def test_create_and_get_cluster():
@@ -563,10 +577,19 @@ def stub_pivot_net(monkeypatch):
     hermetic. Individual tests override specific sources as needed."""
     monkeypatch.setattr(core.pivot, "rdap_lookup", lambda value, kind: {"handle": "H"})
     monkeypatch.setattr(core.pivot, "ripestat_lookup", lambda ip: {"asn": [999]})
-    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {"hostnames": []})
-    monkeypatch.setattr(core.pivot, "hackertarget_reverse_ip", lambda ip: {"domains": []})
-    monkeypatch.setattr(core.pivot, "shodan_internetdb_lookup",
-                        lambda ip: {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []})
+    monkeypatch.setattr(core.pivot, "ptr_lookup", lambda ip: {"hostname": None})
+    monkeypatch.setattr(core.vm_proxy, "tls_grab",
+                        lambda host, port=443: {"cert": None, "resolved_ip": None, "error": None})
+    monkeypatch.setattr(core.vm_proxy, "http_probe",
+                        lambda url, insecure=False: {"status": None, "final_url": url, "title": None,
+                                                     "server": None, "content_type": None,
+                                                     "body_sha256": None, "autoindex": None, "error": None})
+    monkeypatch.setattr(core.webamon, "search_domain",
+                        lambda domain, size=5: {"total_hits": 0, "results": [], "latest": None})
+    monkeypatch.setattr(core.webamon, "search_ip",
+                        lambda ip, size=50: {"total_hits": 0, "domains": [], "results": []})
+    monkeypatch.setattr(core.webamon, "infostealers",
+                        lambda term, size=25: {"total_hits": 0, "results": []})
     # Unset by default so pivot_observable's ThreatFox/HoneyLabs branches
     # short-circuit to their skip notes instead of reaching the real
     # lookup functions; tests that want the lookup set the env var and
@@ -576,46 +599,43 @@ def stub_pivot_net(monkeypatch):
     return monkeypatch
 
 
-def test_pivot_observable_domain_calls_rdap_and_certspotter_not_ripestat(stub_pivot_net):
-    stub_pivot_net.delenv("VT_API_KEY", raising=False)
+def test_pivot_observable_domain_calls_rdap_and_webamon_not_ripestat(stub_pivot_net):
+    stub_pivot_net.setattr(core.webamon, "search_domain",
+                           lambda domain, size=5: {"total_hits": 3, "results": [], "latest": None})
     result = core.pivot_observable("example.com")
     assert result["kind"] == "domain"
     assert result["rdap"] == {"handle": "H"}
-    assert result["certspotter"] == {"hostnames": []}
+    assert result["webamon"]["total_hits"] == 3
+    assert "webamon_infostealers" in result
+    assert "tls" in result and "http" in result
     assert "ripestat" not in result
-    assert "reverse_ip" not in result  # domain, not ip
-    assert "shodan" not in result  # domain, not ip
+    assert "webamon_ip" not in result  # domain, not ip
     assert "skipped" in result["threatfox"]
-    assert "skipped" in result["virustotal"]
 
 
-def test_pivot_observable_ip_calls_rdap_ripestat_and_reverse_ip(stub_pivot_net):
-    stub_pivot_net.delenv("VT_API_KEY", raising=False)
-    stub_pivot_net.setattr(core.pivot, "hackertarget_reverse_ip",
-                           lambda ip: {"domains": ["co-hosted.example"]})
-    stub_pivot_net.setattr(core.pivot, "shodan_internetdb_lookup",
-                           lambda ip: {"ports": [22, 443], "hostnames": [], "cpes": [],
-                                       "tags": [], "vulns": []})
+def test_pivot_observable_ip_calls_rdap_ripestat_and_webamon_ip(stub_pivot_net):
+    stub_pivot_net.setattr(core.webamon, "search_ip",
+                           lambda ip, size=50: {"total_hits": 1, "domains": ["co-hosted.example"],
+                                                "results": []})
     result = core.pivot_observable("1.2.3.4")
     assert result["kind"] == "ip"
     assert result["rdap"] == {"handle": "H"}
     assert result["ripestat"] == {"asn": [999]}
-    assert result["reverse_ip"] == {"domains": ["co-hosted.example"]}
-    assert result["shodan"]["ports"] == [22, 443]
-    assert "certspotter" not in result  # ip, not domain
+    assert result["webamon_ip"]["domains"] == ["co-hosted.example"]
+    assert "ptr" in result
+    assert "webamon" not in result  # ip, not domain (domain-only Webamon scan)
+    assert "tls" not in result  # no live grab on a bare IP
 
 
 def test_pivot_observable_hash_skips_network_sources(stub_pivot_net):
-    stub_pivot_net.delenv("VT_API_KEY", raising=False)
     result = core.pivot_observable("098f6bcd4621d373cade4e832627b4f6")
     assert result["kind"] == "hash"
     assert "rdap" not in result
     assert "ripestat" not in result
-    assert "certspotter" not in result
-    assert "reverse_ip" not in result
-    assert "shodan" not in result
+    assert "webamon" not in result
+    assert "webamon_ip" not in result
+    assert "tls" not in result
     assert "skipped" in result["threatfox"]
-    assert "skipped" in result["virustotal"]
 
 
 def test_pivot_observable_threatfox_skipped_without_key(stub_pivot_net):
@@ -646,29 +666,16 @@ def test_pivot_observable_threatfox_lookup_error_passes_through(stub_pivot_net):
     assert result["threatfox"] == {"error": "threatfox down"}
 
 
-def test_pivot_observable_virustotal_skipped_without_key(stub_pivot_net):
-    stub_pivot_net.delenv("VT_API_KEY", raising=False)
+def test_pivot_observable_domain_webamon_and_tls(stub_pivot_net):
+    stub_pivot_net.setattr(core.webamon, "search_domain",
+                           lambda domain, size=5: {"total_hits": 2, "results": [],
+                                                    "latest": {"report_id": "rid", "risk_score": 55}})
+    stub_pivot_net.setattr(core.vm_proxy, "tls_grab",
+                           lambda host, port=443: {"cert": {"sha256": "abc", "issuer": "R3"},
+                                                   "resolved_ip": "1.2.3.4", "error": None})
     result = core.pivot_observable("example.com")
-    assert "skipped" in result["virustotal"]
-    assert "VT_API_KEY" in result["virustotal"]["skipped"]
-
-
-def test_pivot_observable_virustotal_used_with_key(stub_pivot_net):
-    stub_pivot_net.setenv("VT_API_KEY", "fake-key")
-    stub_pivot_net.setattr(core.pivot, "virustotal_lookup",
-                           lambda value, kind, api_key: {"reputation": 10, "key_used": api_key})
-    result = core.pivot_observable("example.com")
-    assert result["virustotal"] == {"reputation": 10, "key_used": "fake-key"}
-
-
-def test_pivot_observable_virustotal_error_is_contained(stub_pivot_net):
-    stub_pivot_net.setenv("VT_API_KEY", "fake-key")
-
-    def raise_error(value, kind, api_key):
-        raise core.pivot.PivotError("vt down")
-    stub_pivot_net.setattr(core.pivot, "virustotal_lookup", raise_error)
-    result = core.pivot_observable("example.com")
-    assert "error" in result["virustotal"]
+    assert result["webamon"]["latest"]["report_id"] == "rid"
+    assert result["tls"]["cert"]["sha256"] == "abc"
 
 
 def test_pivot_observable_does_not_write_to_any_cluster(stub_pivot_net):
@@ -782,13 +789,13 @@ def test_add_observable_bad_category_raises():
 
 # --- live enrichment at add-time --------------------------------------------
 
-def test_add_observable_new_ip_captures_asn_ports_tags_live(monkeypatch):
+def test_add_observable_new_ip_captures_asn_hostnames_tags_live(monkeypatch):
     core.create_cluster("Live Enrich IP")
     monkeypatch.setattr(core.pivot, "ripestat_lookup",
                         lambda ip: {"asn": [64500], "as_holder": "EVIL-NET"})
-    monkeypatch.setattr(core.pivot, "shodan_internetdb_lookup",
-                        lambda ip: {"ports": [22, 443], "hostnames": [], "cpes": [],
-                                   "tags": ["iot"], "vulns": []})
+    monkeypatch.setattr(core.webamon, "search_ip",
+                        lambda ip, size=50: {"total_hits": 1, "domains": ["evil.example"],
+                                             "results": []})
     monkeypatch.setenv("THREATFOX_API_KEY", "fake-tf-key")
     monkeypatch.setattr(core.pivot, "threatfox_lookup",
                         lambda value, api_key: {"matches": [{"malware": "AsyncRAT"}]})
@@ -797,23 +804,28 @@ def test_add_observable_new_ip_captures_asn_ports_tags_live(monkeypatch):
     ip = next(o for o in data["observables"]["ips"] if o["value"] == "185.10.10.10")
     assert ip["asn"] == 64500
     assert ip["netname"] == "EVIL-NET"
-    assert ip["ports"] == [22, 443]
-    assert "shodan:tag:iot" in ip["tags"]
+    assert ip["ip_hostnames"] == ["evil.example"]
     assert "threatfox:malware:AsyncRAT" in ip["tags"]
+    # Ports are no longer discovered automatically (nmap is on-demand).
+    assert "ports" not in ip
 
 
 def test_add_observable_new_domain_captures_cert_snapshot(monkeypatch):
     core.create_cluster("Live Enrich Domain")
-    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {
-        "hostnames": ["evil.example", "mail.evil.example"],
-        "issuances": [{"issuer": "Let's Encrypt", "not_before": "2026-01-01T00:00:00Z",
-                      "not_after": "2026-04-01T00:00:00Z",
-                      "dns_names": ["evil.example", "mail.evil.example"]}]})
+    monkeypatch.setattr(core.vm_proxy, "tls_grab", lambda host, port=443: {
+        "cert": {"sha256": "deadbeef", "issuer": "Let's Encrypt", "subject": "evil.example",
+                 "sans": ["evil.example", "mail.evil.example"],
+                 "not_before": "2026-01-01", "not_after": "2026-04-01", "protocol": "TLSv1.3"},
+        "resolved_ip": "185.10.10.10", "error": None})
 
     data = core.add_observable("Live Enrich Domain", "domains", "evil.example", "report: r.pdf")
     domain = next(o for o in data["observables"]["domains"] if o["value"] == "evil.example")
     assert domain["cert"]["issuer"] == "Let's Encrypt"
-    assert domain["cert"]["sibling_hostnames"] == ["evil.example", "mail.evil.example"]
+    assert domain["cert"]["sha256"] == "deadbeef"
+    assert domain["cert"]["sans"] == ["evil.example", "mail.evil.example"]
+    assert domain["cert"]["source"] == "tls_live"
+    # The cert sha256 is auto-filed onto the cluster's hashes bucket.
+    assert any(h["value"] == "cert-sha256:deadbeef" for h in data["observables"]["hashes"])
 
 
 def test_add_observable_existing_value_does_not_re_enrich(monkeypatch):
@@ -881,22 +893,19 @@ def test_ingest_report_network_phase_does_not_hold_data_lock(tmp_path, monkeypat
 
 
 def test_pivot_and_expand_new_sibling_captures_enrichment_snapshot(monkeypatch):
-    # certspotter_lookup is called twice with different arguments here:
-    # once (via pivot_and_expand's own pivot on "evil.example") to decide
-    # what siblings to file, and once more (via the enrichment sweep on
-    # the newly-filed sibling itself) to snapshot the sibling's own cert.
-    # Stubbed BEFORE seeding via add_observable, same reason as the
-    # tests above - that call's own enrichment sweep for "evil.example"
-    # would otherwise cache the autouse fixture's empty default first.
-    def certspotter(domain):
-        if domain == "evil.example":
-            return {"hostnames": ["mail.evil.example"]}
-        return {"hostnames": [domain],
-                "issuances": [{"issuer": "ZeroSSL", "dns_names": [domain]}]}
-    monkeypatch.setattr(core.pivot, "certspotter_lookup", certspotter)
+    # subfinder surfaces the sibling to file; the enrichment sweep on the
+    # newly-filed sibling then snapshots its own live cert via tls_grab.
+    # Stubbed BEFORE seeding via add_observable, same reason as the tests
+    # above - that call's own enrichment sweep for "evil.example" would
+    # otherwise cache the autouse fixture's empty default first.
+    monkeypatch.setattr(core.vm_proxy, "subfinder",
+                        lambda domain: {"subdomains": ["mail.evil.example"], "error": None})
+    monkeypatch.setattr(core.vm_proxy, "tls_grab", lambda host, port=443: {
+        "cert": {"sha256": "sib1", "issuer": "ZeroSSL", "subject": host, "sans": [host],
+                 "not_before": None, "not_after": None, "protocol": "TLSv1.3"},
+        "resolved_ip": "1.2.3.4", "error": None})
     core.create_cluster("Expand Enrich")
     core.add_observable("Expand Enrich", "domains", "evil.example", "seed")
-    monkeypatch.delenv("VT_API_KEY", raising=False)
 
     result = core.pivot_and_expand("evil.example", "Expand Enrich")
     assert result["filed"]["domains"] == ["mail.evil.example"]
@@ -905,18 +914,15 @@ def test_pivot_and_expand_new_sibling_captures_enrichment_snapshot(monkeypatch):
     assert sibling["cert"]["issuer"] == "ZeroSSL"
 
 
-def test_pivot_cluster_persists_ports_and_cert_snapshot_onto_observable(stub_cluster_sweep_net):
+def test_pivot_cluster_persists_cert_snapshot_onto_observable(stub_cluster_sweep_net):
     # Stub BEFORE seeding via add_observable, same reason as
-    # test_pivot_cluster_logs_shodan_history above: add_observable's own
+    # test_pivot_cluster_logs_tls_history above: add_observable's own
     # enrichment sweep would otherwise cache the fixture's empty defaults
     # under these values before pivot_cluster gets to run.
-    stub_cluster_sweep_net.setattr(
-        core.pivot, "shodan_internetdb_lookup",
-        lambda ip: {"ports": [22, 443], "hostnames": [], "cpes": [], "tags": [], "vulns": []})
-    stub_cluster_sweep_net.setattr(
-        core.pivot, "certspotter_lookup",
-        lambda domain: {"hostnames": [domain],
-                        "issuances": [{"issuer": "Let's Encrypt", "dns_names": [domain]}]})
+    stub_cluster_sweep_net.setattr(core.vm_proxy, "tls_grab", lambda host, port=443: {
+        "cert": {"sha256": "cafe", "issuer": "Let's Encrypt", "subject": host, "sans": [host],
+                 "not_before": None, "not_after": None, "protocol": "TLSv1.3"},
+        "resolved_ip": "1.2.3.4", "error": None})
     core.create_cluster("Persist Sweep")
     core.add_observable("Persist Sweep", "ips", "185.10.10.10", "r")
     core.add_observable("Persist Sweep", "domains", "evil-cert.example", "r")
@@ -925,10 +931,9 @@ def test_pivot_cluster_persists_ports_and_cert_snapshot_onto_observable(stub_clu
 
     # persisted onto the observable itself, not just the transient summary
     data = core.get_cluster("Persist Sweep")
-    ip = next(o for o in data["observables"]["ips"] if o["value"] == "185.10.10.10")
-    assert ip["ports"] == [22, 443]
     domain = next(o for o in data["observables"]["domains"] if o["value"] == "evil-cert.example")
     assert domain["cert"]["issuer"] == "Let's Encrypt"
+    assert domain["cert"]["sha256"] == "cafe"
 
 
 def test_remove_observable_drops_entry():
@@ -1313,12 +1318,23 @@ def stub_cluster_sweep_net(monkeypatch):
     monkeypatch.setattr(core.pivot, "resolve_host", lambda host: [])  # NXDOMAIN -> dead
     monkeypatch.setattr(core.pivot, "ripestat_lookup",
                         lambda ip: {"prefix": "185.10.0.0/16", "asn": [64500]})
-    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {"hostnames": []})
-    monkeypatch.setattr(core.pivot, "shodan_internetdb_lookup",
-                        lambda ip: {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []})
     monkeypatch.setattr(core.pivot, "ptr_lookup", lambda ip: {"hostname": None})
+    monkeypatch.setattr(core.vm_proxy, "tls_grab",
+                        lambda host, port=443: {"cert": None, "resolved_ip": None, "error": None})
+    monkeypatch.setattr(core.vm_proxy, "http_probe",
+                        lambda url, insecure=False: {"status": None, "final_url": url, "title": None,
+                                                     "server": None, "content_type": None,
+                                                     "body_sha256": None, "autoindex": None, "error": None})
+    monkeypatch.setattr(core.vm_proxy, "subfinder", lambda domain: {"subdomains": [], "error": None})
+    monkeypatch.setattr(core.vm_proxy, "wayback_cdx",
+                        lambda domain: {"urls": [], "subdomains": [], "error": None})
+    monkeypatch.setattr(core.webamon, "search_domain",
+                        lambda domain, size=5: {"total_hits": 0, "results": [], "latest": None})
+    monkeypatch.setattr(core.webamon, "search_ip",
+                        lambda ip, size=50: {"total_hits": 0, "domains": [], "results": []})
+    monkeypatch.setattr(core.webamon, "infostealers",
+                        lambda term, size=25: {"total_hits": 0, "results": []})
     monkeypatch.delenv("THREATFOX_API_KEY", raising=False)
-    monkeypatch.delenv("VT_API_KEY", raising=False)
     return monkeypatch
 
 
@@ -1338,29 +1354,29 @@ def test_pivot_cluster_stamps_lifecycle_status(stub_cluster_sweep_net):
     assert dom["status_checked"]
 
 
-def test_pivot_cluster_logs_shodan_history(stub_cluster_sweep_net):
+def test_pivot_cluster_logs_tls_history(stub_cluster_sweep_net):
     # Stub the real return value BEFORE seeding via add_observable: that
-    # call now also runs a live lifecycle sweep for the new IP (see
-    # _sweep_lifecycle) and caches its shodan result (_cached_pivot) -
+    # call now also runs a live lifecycle sweep for the new domain (see
+    # _sweep_lifecycle) and caches its tls result (_cached_pivot) -
     # overriding the stub afterward would just be shadowed by the cache.
-    stub_cluster_sweep_net.setattr(
-        core.pivot, "shodan_internetdb_lookup",
-        lambda ip: {"ports": [22, 443], "hostnames": ["h.example"], "cpes": [],
-                   "tags": ["cloud"], "vulns": []})
-    core.create_cluster("Shodan Sweep")
-    core.add_observable("Shodan Sweep", "ips", "185.10.10.10", "r")
+    stub_cluster_sweep_net.setattr(core.vm_proxy, "tls_grab", lambda host, port=443: {
+        "cert": {"sha256": "beef", "issuer": "R3", "subject": host, "sans": [host],
+                 "not_before": "2026-01-01", "not_after": "2026-04-01", "protocol": "TLSv1.3"},
+        "resolved_ip": "1.2.3.4", "error": None})
+    core.create_cluster("TLS Sweep")
+    core.add_observable("TLS Sweep", "domains", "evil-tls.example", "r")
 
-    summary = core.pivot_cluster("Shodan Sweep")
-    assert summary["ips"][0]["ports"] == [22, 443]
+    summary = core.pivot_cluster("TLS Sweep")
+    assert summary["domains"][0]["cert_sha256"] == "beef"
     assert "history_note" not in summary
 
     from cti_tools.tracking import store as tracking_store
-    history = tracking_store.observable_history("185.10.10.10")
-    shodan_rows = [o for o in history["observations"] if o["source"] == "shodan"]
-    assert len(shodan_rows) == 1
-    assert shodan_rows[0]["shodan_ports"] == [22, 443]
-    assert shodan_rows[0]["shodan_tags"] == ["cloud"]
-    assert shodan_rows[0]["metadata"]["hostnames"] == ["h.example"]
+    with tracking_store.connect(read_only=True) as con:
+        row = con.execute(
+            """SELECT tls_sha256, tls_issuer FROM observations
+               WHERE indicator_value = ? AND source = 'tls_live'""",
+            ["evil-tls.example"]).fetchone()
+    assert row == ("beef", "R3")
 
 
 def test_pivot_cluster_logs_ptr_history(stub_cluster_sweep_net):
@@ -1448,26 +1464,21 @@ def test_pivot_cluster_survives_tracking_store_failure(stub_cluster_sweep_net, m
 
 # --- pivot_and_expand filing loop -------------------------------------------
 
-def test_pivot_and_expand_files_ct_subdomains_and_vt_resolutions(monkeypatch):
-    # Stub certspotter BEFORE seeding via add_observable: that call now
-    # also runs a live lifecycle sweep for the new domain (see
-    # _sweep_lifecycle) and caches its certspotter result (_cached_pivot)
-    # - stubbing afterward would just be shadowed by the cache.
-    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {
-        "hostnames": ["evil.example", "mail.evil.example", "vpn.evil.example",
-                      "unrelated.other.example"]})
+def test_pivot_and_expand_files_subfinder_siblings(monkeypatch):
+    # Stub subfinder BEFORE seeding via add_observable: that call now also
+    # runs a live lifecycle sweep for the new domain (see _sweep_lifecycle)
+    # and caches its subfinder result (_cached_pivot) - stubbing afterward
+    # would just be shadowed by the cache.
+    monkeypatch.setattr(core.vm_proxy, "subfinder", lambda domain: {
+        "subdomains": ["mail.evil.example", "vpn.evil.example", "unrelated.other.example"],
+        "error": None})
     core.create_cluster("Expand")
     core.add_observable("Expand", "domains", "evil.example", "seed report")
 
-    monkeypatch.setenv("VT_API_KEY", "fake-key")
-    monkeypatch.setattr(core.pivot, "virustotal_lookup", lambda value, kind, api_key: {
-        "resolutions": [{"ip": "185.55.55.55", "date": 1}, {"ip": "185.66.66.66", "date": 2}]})
-
     result = core.pivot_and_expand("evil.example", "Expand")
     assert set(result["filed"]["domains"]) == {"mail.evil.example", "vpn.evil.example"}
-    assert set(result["filed"]["ips"]) == {"185.55.55.55", "185.66.66.66"}
     # the non-sibling hostname is surfaced for review, not filed
-    assert "unrelated.other.example" in result["review"]["certspotter_other_hostnames"]
+    assert "unrelated.other.example" in result["review"]["other_hostnames"]
 
     data = core.get_cluster("Expand")
     domains = {o["value"] for o in data["observables"]["domains"]}
@@ -1476,25 +1487,43 @@ def test_pivot_and_expand_files_ct_subdomains_and_vt_resolutions(monkeypatch):
     assert any("pivot_and_expand on evil.example" in h["entry"] for h in data["hunt_log"])
 
 
+def test_pivot_and_expand_surfaces_webamon_fingerprint_siblings(monkeypatch):
+    monkeypatch.setattr(core.vm_proxy, "subfinder",
+                        lambda domain: {"subdomains": [], "error": None})
+    monkeypatch.setattr(core.webamon, "search_domain", lambda domain, size=5: {
+        "total_hits": 1, "results": [],
+        "latest": {"report_id": "r", "fingerprint": {"dom": "kithash", "ssl": None}}})
+    monkeypatch.setattr(core.webamon, "fingerprint_siblings",
+                        lambda h, kind="dom", size=25: {"total_hits": 2,
+                                                        "domains": ["kit-a.example", "kit-b.example"]})
+    core.create_cluster("Expand FP")
+    core.add_observable("Expand FP", "domains", "evil.example", "seed")
+
+    result = core.pivot_and_expand("evil.example", "Expand FP")
+    # kit siblings are surfaced for review, never auto-filed
+    assert result["review"]["webamon_fingerprint_siblings"]["dom"] == \
+        ["kit-a.example", "kit-b.example"]
+    assert "domains" not in result.get("filed", {})
+
+
 def test_pivot_and_expand_only_files_new_indicators(monkeypatch):
-    # Stub certspotter BEFORE seeding, same reason as the test above.
-    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {
-        "hostnames": ["mail.evil.example", "new.evil.example"]})
+    # Stub subfinder BEFORE seeding, same reason as the test above.
+    monkeypatch.setattr(core.vm_proxy, "subfinder", lambda domain: {
+        "subdomains": ["mail.evil.example", "new.evil.example"], "error": None})
     core.create_cluster("Expand Dedup")
     core.add_observable("Expand Dedup", "domains", "evil.example", "seed")
     core.add_observable("Expand Dedup", "domains", "mail.evil.example", "already tracked")
-
-    monkeypatch.delenv("VT_API_KEY", raising=False)
 
     result = core.pivot_and_expand("evil.example", "Expand Dedup")
     assert result["filed"]["domains"] == ["new.evil.example"]  # mail.* already tracked, not refiled
 
 
 def test_pivot_and_expand_cohosted_gated(monkeypatch):
+    # Stub webamon.search_ip + ripestat BEFORE seeding (cache convention).
+    monkeypatch.setattr(core.webamon, "search_ip", lambda ip, size=50: {
+        "total_hits": 2, "domains": ["shared-a.example", "shared-b.example"], "results": []})
+    monkeypatch.setattr(core.pivot, "ripestat_lookup", lambda ip: {"asn": [64500]})  # not shared
     core.create_cluster("Expand IP")
-    monkeypatch.delenv("VT_API_KEY", raising=False)
-    monkeypatch.setattr(core.pivot, "hackertarget_reverse_ip",
-                        lambda ip: {"domains": ["shared-a.example", "shared-b.example"]})
     core.add_observable("Expand IP", "ips", "185.10.10.10", "seed")
 
     # default: co-hosted domains are surfaced for review, not filed
@@ -1508,53 +1537,29 @@ def test_pivot_and_expand_cohosted_gated(monkeypatch):
 
 
 def test_pivot_and_expand_suppresses_cohosted_domains_for_shared_hosting_ip(monkeypatch):
-    # An IP fronted by a shared CDN/accelerator (per Shodan's own
-    # hostname for it) is multi-tenant - co-hosted domains are every
-    # OTHER tenant, not this actor's infra. include_cohosted=True must
-    # NOT file them (worse than the automatic-sweep case: a permanent
-    # write), and `review` should explain what was suppressed rather
-    # than silently showing nothing or dumping the raw noisy list.
+    # An IP in a known shared-hosting ASN is multi-tenant - the domains
+    # Webamon reports on it are every OTHER tenant, not this actor's infra.
+    # include_cohosted=True must NOT file them, and `review` should explain
+    # what was suppressed rather than dumping the raw noisy list.
+    shared_asn = sorted(core.SHARED_HOSTING_ASNS)[0]
+    monkeypatch.setattr(core.webamon, "search_ip", lambda ip, size=50: {
+        "total_hits": 2, "domains": ["unrelated-tenant-1.example", "unrelated-tenant-2.example"],
+        "results": []})
+    monkeypatch.setattr(core.pivot, "ripestat_lookup", lambda ip: {"asn": [shared_asn]})
     core.create_cluster("Expand Shared Hosting")
-    monkeypatch.delenv("VT_API_KEY", raising=False)
-    monkeypatch.setattr(core.pivot, "hackertarget_reverse_ip",
-                        lambda ip: {"domains": ["unrelated-tenant-1.example",
-                                                "unrelated-tenant-2.example"]})
-    monkeypatch.setattr(
-        core.pivot, "shodan_internetdb_lookup",
-        lambda ip: {"ports": [], "hostnames": ["a2aa9ff50de748dbe.awsglobalaccelerator.com"],
-                   "cpes": [], "tags": [], "vulns": []})
     core.add_observable("Expand Shared Hosting", "ips", "185.10.10.10", "seed")
 
     result = core.pivot_and_expand("185.10.10.10", "Expand Shared Hosting",
                                    include_cohosted=True)
     assert result["filed"] == {}
     assert "cohosted_domains" not in result["review"]
-    assert "awsglobalaccelerator" in result["review"]["cohosted_domains_suppressed"]
+    assert str(shared_asn) in result["review"]["cohosted_domains_suppressed"]
 
 
 def test_pivot_and_expand_rejects_hash(monkeypatch):
     core.create_cluster("Expand Hash")
     with pytest.raises(ValueError):
         core.pivot_and_expand("098f6bcd4621d373cade4e832627b4f6", "Expand Hash")
-
-
-def test_pivot_and_expand_filters_ipv6_from_vt_resolutions(monkeypatch):
-    """Functional rule: ignore IPv6 for pivoting - VT resolution history
-    for a domain can return AAAA records alongside A records, and only
-    the IPv4 ones are worth filing (the probe VM can't act on the rest)."""
-    core.create_cluster("Expand IPv6 Filter")
-    core.add_observable("Expand IPv6 Filter", "domains", "evil.example", "seed")
-
-    monkeypatch.setenv("VT_API_KEY", "fake-key")
-    monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {"hostnames": []})
-    monkeypatch.setattr(core.pivot, "virustotal_lookup", lambda value, kind, api_key: {
-        "resolutions": [{"ip": "185.55.55.55", "date": 1},
-                        {"ip": "2a10:1fc0:6::de96:9634", "date": 2}]})
-
-    result = core.pivot_and_expand("evil.example", "Expand IPv6 Filter")
-    assert result["filed"]["ips"] == ["185.55.55.55"]
-    ips = {o["value"] for o in core.get_cluster("Expand IPv6 Filter")["observables"]["ips"]}
-    assert "2a10:1fc0:6::de96:9634" not in ips
 
 
 def test_pivot_and_expand_skips_ipv6_target():
