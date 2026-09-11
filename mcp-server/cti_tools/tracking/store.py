@@ -134,6 +134,37 @@ CREATE TABLE IF NOT EXISTS attribute_changes (
     confidence TEXT NOT NULL,
     UNIQUE (indicator_value, attribute, detected_at)
 );
+
+-- Files seen in an open directory during an on-demand active scan. Diffed
+-- day over day (a path absent from the prior scan is a new file); one row
+-- per (indicator, listing url, path).
+CREATE TABLE IF NOT EXISTS opendir_files (
+    indicator_value TEXT NOT NULL,
+    url             TEXT NOT NULL,
+    path            TEXT NOT NULL,
+    is_dir          BOOLEAN,
+    size            TEXT,
+    mtime           TEXT,
+    actor           TEXT,
+    first_seen      TIMESTAMP NOT NULL,
+    last_seen       TIMESTAMP NOT NULL,
+    UNIQUE (indicator_value, url, path)
+);
+
+-- Audit of on-demand active scans (nmap/dirsearch), with the Zeek
+-- timestamp window each run occupied so its captured traffic can be
+-- found in OpenSearch/Arkime later (mirrors probe_pending_fingerprints').
+CREATE SEQUENCE IF NOT EXISTS active_scans_seq;
+CREATE TABLE IF NOT EXISTS active_scans (
+    id BIGINT PRIMARY KEY DEFAULT nextval('active_scans_seq'),
+    ran_at TIMESTAMP NOT NULL,
+    indicator_value TEXT NOT NULL,
+    actor TEXT,
+    tools JSON,
+    summary JSON,
+    zeek_first_ts TIMESTAMP,
+    zeek_last_ts TIMESTAMP
+);
 """
 
 # Row/byte caps for anything that flows back into an agent context.
@@ -217,6 +248,29 @@ ALTER TABLE observations ADD COLUMN IF NOT EXISTS discovered_hostnames JSON;
 ALTER TABLE observations ADD COLUMN IF NOT EXISTS vt_file_hashes JSON;
 ALTER TABLE observations ADD COLUMN IF NOT EXISTS ptr_hostname TEXT;
 ALTER TABLE observations ADD COLUMN IF NOT EXISTS resolved_ip JSON;
+-- Live-enrichment columns (Webamon + probe-VM TLS/HTTP/nmap), replacing
+-- the retired Shodan/Cert Spotter/Hackertarget/VirusTotal fields above.
+-- The old columns are kept (readable history) but no longer written.
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS tls_sha256 TEXT;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS tls_issuer TEXT;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS tls_subject TEXT;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS tls_sans JSON;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS tls_not_before TEXT;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS tls_not_after TEXT;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS http_status INTEGER;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS http_title TEXT;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS http_server TEXT;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS http_final_url TEXT;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS webamon_report_id TEXT;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS webamon_risk_score DOUBLE;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS webamon_fingerprint_dom TEXT;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS webamon_fingerprint_ssl TEXT;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS webamon_last_scan TEXT;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS nmap_ports JSON;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS ip_hostnames JSON;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS subdomains JSON;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS infostealer_count INTEGER;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS infostealer_urls JSON;
 """
 
 
@@ -239,11 +293,18 @@ _OBS_COLUMNS = (
     "cert_issuer", "cert_not_before", "cert_not_after", "cert_sibling_hostnames",
     "cert_sha256", "cert_revoked", "discovered_hostnames", "vt_file_hashes",
     "ptr_hostname", "resolved_ip",
+    "tls_sha256", "tls_issuer", "tls_subject", "tls_sans", "tls_not_before",
+    "tls_not_after", "http_status", "http_title", "http_server", "http_final_url",
+    "webamon_report_id", "webamon_risk_score", "webamon_fingerprint_dom",
+    "webamon_fingerprint_ssl", "webamon_last_scan", "nmap_ports", "ip_hostnames",
+    "subdomains", "infostealer_count", "infostealer_urls",
     "asn", "netname", "country_code", "abuse_contact", "metadata",
 )
 _OBS_JSON_COLUMNS = {"hl_ports", "hl_tags", "shodan_ports", "shodan_tags",
                      "threatfox_matches", "cert_sibling_hostnames",
-                     "discovered_hostnames", "vt_file_hashes", "resolved_ip", "metadata"}
+                     "discovered_hostnames", "vt_file_hashes", "resolved_ip", "metadata",
+                     "tls_sans", "nmap_ports", "ip_hostnames", "subdomains",
+                     "infostealer_urls"}
 
 
 def upsert_observation(con: duckdb.DuckDBPyConnection, *, observed_at,
@@ -405,6 +466,150 @@ def latest_resolved_ip_for(con: duckdb.DuckDBPyConnection, domain: str,
 # schema/migrations (never retroactively dropped, see _MIGRATIONS) but are
 # no longer written to. VirusTotal file-hash pivots are on-demand only now
 # (pivot_observable/pivot_and_expand).
+
+
+def latest_nmap_ports_for(con: duckdb.DuckDBPyConnection, ip: str,
+                          before) -> dict[str, Any] | None:
+    """Most recent prior nmap-sourced port list for `ip`, strictly before
+    `before` - the baseline for port-change detection now that ports come
+    from on-demand nmap rather than the retired automatic Shodan sweep."""
+    row = con.execute(
+        """SELECT observed_at, nmap_ports FROM observations
+           WHERE indicator_value = ? AND source = 'nmap'
+             AND nmap_ports IS NOT NULL AND observed_at < ?
+           ORDER BY observed_at DESC LIMIT 1""", [ip, before]).fetchone()
+    if row is None:
+        return None
+    return {"observed_at": row[0], "ports": json.loads(row[1])}
+
+
+def latest_tls_cert_for(con: duckdb.DuckDBPyConnection, domain: str,
+                        before) -> dict[str, Any] | None:
+    """Most recent prior live-TLS-grab certificate for `domain`, strictly
+    before `before` - the baseline for cert/cert_hash change detection,
+    the live replacement for latest_cert_for's Cert Spotter source."""
+    row = con.execute(
+        """SELECT observed_at, tls_issuer, tls_subject, tls_sans, tls_sha256
+           FROM observations
+           WHERE indicator_value = ? AND source = 'tls_live'
+             AND tls_sha256 IS NOT NULL AND observed_at < ?
+           ORDER BY observed_at DESC LIMIT 1""", [domain, before]).fetchone()
+    if row is None:
+        return None
+    return {"observed_at": row[0], "issuer": row[1], "subject": row[2],
+            "sans": json.loads(row[3]) if row[3] else [], "sha256": row[4]}
+
+
+def latest_http_for(con: duckdb.DuckDBPyConnection, host: str,
+                    before) -> dict[str, Any] | None:
+    """Most recent prior http_live observation of `host`, strictly before
+    `before` - the baseline for http_title/http_server change detection."""
+    row = con.execute(
+        """SELECT observed_at, http_status, http_title, http_server FROM observations
+           WHERE indicator_value = ? AND source = 'http_live' AND observed_at < ?
+           ORDER BY observed_at DESC LIMIT 1""", [host, before]).fetchone()
+    if row is None:
+        return None
+    return {"observed_at": row[0], "status": row[1], "title": row[2], "server": row[3]}
+
+
+def latest_ip_hostnames_for(con: duckdb.DuckDBPyConnection, ip: str,
+                            before) -> dict[str, Any] | None:
+    """Most recent prior Webamon-sourced hosted-domains list for `ip`,
+    strictly before `before` - the baseline for the ip_hostnames signal
+    (the reverse-IP replacement)."""
+    row = con.execute(
+        """SELECT observed_at, ip_hostnames FROM observations
+           WHERE indicator_value = ? AND source = 'webamon'
+             AND ip_hostnames IS NOT NULL AND observed_at < ?
+           ORDER BY observed_at DESC LIMIT 1""", [ip, before]).fetchone()
+    if row is None:
+        return None
+    return {"observed_at": row[0], "hostnames": json.loads(row[1]) if row[1] else []}
+
+
+def latest_fingerprint_for(con: duckdb.DuckDBPyConnection, domain: str,
+                           before) -> dict[str, Any] | None:
+    """Most recent prior Webamon kit fingerprint (dom/ssl) for `domain`,
+    strictly before `before` - the baseline for webamon_fingerprint change
+    detection (a rebuilt phishing kit / TLS config)."""
+    row = con.execute(
+        """SELECT observed_at, webamon_fingerprint_dom, webamon_fingerprint_ssl
+           FROM observations
+           WHERE indicator_value = ? AND source = 'webamon'
+             AND webamon_fingerprint_dom IS NOT NULL AND observed_at < ?
+           ORDER BY observed_at DESC LIMIT 1""", [domain, before]).fetchone()
+    if row is None:
+        return None
+    return {"observed_at": row[0], "dom": row[1], "ssl": row[2]}
+
+
+def latest_subdomains_for(con: duckdb.DuckDBPyConnection, apex: str,
+                          before) -> dict[str, Any] | None:
+    """Most recent prior subfinder/Wayback subdomain list for `apex`,
+    strictly before `before` - the baseline for the new-subdomain signal."""
+    row = con.execute(
+        """SELECT observed_at, subdomains FROM observations
+           WHERE indicator_value = ? AND source = 'subdomains'
+             AND subdomains IS NOT NULL AND observed_at < ?
+           ORDER BY observed_at DESC LIMIT 1""", [apex, before]).fetchone()
+    if row is None:
+        return None
+    return {"observed_at": row[0], "subdomains": json.loads(row[1]) if row[1] else []}
+
+
+def latest_infostealer_for(con: duckdb.DuckDBPyConnection, domain: str,
+                           before) -> dict[str, Any] | None:
+    """Most recent prior Webamon infostealer hit count for `domain`,
+    strictly before `before` - the baseline for the infostealer_hits signal."""
+    row = con.execute(
+        """SELECT observed_at, infostealer_count FROM observations
+           WHERE indicator_value = ? AND source = 'webamon_infostealers'
+             AND infostealer_count IS NOT NULL AND observed_at < ?
+           ORDER BY observed_at DESC LIMIT 1""", [domain, before]).fetchone()
+    if row is None:
+        return None
+    return {"observed_at": row[0], "count": row[1]}
+
+
+def upsert_opendir_files(con: duckdb.DuckDBPyConnection, *, indicator_value: str,
+                         url: str, files: list[dict[str, Any]], observed_at,
+                         actor: str | None = None) -> list[dict[str, Any]]:
+    """Record the files seen in one open-directory listing, returning the
+    subset that are new (no prior row for that path) - the day-over-day
+    diff the digest flags. Re-seeing a known path just bumps last_seen."""
+    new_files: list[dict[str, Any]] = []
+    for f in files:
+        path = f.get("href") or f.get("path") or f.get("name")
+        if not path:
+            continue
+        existed = con.execute(
+            "SELECT 1 FROM opendir_files WHERE indicator_value = ? AND url = ? AND path = ?",
+            [indicator_value, url, path]).fetchone()
+        con.execute(
+            """INSERT INTO opendir_files (indicator_value, url, path, is_dir, size,
+                   mtime, actor, first_seen, last_seen)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (indicator_value, url, path) DO UPDATE SET
+                   last_seen = excluded.last_seen, size = excluded.size,
+                   mtime = excluded.mtime""",
+            [indicator_value, url, path, f.get("is_dir"), f.get("size"),
+             f.get("mtime"), actor, observed_at, observed_at])
+        if existed is None:
+            new_files.append({"path": path, "name": f.get("name"),
+                              "size": f.get("size"), "is_dir": f.get("is_dir")})
+    return new_files
+
+
+def record_active_scan(con: duckdb.DuckDBPyConnection, *, ran_at, indicator_value: str,
+                       tools: Any, summary: Any, actor: str | None = None,
+                       zeek_first_ts=None, zeek_last_ts=None) -> None:
+    con.execute(
+        """INSERT INTO active_scans (ran_at, indicator_value, actor, tools, summary,
+               zeek_first_ts, zeek_last_ts)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        [ran_at, indicator_value, actor, _json(tools), _json(summary),
+         zeek_first_ts, zeek_last_ts])
 
 
 def record_attribute_change(con: duckdb.DuckDBPyConnection, *, detected_at,
