@@ -56,6 +56,7 @@ def default_lifecycle_stubs(monkeypatch):
     monkeypatch.setattr(pivot, "shodan_internetdb_lookup",
                         lambda ip: {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []})
     monkeypatch.setattr(pivot, "hackertarget_reverse_ip", lambda ip: {"domains": []})
+    monkeypatch.setattr(pivot, "ptr_lookup", lambda ip: {"hostname": None})
 
 
 def _obs(con, ip, day, source="honeylabs", **kw):
@@ -334,6 +335,18 @@ def _sweep_cert(con, domain, actor, day, issuer, hostnames):
     core._record_cert_change(con, domain, actor, day, {"issuer": issuer}, hostnames)
 
 
+def _sweep_ptr(con, ip, actor, day, hostname):
+    store.upsert_observation(con, observed_at=day, indicator_value=ip,
+                             source="ptr", actor=actor, ptr_hostname=hostname)
+    core._record_ptr_change(con, ip, actor, day, hostname)
+
+
+def _sweep_resolved_ip(con, domain, actor, day, ips):
+    store.upsert_observation(con, observed_at=day, indicator_value=domain,
+                             source="dns_resolve", actor=actor, resolved_ip=ips)
+    core._record_resolved_ip_change(con, domain, actor, day, ips)
+
+
 def test_record_port_change_first_seen_is_baseline_not_change():
     with store.connect() as con:
         _sweep_ports(con, "203.0.113.7", "APT-X", NOW, [22, 443])
@@ -373,6 +386,124 @@ def test_record_port_change_stale_baseline_downgrades_confidence():
         confidence = con.execute(
             "SELECT confidence FROM attribute_changes "
             "WHERE change_type = 'ports_changed'").fetchone()[0]
+    assert confidence == "low"  # medium base, downgraded once for staleness
+
+
+def test_record_ptr_change_first_seen_is_baseline_not_change():
+    with store.connect() as con:
+        _sweep_ptr(con, "203.0.113.7", "APT-X", NOW, "host.example")
+        row = con.execute(
+            "SELECT change_type, confidence FROM attribute_changes "
+            "WHERE attribute = 'ptr'").fetchone()
+        recent = analytics.attribute_changes(con, days=1)
+    assert row == ("first_seen", "medium")
+    assert recent == []  # first_seen is excluded, like ports'/asn's
+
+
+def test_record_ptr_change_no_change_when_hostname_identical():
+    with store.connect() as con:
+        _sweep_ptr(con, "203.0.113.7", "APT-X", NOW - timedelta(days=1), "host.example")
+        _sweep_ptr(con, "203.0.113.7", "APT-X", NOW, "host.example")
+        count = con.execute(
+            "SELECT count(*) FROM attribute_changes WHERE attribute = 'ptr'").fetchone()[0]
+    assert count == 1  # only the first_seen baseline - no spurious "change"
+
+
+def test_record_ptr_change_detects_change():
+    with store.connect() as con:
+        _sweep_ptr(con, "203.0.113.7", "APT-X", NOW - timedelta(days=1), "old.example")
+        _sweep_ptr(con, "203.0.113.7", "APT-X", NOW, "new.example")
+        row = con.execute(
+            "SELECT change_type, old_value, new_value, confidence FROM attribute_changes "
+            "WHERE attribute = 'ptr' AND change_type = 'ptr_changed'").fetchone()
+    assert row[0] == "ptr_changed"
+    assert json.loads(row[1]) == "old.example"
+    assert json.loads(row[2]) == "new.example"
+    assert row[3] == "medium"
+
+
+def test_record_ptr_change_confirmed_absence_is_a_real_value():
+    # None on either side is "confirmed no PTR record", not "no data" -
+    # a flip to/from that state is still a recordable change.
+    with store.connect() as con:
+        _sweep_ptr(con, "203.0.113.7", "APT-X", NOW - timedelta(days=1), "host.example")
+        _sweep_ptr(con, "203.0.113.7", "APT-X", NOW, None)
+        row = con.execute(
+            "SELECT old_value, new_value FROM attribute_changes "
+            "WHERE attribute = 'ptr' AND change_type = 'ptr_changed'").fetchone()
+    assert json.loads(row[0]) == "host.example"
+    assert json.loads(row[1]) is None
+
+
+def test_record_ptr_change_stale_baseline_downgrades_confidence():
+    with store.connect() as con:
+        _sweep_ptr(con, "203.0.113.7", "APT-X", NOW - timedelta(days=120), "old.example")
+        _sweep_ptr(con, "203.0.113.7", "APT-X", NOW, "new.example")
+        confidence = con.execute(
+            "SELECT confidence FROM attribute_changes "
+            "WHERE attribute = 'ptr' AND change_type = 'ptr_changed'").fetchone()[0]
+    assert confidence == "low"  # medium base, downgraded once for staleness
+
+
+def test_record_resolved_ip_change_first_seen_is_baseline_not_change():
+    with store.connect() as con:
+        _sweep_resolved_ip(con, "evil.example", "APT-X", NOW, ["203.0.113.7"])
+        row = con.execute(
+            "SELECT change_type, confidence FROM attribute_changes "
+            "WHERE attribute = 'resolved_ip'").fetchone()
+        recent = analytics.attribute_changes(con, days=1)
+    assert row == ("first_seen", "medium")
+    assert recent == []  # first_seen is excluded, like ports'/asn's
+
+
+def test_record_resolved_ip_change_no_change_when_ips_identical():
+    with store.connect() as con:
+        _sweep_resolved_ip(con, "evil.example", "APT-X", NOW - timedelta(days=1),
+                           ["203.0.113.7", "203.0.113.8"])
+        # order-independent: same set, different order, one day later
+        _sweep_resolved_ip(con, "evil.example", "APT-X", NOW,
+                           ["203.0.113.8", "203.0.113.7"])
+        count = con.execute(
+            "SELECT count(*) FROM attribute_changes WHERE attribute = 'resolved_ip'").fetchone()[0]
+    assert count == 1  # only the first_seen baseline - no spurious "change"
+
+
+def test_record_resolved_ip_change_detects_hosting_shift():
+    with store.connect() as con:
+        _sweep_resolved_ip(con, "evil.example", "APT-X", NOW - timedelta(days=1),
+                           ["203.0.113.7"])
+        _sweep_resolved_ip(con, "evil.example", "APT-X", NOW, ["198.51.100.9"])
+        row = con.execute(
+            "SELECT change_type, old_value, new_value, confidence FROM attribute_changes "
+            "WHERE attribute = 'resolved_ip' AND change_type = 'resolved_ip_changed'").fetchone()
+    assert row[0] == "resolved_ip_changed"
+    assert json.loads(row[1]) == ["203.0.113.7"]
+    assert json.loads(row[2]) == ["198.51.100.9"]
+    assert row[3] == "medium"
+
+
+def test_record_resolved_ip_change_confirmed_dead_is_a_real_value():
+    # [] is "confirmed no resolution" (dead/sinkholed), not "no data" - a
+    # flip to/from that state is still a recordable change.
+    with store.connect() as con:
+        _sweep_resolved_ip(con, "evil.example", "APT-X", NOW - timedelta(days=1),
+                           ["203.0.113.7"])
+        _sweep_resolved_ip(con, "evil.example", "APT-X", NOW, [])
+        row = con.execute(
+            "SELECT old_value, new_value FROM attribute_changes "
+            "WHERE attribute = 'resolved_ip' AND change_type = 'resolved_ip_changed'").fetchone()
+    assert json.loads(row[0]) == ["203.0.113.7"]
+    assert json.loads(row[1]) == []
+
+
+def test_record_resolved_ip_change_stale_baseline_downgrades_confidence():
+    with store.connect() as con:
+        _sweep_resolved_ip(con, "evil.example", "APT-X", NOW - timedelta(days=120),
+                           ["203.0.113.7"])
+        _sweep_resolved_ip(con, "evil.example", "APT-X", NOW, ["198.51.100.9"])
+        confidence = con.execute(
+            "SELECT confidence FROM attribute_changes "
+            "WHERE attribute = 'resolved_ip' AND change_type = 'resolved_ip_changed'").fetchone()[0]
     assert confidence == "low"  # medium base, downgraded once for staleness
 
 
@@ -641,6 +772,26 @@ def test_digest_renders_attribute_changes_section():
     assert digest.NO_ACTIVITY not in text
     assert "Indicator attribute changes" in text
     assert "203.0.113.7" in text and "ports_changed" in text
+
+
+def test_digest_caps_oversized_hostname_list_in_attribute_change():
+    # Regression for the 2026-09-10 blowup: a reverse-IP pivot on a
+    # shared-hosting IP can carry thousands of hostnames in new_value.
+    # old_value/new_value arrive as JSON text (as they do from the real
+    # DB - see store.py's JSON column type), not Python lists.
+    many_hostnames = [f"tenant-{i}.example" for i in range(500)]
+    changes = [{"detected_at": NOW, "indicator_value": "203.0.113.7",
+               "actor": "Fox Tempest", "attribute": "hostnames",
+               "change_type": "hostnames_changed",
+               "old_value": json.dumps(["a.example"]),
+               "new_value": json.dumps({"hostnames": many_hostnames, "added": many_hostnames}),
+               "confidence": "medium"}]
+    path = digest.write(TODAY, {"attribute_changes": changes})
+    text = path.read_text()
+    assert "tenant-0.example" in text
+    assert "tenant-499.example" not in text  # truncated well before 500 items
+    assert "480 more" in text
+    assert len(text) < 20_000  # digest stays bounded, not ~127KB like the incident
 
 
 def test_digest_renders_port_patterns_section():

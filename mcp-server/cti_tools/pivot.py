@@ -431,6 +431,52 @@ def certspotter_lookup(domain: str) -> dict[str, Any]:
     }
 
 
+# Hostname suffixes for shared CDN/load-balancer/accelerator services.
+# A hostname-based counterpart to analytics.SHARED_HOSTING_ASNS: an IP
+# already fronted by one of these (per Shodan's own "hostnames" field)
+# is multi-tenant by design, so hackertarget_reverse_ip's co-hosting
+# list for it is every other customer on the shared/anycast IP, not
+# infrastructure tied to whichever actor happens to be tracked there -
+# see the 2026-09-10 Fox Tempest digest blowup (~1,500 unrelated
+# domains off one AWS Global Accelerator IP).
+SHARED_HOSTING_HOSTNAME_SUFFIXES = (
+    ".awsglobalaccelerator.com",
+    ".cloudfront.net",
+    ".elb.amazonaws.com",
+    ".azureedge.net",
+    ".fastly.net",
+    ".akamaiedge.net",
+    ".akamai.net",
+    ".incapdns.net",
+    ".herokudns.com",
+)
+
+
+def is_shared_hosting_hostname(hostname: str) -> bool:
+    """True if `hostname` belongs to a known shared CDN/load-balancer/
+    accelerator service - see SHARED_HOSTING_HOSTNAME_SUFFIXES."""
+    h = hostname.lower()
+    return any(h.endswith(suffix) for suffix in SHARED_HOSTING_HOSTNAME_SUFFIXES)
+
+
+def ptr_lookup(ip: str) -> dict[str, Any]:
+    """Reverse-DNS (PTR) hostname for `ip`, resolved from the Win11 VM
+    like every other network-touching pivot lookup (see vm_proxy).
+    Returns {"hostname": <name-or-None>} - None is a legitimate "no PTR
+    record configured" answer (common, e.g. most cloud tenant IPs), not
+    a failure, mirroring shodan_internetdb_lookup's empty-but-valid
+    {"ports": []} - or {"error": ...} if the lookup itself was
+    inconclusive, same convention as hackertarget_reverse_ip. Unlike
+    hackertarget_reverse_ip's reverse-IP co-hosting list (every domain
+    currently pointed at the IP - noisy on shared hosting), a PTR
+    record is the IP's own single reverse-DNS name."""
+    try:
+        hostname = vm_proxy.resolve_ptr(ip)
+    except vm_proxy.VMProxyError as e:
+        return {"error": str(e)}
+    return {"hostname": hostname}
+
+
 def hackertarget_reverse_ip(ip: str) -> dict[str, Any]:
     """Domains currently/recently hosted on an IP via Hackertarget's free
     reverse-IP endpoint (plain text, no key, low daily quota). Treat the

@@ -36,11 +36,39 @@ def narrative_dir() -> Path:
                                _REPO_ROOT / "data" / "tracking" / "narratives"))
 
 
+MAX_LIST_ITEMS = 20
+
+
+def _cap_lists(obj: Any, max_items: int = MAX_LIST_ITEMS) -> Any:
+    """Recursively cap any list inside a parsed JSON value to
+    `max_items`, so one oversized field can't blow the digest past its
+    token budget - e.g. attribute_changes.old_value/new_value, where a
+    reverse-IP hostname pivot on a shared-hosting IP can otherwise
+    carry thousands of unrelated co-hosted domains (see the 2026-09-10
+    Fox Tempest digest blowup)."""
+    if isinstance(obj, list):
+        capped = [_cap_lists(v, max_items) for v in obj[:max_items]]
+        if len(obj) > max_items:
+            capped.append(f"...{len(obj) - max_items} more")
+        return capped
+    if isinstance(obj, dict):
+        return {k: _cap_lists(v, max_items) for k, v in obj.items()}
+    return obj
+
+
 def _fmt(value: Any) -> str:
     if isinstance(value, (datetime, date)):
         return value.isoformat(sep=" ") if isinstance(value, datetime) else value.isoformat()
     if value is None:
         return "-"
+    if isinstance(value, str) and value[:1] in "[{":
+        # old_value/new_value columns come back as JSON text (see
+        # store.py's JSON column type) - cap any oversized list before
+        # it hits the table.
+        try:
+            return json.dumps(_cap_lists(json.loads(value)))
+        except (ValueError, TypeError):
+            return value
     return str(value)
 
 

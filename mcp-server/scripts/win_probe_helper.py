@@ -13,7 +13,7 @@ Standalone - not part of the cti_tools package, pure standard library
 (no openssl.exe dependency - uses Python's own ssl/socket modules so
 this runs the same way regardless of what's installed on the box
 beyond Python itself and your JARM tool). Reads one JSON object from
-stdin and writes one JSON object to stdout. Three actions, selected by
+stdin and writes one JSON object to stdout. Four actions, selected by
 the request's "action" field (see cti_tools/vm_proxy.py, the cti-host
 side of this protocol, for the full rationale - short version: every
 outbound request that names a tracked indicator, active probe or
@@ -52,10 +52,21 @@ the analyst's desktop):
    (RDAP/RIPEstat/VirusTotal/ThreatFox/etc. pivot lookups run through
    this instead of reaching out directly from the cti host):
 
-       {"action": "http_fetch", "url": "...", "method": "GET", "headers": {...}, "data": null}
+       {"action": "http_fetch", "url": "...", "method": "GET", "headers": {...}, "data": null, "insecure": false}
 
    "data", when not null, is sent as the request body (e.g. ThreatFox's
    POST JSON query API) - omit or leave null for a plain GET.
+
+   "insecure" (default false) skips TLS certificate verification -
+   every normal caller (RDAP/RIPEstat/VirusTotal/ThreatFox pivots) hits
+   a legitimate service and should leave this false so a spoofed/MITM'd
+   cert still fails closed. Only meant for a deliberate check against
+   infrastructure already known to be adversary-controlled, where a
+   self-signed cert is expected and the point is what's behind the TLS
+   layer (e.g. "does this port's application answer without auth"),
+   not certificate trust. Same CERT_NONE approach run_tls_handshake
+   already uses for the throwaway JARM-adjacent handshake, just also
+   available on the request/response path here.
 
    Responds with:
 
@@ -70,6 +81,24 @@ the analyst's desktop):
        {"status": "resolved", "addrs": ["1.2.3.4", ...]}
        {"status": "nxdomain"}
        {"status": "error", "error": "..."}
+
+4. "resolve_ptr" - reverse-DNS lookup for an IP from this VM:
+
+       {"action": "resolve_ptr", "ip": "1.2.3.4"}
+
+   Responds with one of:
+
+       {"status": "resolved", "hostname": "..."}
+       {"status": "no_ptr"}
+       {"status": "error", "error": "..."}
+
+   "no_ptr" (raised as socket.herror - "host not found", the definitive
+   answer for an address with no PTR record configured) is distinct
+   from "error" (any other OSError - inconclusive, e.g. a resolver
+   timeout) for the same reason resolve_dns distinguishes nxdomain from
+   error: the caller (cti_tools/pivot.py's ptr_lookup) needs to tell
+   "confirmed absent" apart from "couldn't check right now" so it
+   doesn't misrecord a transient failure as a real PTR removal.
 
 resolved_ip gets handed straight back to probe_pending_fingerprints.py,
 which uses it (together with the port this request was sent with) to
@@ -137,6 +166,14 @@ JARM_SUBPROCESS_TIMEOUT = 20
 # if this box's egress doesn't reach ctldl.windowsupdate.com.
 HTTPS_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
+# Only for http_fetch's opt-in "insecure" flag - see the module docstring.
+# Never the default: this exists for a deliberate check against
+# already-confirmed adversary infrastructure, where a self-signed cert is
+# expected and shouldn't block the request.
+INSECURE_HTTPS_CONTEXT = ssl.create_default_context()
+INSECURE_HTTPS_CONTEXT.check_hostname = False
+INSECURE_HTTPS_CONTEXT.verify_mode = ssl.CERT_NONE
+
 
 def is_ip_literal(value: str) -> bool:
     try:
@@ -195,11 +232,12 @@ def run_tls_handshake(target: str, resolved_ip: str, port: int) -> None:
 
 
 def run_http_fetch(url: str, method: str, headers: dict[str, str],
-                    data: str | None = None) -> dict[str, object]:
+                    data: str | None = None, insecure: bool = False) -> dict[str, object]:
     body_bytes = data.encode("utf-8") if data is not None else None
     req = urllib.request.Request(url, data=body_bytes, method=method, headers=headers)
+    context = INSECURE_HTTPS_CONTEXT if insecure else HTTPS_CONTEXT
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=HTTPS_CONTEXT) as resp:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=context) as resp:
             body = resp.read().decode("utf-8", errors="replace")
             return {"status": resp.status, "body": body, "error": None}
     except urllib.error.HTTPError as e:
@@ -221,6 +259,16 @@ def run_resolve_dns(host: str) -> dict[str, object]:
     return {"status": "resolved", "addrs": addrs}
 
 
+def run_resolve_ptr(ip: str) -> dict[str, object]:
+    try:
+        hostname, _aliases, _addrs = socket.gethostbyaddr(ip)
+    except socket.herror:
+        return {"status": "no_ptr"}
+    except OSError as e:
+        return {"status": "error", "error": str(e)}
+    return {"status": "resolved", "hostname": hostname}
+
+
 def main() -> int:
     try:
         request = json.loads(sys.stdin.read() or "{}")
@@ -232,7 +280,8 @@ def main() -> int:
     if action == "http_fetch":
         try:
             result = run_http_fetch(request["url"], request.get("method", "GET"),
-                                     request.get("headers") or {}, request.get("data"))
+                                     request.get("headers") or {}, request.get("data"),
+                                     bool(request.get("insecure", False)))
         except Exception as e:
             result = {"status": None, "body": None, "error": f"bad request: {e}"}
         json.dump(result, sys.stdout)
@@ -241,6 +290,14 @@ def main() -> int:
     if action == "resolve_dns":
         try:
             result = run_resolve_dns(request["host"])
+        except Exception as e:
+            result = {"status": "error", "error": f"bad request: {e}"}
+        json.dump(result, sys.stdout)
+        return 0
+
+    if action == "resolve_ptr":
+        try:
+            result = run_resolve_ptr(request["ip"])
         except Exception as e:
             result = {"status": "error", "error": f"bad request: {e}"}
         json.dump(result, sys.stdout)

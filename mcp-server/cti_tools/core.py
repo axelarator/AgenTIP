@@ -1085,12 +1085,14 @@ def _ip_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
              "as_holder": ripe.get("as_holder") if isinstance(ripe, dict) else None}
     enrichment: dict[str, Any] = {
         "shodan": _cached_pivot("shodan", value, lambda: pivot.shodan_internetdb_lookup(value)),
-        # Free/keyless reverse-IP co-hosting - combined with Shodan's own
-        # "hostnames" field in _log_cluster_enrichment_history to build
-        # the day-over-day "new domain pointed at this IP" signal (the
-        # bgp.he.net cert-transparency-tab equivalent), without VT.
-        "hackertarget": _cached_pivot(
-            "reverse_ip", value, lambda: pivot.hackertarget_reverse_ip(value)),
+        # Reverse-DNS PTR record - a day-over-day attribute diff like
+        # ports/ASN (see _record_ptr_change). Reverse-IP co-hosting
+        # (Hackertarget) used to also feed a "new hostname" signal here,
+        # but that's every OTHER tenant on a shared/CDN IP, not this
+        # actor's infrastructure - dropped from the automatic sweep
+        # (still available on demand via pivot_observable/
+        # pivot_and_expand, where a human reviews it first).
+        "ptr": _cached_pivot("ptr", value, lambda: pivot.ptr_lookup(value)),
     }
     threatfox = _threatfox_enrichment(value)
     if threatfox is not None:
@@ -1198,6 +1200,7 @@ def _apply_enrichment_snapshot(entry: dict[str, Any], category: str,
 _ATTRIBUTE_CONFIDENCE_BASE = {
     "cert_issuer_changed": "high", "ports_changed": "medium", "cert_sans_changed": "medium",
     "cert_new": "high", "hostnames_changed": "medium",
+    "ptr_changed": "medium", "resolved_ip_changed": "medium",
 }
 
 
@@ -1232,6 +1235,66 @@ def _record_port_change(con: duckdb.DuckDBPyConnection, ip: str, actor: str | No
         attribute="ports", change_type="ports_changed",
         confidence=_attribute_confidence("ports_changed", baseline["observed_at"]),
         old_value=baseline["ports"], new_value=new_ports)
+
+
+def _record_ptr_change(con: duckdb.DuckDBPyConnection, ip: str, actor: str | None,
+                       observed_at: datetime, new_hostname: str | None) -> None:
+    """Day-over-day diff of an IP's reverse-DNS (PTR) record - mirrors
+    _record_port_change's shape as a scalar diff instead of a list one.
+    None is a legitimate value on either side (confirmed absent PTR
+    record, see pivot.ptr_lookup) - only a change between two
+    known/confirmed states is recorded, same "definitive answer either
+    way" rule the rest of this module uses for lifecycle checks.
+
+    old_value/new_value are explicitly json.dumps'd (unlike
+    _record_port_change's bare list/dict, which store._json auto-
+    serializes) because store._json passes a Python str straight
+    through unmodified (so an already-JSON string caller isn't double-
+    encoded) - a raw hostname or a bare `None` would otherwise hit the
+    JSON-typed column as unquoted text ("host.example") or a dropped
+    SQL NULL, either of which DuckDB's JSON column rejects or - for
+    None - collapses into "no baseline row" instead of "confirmed no
+    PTR", which is a real, distinct value here."""
+    baseline = tracking_store.latest_ptr_for(con, ip, observed_at)
+    if baseline is None:
+        tracking_store.record_attribute_change(
+            con, detected_at=observed_at, indicator_value=ip, actor=actor,
+            attribute="ptr", change_type="first_seen", confidence="medium",
+            old_value=None, new_value=json.dumps(new_hostname))
+        return
+    if baseline["hostname"] == new_hostname:
+        return  # no change - the common case, nothing recorded
+    tracking_store.record_attribute_change(
+        con, detected_at=observed_at, indicator_value=ip, actor=actor,
+        attribute="ptr", change_type="ptr_changed",
+        confidence=_attribute_confidence("ptr_changed", baseline["observed_at"]),
+        old_value=json.dumps(baseline["hostname"]), new_value=json.dumps(new_hostname))
+
+
+def _record_resolved_ip_change(con: duckdb.DuckDBPyConnection, domain: str, actor: str | None,
+                               observed_at: datetime, new_ips: list[str]) -> None:
+    """Day-over-day diff of a domain's resolved IP(s) - the "domain
+    shifted hosting" signal, mirroring _record_port_change exactly
+    (sorted-list equality). new_ips can legitimately be [] (a confirmed
+    dead/sinkholed domain - see pivot.resolve_host's []-vs-None
+    contract); this function is only ever called with a definitive
+    result, never an inconclusive one (see
+    core._log_cluster_enrichment_history's gate on `detail["resolved"]
+    is not None`)."""
+    baseline = tracking_store.latest_resolved_ip_for(con, domain, observed_at)
+    if baseline is None:
+        tracking_store.record_attribute_change(
+            con, detected_at=observed_at, indicator_value=domain, actor=actor,
+            attribute="resolved_ip", change_type="first_seen", confidence="medium",
+            old_value=None, new_value=new_ips)
+        return
+    if sorted(baseline["resolved_ip"]) == sorted(new_ips):
+        return  # no change - the common case, nothing recorded
+    tracking_store.record_attribute_change(
+        con, detected_at=observed_at, indicator_value=domain, actor=actor,
+        attribute="resolved_ip", change_type="resolved_ip_changed",
+        confidence=_attribute_confidence("resolved_ip_changed", baseline["observed_at"]),
+        old_value=baseline["resolved_ip"], new_value=new_ips)
 
 
 def _record_cert_change(con: duckdb.DuckDBPyConnection, domain: str, actor: str | None,
@@ -1292,15 +1355,27 @@ def _record_cert_hash_change(con: duckdb.DuckDBPyConnection, domain: str, actor:
 
 def _record_hostname_change(con: duckdb.DuckDBPyConnection, ip: str, actor: str | None,
                             observed_at: datetime, new_hostnames: list[str]) -> None:
-    """Day-over-day diff of domains discovered pointing at a tracked IP
+    """No longer called from the automatic daily sweep as of the PTR/
+    resolved_ip attribute work: Hackertarget's reverse-IP co-hosting
+    list is every OTHER tenant on a shared/CDN IP, not this actor's
+    infrastructure (see is_shared_hosting_hostname and the 2026-09-10
+    digest-blowup incident), so "new hostname pointed at this IP" was
+    dropped as an automatic signal in favor of a real PTR record
+    (_record_ptr_change). Kept in the code, uncalled, for
+    schema/historical-row stability - same precedent as
+    latest_vt_file_hashes_for in store.py. Still reachable on demand
+    through pivot_observable/pivot_and_expand, where a human reviews
+    the reverse-IP result before deciding anything's worth tracking.
+
+    Day-over-day diff of domains discovered pointing at a tracked IP
     (Shodan InternetDB's own hostnames field, unioned with Hackertarget's
-    reverse-IP lookup - see _log_cluster_enrichment_history) - the
-    bgp.he.net cert-transparency-tab equivalent for an IP, built from
-    free/keyless sources already in this module rather than VT passive-DNS
-    or a paid platform. Mirrors _record_port_change's shape. When new
-    hostnames actually appear, also runs a best-effort Cert Spotter lookup
-    on each (see _candidate_hostname_certs) so the flagged note carries the
-    same cert-transparency pivot info bgp.he.net's IP page shows - the
+    reverse-IP lookup) - the bgp.he.net cert-transparency-tab equivalent
+    for an IP, built from free/keyless sources already in this module
+    rather than VT passive-DNS or a paid platform. Mirrors
+    _record_port_change's shape. When new hostnames actually appear,
+    also runs a best-effort Cert Spotter lookup on each (see
+    _candidate_hostname_certs) so the flagged note carries the same
+    cert-transparency pivot info bgp.he.net's IP page shows - the
     hostnames themselves are still never auto-filed as tracked
     observables, per the flag-only-new-leads decision."""
     baseline = tracking_store.latest_hostnames_for(con, ip, observed_at)
@@ -1349,17 +1424,18 @@ def _log_cluster_enrichment_history(
         actor: str, observed_at: datetime,
         results: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]) -> str | None:
     """Best-effort: write one dated observation row per ip/domain that got
-    fresh Shodan/Cert Spotter/ThreatFox data this sweep, so the dashboard's
-    per-observable timeline can show when these fields were seen or
-    changed - and, for ports/cert, diff the fresh value against the prior
-    baseline and record a change in attribute_changes when something
-    actually moved (see _record_port_change/_record_cert_change). Returns
-    an error note (never raises) on a tracking-store hiccup - pivot_cluster's
+    fresh Shodan/Cert Spotter/ThreatFox/PTR/resolved-IP data this sweep,
+    so the dashboard's per-observable timeline can show when these
+    fields were seen or changed - and diff the fresh value against the
+    prior baseline, recording a change in attribute_changes when
+    something actually moved (see _record_port_change/_record_cert_change/
+    _record_ptr_change/_record_resolved_ip_change). Returns an error
+    note (never raises) on a tracking-store hiccup - pivot_cluster's
     cluster-JSON write already happened and a separate store's outage
     shouldn't undo or block reporting that success."""
     try:
         with tracking_store.connect(read_only=False) as con:
-            for (category, value), (_status, _detail, enrichment) in results.items():
+            for (category, value), (_status, detail, enrichment) in results.items():
                 indicator_type = "domain" if category == "domains" else "ipv4"
                 shodan = enrichment.get("shodan")
                 if isinstance(shodan, dict) and "error" not in shodan:
@@ -1394,22 +1470,28 @@ def _log_cluster_enrichment_history(
                         con, observed_at=observed_at, indicator_value=value,
                         source="threatfox", actor=actor, indicator_type=indicator_type,
                         threatfox_matches=threatfox.get("matches") or None)
-                # Domain-on-IP discovery (free/keyless): union Shodan's own
-                # "hostnames" field with Hackertarget's reverse-IP domains -
-                # the bgp.he.net cert-transparency-tab equivalent for an IP,
-                # diffed day-over-day the same way ports are.
-                hackertarget = enrichment.get("hackertarget")
-                shodan_hostnames = (shodan.get("hostnames") or []) \
-                    if isinstance(shodan, dict) and "error" not in shodan else []
-                hackertarget_domains = (hackertarget.get("domains") or []) \
-                    if isinstance(hackertarget, dict) and "error" not in hackertarget else []
-                if shodan_hostnames or hackertarget_domains:
-                    discovered = sorted(set(shodan_hostnames) | set(hackertarget_domains))
+                ptr = enrichment.get("ptr")
+                if isinstance(ptr, dict) and "error" not in ptr:
                     tracking_store.upsert_observation(
                         con, observed_at=observed_at, indicator_value=value,
-                        source="hostdiscovery", actor=actor, indicator_type=indicator_type,
-                        discovered_hostnames=discovered)
-                    _record_hostname_change(con, value, actor, observed_at, discovered)
+                        source="ptr", actor=actor, indicator_type=indicator_type,
+                        ptr_hostname=ptr.get("hostname"))
+                    _record_ptr_change(con, value, actor, observed_at, ptr.get("hostname"))
+                if category == "domains":
+                    # Domain-hosting-shift detection: detail["resolved"] is
+                    # the same live A-record lookup _domain_lifecycle
+                    # already runs for alive/dead/sinkhole classification -
+                    # reused here rather than re-resolved. None means the
+                    # lookup was inconclusive (skip, don't record); []
+                    # means a confirmed dead/sinkholed domain, which is
+                    # still a real, recordable answer.
+                    resolved = detail.get("resolved")
+                    if resolved is not None:
+                        tracking_store.upsert_observation(
+                            con, observed_at=observed_at, indicator_value=value,
+                            source="dns_resolve", actor=actor, indicator_type=indicator_type,
+                            resolved_ip=resolved)
+                        _record_resolved_ip_change(con, value, actor, observed_at, resolved)
     except (tracking_store.TrackingBusy, duckdb.IOException) as e:
         return f"enrichment history not recorded: {e}"
     return None
@@ -1579,10 +1661,16 @@ def pivot_and_expand(value: str, cluster_name: str,
 
     Reverse-IP co-hosted domains are NOT filed by default (shared-hosting
     noise); pass include_cohosted=True to file them too, or read them from
-    the returned `review` block and file the real ones yourself. Anything
-    not filed (co-hosted domains, CT names outside the queried name) is
-    returned under `review` for manual follow-up. Only genuinely new
-    indicators are filed; ones already tracked are left as-is.
+    the returned `review` block and file the real ones yourself. If the
+    queried IP is itself behind a known shared CDN/LB/accelerator (see
+    is_shared_hosting_hostname), co-hosted domains are suppressed
+    entirely instead - even with include_cohosted=True - since they'd be
+    every other tenant on that IP, not this actor's infrastructure; a
+    `review["cohosted_domains_suppressed"]` note explains what and why.
+    Anything not filed (co-hosted domains, CT names outside the queried
+    name) is returned under `review` for manual follow-up. Only
+    genuinely new indicators are filed; ones already tracked are left
+    as-is.
 
     Each newly-filed indicator also gets its own live asn/ports/cert/tags
     snapshot (see _apply_enrichment_snapshot) - a second, cheap (cached)
@@ -1633,6 +1721,21 @@ def pivot_and_expand(value: str, cluster_name: str,
                                f"pivot_and_expand via VirusTotal resolution history, checked {now}"))
         rev = _cached_pivot("reverse_ip", value, lambda: pivot.hackertarget_reverse_ip(value))
         cohosted = rev.get("domains", []) if isinstance(rev, dict) and not rev.get("error") else []
+        if cohosted:
+            # Same shared-hosting check the automatic sweep uses (see
+            # _ip_lifecycle's comment): an IP fronted by a shared CDN/LB/
+            # accelerator returns every OTHER tenant here, not this
+            # actor's infra - suppress before it can be filed (worse than
+            # the automatic-sweep case: include_cohosted=True is a
+            # permanent write) or dumped into `review` unfiltered.
+            shodan = _cached_pivot("shodan", value, lambda: pivot.shodan_internetdb_lookup(value))
+            shodan_hostnames = (shodan.get("hostnames") or []) \
+                if isinstance(shodan, dict) and "error" not in shodan else []
+            if any(pivot.is_shared_hosting_hostname(h) for h in shodan_hostnames):
+                review["cohosted_domains_suppressed"] = (
+                    f"{len(cohosted)} co-hosted domains suppressed - "
+                    f"{value} is behind shared hosting/CDN ({shodan_hostnames[0]})")
+                cohosted = []
         if include_cohosted:
             candidates.append(("domains", cohosted,
                                f"pivot_and_expand via Hackertarget reverse-IP, checked {now}"))

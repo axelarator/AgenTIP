@@ -271,6 +271,16 @@ def test_hackertarget_reverse_ip_no_records_message_is_error(monkeypatch):
     assert "domains" not in result
 
 
+def test_is_shared_hosting_hostname_matches_known_suffixes():
+    assert pivot.is_shared_hosting_hostname(
+        "a2aa9ff50de748dbe.awsglobalaccelerator.com")
+    assert pivot.is_shared_hosting_hostname("D111111ABCDEF8.cloudfront.net")
+
+
+def test_is_shared_hosting_hostname_false_for_actor_domain():
+    assert not pivot.is_shared_hosting_hostname("blog.housby.com")
+
+
 def test_shodan_internetdb_lookup_parses_fields(monkeypatch):
     monkeypatch.setattr(
         pivot.vm_proxy, "http_fetch",
@@ -399,6 +409,25 @@ def test_resolve_host_distinguishes_dead_from_inconclusive(monkeypatch):
         raise pivot.vm_proxy.VMProxyError("ssh transport failed")
     monkeypatch.setattr(pivot.vm_proxy, "resolve_dns", boom)
     assert pivot.resolve_host("nope.invalid") is None  # transport failure -> inconclusive
+
+
+def test_ptr_lookup_resolved(monkeypatch):
+    monkeypatch.setattr(pivot.vm_proxy, "resolve_ptr", lambda ip: "host.example")
+    assert pivot.ptr_lookup("185.10.10.10") == {"hostname": "host.example"}
+
+
+def test_ptr_lookup_no_ptr_is_not_an_error(monkeypatch):
+    monkeypatch.setattr(pivot.vm_proxy, "resolve_ptr", lambda ip: None)
+    result = pivot.ptr_lookup("185.10.10.10")
+    assert result == {"hostname": None}
+    assert "error" not in result
+
+
+def test_ptr_lookup_inconclusive_becomes_error(monkeypatch):
+    def boom(ip):
+        raise pivot.vm_proxy.VMProxyError("ssh transport failed")
+    monkeypatch.setattr(pivot.vm_proxy, "resolve_ptr", boom)
+    assert pivot.ptr_lookup("185.10.10.10") == {"error": "ssh transport failed"}
 
 
 def test_post_json_sends_post_with_json_body(monkeypatch):

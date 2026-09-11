@@ -46,6 +46,7 @@ def default_lifecycle_stubs(monkeypatch):
     monkeypatch.setattr(core.pivot, "shodan_internetdb_lookup",
                         lambda ip: {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []})
     monkeypatch.setattr(core.pivot, "hackertarget_reverse_ip", lambda ip: {"domains": []})
+    monkeypatch.setattr(core.pivot, "ptr_lookup", lambda ip: {"hostname": None})
 
 
 def test_create_and_get_cluster():
@@ -1297,11 +1298,16 @@ def test_classify_ip_lifecycle():
 @pytest.fixture
 def stub_cluster_sweep_net(monkeypatch):
     """Stub every network source pivot_cluster's sweep now touches
-    (lifecycle sources plus the Shodan/Cert Spotter/Hackertarget
-    enrichment added alongside them), so sweep tests are hermetic.
-    THREATFOX_API_KEY/VT_API_KEY are left unset by default - tests that
-    want ThreatFox/VirusTotal set the key and stub the relevant
-    pivot.* function themselves."""
+    (lifecycle sources plus the Shodan/Cert Spotter/PTR enrichment added
+    alongside them), so sweep tests are hermetic. THREATFOX_API_KEY/
+    VT_API_KEY are left unset by default - tests that want ThreatFox/
+    VirusTotal set the key and stub the relevant pivot.* function
+    themselves. Note: resolve_host's stub ([] - NXDOMAIN/dead) now also
+    drives the automatic resolved_ip/dns_resolve write path for every
+    domain swept through this fixture, in addition to lifecycle
+    classification - no existing test in this file asserts a total
+    observation-row count without filtering by source, so this is
+    hermetic-safe."""
     monkeypatch.setattr(core.pivot, "rdap_lookup",
                         lambda value, kind: {"nameservers": [], "status": [], "events": []})
     monkeypatch.setattr(core.pivot, "resolve_host", lambda host: [])  # NXDOMAIN -> dead
@@ -1310,7 +1316,7 @@ def stub_cluster_sweep_net(monkeypatch):
     monkeypatch.setattr(core.pivot, "certspotter_lookup", lambda domain: {"hostnames": []})
     monkeypatch.setattr(core.pivot, "shodan_internetdb_lookup",
                         lambda ip: {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []})
-    monkeypatch.setattr(core.pivot, "hackertarget_reverse_ip", lambda ip: {"domains": []})
+    monkeypatch.setattr(core.pivot, "ptr_lookup", lambda ip: {"hostname": None})
     monkeypatch.delenv("THREATFOX_API_KEY", raising=False)
     monkeypatch.delenv("VT_API_KEY", raising=False)
     return monkeypatch
@@ -1355,6 +1361,43 @@ def test_pivot_cluster_logs_shodan_history(stub_cluster_sweep_net):
     assert shodan_rows[0]["shodan_ports"] == [22, 443]
     assert shodan_rows[0]["shodan_tags"] == ["cloud"]
     assert shodan_rows[0]["metadata"]["hostnames"] == ["h.example"]
+
+
+def test_pivot_cluster_logs_ptr_history(stub_cluster_sweep_net):
+    stub_cluster_sweep_net.setattr(
+        core.pivot, "ptr_lookup", lambda ip: {"hostname": "host.example"})
+    core.create_cluster("PTR Sweep")
+    core.add_observable("PTR Sweep", "ips", "185.10.10.10", "r")
+
+    core.pivot_cluster("PTR Sweep")
+
+    # observable_history()'s SELECT list doesn't carry ptr_hostname (same
+    # pre-existing gap as cert_issuer/discovered_hostnames) - query the
+    # tracking DB directly instead.
+    from cti_tools.tracking import store as tracking_store
+    with tracking_store.connect(read_only=True) as con:
+        row = con.execute(
+            """SELECT ptr_hostname FROM observations
+               WHERE indicator_value = ? AND source = 'ptr'""",
+            ["185.10.10.10"]).fetchone()
+    assert row[0] == "host.example"
+
+
+def test_pivot_cluster_logs_resolved_ip_history(stub_cluster_sweep_net):
+    stub_cluster_sweep_net.setattr(
+        core.pivot, "resolve_host", lambda host: ["203.0.113.7"])
+    core.create_cluster("Resolve Sweep")
+    core.add_observable("Resolve Sweep", "domains", "c2.example", "r")
+
+    core.pivot_cluster("Resolve Sweep")
+
+    from cti_tools.tracking import store as tracking_store
+    with tracking_store.connect(read_only=True) as con:
+        row = con.execute(
+            """SELECT resolved_ip FROM observations
+               WHERE indicator_value = ? AND source = 'dns_resolve'""",
+            ["c2.example"]).fetchone()
+    assert json.loads(row[0]) == ["203.0.113.7"]
 
 
 def test_pivot_cluster_logs_threatfox_history_when_keyed(stub_cluster_sweep_net):
@@ -1448,13 +1491,6 @@ def test_pivot_and_expand_only_files_new_indicators(monkeypatch):
 
 
 def test_pivot_and_expand_cohosted_gated(monkeypatch):
-    # Stubbed BEFORE seeding via add_observable, same reason as
-    # test_pivot_and_expand_new_sibling_captures_enrichment_snapshot above:
-    # add_observable's own enrichment sweep now calls hackertarget_reverse_ip
-    # too (see core._ip_lifecycle), under the same "reverse_ip" pivot-cache
-    # tag pivot_and_expand's own cohosted-domains lookup uses below - stubbing
-    # after seeding would let the autouse fixture's empty default get cached
-    # first, and pivot_and_expand would then read that stale cached value.
     core.create_cluster("Expand IP")
     monkeypatch.delenv("VT_API_KEY", raising=False)
     monkeypatch.setattr(core.pivot, "hackertarget_reverse_ip",
@@ -1469,6 +1505,31 @@ def test_pivot_and_expand_cohosted_gated(monkeypatch):
     # opt-in: they get filed
     result = core.pivot_and_expand("185.10.10.10", "Expand IP", include_cohosted=True)
     assert set(result["filed"]["domains"]) == {"shared-a.example", "shared-b.example"}
+
+
+def test_pivot_and_expand_suppresses_cohosted_domains_for_shared_hosting_ip(monkeypatch):
+    # An IP fronted by a shared CDN/accelerator (per Shodan's own
+    # hostname for it) is multi-tenant - co-hosted domains are every
+    # OTHER tenant, not this actor's infra. include_cohosted=True must
+    # NOT file them (worse than the automatic-sweep case: a permanent
+    # write), and `review` should explain what was suppressed rather
+    # than silently showing nothing or dumping the raw noisy list.
+    core.create_cluster("Expand Shared Hosting")
+    monkeypatch.delenv("VT_API_KEY", raising=False)
+    monkeypatch.setattr(core.pivot, "hackertarget_reverse_ip",
+                        lambda ip: {"domains": ["unrelated-tenant-1.example",
+                                                "unrelated-tenant-2.example"]})
+    monkeypatch.setattr(
+        core.pivot, "shodan_internetdb_lookup",
+        lambda ip: {"ports": [], "hostnames": ["a2aa9ff50de748dbe.awsglobalaccelerator.com"],
+                   "cpes": [], "tags": [], "vulns": []})
+    core.add_observable("Expand Shared Hosting", "ips", "185.10.10.10", "seed")
+
+    result = core.pivot_and_expand("185.10.10.10", "Expand Shared Hosting",
+                                   include_cohosted=True)
+    assert result["filed"] == {}
+    assert "cohosted_domains" not in result["review"]
+    assert "awsglobalaccelerator" in result["review"]["cohosted_domains_suppressed"]
 
 
 def test_pivot_and_expand_rejects_hash(monkeypatch):

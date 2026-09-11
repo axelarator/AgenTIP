@@ -215,6 +215,8 @@ ALTER TABLE observations ADD COLUMN IF NOT EXISTS cert_sha256 TEXT;
 ALTER TABLE observations ADD COLUMN IF NOT EXISTS cert_revoked BOOLEAN;
 ALTER TABLE observations ADD COLUMN IF NOT EXISTS discovered_hostnames JSON;
 ALTER TABLE observations ADD COLUMN IF NOT EXISTS vt_file_hashes JSON;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS ptr_hostname TEXT;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS resolved_ip JSON;
 """
 
 
@@ -236,11 +238,12 @@ _OBS_COLUMNS = (
     "shodan_ports", "shodan_tags", "threatfox_matches",
     "cert_issuer", "cert_not_before", "cert_not_after", "cert_sibling_hostnames",
     "cert_sha256", "cert_revoked", "discovered_hostnames", "vt_file_hashes",
+    "ptr_hostname", "resolved_ip",
     "asn", "netname", "country_code", "abuse_contact", "metadata",
 )
 _OBS_JSON_COLUMNS = {"hl_ports", "hl_tags", "shodan_ports", "shodan_tags",
                      "threatfox_matches", "cert_sibling_hostnames",
-                     "discovered_hostnames", "vt_file_hashes", "metadata"}
+                     "discovered_hostnames", "vt_file_hashes", "resolved_ip", "metadata"}
 
 
 def upsert_observation(con: duckdb.DuckDBPyConnection, *, observed_at,
@@ -350,6 +353,50 @@ def latest_hostnames_for(con: duckdb.DuckDBPyConnection, ip: str,
     if row is None:
         return None
     return {"observed_at": row[0], "hostnames": json.loads(row[1]) if row[1] else []}
+
+
+def latest_ptr_for(con: duckdb.DuckDBPyConnection, ip: str,
+                   before) -> dict[str, Any] | None:
+    """Most recent prior PTR-sourced observation of `ip`, strictly
+    before `before` - the baseline for PTR-change detection, mirroring
+    latest_ports_for. Deliberately does NOT filter on
+    `ptr_hostname IS NOT NULL` the way latest_ports_for filters on
+    shodan_ports: a NULL ptr_hostname here is itself a legitimate,
+    confirmed "no PTR record" observation (see pivot.ptr_lookup), not a
+    missing/unattempted one - a 'ptr' source row only ever exists when
+    the lookup succeeded (core._log_cluster_enrichment_history gates
+    the write on "error" not in ptr), so excluding NULLs would silently
+    drop "went from having a PTR to having none" (or vice versa) as a
+    usable future baseline."""
+    row = con.execute(
+        """SELECT observed_at, ptr_hostname FROM observations
+           WHERE indicator_value = ? AND source = 'ptr' AND observed_at < ?
+           ORDER BY observed_at DESC LIMIT 1""", [ip, before]).fetchone()
+    if row is None:
+        return None
+    return {"observed_at": row[0], "hostname": row[1]}
+
+
+def latest_resolved_ip_for(con: duckdb.DuckDBPyConnection, domain: str,
+                           before) -> dict[str, Any] | None:
+    """Most recent prior dns_resolve-sourced observation of `domain`
+    that carried a resolved_ip value, strictly before `before` - the
+    baseline for domain-hosting-shift detection, mirroring
+    latest_ports_for. resolved_ip is written as a JSON list (possibly
+    empty, for a confirmed-dead domain) whenever pivot.resolve_host
+    returned a definitive answer (not None/inconclusive) - see
+    core._log_cluster_enrichment_history - so `resolved_ip IS NOT NULL`
+    correctly excludes only rows where this source was never
+    successfully written, not empty-but-successful ones (an empty
+    Python list serializes to JSON '[]', not SQL NULL)."""
+    row = con.execute(
+        """SELECT observed_at, resolved_ip FROM observations
+           WHERE indicator_value = ? AND source = 'dns_resolve'
+             AND resolved_ip IS NOT NULL AND observed_at < ?
+           ORDER BY observed_at DESC LIMIT 1""", [domain, before]).fetchone()
+    if row is None:
+        return None
+    return {"observed_at": row[0], "resolved_ip": json.loads(row[1])}
 
 # latest_vt_file_hashes_for (source='virustotal_files') was removed along
 # with the automatic VT file-hash pivot it backed - that sweep exhausted

@@ -9,7 +9,7 @@ the source of it any more than a live JARM probe would.
 
 Protocol: one JSON object on stdin, one JSON object on stdout, handled
 by win_probe_helper.py on the VM (see that module's docstring for the
-full request/response shapes per action). Three actions:
+full request/response shapes per action). Four actions:
 
 - "jarm_probe" (default, back-compat with requests that omit "action"):
   active TLS/JARM fingerprinting - see probe_win().
@@ -22,8 +22,11 @@ full request/response shapes per action). Three actions:
 - "resolve_dns": DNS resolution performed from the VM - see
   resolve_dns(). What pivot.resolve_host now runs through instead of
   calling socket.getaddrinfo directly from this host.
+- "resolve_ptr": reverse-DNS (PTR) lookup performed from the VM - see
+  resolve_ptr(). What pivot.ptr_lookup runs through instead of calling
+  socket.gethostbyaddr directly from this host.
 
-Same key/host used for all three - the VM-side forced command already
+Same key/host used for all four - the VM-side forced command already
 has to trust this key with live network access on the analyst's
 behalf, so widening what it's asked to do doesn't widen what it's
 trusted to do.
@@ -94,14 +97,20 @@ def probe_win(target: str, port: int) -> dict[str, object]:
 
 
 def http_fetch(url: str, headers: dict[str, str] | None = None, method: str = "GET",
-                data: str | None = None) -> dict[str, object]:
+                data: str | None = None, insecure: bool = False) -> dict[str, object]:
     """Fetch url from the VM. Returns {"status": int, "body": str,
     "error": str|None} - status/body are None if error is set. `data`,
     when given, is sent as the request body (e.g. a POST endpoint like
-    ThreatFox's JSON query API) - omit it for a plain GET."""
+    ThreatFox's JSON query API) - omit it for a plain GET. `insecure`
+    (default False) skips TLS certificate verification on the VM side -
+    leave it False for every normal pivot lookup (RDAP/RIPEstat/VT/
+    ThreatFox all hit legitimate services and should fail closed on a
+    bad cert); only pass True for a deliberate check against
+    infrastructure already confirmed adversary-controlled, where a
+    self-signed cert is expected and shouldn't block the request."""
     response = _ssh_json_rpc({
         "action": "http_fetch", "url": url, "method": method, "headers": headers or {},
-        "data": data,
+        "data": data, "insecure": insecure,
     })
     if response.get("error"):
         raise VMProxyError(str(response["error"]))
@@ -121,3 +130,21 @@ def resolve_dns(host: str) -> list[str] | None:
     if status == "nxdomain":
         return []
     return None
+
+
+def resolve_ptr(ip: str) -> str | None:
+    """Reverse-DNS (PTR) hostname for `ip`, resolved on the VM. Returns
+    the hostname string on success, or None if the IP has a confirmed
+    absent PTR record (status='no_ptr' - common, not a failure). Unlike
+    resolve_dns, an inconclusive lookup raises VMProxyError rather than
+    also returning None, so pivot.ptr_lookup's caller can tell "no PTR
+    configured" (real, recordable data) apart from "couldn't check
+    right now" (skip, don't record) using the same isinstance(...)/
+    "error" gating every other enrichment source already uses."""
+    response = _ssh_json_rpc({"action": "resolve_ptr", "ip": ip})
+    status = response.get("status")
+    if status == "resolved":
+        return response.get("hostname")
+    if status == "no_ptr":
+        return None
+    raise VMProxyError(str(response.get("error") or "PTR lookup failed"))
