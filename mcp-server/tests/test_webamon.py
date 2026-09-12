@@ -86,6 +86,34 @@ def test_infostealers_strips_plaintext_password(monkeypatch):
     assert row["password_peek"] == "h*****2"
 
 
+def test_infostealers_drops_rows_that_dont_match_the_term(monkeypatch):
+    # The index analyzes `username:@domain` into tokens, so the raw query
+    # ORs into a match on most of the index - a nonsense domain returned
+    # 572k "hits" (aarp.org, canva.com, netflix.com) and every tracked
+    # domain looked compromised. Only rows that really name the term count.
+    captured = {}
+
+    def fake_search(params):
+        captured.update(params)
+        return {"total_hits": 572358, "results": [
+            {"domain": "aarp.org", "url": "https://secure.aarp.org/", "username": "x@gomail5.com"},
+            {"domain": "canva.com", "url": "https://www.canva.com/login", "username": "y@mailop7.com"},
+            {"domain": "evil.example", "url": "https://evil.example/login", "username": "bob"},
+            {"domain": "mail.evil.example", "url": "https://mail.evil.example/", "username": "carol"},
+            {"domain": "unrelated.test", "url": "https://unrelated.test/", "username": "dave@evil.example"},
+        ]}
+
+    monkeypatch.setattr(webamon, "_search", fake_search)
+    out = webamon.infostealers("evil.example")
+
+    assert 'username:"@evil.example"' in captured["lucene_query"]   # phrase-quoted
+    assert [r["domain"] for r in out["results"]] == [
+        "evil.example", "mail.evil.example", "unrelated.test"]      # subdomain + @user kept
+    assert out["total_hits"] == 3          # matched rows, not the index's 572358
+    assert out["raw_total_hits"] == 572358
+    assert out["capped"] is False
+
+
 def test_search_domain_propagates_error(monkeypatch):
     monkeypatch.setattr(webamon, "_search", lambda params: {"error": "webamon rate limited"})
     assert webamon.search_domain("evil.example") == {"error": "webamon rate limited"}

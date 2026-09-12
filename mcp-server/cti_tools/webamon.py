@@ -242,20 +242,39 @@ def search_ip(ip: str, size: int = 50) -> dict[str, Any]:
 
 def infostealers(term: str, size: int = 25) -> dict[str, Any]:
     """Infostealer-log hits for a domain. The plaintext `password` field is
-    dropped at this boundary - only the masked `password_peek` is kept."""
-    quoted = f'"{term}"' if "-" in term else term
-    resp = _search({"lucene_query": f'domain:{quoted} OR username:@{term}',
+    dropped at this boundary - only the masked `password_peek` is kept.
+
+    Both clauses are phrase-quoted, and every returned row is re-checked
+    against `term` before it counts. Unquoted, `username:@example.com` gets
+    analyzed into tokens and ORs into a match against most of the index: a
+    deliberately nonsense domain came back with 572k "hits" on aarp.org /
+    canva.com / netflix.com, so every tracked domain looked compromised.
+    Re-checking client-side keeps that from depending on how the index
+    happens to analyze a field.
+
+    `total_hits` is how many rows actually matched `term`; `raw_total_hits`
+    is what the index claimed for the query, and `capped` means the page
+    came back full, so the real total may be higher than what was counted.
+    """
+    quoted = f'"{term}"'
+    resp = _search({"lucene_query": f'domain:{quoted} OR username:"@{term}"',
                     "index": "infostealers", "size": size})
     if "error" in resp:
         return resp
+    raw = [r for r in (resp.get("results") or []) if isinstance(r, dict)]
+    needle = term.lower()
     out = []
-    for r in (resp.get("results") or []):
-        if not isinstance(r, dict):
+    for r in raw:
+        domain = (r.get("domain") or "").lower()
+        username = (r.get("username") or "").lower()
+        if not (domain == needle or domain.endswith("." + needle)
+                or f"@{needle}" in username):
             continue
         out.append({k: r.get(k) for k in
                     ("domain", "url", "username", "password_peek", "source",
                      "file_name", "file_sha256", "ingest_date")})
-    return {"total_hits": resp.get("total_hits"), "results": out}
+    return {"total_hits": len(out), "raw_total_hits": resp.get("total_hits"),
+            "capped": len(raw) >= size, "results": out}
 
 
 def fingerprint_siblings(fp_hash: str, kind: str = "dom", size: int = 25) -> dict[str, Any]:

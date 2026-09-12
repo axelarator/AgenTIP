@@ -93,7 +93,10 @@ directly (there is no `daily_tracking.py` flag for this).
     subdomains under a tracked domain). Flag-only here; file them with
     `pivot_and_expand`.
   - `infostealer_hits` - new infostealer-log hits for a tracked domain
-    (Webamon; plaintext passwords are never stored).
+    (Webamon; plaintext passwords are never stored). The count is the
+    rows that actually named the domain, re-checked client-side - the
+    raw index query over-matches badly - and is capped at the page size
+    (25), so treat a flat 25 as "at least 25", not an exact count.
   - `ptr` / `resolved_ip` - `ptr_changed` / `resolved_ip_changed`.
   - `opendir_files` - new files in an open directory found by
     `active_scan`'s dirsearch (see `opendir_files` below).
