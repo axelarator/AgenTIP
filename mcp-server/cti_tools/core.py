@@ -898,6 +898,23 @@ def _load_pivot_cache() -> dict[str, Any]:
 _pivot_cache_lock = threading.Lock()
 
 
+def _is_soft_failure(result: Any) -> bool:
+    """True for a source result that reports failure instead of raising.
+
+    Sources signal failure two ways: a top-level "error", or a per-sub-call
+    "<name>_error" (pivot.ripestat_lookup returns one per sub-call so a
+    partial answer still comes back). Only the first used to keep a result
+    out of the cache, so a run where every RIPEstat sub-call failed cached
+    {"network_info_error": ...} as if it were the answer - and for the whole
+    TTL afterwards every sweep reported the IP as "unknown" with no error
+    anywhere to explain it. Seen for real when the MCP server started
+    without CTI_PROBE_* set.
+    """
+    if not isinstance(result, dict):
+        return False
+    return any(k == "error" or str(k).endswith("_error") for k in result)
+
+
 def _cached_pivot(source: str, value: str, fetch) -> Any:
     """Return a cached source result for `value` if it's fresh, else call
     `fetch()`, cache a successful result, and return it. `fetch` may
@@ -923,9 +940,8 @@ def _cached_pivot(source: str, value: str, fetch) -> Any:
     if entry and now - entry.get("ts", 0) < ttl:
         return entry["result"]
     result = fetch()
-    # Don't cache soft failures (sources return an "error" key rather than
-    # raising); a later retry should be able to succeed.
-    if not (isinstance(result, dict) and "error" in result):
+    # Don't cache soft failures; a later retry should be able to succeed.
+    if not _is_soft_failure(result):
         with _pivot_cache_lock:
             cache = _load_pivot_cache()  # re-read so a concurrent writer isn't clobbered
             cache[key] = {"ts": now, "result": result}

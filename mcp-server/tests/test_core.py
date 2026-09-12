@@ -796,6 +796,30 @@ def test_add_observable_bad_category_raises():
         core.add_observable("Bad Category Test", "bogus", "value", "source")
 
 
+def test_partial_source_failure_is_not_cached(monkeypatch):
+    # RIPEstat reports each sub-call's failure as its own "<name>_error" key
+    # rather than raising. Caching that made a misconfigured run's failure
+    # stick for the whole TTL: every later sweep read it back and reported
+    # the IP as "unknown" with no error to explain why.
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            return {"network_info_error": "failed to reach stat.ripe.net"}
+        return {"asn": ["13335"], "prefix": "104.21.48.0/20"}
+
+    first = core._cached_pivot("ripestat", "104.21.60.96", flaky)
+    second = core._cached_pivot("ripestat", "104.21.60.96", flaky)
+
+    assert "network_info_error" in first
+    assert second["asn"] == ["13335"]   # retried rather than served the failure
+    assert len(calls) == 2
+    # a good result still caches
+    third = core._cached_pivot("ripestat", "104.21.60.96", flaky)
+    assert third["asn"] == ["13335"] and len(calls) == 2
+
+
 # --- live enrichment at add-time --------------------------------------------
 
 def test_add_observable_new_ip_captures_asn_hostnames_tags_live(monkeypatch):
