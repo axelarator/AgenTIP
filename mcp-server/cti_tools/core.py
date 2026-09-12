@@ -1221,6 +1221,27 @@ def _stamp_webamon_summary(entry: dict[str, Any], webamon: dict[str, Any]) -> No
     entry["webamon"] = summary
 
 
+def _asn_int(value: Any) -> int | None:
+    """Normalize an ASN to int. RIPEstat reports ASNs as strings ("16509",
+    occasionally "AS16509") and hands back a list when an IP is announced by
+    more than one; SHARED_HOSTING_ASNS and the tracking store use ints.
+    Coercing once, here, is what keeps `asn in SHARED_HOSTING_ASNS` honest -
+    comparing the raw string never matched, so shared-hosting suppression
+    silently did nothing and stamped 50 other tenants' domains onto tracked
+    AWS IPs. Returns None for anything unparseable, so callers can keep the
+    raw value instead."""
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip().upper()
+    if text.startswith("AS"):
+        text = text[2:]
+    return int(text) if text.isdigit() else None
+
+
 def _apply_enrichment_snapshot(entry: dict[str, Any], category: str,
                                 detail: dict[str, Any], enrichment: dict[str, Any]) -> None:
     """Stamp the latest known asn/netname/ports/cert/tags snapshot onto an
@@ -1246,7 +1267,9 @@ def _apply_enrichment_snapshot(entry: dict[str, Any], category: str,
         # (_as_int(asns[0])) and the DuckDB observations.asn column.
         asn_list = detail.get("asn")
         if asn_list:
-            entry["asn"] = asn_list[0] if isinstance(asn_list, list) else asn_list
+            asn_value = _asn_int(asn_list)
+            entry["asn"] = (asn_value if asn_value is not None else
+                            (asn_list[0] if isinstance(asn_list, list) else asn_list))
         if detail.get("as_holder"):
             entry["netname"] = detail["as_holder"]
         webamon_ip = enrichment.get("webamon_ip")
@@ -1904,7 +1927,7 @@ def pivot_and_expand(value: str, cluster_name: str,
         # actor's infra - suppress before they can be filed or reviewed.
         ripe = _cached_pivot("ripestat", value, lambda: pivot.ripestat_lookup(value))
         asn_list = ripe.get("asn") if isinstance(ripe, dict) else None
-        asn = (asn_list[0] if isinstance(asn_list, list) and asn_list else asn_list)
+        asn = _asn_int(asn_list)  # RIPEstat gives strings; see _asn_int
         if hosted and asn in SHARED_HOSTING_ASNS:
             review["cohosted_domains_suppressed"] = (
                 f"{len(hosted)} co-hosted domains suppressed - "

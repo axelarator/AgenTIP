@@ -800,8 +800,9 @@ def test_add_observable_bad_category_raises():
 
 def test_add_observable_new_ip_captures_asn_hostnames_tags_live(monkeypatch):
     core.create_cluster("Live Enrich IP")
+    # RIPEstat returns ASNs as strings; core normalizes them to int.
     monkeypatch.setattr(core.pivot, "ripestat_lookup",
-                        lambda ip: {"asn": [64500], "as_holder": "EVIL-NET"})
+                        lambda ip: {"asn": ["64500"], "as_holder": "EVIL-NET"})
     monkeypatch.setattr(core.webamon, "search_ip",
                         lambda ip, size=50: {"total_hits": 1, "domains": ["evil.example"],
                                              "results": []})
@@ -817,6 +818,26 @@ def test_add_observable_new_ip_captures_asn_hostnames_tags_live(monkeypatch):
     assert "threatfox:malware:AsyncRAT" in ip["tags"]
     # Ports are no longer discovered automatically (nmap is on-demand).
     assert "ports" not in ip
+
+
+def test_enrichment_snapshot_suppresses_cohosted_domains_for_shared_hosting_ip(monkeypatch):
+    # Regression: RIPEstat reports the ASN as a string, so the shared-hosting
+    # membership test used to miss and every co-tenant domain Webamon knows
+    # about got stamped onto the tracked IP (seen live: 50 unrelated domains
+    # on two AWS IPs).
+    shared_asn = sorted(core.SHARED_HOSTING_ASNS)[0]
+    core.create_cluster("Shared Hosting Snapshot")
+    monkeypatch.setattr(core.pivot, "ripestat_lookup",
+                        lambda ip: {"asn": [str(shared_asn)], "as_holder": "AMAZON-02"})
+    monkeypatch.setattr(core.webamon, "search_ip",
+                        lambda ip, size=50: {"total_hits": 2,
+                                             "domains": ["tenant-a.example", "tenant-b.example"],
+                                             "results": []})
+
+    data = core.add_observable("Shared Hosting Snapshot", "ips", "3.33.130.190", "report: r.pdf")
+    ip = next(o for o in data["observables"]["ips"] if o["value"] == "3.33.130.190")
+    assert ip["asn"] == shared_asn          # normalized to int, not "16509"
+    assert "ip_hostnames" not in ip         # co-tenants suppressed
 
 
 def test_add_observable_new_domain_captures_cert_snapshot(monkeypatch):
@@ -1554,7 +1575,11 @@ def test_pivot_and_expand_suppresses_cohosted_domains_for_shared_hosting_ip(monk
     monkeypatch.setattr(core.webamon, "search_ip", lambda ip, size=50: {
         "total_hits": 2, "domains": ["unrelated-tenant-1.example", "unrelated-tenant-2.example"],
         "results": []})
-    monkeypatch.setattr(core.pivot, "ripestat_lookup", lambda ip: {"asn": [shared_asn]})
+    # RIPEstat hands back the ASN as a string ("16509"), not an int - the
+    # shape that used to slip past the SHARED_HOSTING_ASNS membership test
+    # and stamp 50 other tenants' domains onto a tracked IP.
+    monkeypatch.setattr(core.pivot, "ripestat_lookup",
+                        lambda ip: {"asn": [str(shared_asn)]})
     core.create_cluster("Expand Shared Hosting")
     core.add_observable("Expand Shared Hosting", "ips", "185.10.10.10", "seed")
 

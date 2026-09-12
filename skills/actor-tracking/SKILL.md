@@ -45,9 +45,10 @@ directly (there is no `daily_tracking.py` flag for this).
 
 - `observations` - one row per (day, indicator, source). Live sources:
   `report:<file>`, `honeylabs`, `rdap`, `threatfox`, `tls_live`,
-  `http_live`, `dns_live`, `webamon`, `webamon_infostealers`,
-  `subfinder`, `wayback`, `nmap`, `dirsearch`, `opendir`, or
-  `cluster:<slug>`.
+  `http_live`, `dns_resolve`, `ptr`, `webamon`, `webamon_infostealers`,
+  `subdomains` (subfinder + Wayback, unioned), `nmap`, or
+  `cluster:<slug>`. Open-directory listings are not an observation
+  source - they live in `opendir_files` (below).
   HoneyLabs fields: hl_events, hl_events_7d, hl_first_seen,
   hl_last_seen, hl_ports (JSON int array), hl_tags, hl_threat_level.
   Registry fields: asn, netname, country_code. Live TLS
