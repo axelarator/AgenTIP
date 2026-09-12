@@ -19,8 +19,9 @@ from typing import Any, Iterator
 
 import duckdb
 
-from . import attack, pivot, report_ingest, stix
+from . import attack, pivot, report_ingest, stix, vm_proxy, webamon
 from .tracking import store as tracking_store
+from .tracking.analytics import SHARED_HOSTING_ASNS
 from .tracking.enrich import STALE_BASELINE_DAYS as _ATTR_STALE_BASELINE_DAYS
 
 try:
@@ -787,9 +788,8 @@ def add_observable(name: str, category: str, value: str, source: str,
     always) - e.g. filing a file hash pivoted via pivot_observable with
     its filenames: add_observable(cluster, "hashes", "sha256:<hex>",
     source, metadata={"hash_kind": "file", "filenames": [...]}), so the
-    filename isn't lost the way it is when only reading
-    pivot_observable's own VirusTotal result (display-only, never
-    auto-filed).
+    filename isn't lost the way it is when only reading it off a
+    display-only lookup.
 
     A new domain/ip is still always tracked as an observable, but only
     queued for active fingerprinting if it passes _is_probe_worthy (not
@@ -862,13 +862,14 @@ def remove_observable(name: str, category: str, value: str) -> dict[str, Any]:
     return {**data, "removed": [o["value"] for o in removed]}
 
 
-# Pivot enrichment cache. VirusTotal's free tier is 4 req/min, 500/day,
-# so refetching the same indicator on every pivot burns straight through
-# it; RDAP/RIPEstat are also slow round-trips worth not repeating. This
-# caches each source's answer for a value for a short TTL. It is NOT
-# cluster data - just a transient enrichment cache under _registry -
-# and only successful lookups are cached (never errors or the VT skip
-# note). Set CTI_PIVOT_CACHE_TTL=0 to disable caching entirely.
+# Pivot enrichment cache. Webamon calls count against a daily budget and
+# HoneyLabs credits are metered, so refetching the same indicator on every
+# pivot burns through both; RDAP/RIPEstat and the probe-VM round-trips are
+# also slow and worth not repeating. This caches each source's answer for
+# a value for a short TTL. It is NOT cluster data - just a transient
+# enrichment cache under _registry - and only successful lookups are
+# cached (never errors or a missing-key skip note). Set
+# CTI_PIVOT_CACHE_TTL=0 to disable caching entirely.
 _PIVOT_CACHE_TTL_ENV = "CTI_PIVOT_CACHE_TTL"
 _PIVOT_CACHE_TTL_DEFAULT = 3600
 
@@ -894,58 +895,142 @@ def _load_pivot_cache() -> dict[str, Any]:
         return {}
 
 
+_pivot_cache_lock = threading.Lock()
+
+
+def _is_soft_failure(result: Any) -> bool:
+    """True for a source result that reports failure instead of raising.
+
+    Sources signal failure two ways: a top-level "error", or a per-sub-call
+    "<name>_error" (pivot.ripestat_lookup returns one per sub-call so a
+    partial answer still comes back). Only the first used to keep a result
+    out of the cache, so a run where every RIPEstat sub-call failed cached
+    {"network_info_error": ...} as if it were the answer - and for the whole
+    TTL afterwards every sweep reported the IP as "unknown" with no error
+    anywhere to explain it. Seen for real when the MCP server started
+    without CTI_PROBE_* set.
+    """
+    if not isinstance(result, dict):
+        return False
+    return any(k == "error" or str(k).endswith("_error") for k in result)
+
+
 def _cached_pivot(source: str, value: str, fetch) -> Any:
     """Return a cached source result for `value` if it's fresh, else call
     `fetch()`, cache a successful result, and return it. `fetch` may
-    raise (e.g. VirusTotal) - exceptions propagate uncached so a transient
-    outage isn't remembered as the answer."""
+    raise - exceptions propagate uncached so a transient outage isn't
+    remembered as the answer.
+
+    The read and the write are each taken under _pivot_cache_lock so the
+    6-thread _sweep_lifecycle pool can't lose entries to an interleaved
+    read-modify-write of the shared pivot_cache.json (the write re-reads
+    the file so a concurrent writer's entry survives). fetch() itself runs
+    OUTSIDE the lock - it's a network round trip and mustn't serialize the
+    whole pool. Cross-process races (cron vs MCP server) still exist but
+    _atomic_write_text keeps each write internally consistent, so the worst
+    case is a dropped cache entry, not corruption."""
     import time
     ttl = _pivot_cache_ttl()
     if ttl <= 0:
         return fetch()
     key = f"{source}:{value}"
-    cache = _load_pivot_cache()
-    entry = cache.get(key)
     now = time.time()
+    with _pivot_cache_lock:
+        entry = _load_pivot_cache().get(key)
     if entry and now - entry.get("ts", 0) < ttl:
         return entry["result"]
     result = fetch()
-    # Don't cache soft failures (RDAP/RIPEstat return an "error" key rather
-    # than raising); a later retry should be able to succeed.
-    if not (isinstance(result, dict) and "error" in result):
-        cache[key] = {"ts": now, "result": result}
-        try:
-            _atomic_write_text(_pivot_cache_path(), json.dumps(cache))
-        except OSError:
-            pass
+    # Don't cache soft failures; a later retry should be able to succeed.
+    if not _is_soft_failure(result):
+        with _pivot_cache_lock:
+            cache = _load_pivot_cache()  # re-read so a concurrent writer isn't clobbered
+            cache[key] = {"ts": now, "result": result}
+            try:
+                _atomic_write_text(_pivot_cache_path(), json.dumps(cache))
+            except OSError:
+                pass
     return result
 
 
+def _norm_live(result: dict[str, Any] | Any) -> dict[str, Any]:
+    """Normalize a vm_proxy live-grab response (tls_grab/http_probe/
+    dns_lookup) - which always carries an `error` key, None on success -
+    into the {...}|{"error": ...} shape the enrichment consumers gate on
+    (`"error" not in result`). Drops the `error: None` key on success so a
+    good result isn't misread as a failure or refused by _cached_pivot."""
+    if not isinstance(result, dict):
+        return {"error": "unexpected probe response"}
+    if result.get("error"):
+        return {"error": str(result["error"])}
+    return {k: v for k, v in result.items() if k != "error"}
+
+
+def _live_tls(host: str) -> dict[str, Any]:
+    try:
+        return _cached_pivot("tls_live", host, lambda: _norm_live(vm_proxy.tls_grab(host)))
+    except vm_proxy.VMProxyError as e:
+        return {"error": str(e)}
+
+
+def _live_http(host: str) -> dict[str, Any]:
+    try:
+        return _cached_pivot("http_live", host,
+                             lambda: _norm_live(vm_proxy.http_probe(f"https://{host}")))
+    except vm_proxy.VMProxyError as e:
+        return {"error": str(e)}
+
+
+def _webamon_domain(domain: str) -> dict[str, Any]:
+    return _cached_pivot("webamon", domain, lambda: webamon.search_domain(domain))
+
+
+def _webamon_ip(ip: str) -> dict[str, Any]:
+    return _cached_pivot("webamon_ip", ip, lambda: webamon.search_ip(ip))
+
+
+def _webamon_infostealers(domain: str) -> dict[str, Any]:
+    return _cached_pivot("webamon_is", domain, lambda: webamon.infostealers(domain))
+
+
+def _subdomains_for(domain: str) -> dict[str, Any]:
+    """Passive subdomain discovery for the automatic sweep: subfinder unioned
+    with Wayback CDX, both run on the probe VM. Flag-only (never auto-filed
+    here - see _record_subdomains_change). Returns {"subdomains": [...]} or
+    {"error": ...}."""
+    subs: set[str] = set()
+    errors = []
+    for source, fn in (("subfinder", vm_proxy.subfinder), ("wayback", vm_proxy.wayback_cdx)):
+        try:
+            r = _cached_pivot(source, domain, lambda fn=fn: _norm_live(fn(domain)))
+        except vm_proxy.VMProxyError as e:
+            errors.append(str(e))
+            continue
+        if isinstance(r, dict) and "error" not in r:
+            subs |= {s.lower() for s in (r.get("subdomains") or [])}
+    if not subs and errors:
+        return {"error": "; ".join(errors)}
+    return {"subdomains": sorted(subs)}
+
+
 def pivot_observable(value: str) -> dict[str, Any]:
-    """On-demand infrastructure pivot for a single hash/domain/ip/url
-    against free, no-recurring-cost public data sources - RDAP
-    (registration data), RIPEstat (ASN/network context, IP only), and
-    VirusTotal (reputation + resolution history, if VT_API_KEY is set
-    in the environment). Display only: no cluster data is written, unlike
-    ingest_report - though successful lookups are cached transiently
-    under _registry to respect source rate limits (see CTI_PIVOT_CACHE_TTL).
-    If a pivot surfaces something worth keeping, record it yourself via
+    """On-demand infrastructure pivot for a single hash/domain/ip/url.
+    Display only: no cluster data is written, unlike ingest_report -
+    though successful lookups are cached transiently under _registry to
+    respect source rate limits (see CTI_PIVOT_CACHE_TTL). If a pivot
+    surfaces something worth keeping, record it yourself via
     append_hunt_log, add_gap, or by filing the new indicator into a
     cluster.
 
-    VirusTotal is skipped (with a note, not an error) if VT_API_KEY
-    isn't configured - RDAP and RIPEstat need no key at all and always
-    run for the observable types they apply to. Certificate-transparency
-    history (Cert Spotter, for domains), reverse-IP co-hosting
-    (Hackertarget, for IPs), and open-port/CPE data (Shodan InternetDB,
-    for IPs) are also keyless and surface sibling infrastructure or
-    context as new pivot leads. ThreatFox (abuse.ch, THREATFOX_API_KEY)
-    checks every kind against known malware-C2 IOCs, and is likewise
-    skipped with a note when unconfigured - abuse.ch's Auth Portal now
-    requires a free Auth-Key on every ThreatFox call. HoneyLabs
-    honeypot-fleet telemetry (IPs only, HONEYLABS_API_KEY) is likewise
-    skipped with a note when unconfigured; see summarize_honeylabs for
-    how to read it.
+    Sources: RDAP (registration data, domain/ip); RIPEstat (ASN/network
+    context, ip); Webamon (a domain's latest scan - cert, DNS, ASN, tech,
+    kit fingerprints - and its infostealer-log hits; an IP's hosted
+    domains, the reverse-IP replacement); a live TLS grab and HTTP probe
+    from the probe VM (a domain's current certificate and liveness);
+    PTR (ip); ThreatFox known-malware-C2 IOC match (THREATFOX_API_KEY);
+    and HoneyLabs honeypot telemetry (ip, HONEYLABS_API_KEY). ThreatFox/
+    HoneyLabs are skipped with a note when their key is unset; the rest
+    need no key (Webamon uses WEBAMON_API_KEY, surfacing an error dict if
+    unset). See summarize_honeylabs for how to read the HoneyLabs result.
     """
     kind = pivot.classify(value)
     result: dict[str, Any] = {"value": value, "kind": kind}
@@ -962,25 +1047,14 @@ def pivot_observable(value: str) -> dict[str, Any]:
         result["rdap"] = _cached_pivot("rdap", value, lambda: pivot.rdap_lookup(value, kind))
     if kind == "ip":
         result["ripestat"] = _cached_pivot("ripestat", value, lambda: pivot.ripestat_lookup(value))
-        result["reverse_ip"] = _cached_pivot(
-            "reverse_ip", value, lambda: pivot.hackertarget_reverse_ip(value))
-        result["shodan"] = _cached_pivot(
-            "shodan", value, lambda: pivot.shodan_internetdb_lookup(value))
+        result["webamon_ip"] = _webamon_ip(value)  # hosted domains (reverse-IP replacement)
+        result["ptr"] = _cached_pivot("ptr", value, lambda: pivot.ptr_lookup(value))
         result["honeylabs"] = honeylabs_context(value)
     if kind == "domain":
-        result["certspotter"] = _cached_pivot(
-            "certspotter", value, lambda: pivot.certspotter_lookup(value))
-
-    api_key = os.environ.get(pivot.VT_API_KEY_ENV)
-    if not api_key:
-        result["virustotal"] = {
-            "skipped": f"set {pivot.VT_API_KEY_ENV} to enable VirusTotal lookups"}
-    else:
-        try:
-            result["virustotal"] = _cached_pivot(
-                "virustotal", value, lambda: pivot.virustotal_lookup(value, kind, api_key))
-        except pivot.PivotError as e:
-            result["virustotal"] = {"error": str(e)}
+        result["webamon"] = _webamon_domain(value)  # latest scan: cert, DNS, ASN, kit fingerprints
+        result["webamon_infostealers"] = _webamon_infostealers(value)  # compromised creds (masked)
+        result["tls"] = _live_tls(value)   # current certificate, live from the probe VM
+        result["http"] = _live_http(value)  # live liveness/title/server
 
     return result
 
@@ -1068,8 +1142,17 @@ def _domain_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     status = pivot.classify_domain_lifecycle(rdap, resolved)
     detail = {"resolved": resolved,
              "nameservers": rdap.get("nameservers") if isinstance(rdap, dict) else None}
+    # Live current-cert grab (replaces Cert Spotter's CT history), a live
+    # HTTP probe, the domain's latest Webamon scan (ASN/tech/kit
+    # fingerprints), its infostealer hits, and passive subdomain discovery
+    # (subfinder + Wayback, flag-only). All day-over-day attribute diffs -
+    # see _log_cluster_enrichment_history.
     enrichment: dict[str, Any] = {
-        "certspotter": _cached_pivot("certspotter", value, lambda: pivot.certspotter_lookup(value)),
+        "tls": _live_tls(value),
+        "http": _live_http(value),
+        "webamon": _webamon_domain(value),
+        "webamon_infostealers": _webamon_infostealers(value),
+        "subdomains": _subdomains_for(value),
     }
     threatfox = _threatfox_enrichment(value)
     if threatfox is not None:
@@ -1084,14 +1167,13 @@ def _ip_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
              "prefix": ripe.get("prefix") if isinstance(ripe, dict) else None,
              "as_holder": ripe.get("as_holder") if isinstance(ripe, dict) else None}
     enrichment: dict[str, Any] = {
-        "shodan": _cached_pivot("shodan", value, lambda: pivot.shodan_internetdb_lookup(value)),
-        # Reverse-DNS PTR record - a day-over-day attribute diff like
-        # ports/ASN (see _record_ptr_change). Reverse-IP co-hosting
-        # (Hackertarget) used to also feed a "new hostname" signal here,
-        # but that's every OTHER tenant on a shared/CDN IP, not this
-        # actor's infrastructure - dropped from the automatic sweep
-        # (still available on demand via pivot_observable/
-        # pivot_and_expand, where a human reviews it first).
+        # Domains Webamon has scanned resolving to this IP - the reverse-IP
+        # / hosted-domain signal (replaces Shodan hostnames + Hackertarget).
+        # Open ports are no longer discovered automatically here: that's
+        # nmap, run on demand via active_scan (see the port-change signal).
+        "webamon_ip": _webamon_ip(value),
+        # Reverse-DNS PTR record - a day-over-day attribute diff like ASN
+        # (see _record_ptr_change).
         "ptr": _cached_pivot("ptr", value, lambda: pivot.ptr_lookup(value)),
     }
     threatfox = _threatfox_enrichment(value)
@@ -1107,7 +1189,7 @@ def _sweep_lifecycle(domains: list[str], ips: list[str]
     already-tracked observables) and the add-time enrichment path
     (add_observable/ingest_report/pivot_and_expand, for genuinely new
     ones). Never call this while holding _data_lock: a batch of RDAP/
-    RIPEstat/Shodan/Cert Spotter/ThreatFox round-trips can take a while,
+    RIPEstat/Webamon/probe-VM/ThreatFox round-trips can take a while,
     and every other MCP tool call would block behind the lock for the
     duration - see pivot_cluster's docstring for why its own network
     phase already runs unlocked. A single lookup blowing up is recorded
@@ -1137,6 +1219,45 @@ def _new_values(data: dict[str, Any], category: str, values: list[str]) -> list[
     return [v for v in dict.fromkeys(values) if v and v not in existing]
 
 
+def _stamp_webamon_summary(entry: dict[str, Any], webamon: dict[str, Any]) -> None:
+    """Stamp a compact Webamon snapshot (report_id, last scan date, risk
+    score, kit fingerprints) onto an observable. Accepts both a domain
+    result (carries `latest`) and an IP result (carries only `total_hits`/
+    `domains`)."""
+    latest = webamon.get("latest")
+    summary: dict[str, Any] = {"checked": _now(), "total_hits": webamon.get("total_hits")}
+    if isinstance(latest, dict):
+        summary.update({
+            "report_id": latest.get("report_id"),
+            "last_scan": latest.get("date"),
+            "risk_score": latest.get("risk_score"),
+            "fingerprint_dom": (latest.get("fingerprint") or {}).get("dom"),
+            "fingerprint_ssl": (latest.get("fingerprint") or {}).get("ssl"),
+        })
+    entry["webamon"] = summary
+
+
+def _asn_int(value: Any) -> int | None:
+    """Normalize an ASN to int. RIPEstat reports ASNs as strings ("16509",
+    occasionally "AS16509") and hands back a list when an IP is announced by
+    more than one; SHARED_HOSTING_ASNS and the tracking store use ints.
+    Coercing once, here, is what keeps `asn in SHARED_HOSTING_ASNS` honest -
+    comparing the raw string never matched, so shared-hosting suppression
+    silently did nothing and stamped 50 other tenants' domains onto tracked
+    AWS IPs. Returns None for anything unparseable, so callers can keep the
+    raw value instead."""
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip().upper()
+    if text.startswith("AS"):
+        text = text[2:]
+    return int(text) if text.isdigit() else None
+
+
 def _apply_enrichment_snapshot(entry: dict[str, Any], category: str,
                                 detail: dict[str, Any], enrichment: dict[str, Any]) -> None:
     """Stamp the latest known asn/netname/ports/cert/tags snapshot onto an
@@ -1162,31 +1283,40 @@ def _apply_enrichment_snapshot(entry: dict[str, Any], category: str,
         # (_as_int(asns[0])) and the DuckDB observations.asn column.
         asn_list = detail.get("asn")
         if asn_list:
-            entry["asn"] = asn_list[0] if isinstance(asn_list, list) else asn_list
+            asn_value = _asn_int(asn_list)
+            entry["asn"] = (asn_value if asn_value is not None else
+                            (asn_list[0] if isinstance(asn_list, list) else asn_list))
         if detail.get("as_holder"):
             entry["netname"] = detail["as_holder"]
-        shodan = enrichment.get("shodan")
-        if isinstance(shodan, dict) and "error" not in shodan:
-            new_ports = shodan.get("ports") or []
-            if new_ports:  # don't stamp an empty ports:[] where nothing was there before
-                ports = entry.setdefault("ports", [])
-                for p in new_ports:
-                    if p not in ports:
-                        ports.append(p)
-            tags |= {f"shodan:tag:{t}" for t in shodan.get("tags") or []}
+        webamon_ip = enrichment.get("webamon_ip")
+        if isinstance(webamon_ip, dict) and "error" not in webamon_ip:
+            # Hosted domains Webamon has scanned on this IP. Suppress when the
+            # IP sits in a known shared-hosting ASN - those are every other
+            # tenant, not this actor's infra (same rationale as the retired
+            # Hackertarget co-hosting signal; see SHARED_HOSTING_ASNS).
+            asn = entry.get("asn")
+            if asn not in SHARED_HOSTING_ASNS:
+                hosts = webamon_ip.get("domains") or []
+                if hosts:
+                    entry["ip_hostnames"] = sorted(set(entry.get("ip_hostnames") or []) | set(hosts))
+            _stamp_webamon_summary(entry, webamon_ip)
     elif category == "domains":
-        certspotter = enrichment.get("certspotter")
-        if isinstance(certspotter, dict) and "error" not in certspotter:
-            issuances = certspotter.get("issuances") or []
-            if issuances:  # nothing in CT logs yet - don't stamp an empty/None cert block
-                latest = issuances[0]
-                entry["cert"] = {"issuer": latest.get("issuer"),
-                                  "not_before": latest.get("not_before"),
-                                  "not_after": latest.get("not_after"),
-                                  "sibling_hostnames": certspotter.get("hostnames") or [],
-                                  "sha256": latest.get("cert_sha256"),
-                                  "revoked": latest.get("revoked"),
-                                  "checked": _now()}
+        tls = enrichment.get("tls")
+        if isinstance(tls, dict) and "error" not in tls and tls.get("cert"):
+            cert = tls["cert"]
+            entry["cert"] = {"issuer": cert.get("issuer"), "subject": cert.get("subject"),
+                              "sans": cert.get("sans") or [],
+                              "not_before": cert.get("not_before"),
+                              "not_after": cert.get("not_after"),
+                              "sha256": cert.get("sha256"),
+                              "checked": _now(), "source": "tls_live"}
+        http = enrichment.get("http")
+        if isinstance(http, dict) and "error" not in http and http.get("status") is not None:
+            entry["http"] = {"status": http.get("status"), "title": http.get("title"),
+                              "server": http.get("server"), "final_url": http.get("final_url")}
+        webamon = enrichment.get("webamon")
+        if isinstance(webamon, dict) and "error" not in webamon:
+            _stamp_webamon_summary(entry, webamon)
     threatfox = enrichment.get("threatfox")
     if isinstance(threatfox, dict) and "error" not in threatfox:
         for m in threatfox.get("matches") or []:
@@ -1201,6 +1331,9 @@ _ATTRIBUTE_CONFIDENCE_BASE = {
     "cert_issuer_changed": "high", "ports_changed": "medium", "cert_sans_changed": "medium",
     "cert_new": "high", "hostnames_changed": "medium",
     "ptr_changed": "medium", "resolved_ip_changed": "medium",
+    "ip_hostnames_changed": "medium", "http_server_changed": "medium",
+    "http_title_changed": "low", "webamon_fingerprint_changed": "high",
+    "subdomains_changed": "low",
 }
 
 
@@ -1221,7 +1354,9 @@ def _attribute_confidence(change_type: str, baseline_observed_at: datetime) -> s
 
 def _record_port_change(con: duckdb.DuckDBPyConnection, ip: str, actor: str | None,
                         observed_at: datetime, new_ports: list[int]) -> None:
-    baseline = tracking_store.latest_ports_for(con, ip, observed_at)
+    # Baseline is the prior on-demand nmap scan (ports are no longer
+    # discovered automatically now that Shodan InternetDB is retired).
+    baseline = tracking_store.latest_nmap_ports_for(con, ip, observed_at)
     if baseline is None:
         tracking_store.record_attribute_change(
             con, detected_at=observed_at, indicator_value=ip, actor=actor,
@@ -1298,50 +1433,52 @@ def _record_resolved_ip_change(con: duckdb.DuckDBPyConnection, domain: str, acto
 
 
 def _record_cert_change(con: duckdb.DuckDBPyConnection, domain: str, actor: str | None,
-                        observed_at: datetime, latest_issuance: dict[str, Any],
-                        hostnames: list[str]) -> None:
-    new_issuer = latest_issuance.get("issuer")
-    baseline = tracking_store.latest_cert_for(con, domain, observed_at)
+                        observed_at: datetime, cert: dict[str, Any]) -> None:
+    """Day-over-day diff of a domain's live certificate (issuer / SANs),
+    from the probe-VM TLS grab that replaced Cert Spotter. A same-issuer,
+    same-SANs renewal is routine and not recorded (the sha256 rotation is
+    tracked separately by _record_cert_hash_change)."""
+    new_issuer = cert.get("issuer")
+    sans = sorted(cert.get("sans") or [])
+    baseline = tracking_store.latest_tls_cert_for(con, domain, observed_at)
     if baseline is None:
-        if new_issuer is None:
+        if new_issuer is None and not sans:
             return
         tracking_store.record_attribute_change(
             con, detected_at=observed_at, indicator_value=domain, actor=actor,
             attribute="cert", change_type="first_seen", confidence="medium",
-            old_value=None, new_value={"issuer": new_issuer, "hostnames": hostnames})
+            old_value=None, new_value={"issuer": new_issuer, "sans": sans})
         return
+    base_sans = sorted(baseline.get("sans") or [])
     if new_issuer and baseline["issuer"] and new_issuer != baseline["issuer"]:
         change_type = "cert_issuer_changed"
-    elif set(hostnames) != set(baseline["sibling_hostnames"]):
+    elif set(sans) != set(base_sans):
         change_type = "cert_sans_changed"
     else:
-        return  # same issuer, same siblings - routine renewal, not recorded
+        return  # same issuer, same SANs - routine renewal, not recorded
     tracking_store.record_attribute_change(
         con, detected_at=observed_at, indicator_value=domain, actor=actor,
         attribute="cert", change_type=change_type,
         confidence=_attribute_confidence(change_type, baseline["observed_at"]),
-        old_value={"issuer": baseline["issuer"], "hostnames": baseline["sibling_hostnames"]},
-        new_value={"issuer": new_issuer, "hostnames": hostnames})
+        old_value={"issuer": baseline["issuer"], "sans": base_sans},
+        new_value={"issuer": new_issuer, "sans": sans})
 
 
 def _record_cert_hash_change(con: duckdb.DuckDBPyConnection, domain: str, actor: str | None,
-                             observed_at: datetime, latest_issuance: dict[str, Any]) -> None:
+                             observed_at: datetime, cert: dict[str, Any]) -> None:
     """A separate diff from _record_cert_change: that one tracks issuer/SAN
-    changes and deliberately treats a same-issuer/same-SANs renewal as
-    routine (not recorded), but a renewal always mints a brand new
-    certificate - and therefore a new cert_sha256 - so this tracks that
-    pivot value on its own timeline instead of conflating it with the
-    issuer/SANs signal."""
-    new_sha256 = latest_issuance.get("cert_sha256")
+    changes and treats a same-issuer/same-SANs renewal as routine, but a
+    renewal always mints a brand new certificate - and therefore a new
+    sha256 - so this tracks that pivot value on its own timeline."""
+    new_sha256 = cert.get("sha256")
     if not new_sha256:
         return
-    baseline = tracking_store.latest_cert_for(con, domain, observed_at)
+    baseline = tracking_store.latest_tls_cert_for(con, domain, observed_at)
     if baseline is None or not baseline.get("sha256"):
         tracking_store.record_attribute_change(
             con, detected_at=observed_at, indicator_value=domain, actor=actor,
             attribute="cert_hash", change_type="first_seen", confidence="medium",
-            old_value=None,
-            new_value={"sha256": new_sha256, "revoked": latest_issuance.get("revoked")})
+            old_value=None, new_value={"sha256": new_sha256})
         return
     if new_sha256 == baseline["sha256"]:
         return  # same cert as last check - nothing to record
@@ -1349,149 +1486,234 @@ def _record_cert_hash_change(con: duckdb.DuckDBPyConnection, domain: str, actor:
         con, detected_at=observed_at, indicator_value=domain, actor=actor,
         attribute="cert_hash", change_type="cert_new",
         confidence=_attribute_confidence("cert_new", baseline["observed_at"]),
-        old_value={"sha256": baseline["sha256"], "revoked": baseline.get("revoked")},
-        new_value={"sha256": new_sha256, "revoked": latest_issuance.get("revoked")})
+        old_value={"sha256": baseline["sha256"]}, new_value={"sha256": new_sha256})
 
 
-def _record_hostname_change(con: duckdb.DuckDBPyConnection, ip: str, actor: str | None,
-                            observed_at: datetime, new_hostnames: list[str]) -> None:
-    """No longer called from the automatic daily sweep as of the PTR/
-    resolved_ip attribute work: Hackertarget's reverse-IP co-hosting
-    list is every OTHER tenant on a shared/CDN IP, not this actor's
-    infrastructure (see is_shared_hosting_hostname and the 2026-09-10
-    digest-blowup incident), so "new hostname pointed at this IP" was
-    dropped as an automatic signal in favor of a real PTR record
-    (_record_ptr_change). Kept in the code, uncalled, for
-    schema/historical-row stability - same precedent as
-    latest_vt_file_hashes_for in store.py. Still reachable on demand
-    through pivot_observable/pivot_and_expand, where a human reviews
-    the reverse-IP result before deciding anything's worth tracking.
-
-    Day-over-day diff of domains discovered pointing at a tracked IP
-    (Shodan InternetDB's own hostnames field, unioned with Hackertarget's
-    reverse-IP lookup) - the bgp.he.net cert-transparency-tab equivalent
-    for an IP, built from free/keyless sources already in this module
-    rather than VT passive-DNS or a paid platform. Mirrors
-    _record_port_change's shape. When new hostnames actually appear,
-    also runs a best-effort Cert Spotter lookup on each (see
-    _candidate_hostname_certs) so the flagged note carries the same
-    cert-transparency pivot info bgp.he.net's IP page shows - the
-    hostnames themselves are still never auto-filed as tracked
-    observables, per the flag-only-new-leads decision."""
-    baseline = tracking_store.latest_hostnames_for(con, ip, observed_at)
+def _record_ip_hostnames_change(con: duckdb.DuckDBPyConnection, ip: str, actor: str | None,
+                                observed_at: datetime, new_hostnames: list[str]) -> None:
+    """Day-over-day diff of the domains Webamon reports resolving to a
+    tracked IP (search_ip) - the reverse-IP / hosted-domain signal. Flag
+    only: the new hostnames are surfaced (`added`) but never auto-filed as
+    tracked observables (that's a reviewed pivot_and_expand decision)."""
+    baseline = tracking_store.latest_ip_hostnames_for(con, ip, observed_at)
     if baseline is None:
         tracking_store.record_attribute_change(
             con, detected_at=observed_at, indicator_value=ip, actor=actor,
-            attribute="hostnames", change_type="first_seen", confidence="medium",
+            attribute="ip_hostnames", change_type="first_seen", confidence="medium",
             old_value=None, new_value={"hostnames": new_hostnames})
         return
     if sorted(baseline["hostnames"]) == sorted(new_hostnames):
-        return  # no change - the common case, nothing recorded
-    new_only = sorted(set(new_hostnames) - set(baseline["hostnames"]))
+        return
+    added = sorted(set(new_hostnames) - set(baseline["hostnames"]))
     tracking_store.record_attribute_change(
         con, detected_at=observed_at, indicator_value=ip, actor=actor,
-        attribute="hostnames", change_type="hostnames_changed",
-        confidence=_attribute_confidence("hostnames_changed", baseline["observed_at"]),
+        attribute="ip_hostnames", change_type="ip_hostnames_changed",
+        confidence=_attribute_confidence("ip_hostnames_changed", baseline["observed_at"]),
         old_value=baseline["hostnames"],
-        new_value={"hostnames": new_hostnames, "added": new_only,
-                  "certs": _candidate_hostname_certs(new_only) if new_only else []})
+        new_value={"hostnames": new_hostnames, "added": added})
 
 
-def _candidate_hostname_certs(hostnames: list[str]) -> list[dict[str, Any]]:
-    """Best-effort Cert Spotter lookup for each newly-discovered (not yet
-    tracked) hostname found pointing at a monitored IP - gives the analyst
-    the same cert-transparency pivot info bgp.he.net's IP page shows,
-    without filing the hostname itself as a tracked observable (new leads
-    are flag-only, per the threat-cluster-tracking skill). Kept to a small
-    list since this only ever runs over genuinely new hostnames from one
-    sweep, and Cert Spotter's own error handling (rate-limited without a
-    token) already degrades a single failed lookup to {"error": ...}
-    rather than raising."""
-    out = []
-    for h in hostnames:
-        cs = _cached_pivot("certspotter", h, lambda h=h: pivot.certspotter_lookup(h))
-        if isinstance(cs, dict) and "error" not in cs and cs.get("issuances"):
-            latest = cs["issuances"][0]
-            out.append({"hostname": h, "cert_issuer": latest.get("issuer"),
-                       "cert_sha256": latest.get("cert_sha256"),
-                       "revoked": latest.get("revoked")})
-        else:
-            out.append({"hostname": h, "cert_issuer": None, "cert_sha256": None, "revoked": None})
-    return out
+def _record_http_change(con: duckdb.DuckDBPyConnection, host: str, actor: str | None,
+                        observed_at: datetime, title: str | None, server: str | None) -> None:
+    """Day-over-day diff of a host's HTTP title / Server header (from the
+    live probe) - a served-content change on already-tracked infra."""
+    baseline = tracking_store.latest_http_for(con, host, observed_at)
+    if baseline is None:
+        if title is None and server is None:
+            return
+        tracking_store.record_attribute_change(
+            con, detected_at=observed_at, indicator_value=host, actor=actor,
+            attribute="http", change_type="first_seen", confidence="low",
+            old_value=None, new_value={"title": title, "server": server})
+        return
+    if title == baseline["title"] and server == baseline["server"]:
+        return
+    change_type = "http_server_changed" if server != baseline["server"] else "http_title_changed"
+    tracking_store.record_attribute_change(
+        con, detected_at=observed_at, indicator_value=host, actor=actor,
+        attribute="http", change_type=change_type,
+        confidence=_attribute_confidence(change_type, baseline["observed_at"]),
+        old_value={"title": baseline["title"], "server": baseline["server"]},
+        new_value={"title": title, "server": server})
+
+
+def _record_fingerprint_change(con: duckdb.DuckDBPyConnection, domain: str, actor: str | None,
+                               observed_at: datetime, dom: str | None, ssl: str | None) -> None:
+    """Day-over-day diff of a domain's Webamon kit fingerprints (dom/ssl) -
+    a rebuilt phishing kit or changed TLS config on already-tracked infra."""
+    baseline = tracking_store.latest_fingerprint_for(con, domain, observed_at)
+    if baseline is None:
+        if dom is None and ssl is None:
+            return
+        tracking_store.record_attribute_change(
+            con, detected_at=observed_at, indicator_value=domain, actor=actor,
+            attribute="webamon_fingerprint", change_type="first_seen", confidence="medium",
+            old_value=None, new_value={"dom": dom, "ssl": ssl})
+        return
+    if dom == baseline["dom"] and ssl == baseline["ssl"]:
+        return
+    tracking_store.record_attribute_change(
+        con, detected_at=observed_at, indicator_value=domain, actor=actor,
+        attribute="webamon_fingerprint", change_type="webamon_fingerprint_changed",
+        confidence=_attribute_confidence("webamon_fingerprint_changed", baseline["observed_at"]),
+        old_value={"dom": baseline["dom"], "ssl": baseline["ssl"]},
+        new_value={"dom": dom, "ssl": ssl})
+
+
+def _record_subdomains_change(con: duckdb.DuckDBPyConnection, apex: str, actor: str | None,
+                              observed_at: datetime, new_subdomains: list[str]) -> None:
+    """Day-over-day diff of an apex's discovered subdomains (subfinder +
+    Wayback) - flag only, surfacing the newly-appeared names for review."""
+    baseline = tracking_store.latest_subdomains_for(con, apex, observed_at)
+    if baseline is None:
+        tracking_store.record_attribute_change(
+            con, detected_at=observed_at, indicator_value=apex, actor=actor,
+            attribute="subdomains", change_type="first_seen", confidence="low",
+            old_value=None, new_value={"subdomains": new_subdomains})
+        return
+    if sorted(baseline["subdomains"]) == sorted(new_subdomains):
+        return
+    added = sorted(set(new_subdomains) - set(baseline["subdomains"]))
+    if not added:
+        return  # only removals - not a lead
+    tracking_store.record_attribute_change(
+        con, detected_at=observed_at, indicator_value=apex, actor=actor,
+        attribute="subdomains", change_type="subdomains_changed",
+        confidence=_attribute_confidence("subdomains_changed", baseline["observed_at"]),
+        old_value=baseline["subdomains"],
+        new_value={"subdomains": new_subdomains, "added": added})
+
+
+def _record_infostealer_change(con: duckdb.DuckDBPyConnection, domain: str, actor: str | None,
+                               observed_at: datetime, count: int, urls: list[str]) -> None:
+    """Day-over-day diff of a domain's Webamon infostealer-log hit count -
+    a new/growing credential-leak footprint. Every hit is notable, so the
+    first sighting of a non-zero count is itself recorded (not first_seen
+    baseline)."""
+    baseline = tracking_store.latest_infostealer_for(con, domain, observed_at)
+    prev = baseline["count"] if baseline else 0
+    if count <= (prev or 0):
+        return  # no new hits since last check
+    tracking_store.record_attribute_change(
+        con, detected_at=observed_at, indicator_value=domain, actor=actor,
+        attribute="infostealer_hits", change_type="infostealer_hits",
+        confidence="medium", old_value={"count": prev},
+        new_value={"count": count, "sample_urls": urls[:10]})
 
 
 def _log_cluster_enrichment_history(
         actor: str, observed_at: datetime,
         results: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]) -> str | None:
     """Best-effort: write one dated observation row per ip/domain that got
-    fresh Shodan/Cert Spotter/ThreatFox/PTR/resolved-IP data this sweep,
-    so the dashboard's per-observable timeline can show when these
-    fields were seen or changed - and diff the fresh value against the
-    prior baseline, recording a change in attribute_changes when
-    something actually moved (see _record_port_change/_record_cert_change/
-    _record_ptr_change/_record_resolved_ip_change). Returns an error
-    note (never raises) on a tracking-store hiccup - pivot_cluster's
-    cluster-JSON write already happened and a separate store's outage
-    shouldn't undo or block reporting that success."""
+    fresh live-enrichment data this sweep (TLS/HTTP/Webamon/infostealer/
+    subdomains/ThreatFox/PTR/resolved-IP), so the dashboard's per-observable
+    timeline can show when these fields were seen or changed - and diff the
+    fresh value against the prior baseline, recording a change in
+    attribute_changes when something actually moved (see the _record_*
+    functions). Returns an error note (never raises) on a tracking-store
+    hiccup - pivot_cluster's cluster-JSON write already happened and a
+    separate store's outage shouldn't undo or block reporting that success."""
     try:
         with tracking_store.connect(read_only=False) as con:
             for (category, value), (_status, detail, enrichment) in results.items():
-                indicator_type = "domain" if category == "domains" else "ipv4"
-                shodan = enrichment.get("shodan")
-                if isinstance(shodan, dict) and "error" not in shodan:
-                    tracking_store.upsert_observation(
-                        con, observed_at=observed_at, indicator_value=value,
-                        source="shodan", actor=actor, indicator_type=indicator_type,
-                        shodan_ports=shodan.get("ports") or None,
-                        shodan_tags=shodan.get("tags") or None,
-                        metadata={"hostnames": shodan.get("hostnames"),
-                                 "cpes": shodan.get("cpes"), "vulns": shodan.get("vulns")})
-                    _record_port_change(con, value, actor, observed_at,
-                                        shodan.get("ports") or [])
-                certspotter = enrichment.get("certspotter")
-                if isinstance(certspotter, dict) and "error" not in certspotter:
-                    issuances = certspotter.get("issuances") or []
-                    latest = issuances[0] if issuances else {}
-                    hostnames = certspotter.get("hostnames") or []
-                    tracking_store.upsert_observation(
-                        con, observed_at=observed_at, indicator_value=value,
-                        source="certspotter", actor=actor, indicator_type=indicator_type,
-                        cert_issuer=latest.get("issuer"),
-                        cert_not_before=latest.get("not_before"),
-                        cert_not_after=latest.get("not_after"),
-                        cert_sibling_hostnames=hostnames or None,
-                        cert_sha256=latest.get("cert_sha256"),
-                        cert_revoked=latest.get("revoked"))
-                    _record_cert_change(con, value, actor, observed_at, latest, hostnames)
-                    _record_cert_hash_change(con, value, actor, observed_at, latest)
+                if category == "domains":
+                    indicator_type = "domain"
+                else:
+                    indicator_type = "ipv6" if ":" in value else "ipv4"
+
                 threatfox = enrichment.get("threatfox")
                 if isinstance(threatfox, dict) and "error" not in threatfox:
                     tracking_store.upsert_observation(
                         con, observed_at=observed_at, indicator_value=value,
                         source="threatfox", actor=actor, indicator_type=indicator_type,
                         threatfox_matches=threatfox.get("matches") or None)
-                ptr = enrichment.get("ptr")
-                if isinstance(ptr, dict) and "error" not in ptr:
-                    tracking_store.upsert_observation(
-                        con, observed_at=observed_at, indicator_value=value,
-                        source="ptr", actor=actor, indicator_type=indicator_type,
-                        ptr_hostname=ptr.get("hostname"))
-                    _record_ptr_change(con, value, actor, observed_at, ptr.get("hostname"))
-                if category == "domains":
-                    # Domain-hosting-shift detection: detail["resolved"] is
-                    # the same live A-record lookup _domain_lifecycle
-                    # already runs for alive/dead/sinkhole classification -
-                    # reused here rather than re-resolved. None means the
-                    # lookup was inconclusive (skip, don't record); []
-                    # means a confirmed dead/sinkholed domain, which is
-                    # still a real, recordable answer.
-                    resolved = detail.get("resolved")
-                    if resolved is not None:
+
+                if category == "ips":
+                    webamon_ip = enrichment.get("webamon_ip")
+                    if isinstance(webamon_ip, dict) and "error" not in webamon_ip:
+                        hosts = webamon_ip.get("domains") or []
                         tracking_store.upsert_observation(
                             con, observed_at=observed_at, indicator_value=value,
-                            source="dns_resolve", actor=actor, indicator_type=indicator_type,
-                            resolved_ip=resolved)
-                        _record_resolved_ip_change(con, value, actor, observed_at, resolved)
+                            source="webamon", actor=actor, indicator_type=indicator_type,
+                            ip_hostnames=hosts or None)
+                        _record_ip_hostnames_change(con, value, actor, observed_at, hosts)
+                    ptr = enrichment.get("ptr")
+                    if isinstance(ptr, dict) and "error" not in ptr:
+                        tracking_store.upsert_observation(
+                            con, observed_at=observed_at, indicator_value=value,
+                            source="ptr", actor=actor, indicator_type=indicator_type,
+                            ptr_hostname=ptr.get("hostname"))
+                        _record_ptr_change(con, value, actor, observed_at, ptr.get("hostname"))
+                    continue
+
+                # --- domains ---
+                tls = enrichment.get("tls")
+                if isinstance(tls, dict) and "error" not in tls and tls.get("cert"):
+                    cert = tls["cert"]
+                    tracking_store.upsert_observation(
+                        con, observed_at=observed_at, indicator_value=value,
+                        source="tls_live", actor=actor, indicator_type="domain",
+                        tls_sha256=cert.get("sha256"), tls_issuer=cert.get("issuer"),
+                        tls_subject=cert.get("subject"), tls_sans=cert.get("sans") or None,
+                        tls_not_before=cert.get("not_before"), tls_not_after=cert.get("not_after"))
+                    _record_cert_change(con, value, actor, observed_at, cert)
+                    _record_cert_hash_change(con, value, actor, observed_at, cert)
+
+                http = enrichment.get("http")
+                if isinstance(http, dict) and "error" not in http and http.get("status") is not None:
+                    tracking_store.upsert_observation(
+                        con, observed_at=observed_at, indicator_value=value,
+                        source="http_live", actor=actor, indicator_type="domain",
+                        http_status=http.get("status"), http_title=http.get("title"),
+                        http_server=http.get("server"), http_final_url=http.get("final_url"))
+                    _record_http_change(con, value, actor, observed_at,
+                                        http.get("title"), http.get("server"))
+
+                webamon = enrichment.get("webamon")
+                if isinstance(webamon, dict) and "error" not in webamon:
+                    latest = webamon.get("latest") or {}
+                    fp = latest.get("fingerprint") or {}
+                    tracking_store.upsert_observation(
+                        con, observed_at=observed_at, indicator_value=value,
+                        source="webamon", actor=actor, indicator_type="domain",
+                        webamon_report_id=latest.get("report_id"),
+                        webamon_risk_score=latest.get("risk_score"),
+                        webamon_fingerprint_dom=fp.get("dom"),
+                        webamon_fingerprint_ssl=fp.get("ssl"),
+                        webamon_last_scan=latest.get("date"))
+                    _record_fingerprint_change(con, value, actor, observed_at,
+                                               fp.get("dom"), fp.get("ssl"))
+
+                infostealers = enrichment.get("webamon_infostealers")
+                if isinstance(infostealers, dict) and "error" not in infostealers:
+                    hits = infostealers.get("results") or []
+                    urls = sorted({h.get("url") for h in hits if h.get("url")})
+                    tracking_store.upsert_observation(
+                        con, observed_at=observed_at, indicator_value=value,
+                        source="webamon_infostealers", actor=actor, indicator_type="domain",
+                        infostealer_count=len(hits), infostealer_urls=urls or None)
+                    _record_infostealer_change(con, value, actor, observed_at, len(hits), urls)
+
+                subdomains = enrichment.get("subdomains")
+                if isinstance(subdomains, dict) and "error" not in subdomains:
+                    subs = subdomains.get("subdomains") or []
+                    tracking_store.upsert_observation(
+                        con, observed_at=observed_at, indicator_value=value,
+                        source="subdomains", actor=actor, indicator_type="domain",
+                        subdomains=subs or None)
+                    _record_subdomains_change(con, value, actor, observed_at, subs)
+
+                # Domain-hosting-shift detection: detail["resolved"] is the
+                # same live A-record lookup _domain_lifecycle already runs.
+                # None = inconclusive (skip); [] = confirmed dead/sinkholed
+                # (a real, recordable answer).
+                resolved = detail.get("resolved")
+                if resolved is not None:
+                    tracking_store.upsert_observation(
+                        con, observed_at=observed_at, indicator_value=value,
+                        source="dns_resolve", actor=actor, indicator_type="domain",
+                        resolved_ip=resolved)
+                    _record_resolved_ip_change(con, value, actor, observed_at, resolved)
     except (tracking_store.TrackingBusy, duckdb.IOException) as e:
         return f"enrichment history not recorded: {e}"
     return None
@@ -1502,15 +1724,15 @@ def _file_cert_hash(data: dict[str, Any], domain: str, sha256: str,
     """Auto-file a certificate's own SHA256 fingerprint onto the cluster's
     hashes list when pivot_cluster sees a new one for an already-tracked
     domain - an attribute of infrastructure already being tracked (like
-    ASN/ports/cert issuer), not a new lead, so unlike a sibling hostname
-    (see _record_hostname_change, flag-only) this auto-updates without
+    ASN/ports/cert issuer), not a new lead, so unlike a discovered
+    subdomain or hosted domain (flag-only) this auto-updates without
     analyst confirmation. The `cert-sha256:` value prefix (distinct from
     the existing `sha256:`/`sha1:`/`md5:` file-hash prefixes) plus the
     explicit hash_kind field make this unambiguous as a certificate hash,
     not a file hash; cert_for names the domain it belongs to."""
     value = f"cert-sha256:{sha256}"
     bucket = data["observables"]["hashes"]
-    source = f"Cert Spotter CT log for {domain}, seen {now[:10]}"
+    source = f"live TLS grab for {domain}, seen {now[:10]}"
     for entry in bucket:
         if entry["value"] == value:
             if source not in entry["sources"]:
@@ -1537,15 +1759,19 @@ def pivot_cluster(name: str) -> dict[str, Any]:
     display-only), and a summary is returned. Successful source lookups
     are cached (see CTI_PIVOT_CACHE_TTL) so re-sweeping is cheap.
 
-    Each ip is also enriched via Shodan InternetDB (keyless) and, for
-    both ips and domains, ThreatFox (if THREATFOX_API_KEY is set) -
-    domains additionally get Cert Spotter. This enrichment is stamped
-    onto each observable's asn/netname/ports/cert/tags fields (see
-    _apply_enrichment_snapshot) so the current-known-value snapshot stays
-    fresh, AND a dated snapshot is recorded to the tracking-store history
-    (mcp_tools.tracking.store), which also runs day-over-day diffing for
-    ports/cert and records a change when something moved - see
-    _log_cluster_enrichment_history. The dashboard's per-observable
+    Domains are also enriched via a live TLS grab + HTTP probe from the
+    probe VM, Webamon (latest scan, kit fingerprints, infostealer hits),
+    and subfinder/Wayback subdomain discovery (flag-only here); ips via
+    Webamon hosted-domains and PTR; both via ThreatFox (if
+    THREATFOX_API_KEY is set). This enrichment is stamped onto each
+    observable's asn/netname/cert/http/webamon/ip_hostnames/tags fields
+    (see _apply_enrichment_snapshot) so the current-known-value snapshot
+    stays fresh, AND a dated snapshot is recorded to the tracking-store
+    history (cti_tools.tracking.store), which also runs day-over-day
+    diffing and records a change when something moved - see
+    _log_cluster_enrichment_history. Open ports are not discovered here
+    (nothing passive replaced Shodan's); they come from report text and
+    the on-demand active_scan. The dashboard's per-observable
     profile reads that history back - see get_observables/the dashboard.
 
     The network lookups run concurrently and, crucially, OUTSIDE the data
@@ -1593,12 +1819,15 @@ def pivot_cluster(name: str) -> dict[str, Any]:
                         _file_cert_hash(data, o["value"], new_sha256, new_cert.get("issuer"),
                                        new_cert.get("revoked"), now)
                 row = {"value": o["value"], "status": status}
-                shodan = enrichment.get("shodan")
-                if isinstance(shodan, dict) and "error" not in shodan:
-                    row["ports"] = shodan.get("ports")
-                certspotter = enrichment.get("certspotter")
-                if isinstance(certspotter, dict) and "error" not in certspotter:
-                    row["cert_sibling_count"] = len(certspotter.get("hostnames") or [])
+                tls = enrichment.get("tls")
+                if isinstance(tls, dict) and "error" not in tls and tls.get("cert"):
+                    row["cert_sha256"] = tls["cert"].get("sha256")
+                webamon_ip = enrichment.get("webamon_ip")
+                if isinstance(webamon_ip, dict) and "error" not in webamon_ip:
+                    row["hosted_domains"] = len(webamon_ip.get("domains") or [])
+                webamon = enrichment.get("webamon")
+                if isinstance(webamon, dict) and "error" not in webamon and webamon.get("latest"):
+                    row["webamon_risk"] = webamon["latest"].get("risk_score")
                 threatfox = enrichment.get("threatfox")
                 if isinstance(threatfox, dict) and "error" not in threatfox:
                     row["threatfox_matches"] = len(threatfox.get("matches") or [])
@@ -1616,16 +1845,6 @@ def pivot_cluster(name: str) -> dict[str, Any]:
     if history_error:
         summary["history_note"] = history_error
     return summary
-
-
-def _safe_vt(value: str, kind: str, api_key: str) -> dict[str, Any]:
-    """VirusTotal lookup that returns an {"error": ...} dict instead of
-    raising, so it composes with _cached_pivot (which caches successes,
-    never errors) inside a larger expansion."""
-    try:
-        return pivot.virustotal_lookup(value, kind, api_key)
-    except pivot.PivotError as e:
-        return {"error": str(e)}
 
 
 def _file_new_observables(data: dict[str, Any], category: str, values: list[str],
@@ -1654,25 +1873,20 @@ def pivot_and_expand(value: str, cluster_name: str,
     hunt-log entry), instead of leaving you to copy each finding back by
     hand. What gets filed:
 
-    - domain: sibling hostnames from certificate-transparency logs that
-      sit under the queried name (same operator, high confidence), and
-      the domain's historical resolution IPs from VirusTotal.
-    - ip: the IP's historical resolutions (domains) from VirusTotal.
+    - domain: sibling subdomains under the queried name (subfinder +
+      Wayback, same operator, high confidence). Webamon kit-fingerprint
+      siblings (other scanned domains sharing this domain's dom/ssl
+      fingerprint) are surfaced under `review`, not auto-filed.
+    - ip: the domains Webamon has scanned resolving to this IP.
 
-    Reverse-IP co-hosted domains are NOT filed by default (shared-hosting
-    noise); pass include_cohosted=True to file them too, or read them from
-    the returned `review` block and file the real ones yourself. If the
-    queried IP is itself behind a known shared CDN/LB/accelerator (see
-    is_shared_hosting_hostname), co-hosted domains are suppressed
-    entirely instead - even with include_cohosted=True - since they'd be
-    every other tenant on that IP, not this actor's infrastructure; a
-    `review["cohosted_domains_suppressed"]` note explains what and why.
-    Anything not filed (co-hosted domains, CT names outside the queried
-    name) is returned under `review` for manual follow-up. Only
-    genuinely new indicators are filed; ones already tracked are left
-    as-is.
+    Co-hosted domains on a shared-hosting IP are noise; when the queried
+    IP sits in a known shared-hosting ASN (see SHARED_HOSTING_ASNS) they
+    are suppressed and a `review["cohosted_domains_suppressed"]` note
+    explains why. Otherwise, by default they go to `review` rather than
+    being filed; pass include_cohosted=True to file them. Only genuinely
+    new indicators are filed; ones already tracked are left as-is.
 
-    Each newly-filed indicator also gets its own live asn/ports/cert/tags
+    Each newly-filed indicator also gets its own live asn/cert/tags
     snapshot (see _apply_enrichment_snapshot) - a second, cheap (cached)
     lookup on the newly-discovered value itself, run in the same unlocked
     network phase as the rest of this pivot; see _sweep_lifecycle for why
@@ -1684,63 +1898,62 @@ def pivot_and_expand(value: str, cluster_name: str,
             f"pivot_and_expand supports domain/ip values; got kind={kind!r} for {value!r}")
     if kind == "ip" and ipaddress.ip_address(value).version == 6:
         # Functional rule: ignore IPv6 for pivoting and probing - the probe
-        # VM has no IPv6 route, so neither a VT lookup here nor anything
-        # downstream (fingerprinting) can act on the result.
+        # VM has no IPv6 route, so nothing downstream can act on the result.
         return _pivot_and_expand_ipv6_skip(value, cluster_name, kind)
 
     now = _now()
-    api_key = os.environ.get(pivot.VT_API_KEY_ENV)
     candidates: list[tuple[str, list[str], str]] = []  # (category, values, source)
     review: dict[str, Any] = {}
 
     if kind == "domain":
-        ct = _cached_pivot("certspotter", value, lambda: pivot.certspotter_lookup(value))
-        if isinstance(ct, dict) and ct.get("error"):
-            review["certspotter_error"] = ct["error"]
-        elif isinstance(ct, dict):
-            hostnames = ct.get("hostnames", [])
-            siblings = [h for h in hostnames if h != value and h.endswith("." + value)]
+        # Sibling subdomains under the queried name (subfinder + Wayback).
+        subs = _subdomains_for(value)
+        if isinstance(subs, dict) and subs.get("error"):
+            review["subdomain_discovery_error"] = subs["error"]
+        else:
+            all_subs = (subs.get("subdomains") or []) if isinstance(subs, dict) else []
+            siblings = [h for h in all_subs if h != value and h.endswith("." + value)]
             candidates.append(("domains", siblings,
-                               f"pivot_and_expand via Cert Spotter CT log, checked {now}"))
-            others = [h for h in hostnames if h != value and not h.endswith("." + value)]
+                               f"pivot_and_expand via subfinder/Wayback, checked {now}"))
+            others = [h for h in all_subs if h != value and not h.endswith("." + value)]
             if others:
-                review["certspotter_other_hostnames"] = others
-        if api_key:
-            vt = _cached_pivot("virustotal", value, lambda: _safe_vt(value, kind, api_key))
-            ips = [r["ip"] for r in (vt.get("resolutions") or []) if r.get("ip")] \
-                if isinstance(vt, dict) else []
-            ips = [ip for ip in ips if _is_ipv4(ip)]  # ignore IPv6 for pivoting/probing - no route from the probe VM
-            candidates.append(("ips", ips,
-                               f"pivot_and_expand via VirusTotal resolution history, checked {now}"))
+                review["other_hostnames"] = others
+        # Webamon kit-fingerprint siblings - the campaign-cluster signal,
+        # surfaced for review rather than auto-filed (a shared kit isn't
+        # proof of the same operator).
+        wm = _webamon_domain(value)
+        latest = wm.get("latest") if isinstance(wm, dict) and "error" not in wm else None
+        if isinstance(latest, dict):
+            fp = latest.get("fingerprint") or {}
+            fp_siblings: dict[str, list[str]] = {}
+            for kindfp in ("dom", "ssl"):
+                if fp.get(kindfp):
+                    sib = webamon.fingerprint_siblings(fp[kindfp], kind=kindfp)
+                    doms = [d for d in (sib.get("domains") or []) if d != value] \
+                        if isinstance(sib, dict) and "error" not in sib else []
+                    if doms:
+                        fp_siblings[kindfp] = doms
+            if fp_siblings:
+                review["webamon_fingerprint_siblings"] = fp_siblings
     else:  # ip
-        if api_key:
-            vt = _cached_pivot("virustotal", value, lambda: _safe_vt(value, kind, api_key))
-            domains = [r["domain"] for r in (vt.get("resolutions") or []) if r.get("domain")] \
-                if isinstance(vt, dict) else []
-            candidates.append(("domains", domains,
-                               f"pivot_and_expand via VirusTotal resolution history, checked {now}"))
-        rev = _cached_pivot("reverse_ip", value, lambda: pivot.hackertarget_reverse_ip(value))
-        cohosted = rev.get("domains", []) if isinstance(rev, dict) and not rev.get("error") else []
-        if cohosted:
-            # Same shared-hosting check the automatic sweep uses (see
-            # _ip_lifecycle's comment): an IP fronted by a shared CDN/LB/
-            # accelerator returns every OTHER tenant here, not this
-            # actor's infra - suppress before it can be filed (worse than
-            # the automatic-sweep case: include_cohosted=True is a
-            # permanent write) or dumped into `review` unfiltered.
-            shodan = _cached_pivot("shodan", value, lambda: pivot.shodan_internetdb_lookup(value))
-            shodan_hostnames = (shodan.get("hostnames") or []) \
-                if isinstance(shodan, dict) and "error" not in shodan else []
-            if any(pivot.is_shared_hosting_hostname(h) for h in shodan_hostnames):
-                review["cohosted_domains_suppressed"] = (
-                    f"{len(cohosted)} co-hosted domains suppressed - "
-                    f"{value} is behind shared hosting/CDN ({shodan_hostnames[0]})")
-                cohosted = []
+        wm = _webamon_ip(value)
+        hosted = wm.get("domains", []) if isinstance(wm, dict) and "error" not in wm else []
+        # Same shared-hosting guard the automatic sweep uses: a shared-
+        # hosting ASN's hosted domains are every other tenant, not this
+        # actor's infra - suppress before they can be filed or reviewed.
+        ripe = _cached_pivot("ripestat", value, lambda: pivot.ripestat_lookup(value))
+        asn_list = ripe.get("asn") if isinstance(ripe, dict) else None
+        asn = _asn_int(asn_list)  # RIPEstat gives strings; see _asn_int
+        if hosted and asn in SHARED_HOSTING_ASNS:
+            review["cohosted_domains_suppressed"] = (
+                f"{len(hosted)} co-hosted domains suppressed - "
+                f"{value} is in a shared-hosting ASN ({asn})")
+            hosted = []
         if include_cohosted:
-            candidates.append(("domains", cohosted,
-                               f"pivot_and_expand via Hackertarget reverse-IP, checked {now}"))
-        elif cohosted:
-            review["cohosted_domains"] = cohosted
+            candidates.append(("domains", hosted,
+                               f"pivot_and_expand via Webamon hosted-domains, checked {now}"))
+        elif hosted:
+            review["cohosted_domains"] = hosted
 
     new_domains = _new_values(data, "domains",
                               [v for cat, vs, _ in candidates if cat == "domains" for v in vs])
@@ -1790,6 +2003,170 @@ def _pivot_and_expand_merge(value: str, kind: str, cluster_name: str, now: str,
 
     return {"value": value, "kind": kind, "cluster": cluster_name,
             "filed": filed, "review": review, "cluster_state": load_cluster(cluster_name)}
+
+
+# --------------------------------------------------------------------------- #
+# active_scan - on-demand loud probing (nmap + dirsearch/open-directory)
+# --------------------------------------------------------------------------- #
+_ACTIVE_SCAN_TOOLS = ("nmap", "dirsearch")
+
+
+def _opensearch_max_ts() -> float | None:
+    """Best-effort snapshot of the newest `ts` indexed in the lab's Zeek/
+    OpenSearch, used to bracket an active scan's captured traffic (the same
+    provenance anchor probe_pending_fingerprints uses). None if OpenSearch
+    isn't reachable - provenance is nice-to-have, never blocks the scan."""
+    try:
+        from .opensearch_client import OpenSearchClient
+        return OpenSearchClient().current_max_ts()
+    except Exception:
+        return None
+
+
+def _ts_to_dt(ts: float | None) -> datetime | None:
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
+
+
+def active_scan(target: str, cluster: str | None = None,
+                tools: list[str] | None = None) -> dict[str, Any]:
+    """On-demand, LOUD active scan of a domain/ip - explicitly separate
+    from the automatic light-touch enrichment sweep. Runs nmap (top-ports
+    -sV) and/or dirsearch (web path map + recursive open-directory file
+    listing) from the probe VM, so the target's own infrastructure
+    receives the traffic; only call when explicitly asked. Open ports feed
+    the port-change signal; open-directory files are diffed day over day
+    (new files flagged). Results are written to the tracking store (and,
+    if `cluster` is given and the target is tracked there, stamped onto its
+    observable), and the run is audited in active_scans with the Zeek
+    timestamp window its traffic falls in, so the captured packets can be
+    found later in OpenSearch/Arkime."""
+    kind = pivot.classify(target)
+    if kind not in ("domain", "ip"):
+        raise ValueError(f"active_scan supports domain/ip; got kind={kind!r} for {target!r}")
+    if kind == "ip" and ipaddress.ip_address(target).version == 6:
+        return {"target": target, "kind": kind, "skipped": "IPv6 (no route from the probe VM)"}
+    requested = list(tools) if tools else list(_ACTIVE_SCAN_TOOLS)
+    unknown = [t for t in requested if t not in _ACTIVE_SCAN_TOOLS]
+    if unknown:
+        raise ValueError(f"unknown active_scan tool(s): {unknown}; valid: {_ACTIVE_SCAN_TOOLS}")
+
+    ran_at = _now()
+    observed_at = datetime.fromisoformat(ran_at).replace(tzinfo=None)
+    before_ts = _opensearch_max_ts()
+
+    # Network phase - unlocked (nmap/dirsearch take minutes).
+    summary: dict[str, Any] = {"target": target, "kind": kind, "cluster": cluster,
+                               "tools": requested, "ran_at": ran_at}
+    nmap_ports: list[int] = []
+    if "nmap" in requested:
+        try:
+            nres = vm_proxy.nmap(target)
+        except vm_proxy.VMProxyError as e:
+            nres = {"error": str(e)}
+        if isinstance(nres, dict) and not nres.get("error"):
+            nmap_ports = sorted({p["port"] for p in (nres.get("ports") or []) if p.get("port")})
+            summary["nmap"] = {"ports": nres.get("ports") or [], "resolved_ip": nres.get("resolved_ip")}
+        else:
+            summary["nmap"] = {"error": nres.get("error")}
+
+    opendirs: list[dict[str, Any]] = []
+    if "dirsearch" in requested:
+        url = target if target.startswith(("http://", "https://")) else f"http://{target}/"
+        try:
+            dres = vm_proxy.dirsearch(url)
+        except vm_proxy.VMProxyError as e:
+            dres = {"error": str(e)}
+        if isinstance(dres, dict) and not dres.get("error"):
+            opendirs = dres.get("opendirs") or []
+            summary["dirsearch"] = {"hits": len(dres.get("hits") or []),
+                                    "opendirs": len(opendirs),
+                                    "baseline_404": dres.get("baseline_404")}
+        else:
+            summary["dirsearch"] = {"error": dres.get("error")}
+
+    after_ts = _opensearch_max_ts()
+
+    # Tracking-store write (own locking) - records observations, port/opendir
+    # diffs, and the active_scans audit row.
+    new_files: list[dict[str, Any]] = []
+    indicator_type = "domain" if kind == "domain" else ("ipv6" if ":" in target else "ipv4")
+    try:
+        with tracking_store.connect(read_only=False) as con:
+            if nmap_ports:
+                tracking_store.upsert_observation(
+                    con, observed_at=observed_at, indicator_value=target,
+                    source="nmap", actor=cluster, indicator_type=indicator_type,
+                    nmap_ports=nmap_ports)
+                _record_port_change(con, target, cluster, observed_at, nmap_ports)
+            for listing in opendirs:
+                url = listing.get("url")
+                files = listing.get("files") or []
+                if not url:
+                    continue
+                had_prior = con.execute(
+                    "SELECT 1 FROM opendir_files WHERE indicator_value = ? LIMIT 1",
+                    [target]).fetchone()
+                added = tracking_store.upsert_opendir_files(
+                    con, indicator_value=target, url=url, files=files,
+                    observed_at=observed_at, actor=cluster)
+                # First-ever scan is a baseline (every file is "new") - only
+                # flag genuinely new files against an existing baseline.
+                if had_prior and added:
+                    new_files.extend(added)
+                    tracking_store.record_attribute_change(
+                        con, detected_at=observed_at, indicator_value=target, actor=cluster,
+                        attribute="opendir_files", change_type="opendir_files",
+                        confidence="medium", old_value=None,
+                        new_value={"url": url, "added": [f["path"] for f in added]})
+            tracking_store.record_active_scan(
+                con, ran_at=observed_at, indicator_value=target, actor=cluster,
+                tools=requested, summary=summary,
+                zeek_first_ts=_ts_to_dt(before_ts), zeek_last_ts=_ts_to_dt(after_ts))
+    except (tracking_store.TrackingBusy, duckdb.IOException) as e:
+        summary["history_note"] = f"active-scan history not recorded: {e}"
+
+    summary["new_open_dir_files"] = new_files
+    if cluster is not None:
+        summary["cluster_state"] = _active_scan_file(target, kind, cluster, ran_at,
+                                                      nmap_ports, opendirs, new_files)
+    return summary
+
+
+@_synchronized
+def _active_scan_file(target: str, kind: str, cluster: str, now: str,
+                      nmap_ports: list[int], opendirs: list[dict[str, Any]],
+                      new_files: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Locked write phase: stamp nmap ports and any open-directory listing
+    onto the target's observable in `cluster` (if it's tracked there) and
+    log the scan to the hunt log. Returns the fresh cluster state, or None
+    if the cluster doesn't exist."""
+    try:
+        data = load_cluster(cluster)
+    except ClusterNotFound:
+        return None
+    category = "domains" if kind == "domain" else "ips"
+    entry = next((o for o in data["observables"][category] if o["value"] == target), None)
+    if entry is not None:
+        if nmap_ports:
+            ports = entry.setdefault("ports", [])
+            for p in nmap_ports:
+                if p not in ports:
+                    ports.append(p)
+        if opendirs:
+            entry["opendir"] = [{"url": d.get("url"), "file_count": len(d.get("files") or [])}
+                                for d in opendirs]
+    parts = []
+    if nmap_ports:
+        parts.append(f"nmap: {len(nmap_ports)} open port(s)")
+    if opendirs:
+        parts.append(f"{len(opendirs)} open director{'y' if len(opendirs) == 1 else 'ies'}"
+                     + (f", {len(new_files)} new file(s)" if new_files else ""))
+    if parts:
+        data["hunt_log"].append({"date": now, "entry": f"active_scan on {target}: " + "; ".join(parts)})
+    save_cluster(data)
+    return load_cluster(cluster)
 
 
 # Report-fetch cache. analyze_report (preview) and ingest_report (commit)
@@ -1878,9 +2255,8 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
 
     metadata, if given, is stamped (via dict.update) onto any newly-created
     entry - e.g. add_observable's own metadata= param, for recording a
-    file hash's filenames (see mcp-server/cti_tools/pivot.py's VirusTotal
-    communicating/downloaded_files data, surfaced but never persisted
-    until an analyst manually files one this way). Only meaningful when
+    file hash's filenames when an analyst manually files one. Only
+    meaningful when
     `extracted` names a single value (add_observable's own call shape) -
     a bulk multi-value call (ingest_report, import_stix_bundle) never
     passes this, since one metadata dict can't sensibly apply to every

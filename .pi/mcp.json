@@ -5,9 +5,14 @@
       "command": "/home/agent/cti-agent/mcp-server/.venv/bin/python",
       "args": ["-m", "cti_tools.server"],
       "cwd": "/home/agent/cti-agent/mcp-server",
-      "env": {"VT_API_KEY": "${VT_API_KEY}",
+      "env": {"WEBAMON_API_KEY": "${WEBAMON_API_KEY}",
               "HONEYLABS_API_KEY": "${HONEYLABS_API_KEY}",
-              "THREATFOX_API_KEY": "${THREATFOX_API_KEY}"},
+              "THREATFOX_API_KEY": "${THREATFOX_API_KEY}",
+              "CTI_PROBE_HOST": "${CTI_PROBE_HOST}",
+              "CTI_PROBE_USER": "${CTI_PROBE_USER}",
+              "CTI_PROBE_SSH_KEY": "${CTI_PROBE_SSH_KEY}",
+              "CTI_PROBE_KNOWN_HOSTS": "${CTI_PROBE_KNOWN_HOSTS}",
+              "CTI_PROBE_HELPER_CMD": "${CTI_PROBE_HELPER_CMD}"},
       "lifecycle": "lazy"
     }
   }

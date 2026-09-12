@@ -1,6 +1,6 @@
 ---
 name: threat-cluster-tracking
-description: Use when the user is investigating, naming, or updating a threat actor cluster; asks to log a hunt, update ATT&CK/TTP coverage, record a detection, or note a gap; mentions tracking infrastructure/campaign activity over time; or asks to "probe" a cluster's indicators/infrastructure, get JARM/JA4+ fingerprints, or otherwise actively fingerprint a target — "probe" is a defined term here (active traffic via the Win11 VM, only when explicitly asked) distinct from "pivot" (passive third-party lookups, run automatically); see "Pivoting vs. probing" below before treating the two as interchangeable. Provides the workflow and data model for maintaining persistent cluster profiles instead of one-off notes.
+description: Use when the user is investigating, naming, or updating a threat actor cluster; asks to log a hunt, update ATT&CK/TTP coverage, record a detection, or note a gap; mentions tracking infrastructure/campaign activity over time; or asks to "probe" a cluster's indicators/infrastructure, get JARM/JA4+ fingerprints, run nmap/dirsearch (`active_scan`), or otherwise actively fingerprint a target — "probe" is a defined term here (crafted or loud traffic via the lab probe VM, only when explicitly asked) distinct from "pivot" (passive lookups plus light-touch live TLS/HTTP/DNS checks from the probe VM, run automatically); see "Pivoting vs. probing" below before treating the two as interchangeable. Provides the workflow and data model for maintaining persistent cluster profiles instead of one-off notes.
 ---
 
 # Threat cluster tracking
@@ -166,9 +166,8 @@ directly (every IPv6 target in a real probe run failed with `WinError
 DNS-driven pivot lookups worked fine). This is enforced in three places,
 not just left to the caller's discipline: `_is_probe_worthy` rejects
 IPv6 IPs from the fingerprint queue (as above); `pivot_and_expand`
-filters IPv6 addresses out of VirusTotal resolution-history results
-before filing them as new `ips` observables, and short-circuits entirely
-(no VT lookup at all) when called directly on an IPv6 target; and
+short-circuits entirely (no expansion lookups at all) when called
+directly on an IPv6 target; and
 `requeue_fingerprint` refuses to force an IPv6 IP back onto the queue.
 `pivot_cluster`'s per-IP RIPEstat lifecycle check is unaffected and still
 runs on tracked IPv6 IPs — it's a third-party API query keyed on the IP
@@ -181,7 +180,7 @@ DNS footprint, not a queued probe/pivot target.
 That queue only tells you *what* needs probing — moving it to and from
 wherever you actually do the probing is outside this tool's scope, but
 `mcp-server/scripts/probe_pending_fingerprints.py` +
-`mcp-server/scripts/win_probe_helper.py` are a reference implementation
+`mcp-server/scripts/probe_helper.py` are a reference implementation
 for a specific, common lab shape: a dedicated probe VM sitting inside
 an isolated network segment (its own VLAN, its own OPNsense-fronted
 LAN) which is deliberately firewalled so it can *never* connect back
@@ -324,9 +323,13 @@ call does it with one fewer moving part.
   channel and makes the exact same OpenSearch query `_current_max_ts()`
   would, rather than inferring reachability from a bare ping or a
   file's presence on disk.
-- `win_probe_helper.py` runs on the probe VM (needs nothing from this
-  repo — standalone, pure standard library so it doesn't matter if
-  it's Windows or Linux). Per job (one target/port pair — see below) it:
+- `probe_helper.py` runs on the Linux probe VM (needs nothing from this
+  repo — standalone, standard library plus `certifi`, shelling out to
+  `dig`/`openssl`/`nmap`/`subfinder`/`dirsearch`/Salesforce `jarm` for
+  the actions that need them; it also serves the pivot sources' and the
+  enrichment sweep's `http_fetch`/`resolve_dns`/`tls_grab`/`http_probe`/
+  etc. — see its module docstring). For a `jarm_probe` job (one
+  target/port pair — see below) it:
   resolves the target to an IP once (Zeek's logs only ever key on the
   resolved address, never a hostname string) and reuses that same IP for
   the handshake rather than letting the connection call re-resolve it —
@@ -377,9 +380,12 @@ above, nor ja4x (needs x509.log, and wasn't computed at all by the
 zeek-ja4 build tested against here — confirm against your own build
 before assuming otherwise).
 
-Both scripts have environment-specific constants marked for you to
-fill in (SSH host/key/known_hosts, JARM CLI path, the OpenSearch
-URL/index/username — the exact document field names in your own
+The SSH hop is configured from the environment (`CTI_PROBE_HOST`/
+`CTI_PROBE_USER`/`CTI_PROBE_SSH_KEY`/`CTI_PROBE_KNOWN_HOSTS`/
+`CTI_PROBE_HELPER_CMD`, read by `cti_tools/vm_proxy.py`); the remaining
+environment-specific constants are marked for you to fill in at the top
+of each script (tool/JARM CLI paths in `probe_helper.py`, the OpenSearch
+URL/index in `probe_pending_fingerprints.py` — the exact document field names in your own
 OpenSearch index depend on how your ingestion pipeline maps Zeek's
 fields, e.g. this lab's pipeline renames `id.resp_h` to a flat `dst_ip`
 field, so verify against a real query before trusting the output, the
@@ -387,18 +393,19 @@ same way the ja4ts/ja4x gaps here were only found by testing against
 this lab's actual data rather than assumed). File results with
 `add_observable` citing method + date in `source` as above.
 
-Windows probe VM gotcha worth knowing before you debug it blind: if
-the probe VM's account is a member of Administrators, Windows OpenSSH
-only honors `C:\ProgramData\ssh\administrators_authorized_keys` (ACLed
-to SYSTEM + Administrators only), and only if sshd_config actually has
-`Match Group administrators` uncommented — the ordinary per-user
-`authorized_keys` is ignored for that account regardless of what's in
-it. And the forced `command=` restriction is worthless if a second,
+Pin the probe VM's `authorized_keys` entry for this key to the helper
+with a forced command, so the key can do nothing else:
+`command="python3 /opt/cti/probe_helper.py",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA...`
+(full build checklist: "Probe VM build" in `mcp-server/README.md`).
+The forced `command=` restriction is worthless if a second,
 unrestricted line for the same key is sitting above it in that file
 (sshd matches the first line, not the most specific one) — if a raw
 key was added for initial connectivity testing before the restricted
 line was appended, delete it, don't just add the restricted one
-alongside it.
+alongside it. (The lab previously used a Windows probe VM; if you ever
+go back to one, Windows OpenSSH ignores the per-user `authorized_keys`
+for Administrators-group accounts and only honors
+`C:\ProgramData\ssh\administrators_authorized_keys`.)
 
 ## Infrastructure pivoting
 
@@ -407,18 +414,23 @@ alongside it.
 request's wording doesn't always distinguish them the way you'd expect:
 
 - **"Probe"** (a request to "probe the indicators," "get
-  fingerprints/JARM/JA4," "actively check this infra," or naming the
-  Win11 VM/vantage point specifically) means **active** traffic that
-  actually reaches the adversary's infrastructure — a live TLS
-  handshake or JARM scan — routed exclusively through the Win11 probe
-  VM pipeline (see "Automating the handoff" below). **Only run this
-  when explicitly asked, and never as a default follow-up to a pivot.**
+  fingerprints/JARM/JA4," "scan it," "run nmap/dirsearch," "check for
+  open directories," or naming the probe VM/vantage point specifically)
+  means **crafted or loud** traffic against the adversary's
+  infrastructure — a JARM scan (deliberately malformed ClientHellos),
+  the fingerprint-queue pipeline (see "Automating the handoff" above),
+  or `active_scan`'s nmap port scan / dirsearch path brute-force —
+  routed exclusively through the lab probe VM. **Only run this when
+  explicitly asked, and never as a default follow-up to a pivot.**
 - **"Pivot"** (`pivot_observable`, `pivot_cluster`, `pivot_and_expand`)
-  means passive third-party lookups (RDAP, RIPEstat, Cert Spotter,
-  Shodan InternetDB, ThreatFox if `THREATFOX_API_KEY` is set,
-  VirusTotal) — no crafted traffic reaches the target itself. Safe and
-  expected to run automatically as part of working a report, no need to
-  wait for a separate ask.
+  means passive lookups (RDAP, RIPEstat, Webamon, ThreatFox if
+  `THREATFOX_API_KEY` is set, HoneyLabs, subfinder/Wayback) plus a
+  **light-touch live check** of domains from the probe VM: DNS, one
+  ordinary TLS handshake, one HTTP GET — the same traffic any visitor
+  generates, nothing crafted. Safe and expected to run automatically as
+  part of working a report, no need to wait for a separate ask. The live
+  check exists because accuracy and timeliness matter: a current
+  handshake beats a scan platform's dated record.
 
 If a request says "probe" without other cluster-tracking context, that
 alone is enough to mean the active JARM/JA4 pipeline — don't downgrade
@@ -435,17 +447,21 @@ whether they're still live. Three tools cover this, from lightest to
 heaviest:
 
 **`pivot_observable(value)`** / `cti pivot-observable <value>` — look a
-single hash/domain/ip/url up against free public sources and show the
-result, writing nothing. Sources: RDAP registration data; RIPEstat
-ASN/network context (IPs); Cert Spotter certificate-transparency
-history (domains — sibling subdomains as pivot leads, the keyless
-stand-in for crt.sh, which is no longer reachable); Hackertarget
-reverse-IP co-hosting (IPs); Shodan InternetDB open ports/hostnames/
-CPEs/vulns/tags (IPs, keyless); ThreatFox known-malware-C2 IOC match
-(every kind) if `THREATFOX_API_KEY` is set (register a free Auth-Key at
-https://auth.abuse.ch/); VirusTotal reputation + resolution history if
-`VT_API_KEY` is set; and HoneyLabs honeypot-fleet telemetry (IPs) if
-`HONEYLABS_API_KEY` is set. Reach for it when:
+single hash/domain/ip/url up and show the result, writing nothing.
+Sources: RDAP registration data; RIPEstat ASN/network context (IPs);
+Webamon (`WEBAMON_API_KEY`) — a domain's latest scan (certificate, DNS,
+ASN, tech stack, kit fingerprints) and its infostealer-log hits
+(plaintext passwords are dropped at the client; only the masked peek is
+kept), and an IP's hosted domains (the reverse-IP replacement); a live
+TLS grab and HTTP probe from the probe VM (domains — the current
+certificate and liveness, as of the moment checked); PTR (IPs);
+ThreatFox known-malware-C2 IOC match (every kind) if
+`THREATFOX_API_KEY` is set (register a free Auth-Key at
+https://auth.abuse.ch/); and HoneyLabs honeypot-fleet telemetry (IPs)
+if `HONEYLABS_API_KEY` is set. VirusTotal, Shodan InternetDB,
+Hackertarget, and Cert Spotter are retired (crt.sh is shut down), so
+there is no passive open-port source any more — ports come from report
+text or an explicitly-requested `active_scan`. Reach for it when:
 
 - you want to know if a tracked domain/IP is still active or has been
   sinkholed/taken down (RDAP nameservers/status — a domain suddenly
@@ -453,11 +469,12 @@ https://auth.abuse.ch/); VirusTotal reputation + resolution history if
   `*.microsoftinternetsafety.net`, means it's dead),
 - you want the ASN/network owner behind an IP before deciding it's
   worth its own observable entry vs. shared hosting noise,
-- you want sibling infrastructure the same operator stood up (Cert
-  Spotter subdomains, VirusTotal resolution history, reverse-IP
-  co-hosting) as new pivot leads,
-- you want a quick read on what's actually running on a tracked IP
-  (Shodan InternetDB's open ports/CPEs/vulns) without a live probe,
+- you want sibling infrastructure the same operator stood up (the
+  certificate's SANs, Webamon's hosted-domains for an IP, Webamon kit
+  fingerprints shared with other scanned domains) as new pivot leads,
+- you want to know what a tracked domain is serving right now (live
+  HTTP status/title/server, current cert) or whether its credentials
+  show up in infostealer logs (Webamon),
 - you want to check a tracked indicator against known malware-C2 IOCs
   (ThreatFox) — a hit names the associated malware family directly,
 - you want to know whether a tracked IP is opportunistic background
@@ -482,8 +499,8 @@ filters and small limits over broad sweeps.
 Display-only: nothing is written. If it surfaces something worth
 keeping, record it yourself with `append_hunt_log`, `add_gap`, or
 `add_observable(name, category, value, source)` — cite the pivot as the
-source (e.g. "pivot_observable via VirusTotal resolution history,
-checked <date>"), not a report URL.
+source (e.g. "pivot_observable via Webamon hosted-domains, checked
+<date>"), not a report URL.
 
 **`pivot_cluster(name)`** / `cti pivot-cluster <name>` — sweep *every*
 tracked domain and IP for a cluster at once and stamp a lifecycle status
@@ -491,36 +508,82 @@ onto each: domains become `active` / `dead` / `sinkholed` / `expired` /
 `unknown` (RDAP + a live DNS resolution), IPs `routed` / `unrouted` /
 `unknown` (RIPEstat). Unlike `pivot_observable`, this **writes** the
 status (and when it was checked) back onto the observables, so the
-cluster's markdown shows at a glance what's still up. Run it to
-re-validate a cluster's infrastructure periodically.
+cluster's markdown shows at a glance what's still up. The daily cron
+(`scripts/daily_tracking.py`, 06:15) now runs this for every tracked
+cluster automatically, so `status`/`status_checked` and the snapshot
+fields below stay fresh without a manual call - run it by hand only
+when you want an out-of-band check sooner than the next cron pass (e.g.
+right after adding a cluster mid-day).
 
-Each sweep also enriches ips via Shodan InternetDB (keyless) and, for
-both ips and domains, ThreatFox if `THREATFOX_API_KEY` is set (domains
-additionally get Cert Spotter, surfaced in the returned summary only —
-its sibling hostnames are pivot leads, not a field worth tracking over
-time). A dated snapshot of that enrichment is logged to the
+Each sweep also enriches domains via a live TLS grab and HTTP probe
+from the probe VM, Webamon (latest scan, kit fingerprints, infostealer
+hits), and subfinder/Wayback subdomain discovery; ips via Webamon
+hosted-domains and PTR; both via ThreatFox if `THREATFOX_API_KEY` is
+set. The latest snapshot is stamped directly onto each observable —
+`asn`/`netname`/`ip_hostnames` (ips), `cert` (domains: the live
+certificate's issuer, subject, SANs, validity window, sha256), `http`
+(domains: status/title/server/final URL), `webamon` (last scan date,
+report id, risk score, fingerprints), and `tags` (ThreatFox
+malware-family names) — so `get_observables`/the cluster markdown
+always shows the current known values, not just lifecycle status.
+`ports`/`tags`/`ip_hostnames` are unioned (a value seen once stays
+recorded); the rest are overwritten with the latest check. The sweep
+no longer discovers open ports on its own (nothing passive replaced
+Shodan InternetDB): `ports` is filled from report text and from
+`active_scan`'s nmap run. Newly-discovered subdomains are flag-only in
+the sweep (recorded as a change, never auto-filed) — use
+`pivot_and_expand` to file them.
+
+A dated snapshot of that same enrichment is also logged to the
 tracking-store history (`cti_tools/tracking/store.py`'s `observations`
-table — the same store behind the dashboard's "Live tracking" pages) so
-the dashboard's per-observable profile can show a timeline of when
-ports/tags/matches were seen or changed, rather than each sweep silently
-overwriting the last one. This is best-effort: a tracking-store hiccup
-(e.g. the daily cron running concurrently) surfaces as a `history_note`
-in the returned summary, not a failed sweep — the cluster-JSON status
-write above always lands regardless.
+table — the same store behind the dashboard's "Live tracking" pages),
+and the sweep diffs the fresh values (cert, cert hash, HTTP server/
+title, Webamon fingerprint, hosted domains, PTR, resolved IP,
+subdomains, infostealer hits) against the prior baseline: a genuine
+change (not just a re-check of an unchanged value) is recorded to the
+`attribute_changes` table and picked up by the next day's tracking
+digest/narrative (see `skills/actor-tracking/`). A same-issuer
+certificate renewal with unchanged SANs is routine and is not recorded
+as a change. This history/diffing is
+best-effort: a tracking-store hiccup (e.g. the daily cron running
+concurrently) surfaces as a `history_note` in the returned summary, not
+a failed sweep — the cluster-JSON status/snapshot write above always
+lands regardless.
 
 **`pivot_and_expand(value, cluster_name)`** / `cti pivot-and-expand
 <value> <cluster_name>` — pivot a domain/IP and **file** the
 high-confidence new indicators it surfaces straight onto an existing
 cluster, with provenance and a hunt-log entry, instead of copying each
-finding back by hand. Files by default: Cert Spotter sibling subdomains
-under the queried name (same operator) and VirusTotal historical
-resolutions. Reverse-IP co-hosted domains are *not* filed by default
-(shared-hosting noise) — they come back in the result's `review` block,
-or pass `--include-cohosted` / `include_cohosted=True` to file them too.
-Only genuinely new indicators are filed; the `review` block lists
-everything left for you to judge. Use this once you trust a pivot
-enough to expand from it; use `pivot_observable` first when you just
-want to look.
+finding back by hand. For a domain it files sibling subdomains under
+the queried name (subfinder + Wayback — same operator, high
+confidence); Webamon kit-fingerprint siblings (other scanned domains
+sharing this domain's DOM/SSL fingerprint) go to the result's `review`
+block, not filed. For an IP, the domains Webamon has scanned resolving
+to it are co-hosting candidates: suppressed outright when the IP sits
+in a known shared-hosting ASN (AWS/Alibaba/Cloudflare — see
+`SHARED_HOSTING_ASNS`), otherwise returned under `review` unless you
+pass `--include-cohosted` / `include_cohosted=True`. Only genuinely new
+indicators are filed; the `review` block lists everything left for you
+to judge. Each newly-filed indicator also gets its own live
+asn/cert/tags enrichment snapshot (its own fresh, cached lookup — not
+just whatever the parent pivot happened to fetch on the original
+queried value). Use this once you trust a pivot enough to expand from
+it; use `pivot_observable` first when you just want to look.
+
+**`active_scan(target, cluster=None, tools=None)`** — the loud one, and
+**probing, not pivoting**: only run it when explicitly asked. From the
+probe VM it runs nmap (top-100 ports, service detection) and/or
+dirsearch (web path map with 404-baseline suppression, plus a recursive
+listing of any open directory it finds — every file, with size/mtime);
+`tools` defaults to both. Open ports feed the `ports` attribute-change
+signal; open-directory files land in the tracking store's
+`opendir_files` table and are diffed day over day, so a newly-dropped
+file on a known open directory surfaces in the digest. If `cluster` is
+given and the target is tracked there, results are stamped onto its
+observable. Each run is audited in `active_scans` with the Zeek
+timestamp window its traffic falls in, so the captured packets can be
+pulled up in OpenSearch/Arkime afterwards. Calls block for up to
+`CTI_PROBE_LONG_TIMEOUT` (default 900s).
 
 ### Pivoting vs. probing — when each runs
 
@@ -528,36 +591,39 @@ want to look.
 run on different triggers — don't conflate them:
 
 - **Pivoting** (`pivot_observable`, `pivot_cluster`, `pivot_and_expand`,
-  above) only ever touches free public sources (RDAP, RIPEstat, Cert
-  Spotter, Hackertarget, VirusTotal). It's passive in the sense that no
-  crafted/active traffic reaches the adversary's infrastructure itself —
-  but a lookup still *names* the tracked indicator to a third-party
-  service (RDAP/RIPEstat/VT all see the domain or IP being pivoted on),
-  so it is not traffic-free. Every HTTP call and DNS resolution these
-  lookups make is proxied through the Win11 probe VM (`cti_tools.vm_proxy`
-  — same SSH channel probing uses, extended with `http_fetch`/`resolve_dns`
-  actions) rather than originating from wherever this tool itself is
-  running. **Run it automatically** as part of working through a report:
+  above) touches third-party sources (RDAP, RIPEstat, ThreatFox,
+  Webamon, HoneyLabs, subfinder's passive sources, the Wayback Machine)
+  plus a light-touch live check of the target itself (DNS, one ordinary
+  TLS handshake, one HTTP GET). No crafted traffic reaches the
+  adversary's infrastructure, but it is not traffic-free: a lookup still
+  *names* the tracked indicator to a third party, and the live check
+  does reach the target like any visitor would. Everything except the
+  Webamon and HoneyLabs SaaS calls is proxied through the lab probe VM
+  (`cti_tools.vm_proxy` — the same SSH channel probing uses) rather than
+  originating from wherever this tool itself is running; Webamon and
+  HoneyLabs are called directly because they hit the vendor's API, not
+  the indicator's infrastructure. **Run it automatically** as part of working through a report:
   after `ingest_report`/`analyze_report` files new domains/IPs onto a
   cluster, pivot them (a `pivot_cluster` sweep for lifecycle status, or
   `pivot_and_expand` on ones worth expanding from) without waiting to
   be asked. There's no reason to gate a public-source lookup behind an
   explicit request — the VM-routing requirement is about where the
   traffic originates, not whether the lookup itself needs permission.
-- **Probing** (JA4+/JARM fingerprinting via the vantage point described
-  below) generates *active* network traffic against the target — a live
-  TLS handshake or a JARM scan the adversary's infrastructure actually
-  receives, as opposed to pivoting's third-party-service lookups.
+- **Probing** (JA4+/JARM fingerprinting via the pipeline in "Automating
+  the handoff" above, and `active_scan`'s nmap/dirsearch) generates
+  *crafted or loud* traffic against the target — malformed ClientHellos,
+  a port scan, a path brute-force — that an attentive operator could
+  notice, as opposed to pivoting's lookups and single ordinary requests.
   **Only run it when explicitly asked** ("probe the indicators," "get
-  fingerprints," etc.) — never automatically during ingestion or
-  pivoting, and never as a default follow-up to a pivot. Always route it
-  through the dedicated vantage point (the Win11 probe VM pipeline, see
-  "Automating the handoff" above) — never generate probe traffic from
+  fingerprints," "scan it," etc.) — never automatically during ingestion
+  or pivoting, and never as a default follow-up to a pivot. Always route
+  it through the lab probe VM — never generate probe traffic from
   wherever this tool itself is running.
 
 If a request says "pivot on infrastructure" but clearly means
-fingerprinting (JARM/JA4, a specific VM/vantage point named), treat it
-as a probing request, not a call to `pivot_*` — confirm with the user
+fingerprinting or scanning (JARM/JA4, nmap, open directories, a
+specific VM/vantage point named), treat it as a probing request, not a
+call to `pivot_*` — confirm with the user
 if genuinely ambiguous rather than guessing from the word alone.
 
 ## Ingesting threat reports
@@ -578,6 +644,14 @@ them into a cluster:
 - Private/reserved IPs (RFC1918, loopback, link-local, etc.) are
   filtered out; they're essentially never useful as adversary
   infrastructure.
+- Every genuinely new domain/ip extracted also gets a live asn/cert/
+  http/tags enrichment lookup (RDAP/RIPEstat, Webamon, the probe VM's
+  TLS grab/HTTP probe, ThreatFox — same sources `pivot_observable`
+  uses) before
+  it's filed, stamped onto the observable alongside the report as its
+  `sources` entry. An already-tracked value mentioned again is not
+  re-enriched here — that's `pivot_cluster`'s job on the next daily
+  sweep.
 
 If you omit `cluster_name`, extraction tries to infer the threat
 actor/malware name from the report text (Microsoft weather-style,
@@ -732,8 +806,9 @@ first, to create the venv and wire those files): `list_clusters`,
 `export_stix_bundle`, `export_stix_ecosystem`, `import_stix_bundle`,
 `get_observables`, `find_observable`, `add_observable`,
 `remove_observable`, `list_pending_fingerprints`,
-`pop_pending_fingerprints`, `pivot_observable`, `pivot_cluster`,
-`pivot_and_expand`, `analyze_report`, `ingest_report`.
+`pop_pending_fingerprints`, `requeue_fingerprint`, `pivot_observable`,
+`pivot_cluster`, `pivot_and_expand`, `active_scan` (probing — only when
+asked), `analyze_report`, `ingest_report`.
 
 All harnesses write to the same JSON store via the same `cti-tools` MCP
 server, so the data is identical regardless of which harness you're

@@ -85,6 +85,11 @@ def observable_to_pattern(category: str, value: str) -> str | None:
     if category == "hashes":
         if ":" in value:
             algo, digest = value.split(":", 1)
+            # A certificate's own SHA-256 fingerprint (filed as
+            # `cert-sha256:<hash>` from the live TLS grab) is an
+            # x509-certificate, not a file hash - it has a clean SCO.
+            if algo.lower() == "cert-sha256":
+                return f"[x509-certificate:hashes.'SHA-256' = '{_pattern_escape(digest)}']"
             stix_algo = _HASH_ALGO_TO_STIX.get(algo.lower())
         else:
             digest = value
@@ -124,6 +129,8 @@ def pattern_to_observable(pattern: str) -> tuple[str, str] | None:
         if not algo:
             return None
         return "hashes", f"{algo}:{value}"
+    if objtype == "x509-certificate":
+        return "hashes", f"cert-sha256:{value}"
     return {
         "domain-name": ("domains", value),
         "ipv4-addr": ("ips", value),

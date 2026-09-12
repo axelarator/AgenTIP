@@ -98,6 +98,7 @@ def _has_signals(sections: dict[str, Any]) -> bool:
         or sections.get("new_indicators_in_known_asns")
         or sections.get("cross_actor_asn_overlap")
         or sections.get("temporal_clusters")
+        or sections.get("open_directories")
     )
 
 
@@ -176,16 +177,30 @@ def write(day: date, sections: dict[str, Any]) -> Path:
 
     attr_changes = sections.get("attribute_changes") or []
     if attr_changes:
-        lines += ["## Indicator attribute changes (ports/certificates)", ""]
+        # cert / cert_hash / http / webamon_fingerprint (live TLS/HTTP/
+        # Webamon on tracked domains), ip_hostnames / ptr / resolved_ip,
+        # ports (on-demand nmap), subdomains / infostealer_hits / opendir_
+        # files - all the day-over-day diffs on already-tracked infra.
+        lines += ["## Indicator attribute changes", ""]
         lines += _table(attr_changes,
                         ["detected_at", "indicator_value", "actor", "attribute",
                          "change_type", "old_value", "new_value", "confidence"])
         lines.append("")
 
+    open_dirs = sections.get("open_directories") or []
+    if open_dirs:
+        # Files newly seen in an open directory during an on-demand
+        # active_scan - a rare, high-signal find (staged payloads, backups,
+        # config) worth surfacing on its own with the file paths.
+        lines += ["## Open-directory files (on-demand active scans)", ""]
+        lines += _table(open_dirs,
+                        ["first_seen", "indicator_value", "actor", "url", "path", "size"])
+        lines.append("")
+
     patterns = sections.get("port_patterns") or []
     if patterns:
         # HoneyLabs-observed scan/attack ports per actor - distinct from
-        # the attribute-changes table above, which tracks Shodan's *open
+        # the attribute-changes table above, which tracks nmap's *open
         # service* ports on tracked infra. Keep the header explicit so
         # Stage B doesn't conflate "actor gets scanned on port X" with
         # "actor's C2 listens on port X".

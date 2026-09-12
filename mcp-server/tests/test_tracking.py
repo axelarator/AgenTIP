@@ -52,11 +52,22 @@ def default_lifecycle_stubs(monkeypatch):
                         lambda value, kind: {"nameservers": [], "status": [], "events": []})
     monkeypatch.setattr(pivot, "resolve_host", lambda host: [])
     monkeypatch.setattr(pivot, "ripestat_lookup", lambda ip: {"asn": []})
-    monkeypatch.setattr(pivot, "certspotter_lookup", lambda domain: {"hostnames": []})
-    monkeypatch.setattr(pivot, "shodan_internetdb_lookup",
-                        lambda ip: {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []})
-    monkeypatch.setattr(pivot, "hackertarget_reverse_ip", lambda ip: {"domains": []})
     monkeypatch.setattr(pivot, "ptr_lookup", lambda ip: {"hostname": None})
+    monkeypatch.setattr(core.vm_proxy, "tls_grab",
+                        lambda host, port=443: {"cert": None, "resolved_ip": None, "error": None})
+    monkeypatch.setattr(core.vm_proxy, "http_probe",
+                        lambda url, insecure=False: {"status": None, "final_url": url, "title": None,
+                                                     "server": None, "content_type": None,
+                                                     "body_sha256": None, "autoindex": None, "error": None})
+    monkeypatch.setattr(core.vm_proxy, "subfinder", lambda domain: {"subdomains": [], "error": None})
+    monkeypatch.setattr(core.vm_proxy, "wayback_cdx",
+                        lambda domain: {"urls": [], "subdomains": [], "error": None})
+    monkeypatch.setattr(core.webamon, "search_domain",
+                        lambda domain, size=5: {"total_hits": 0, "results": [], "latest": None})
+    monkeypatch.setattr(core.webamon, "search_ip",
+                        lambda ip, size=50: {"total_hits": 0, "domains": [], "results": []})
+    monkeypatch.setattr(core.webamon, "infostealers",
+                        lambda term, size=25: {"total_hits": 0, "results": []})
 
 
 def _obs(con, ip, day, source="honeylabs", **kw):
@@ -318,21 +329,22 @@ def test_netname_change(fake_net):
 # ---------------------------------------------------- attribute_changes
 # _record_port_change/_record_cert_change diff against the prior
 # observations row for the same (indicator, source) - see
-# store.latest_ports_for/latest_cert_for - so these helpers mirror the
-# real call order _log_cluster_enrichment_history uses: write the dated
-# shodan/certspotter observation first, then diff/record.
+# store.latest_nmap_ports_for/latest_tls_cert_for - so these helpers
+# mirror the real call order _log_cluster_enrichment_history uses: write
+# the dated nmap/tls_live observation first, then diff/record.
 
 def _sweep_ports(con, ip, actor, day, ports):
     store.upsert_observation(con, observed_at=day, indicator_value=ip,
-                             source="shodan", actor=actor, shodan_ports=ports or None)
+                             source="nmap", actor=actor, nmap_ports=ports or None)
     core._record_port_change(con, ip, actor, day, ports)
 
 
-def _sweep_cert(con, domain, actor, day, issuer, hostnames):
+def _sweep_cert(con, domain, actor, day, issuer, sans):
     store.upsert_observation(con, observed_at=day, indicator_value=domain,
-                             source="certspotter", actor=actor, cert_issuer=issuer,
-                             cert_sibling_hostnames=hostnames or None)
-    core._record_cert_change(con, domain, actor, day, {"issuer": issuer}, hostnames)
+                             source="tls_live", actor=actor, tls_issuer=issuer,
+                             tls_sha256=f"sha-{issuer}-{','.join(sorted(sans))}",
+                             tls_sans=sans or None)
+    core._record_cert_change(con, domain, actor, day, {"issuer": issuer, "sans": sans})
 
 
 def _sweep_ptr(con, ip, actor, day, hostname):
@@ -772,6 +784,17 @@ def test_digest_renders_attribute_changes_section():
     assert digest.NO_ACTIVITY not in text
     assert "Indicator attribute changes" in text
     assert "203.0.113.7" in text and "ports_changed" in text
+
+
+def test_digest_renders_open_directories_section():
+    open_dirs = [{"first_seen": NOW, "indicator_value": "203.0.113.7", "actor": "APT-X",
+                  "url": "http://203.0.113.7/files/", "path": "http://203.0.113.7/files/b.exe",
+                  "size": "2M"}]
+    path = digest.write(TODAY, {"open_directories": open_dirs})
+    text = path.read_text()
+    assert digest.NO_ACTIVITY not in text  # an open-dir file alone is a signal
+    assert "Open-directory files" in text
+    assert "b.exe" in text
 
 
 def test_digest_caps_oversized_hostname_list_in_attribute_change():

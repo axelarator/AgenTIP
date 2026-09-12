@@ -26,9 +26,14 @@ cat > "$ROOT/.mcp.json" <<EOF
       "command": "$ROOT/mcp-server/.venv/bin/python",
       "args": ["-m", "cti_tools.server"],
       "cwd": "$ROOT/mcp-server",
-      "env": {"VT_API_KEY": "\${VT_API_KEY}",
+      "env": {"WEBAMON_API_KEY": "\${WEBAMON_API_KEY}",
               "HONEYLABS_API_KEY": "\${HONEYLABS_API_KEY}",
-              "THREATFOX_API_KEY": "\${THREATFOX_API_KEY}"}
+              "THREATFOX_API_KEY": "\${THREATFOX_API_KEY}",
+              "CTI_PROBE_HOST": "\${CTI_PROBE_HOST}",
+              "CTI_PROBE_USER": "\${CTI_PROBE_USER}",
+              "CTI_PROBE_SSH_KEY": "\${CTI_PROBE_SSH_KEY}",
+              "CTI_PROBE_KNOWN_HOSTS": "\${CTI_PROBE_KNOWN_HOSTS}",
+              "CTI_PROBE_HELPER_CMD": "\${CTI_PROBE_HELPER_CMD}"}
     },
     "honeylabs": {
       "type": "http",
@@ -54,9 +59,14 @@ cat > "$ROOT/.pi/mcp.json" <<EOF
       "command": "$ROOT/mcp-server/.venv/bin/python",
       "args": ["-m", "cti_tools.server"],
       "cwd": "$ROOT/mcp-server",
-      "env": {"VT_API_KEY": "\${VT_API_KEY}",
+      "env": {"WEBAMON_API_KEY": "\${WEBAMON_API_KEY}",
               "HONEYLABS_API_KEY": "\${HONEYLABS_API_KEY}",
-              "THREATFOX_API_KEY": "\${THREATFOX_API_KEY}"},
+              "THREATFOX_API_KEY": "\${THREATFOX_API_KEY}",
+              "CTI_PROBE_HOST": "\${CTI_PROBE_HOST}",
+              "CTI_PROBE_USER": "\${CTI_PROBE_USER}",
+              "CTI_PROBE_SSH_KEY": "\${CTI_PROBE_SSH_KEY}",
+              "CTI_PROBE_KNOWN_HOSTS": "\${CTI_PROBE_KNOWN_HOSTS}",
+              "CTI_PROBE_HELPER_CMD": "\${CTI_PROBE_HELPER_CMD}"},
       "lifecycle": "lazy"
     }
   }
@@ -70,8 +80,9 @@ touch "$ROOT"/data/tracking/.gitkeep
 # canonical copy there the same way .pi/skills/ already mirrors it for
 # Pi, so a fresh clone doesn't silently run without the skill (in
 # particular, its "pivoting vs. probing" section - the one place the
-# distinction between a passive lookup and an active JARM/JA4 probe via
-# the Win11 VM is actually written down). Plain copy, not a symlink -
+# distinction between a passive lookup and an active JARM/JA4/nmap/
+# dirsearch probe via the lab probe VM is actually written down). Plain
+# copy, not a symlink -
 # same convention as .pi/skills/, and avoids relying on every harness
 # following symlinks the same way.
 mkdir -p "$ROOT"/.claude/skills/threat-cluster-tracking
@@ -91,7 +102,12 @@ echo
 echo "Daily actor-tracking loop (skills/actor-tracking/): add to crontab -e:"
 echo "  15 6 * * * cd $ROOT && mcp-server/.venv/bin/python mcp-server/scripts/daily_tracking.py >> data/tracking/logs/stage_a.log 2>&1"
 echo "  45 6 * * * cd $ROOT && bash mcp-server/scripts/daily_narrative.sh >> data/tracking/logs/stage_b.log 2>&1"
+echo "Secrets (env, e.g. in ~/.bashrc - never committed): WEBAMON_API_KEY,"
+echo "  HONEYLABS_API_KEY, THREATFOX_API_KEY (optional)."
+echo "Probe VM (env): CTI_PROBE_HOST/USER/SSH_KEY/KNOWN_HOSTS/HELPER_CMD"
+echo "  (default helper: python3 /opt/cti/probe_helper.py on the Linux probe VM)."
 echo "Tunables (env): CTI_DUCKDB_PATH (default data/tracking/tracking.duckdb),"
-echo "  CTI_HL_BUDGET (HoneyLabs lookups/day, default 400)."
+echo "  CTI_HL_BUDGET (HoneyLabs lookups/day, default 400),"
+echo "  CTI_WEBAMON_DAILY_BUDGET (default 1000), CTI_WEBAMON_RESCAN_DAYS (default 7)."
 echo "One-time seed from the cluster store:"
 echo "  mcp-server/.venv/bin/python mcp-server/scripts/daily_tracking.py --seed"

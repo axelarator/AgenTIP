@@ -24,5 +24,9 @@ data/pending_fingerprints.json
 data/tracking/*
 !data/tracking/.gitkeep
 
+# Secrets - API keys (WEBAMON_API_KEY etc.) live in the shell environment
+# (~/.bashrc, sourced by cron), never committed.
+.env
+
 # Harness-local state
 .claude/settings.local.json

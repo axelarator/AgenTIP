@@ -12,24 +12,19 @@ tracked cluster so lifecycle status and open ports don't go stale
 between manual pivots. See SKILL.md's "Infrastructure pivoting" section
 for when to reach for either by hand.
 
-Sources, none of which require a paid plan:
+The scan-platform sources this module used to carry (VirusTotal, Shodan
+InternetDB, Hackertarget reverse-IP, Cert Spotter CT logs) were retired
+in favor of the Webamon API (cti_tools/webamon.py, queried directly from
+the host) plus live interaction from the probe VM (a current TLS grab
+replaces Cert Spotter's CT cert, nmap replaces Shodan's ports, Webamon's
+server.ip search replaces reverse-IP co-hosting). crt.sh is gone (shut
+down). What remains here are the live registry/telemetry sources:
+
 - RDAP (WHOIS's standardized successor) via the public rdap.org
   bootstrap redirector - no API key, no per-registry bootstrap logic
   needed on our side.
 - RIPEstat's free Data API - no API key, covers ASN/network context
   and geolocation for any routed IP, not just RIPE-region space.
-- VirusTotal's public API - free tier, but does require your own API
-  key (VT_API_KEY env var) and is rate-limited (4 req/min, 500/day as
-  of writing). Gives reputation, resolution history (VT's equivalent
-  of passive DNS), file/URL detection verdicts, and - for IPs -
-  communicating_files/downloaded_files: samples VT has actually seen
-  talk to or fetch from that IP, useful for finding malware hashes
-  tied to a tracked C2 IP when the source report only gave you the
-  infrastructure, not per-sample coverage. Skipped gracefully if no
-  key is configured - RDAP/RIPEstat still work without one.
-- Shodan InternetDB (internetdb.shodan.io) - no API key, no published
-  rate limit; open ports, hostnames, CPEs, vulns, and tags Shodan has
-  observed for an IP. IP only.
 - ThreatFox (abuse.ch) - free IOC-matching API; checks a domain/ip/
   url/hash against abuse.ch's own malware-C2 IOC database and returns
   any matching threat/malware-family tags. Covers every observable
@@ -53,12 +48,11 @@ Every one of these lookups names a tracked indicator to a third party
 (the domain/IP/hash being pivoted on), so - same as active
 fingerprinting - none of it originates from this host. All HTTP calls
 and DNS resolution route through cti_tools.vm_proxy, which proxies them
-through the Win11 probe VM over its restricted SSH channel. See
+through the probe VM over its restricted SSH channel. See
 vm_proxy's module docstring for why.
 """
 from __future__ import annotations
 
-import base64
 import ipaddress
 import json
 from datetime import datetime, timezone
@@ -67,7 +61,6 @@ from typing import Any
 from . import vm_proxy
 
 USER_AGENT = "cti-agent-pivot/1.0 (+local analysis tool, on-demand only)"
-VT_API_KEY_ENV = "VT_API_KEY"
 HONEYLABS_API_KEY_ENV = "HONEYLABS_API_KEY"
 THREATFOX_API_KEY_ENV = "THREATFOX_API_KEY"
 
@@ -95,7 +88,7 @@ def _get_json(url: str, headers: dict[str, str] | None = None) -> Any:
 def _get_text(url: str, headers: dict[str, str] | None = None) -> str:
     """Fetch a response body (some free enrichment endpoints return
     newline-delimited text rather than JSON, hence text rather than
-    always decoding JSON here). Proxied through the Win11 VM - see the
+    always decoding JSON here). Proxied through the probe VM - see the
     module docstring."""
     try:
         result = vm_proxy.http_fetch(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
@@ -110,7 +103,7 @@ def _get_text(url: str, headers: dict[str, str] | None = None) -> str:
 def _post_json(url: str, payload: dict[str, Any],
                 headers: dict[str, str] | None = None) -> Any:
     """POST a JSON body and parse a JSON response - the ThreatFox-shaped
-    counterpart to _get_json. Proxied through the Win11 VM like every
+    counterpart to _get_json. Proxied through the probe VM like every
     other pivot call; see the module docstring."""
     try:
         result = vm_proxy.http_fetch(
@@ -154,7 +147,7 @@ def resolve_host(host: str) -> list[str] | None:
     is never legitimately reachable at those addresses, so this can't
     hide a genuine resolution.
 
-    Resolution itself happens on the Win11 VM (see vm_proxy.resolve_dns)
+    Resolution itself happens on the probe VM (see vm_proxy.resolve_dns)
     rather than via this host's own resolver - same reasoning as every
     other pivot lookup in this module."""
     try:
@@ -248,100 +241,6 @@ def ripestat_lookup(ip: str) -> dict[str, Any]:
     return result
 
 
-def virustotal_lookup(value: str, kind: str, api_key: str) -> dict[str, Any]:
-    """Reputation and resolution-history data via VirusTotal's public
-    API v3. domain/ip lookups include VT's resolution history (its
-    passive-DNS equivalent); hash lookups return detection verdicts and
-    known filenames; url lookups return detection verdicts. Raises
-    PivotError on request failure - the caller decides whether that's
-    fatal or just a missing section in a larger result."""
-    headers = {"x-apikey": api_key}
-
-    if kind == "domain":
-        base = _get_json(f"https://www.virustotal.com/api/v3/domains/{value}", headers)
-        resolutions = _get_json(
-            f"https://www.virustotal.com/api/v3/domains/{value}/resolutions?limit=20", headers)
-        attrs = (base.get("data") or {}).get("attributes", {})
-        return {
-            "reputation": attrs.get("reputation"),
-            "categories": attrs.get("categories"),
-            "last_analysis_stats": attrs.get("last_analysis_stats"),
-            "resolutions": [
-                {"ip": r["attributes"].get("ip_address"), "date": r["attributes"].get("date")}
-                for r in resolutions.get("data", [])
-            ],
-        }
-
-    if kind == "ip":
-        base = _get_json(f"https://www.virustotal.com/api/v3/ip_addresses/{value}", headers)
-        resolutions = _get_json(
-            f"https://www.virustotal.com/api/v3/ip_addresses/{value}/resolutions?limit=20", headers)
-        attrs = (base.get("data") or {}).get("attributes", {})
-        result = {
-            "reputation": attrs.get("reputation"),
-            "as_owner": attrs.get("as_owner"),
-            "country": attrs.get("country"),
-            "last_analysis_stats": attrs.get("last_analysis_stats"),
-            "resolutions": [
-                {"domain": r["attributes"].get("host_name"), "date": r["attributes"].get("date")}
-                for r in resolutions.get("data", [])
-            ],
-        }
-        # Files VT has actually observed talking to this IP (its C2/callback
-        # traffic) or fetched from it (dropped/staged payloads) - the two
-        # relationships that can turn "we tracked this IP" into "here is a
-        # sample that used it", which resolution history alone can't do.
-        # Each entry carries just enough to triage by hand before filing
-        # anything: VT's own suggested family label plus the detection
-        # ratio, not a blind hash dump - a communicating/downloaded
-        # relationship on VT means "this file talked to this IP", not
-        # "this file belongs to the actor you're tracking that IP for".
-        for relationship, key in (("communicating_files", "communicating_files"),
-                                   ("downloaded_files", "downloaded_files")):
-            try:
-                rel = _get_json(
-                    f"https://www.virustotal.com/api/v3/ip_addresses/{value}/{relationship}?limit=20",
-                    headers)
-            except PivotError:
-                rel = {"data": []}
-            result[key] = [
-                {
-                    "sha256": f["id"],
-                    "names": (f.get("attributes") or {}).get("names", [])[:3],
-                    "suggested_label": ((f.get("attributes") or {}).get("popular_threat_classification") or {})
-                        .get("suggested_threat_label"),
-                    "malicious": ((f.get("attributes") or {}).get("last_analysis_stats") or {}).get("malicious"),
-                    "total_engines": sum(((f.get("attributes") or {}).get("last_analysis_stats") or {}).values())
-                        if (f.get("attributes") or {}).get("last_analysis_stats") else None,
-                    "first_submission_date": (f.get("attributes") or {}).get("first_submission_date"),
-                }
-                for f in rel.get("data", [])
-            ]
-        return result
-
-    if kind == "hash":
-        base = _get_json(f"https://www.virustotal.com/api/v3/files/{value}", headers)
-        attrs = (base.get("data") or {}).get("attributes", {})
-        return {
-            "names": attrs.get("names"),
-            "type_description": attrs.get("type_description"),
-            "last_analysis_stats": attrs.get("last_analysis_stats"),
-            "popular_threat_classification": attrs.get("popular_threat_classification"),
-        }
-
-    if kind == "url":
-        url_id = base64.urlsafe_b64encode(value.encode()).decode().strip("=")
-        base = _get_json(f"https://www.virustotal.com/api/v3/urls/{url_id}", headers)
-        attrs = (base.get("data") or {}).get("attributes", {})
-        return {
-            "last_analysis_stats": attrs.get("last_analysis_stats"),
-            "categories": attrs.get("categories"),
-            "last_final_url": attrs.get("last_final_url"),
-        }
-
-    raise PivotError(f"unsupported kind for VirusTotal lookup: {kind}")
-
-
 def honeylabs_lookup(ip: str, api_key: str) -> dict[str, Any]:
     """Honeypot-fleet telemetry for an IP via HoneyLabs' lookup API:
     event volume/recency across their sensors, their own verdict
@@ -385,60 +284,13 @@ def honeylabs_lookup(ip: str, api_key: str) -> dict[str, Any]:
     }
 
 
-def certspotter_lookup(domain: str) -> dict[str, Any]:
-    """Certificate-transparency history for a domain via SSLMate's Cert
-    Spotter API - the free, no-key stand-in for crt.sh (which is no longer
-    reliably reachable). Returns every hostname seen in a CT-logged
-    certificate for the domain and its subdomains (`hostnames`), plus a
-    per-issuance summary (issuer + validity window + the certificate's own
-    SHA256 fingerprint and revocation status). Those sibling hostnames are
-    the pivot leads: infrastructure the same operator stood up under the
-    same name that you might not have observed directly; `cert_sha256` is
-    itself a pivot value (query it on crt.sh/Censys/VT to find the same
-    cert reused elsewhere).
-
-    The public endpoint is rate-limited without an API token; a 429/HTTP
-    error comes back as {"error": ...} rather than raising, so a batch
-    pivot degrades gracefully."""
-    url = (f"https://api.certspotter.com/v1/issuances?domain={domain}"
-           "&include_subdomains=true&expand=dns_names&expand=issuer")
-    try:
-        data = _get_json(url)
-    except PivotError as e:
-        return {"error": str(e)}
-    if not isinstance(data, list):
-        return {"error": "unexpected Cert Spotter response shape"}
-
-    hostnames: set[str] = set()
-    issuances = []
-    for iss in data:
-        names = iss.get("dns_names") or []
-        for n in names:
-            hostnames.add(n.lstrip("*.").lower())
-        issuer = iss.get("issuer")
-        issuances.append({
-            "issuer": issuer.get("name") if isinstance(issuer, dict) else issuer,
-            "not_before": iss.get("not_before"),
-            "not_after": iss.get("not_after"),
-            "dns_names": names,
-            "cert_sha256": iss.get("cert_sha256"),
-            "revoked": iss.get("revoked"),
-        })
-    return {
-        "issuance_count": len(issuances),
-        "hostnames": sorted(hostnames),
-        "issuances": issuances[:50],  # cap the verbose part; hostnames is the pivot surface
-    }
-
-
 # Hostname suffixes for shared CDN/load-balancer/accelerator services.
 # A hostname-based counterpart to analytics.SHARED_HOSTING_ASNS: an IP
-# already fronted by one of these (per Shodan's own "hostnames" field)
-# is multi-tenant by design, so hackertarget_reverse_ip's co-hosting
-# list for it is every other customer on the shared/anycast IP, not
-# infrastructure tied to whichever actor happens to be tracked there -
-# see the 2026-09-10 Fox Tempest digest blowup (~1,500 unrelated
-# domains off one AWS Global Accelerator IP).
+# already fronted by one of these is multi-tenant by design, so the
+# domains Webamon reports resolving to it (search_ip) are every other
+# customer on the shared/anycast IP, not infrastructure tied to whichever
+# actor happens to be tracked there - see the 2026-09-10 Fox Tempest
+# digest blowup (~1,500 unrelated domains off one AWS Global Accelerator IP).
 SHARED_HOSTING_HOSTNAME_SUFFIXES = (
     ".awsglobalaccelerator.com",
     ".cloudfront.net",
@@ -460,80 +312,19 @@ def is_shared_hosting_hostname(hostname: str) -> bool:
 
 
 def ptr_lookup(ip: str) -> dict[str, Any]:
-    """Reverse-DNS (PTR) hostname for `ip`, resolved from the Win11 VM
+    """Reverse-DNS (PTR) hostname for `ip`, resolved from the probe VM
     like every other network-touching pivot lookup (see vm_proxy).
     Returns {"hostname": <name-or-None>} - None is a legitimate "no PTR
     record configured" answer (common, e.g. most cloud tenant IPs), not
-    a failure, mirroring shodan_internetdb_lookup's empty-but-valid
-    {"ports": []} - or {"error": ...} if the lookup itself was
-    inconclusive, same convention as hackertarget_reverse_ip. Unlike
-    hackertarget_reverse_ip's reverse-IP co-hosting list (every domain
-    currently pointed at the IP - noisy on shared hosting), a PTR
-    record is the IP's own single reverse-DNS name."""
+    a failure - or {"error": ...} if the lookup itself was inconclusive.
+    A PTR record is the IP's own single reverse-DNS name, distinct from
+    the domains Webamon reports resolving to the IP (search_ip), which
+    are co-hosting and noisy on shared infrastructure."""
     try:
         hostname = vm_proxy.resolve_ptr(ip)
     except vm_proxy.VMProxyError as e:
         return {"error": str(e)}
     return {"hostname": hostname}
-
-
-def hackertarget_reverse_ip(ip: str) -> dict[str, Any]:
-    """Domains currently/recently hosted on an IP via Hackertarget's free
-    reverse-IP endpoint (plain text, no key, low daily quota). Treat the
-    result as co-hosting, NOT confirmed shared ownership: on shared
-    hosting these are unrelated tenants. Their own error/quota strings
-    come back as {"error": ...}."""
-    try:
-        text = _get_text(f"https://api.hackertarget.com/reverseiplookup/?q={ip}").strip()
-    except PivotError as e:
-        return {"error": str(e)}
-    low = text.lower()
-    # Hackertarget signals "nothing here" / quota / bad input as a single
-    # human-readable line rather than an HTTP error, e.g. "No DNS A records
-    # found" or "API count exceeded". Catch the known phrases explicitly.
-    if not text or any(marker in low for marker in
-                       ("api count exceeded", "no dns", "no records", "invalid", "error")):
-        return {"error": text or "empty response"}
-    # Defense in depth: real results are one hostname per line. Drop any
-    # line that can't be a hostname (has spaces, or no dot) so a novel
-    # status message can't slip through as a bogus domain.
-    domains = sorted({line.strip() for line in text.splitlines()
-                      if line.strip() and " " not in line.strip() and "." in line.strip()})
-    if not domains:
-        return {"error": text or "no domains returned"}
-    return {"domains": domains}
-
-
-def shodan_internetdb_lookup(ip: str) -> dict[str, Any]:
-    """Open ports, hostnames, CPEs, vulns, and tags Shodan has observed
-    for an IP, via their free, keyless InternetDB endpoint. Called
-    directly (not via _get_json) because InternetDB signals "nothing on
-    record for this IP" as an HTTP 404 rather than an empty body - a
-    routine, expected outcome for infrastructure Shodan hasn't scanned,
-    not a failure - so it's normalized to the same empty shape a hit
-    would have rather than surfacing as {"error": ...}. Any other >=400
-    status is a real failure and does become {"error": ...}."""
-    url = f"https://internetdb.shodan.io/{ip}"
-    try:
-        result = vm_proxy.http_fetch(url, headers={"User-Agent": USER_AGENT})
-    except vm_proxy.VMProxyError as e:
-        return {"error": f"failed to reach {url}: {e}"}
-    status = result.get("status")
-    if status == 404:
-        return {"ports": [], "hostnames": [], "cpes": [], "tags": [], "vulns": []}
-    if status is not None and status >= 400:
-        return {"error": f"{url} returned HTTP {status}"}
-    try:
-        data = json.loads(str(result.get("body") or ""))
-    except ValueError as e:
-        return {"error": f"{url} returned an unparseable response: {e}"}
-    return {
-        "ports": data.get("ports", []),
-        "hostnames": data.get("hostnames", []),
-        "cpes": data.get("cpes", []),
-        "tags": data.get("tags", []),
-        "vulns": data.get("vulns", []),
-    }
 
 
 def threatfox_lookup(value: str, api_key: str) -> dict[str, Any]:

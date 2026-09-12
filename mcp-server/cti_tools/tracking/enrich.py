@@ -12,7 +12,7 @@ rate-limited response stops further HoneyLabs calls but keeps
 everything already collected - enrichment degrades, never crashes.
 
 Registry lookups (RIPEstat + rdap.org, free/no-key, still via the
-Win11 VM SSH hop) run as a second phase with their own smaller cap.
+probe VM SSH hop) run as a second phase with their own smaller cap.
 
 Deliberately bypasses core.honeylabs_context: its TTL cache is sized
 for interactive pivots and would mask the staleness this pipeline
@@ -60,7 +60,7 @@ def build_worklist(con: duckdb.DuckDBPyConnection,
     """(ips_to_enrich, rdap_due) - never-enriched tracked IPs first,
     then the stalest re-checks, truncated to budget."""
     # HoneyLabs/RDAP/RIPEstat are IP-only sources - exclude domain
-    # observations (e.g. from pivot_cluster's Shodan/ThreatFox history
+    # observations (e.g. from pivot_cluster's TLS/Webamon/ThreatFox history
     # logging) so they don't reach the IP-prefilter/CIDR logic below.
     fresh_cutoff = datetime.now() - timedelta(days=RECHECK_AFTER_DAYS)
     never = [r[0] for r in con.execute(

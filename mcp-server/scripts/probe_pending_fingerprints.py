@@ -6,7 +6,7 @@ One remote hop and one HTTPS query per target, not two SSH hops - and,
 as of this change, every target in a queued batch is dispatched
 concurrently rather than one at a time (see below):
 
-  1. win_probe_helper.py on the Win11 probe VM (10.20.30.16) - generates
+  1. probe_helper.py on the lab probe VM (10.20.30.16) - generates
      a JARM scan and one ordinary TLS handshake against the target.
   2. An OpenSearch query against the Arkime VM (10.20.0.18:9200) -
      reads back whatever that handshake produced in ssl.log/conn.log,
@@ -41,7 +41,7 @@ covers the same ground a per-target one did).
 collect_zeek_fingerprints_batch() later only accepts documents newer
 than that snapshot, for every resolved IP in the batch at once. Every ts
 compared is stamped by the same clock (Zeek's, via OpenSearch), never a
-wall-clock reading taken on the cti host or the Win11 probe VM - that's
+wall-clock reading taken on the cti host or the lab probe VM - that's
 what actually caused the earlier bug, not just "clocks can drift", so a
 fixed offset/window wouldn't have been a real fix. Taking the snapshot
 before any probe fires (rather than right before querying, after the
@@ -64,21 +64,21 @@ the whole run instead of opening a fresh one per query
 (_opensearch_connection()).
 
 Direction still matters for the one remaining SSH hop: the OPNsense LAN
-(VLAN30, where the Win11 VM lives) is firewalled so it can never
+(VLAN30, where the probe VM lives) is firewalled so it can never
 connect back out to the cti host's home-LAN segment - deliberate lab
 hygiene. This script runs as part of the cti_tools package (it imports
 core.py directly - no listener, nothing accepts inbound connections
 here) and *initiates* the SSH connection itself, outbound into the lab.
 The OpenSearch query is a plain outbound HTTPS call to the Arkime VM,
 which - per lab setup - is reachable directly from the cti host over
-the same Tailscale/home-LAN routes as the Win11 VM, not proxied through
+the same Tailscale/home-LAN routes as the probe VM, not proxied through
 any other lab host.
 
 Usage (run manually, or on a cron/systemd timer):
 
     python3 probe_pending_fingerprints.py
 
-Every run validates both the Win11 SSH hop and OpenSearch reachability
+Every run validates both the probe VM SSH hop and OpenSearch reachability
 first (see check_access()) and aborts before touching the queue if
 either fails - probing/pivoting shouldn't start without confirmed
 access. To check access on its own, without draining the queue:
@@ -86,7 +86,7 @@ access. To check access on its own, without draining the queue:
     python3 probe_pending_fingerprints.py --check-access
 
 Requires: cti_tools importable (run from within the mcp-server venv/repo
-checkout); an SSH keypair authorized to reach the Win11 probe VM. No
+checkout); an SSH keypair authorized to reach the lab probe VM. No
 OpenSearch credential is required - the Arkime VM's OpenSearch (as of
 the 10.20.0.18 move) sits on plain HTTP with no login in front of it,
 lab-internal only.
@@ -110,8 +110,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cti_tools import core, vm_proxy  # noqa: E402
 
 # --- adjust for your environment --------------------------------------------
-# SSH connection details for the Win11 probe VM (WIN_PROBE_USER/HOST,
-# WIN_SSH_KEY, WIN_KNOWN_HOSTS, WIN_HELPER_CMD) now live in
+# SSH connection details for the lab probe VM (CTI_PROBE_HOST/USER/
+# SSH_KEY/KNOWN_HOSTS/HELPER_CMD, from the environment) now live in
 # cti_tools.vm_proxy - that module is the shared chokepoint pivot.py
 # also routes through, so there's one source of truth for how this
 # process reaches the VM instead of two copies drifting apart.
@@ -130,7 +130,7 @@ OPENSEARCH_INDEX = "zeek-*"
 # trusting multi-port results.
 _DST_PORT_FIELD = "dst_port"
 
-SOURCE_LABEL = "Win11 probe VM"
+SOURCE_LABEL = "lab probe VM"
 
 # Concurrent SSH channels dispatched to the probe VM at once, multiplexed
 # over the one shared ControlMaster connection (see vm_proxy.py) rather
@@ -160,7 +160,7 @@ _TRAILING_PORT_RE = re.compile(r":(\d{2,5})(?:/|$)")
 def _lookup_ports(cluster: str, target: str) -> list[int]:
     """Best-effort port lookup for a fingerprint-queue target: the queue
     only ever carries a bare domain/ip (see core._enqueue_pending_fingerprints),
-    not the port(s) its C2 traffic actually uses, and win_probe_helper.py
+    not the port(s) its C2 traffic actually uses, and probe_helper.py
     defaults to 443 if none is given - which silently fingerprints
     whatever's on 443 (or nothing) instead of the real service for any
     C2 running on a nonstandard port. Returns every port worth probing
@@ -351,7 +351,7 @@ def collect_zeek_fingerprints_batch(resolved: list[tuple[str, int]], baseline_ts
 
     A single probe produces roughly a dozen ssl.log rows for the same
     target, not one: JARM's ~10 malformed-ClientHello attempts each get
-    their own row alongside win_probe_helper's one *ordinary* handshake,
+    their own row alongside probe_helper's one *ordinary* handshake,
     and Zeek's ja4 plugin computes a ja4s for every row that negotiated
     far enough to have one - which most of JARM's malformed variants do,
     each producing a genuinely different ja4s (that's the point of
@@ -494,7 +494,7 @@ def _enrich_with_honeylabs(pairs: set[tuple[str, str]]) -> None:
 
 
 def check_access() -> list[str]:
-    """Validates both the Win11 SSH hop and OpenSearch reachability before
+    """Validates both the probe VM SSH hop and OpenSearch reachability before
     any probing starts - probing/pivoting shouldn't start without
     confirmed access. The SSH hop is checked the same way as before
     (round-trip an incomplete request through the forced `command=`
@@ -507,7 +507,7 @@ def check_access() -> list[str]:
     try:
         vm_proxy._ssh_json_rpc({})
     except vm_proxy.VMProxyError as e:
-        problems.append(f"win probe VM ({vm_proxy.WIN_PROBE_HOST}): {e}")
+        problems.append(f"probe VM ({vm_proxy.PROBE_HOST}): {e}")
     try:
         _opensearch_search({"match_all": {}}, size=1)
     except ProbeError as e:

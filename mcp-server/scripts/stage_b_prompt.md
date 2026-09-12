@@ -10,7 +10,10 @@ Rules (token budget is the point of this design - stay inside it):
   `SELECT * FROM observations`, no unfiltered scans).
 - For each finding worth keeping, persist it with save_correlation
   (correlation_type one of: asn_pivot, port_pattern, temporal_cluster,
-  new_infrastructure; include the supporting IPs as indicators).
+  new_infrastructure, shared_fingerprint; include the supporting IPs or
+  domains as indicators). Use shared_fingerprint when a webamon_fingerprint
+  change or a shared Webamon dom/ssl kit hash ties tracked domains together
+  (a rebuilt or reused phishing kit).
   Deliberately out of scope: Zeek/OpenSearch/Arkime cross-referencing -
   the digest never includes it (that's a separate, on-demand,
   post-probe capability, not part of this routine daily narrative) -
@@ -19,14 +22,26 @@ Rules (token budget is the point of this design - stay inside it):
 - What to weigh: an ASN change on actor infrastructure is a pivot
   candidate, but heavy HoneyLabs event counts mean mass-scanner noise,
   not dedicated C2 - say so instead of over-claiming.
-- A port change in the "Indicator attribute changes" table (Shodan
-  InternetDB's open-port diff on tracked infra, NOT the separate "Port
-  scan patterns" table below it - that one is HoneyLabs scan-pattern
-  telemetry, a different thing) can mean a C2 listener redeployed or a
-  service was added/removed - weigh a medium-confidence port change as
-  a pivot candidate similar to an ASN change, but Shodan's snapshot
-  reflects whatever last scanned the host and can flap day to day, so a
-  low-confidence one (stale baseline) is background noise, not a lead.
+- A port change in the "Indicator attribute changes" table (nmap's
+  open-port diff on tracked infra from an on-demand active_scan, NOT the
+  separate "Port scan patterns" table below it - that one is HoneyLabs
+  scan-pattern telemetry, a different thing) can mean a C2 listener
+  redeployed or a service was added/removed - weigh a medium-confidence
+  port change as a pivot candidate similar to an ASN change. Ports are now
+  only scanned on demand, so a port change means someone actively rescanned
+  the host, not routine daily churn.
+- Other "Indicator attribute changes" attributes from the live sweep:
+  http (title/Server header changed on a tracked domain - a served-content
+  change), webamon_fingerprint (a domain's Webamon dom/ssl kit hash changed
+  - a rebuilt kit, a strong shared_fingerprint/new_infrastructure lead),
+  ip_hostnames (new domains Webamon sees hosted on a tracked IP - a lead,
+  never auto-filed), subdomains (new subfinder/Wayback subdomains under a
+  tracked apex - low-confidence leads), infostealer_hits (a domain's
+  compromised-credential footprint grew - notable even the first time),
+  opendir_files (new files in an open directory - see below).
+- The "Open-directory files" section lists files newly exposed in an open
+  directory found by an on-demand active_scan - staged payloads, backups,
+  or config are high-signal; call them out with the file path.
 - A certificate change in that same table only ever appears when the
   issuer changed or new sibling hostnames showed up on the cert -
   routine same-issuer renewals are filtered out before they reach you.
