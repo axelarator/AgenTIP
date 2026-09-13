@@ -509,7 +509,8 @@ def _build_reverse_index() -> dict[str, Any]:
             if tid in techniques:
                 techniques[tid]["detections"].append({
                     "id": det["id"], "description": det["description"],
-                    "status": det["status"],
+                    "status": det["status"], "scope": _detection_scope(det),
+                    "clusters": det.get("clusters", []),
                 })
     return {"signature": _index_signature(), "observables": observables,
             "techniques": techniques}
@@ -535,72 +536,103 @@ def _reverse_index() -> dict[str, Any]:
     return idx
 
 
+DETECTION_SCOPES = ("cluster", "technique")
+
+
+def _detection_scope(det: dict[str, Any]) -> str:
+    # Entries written before scoping existed carry no field; they keep the
+    # original technique-wide join so nothing silently drops off a cluster.
+    return det.get("scope", "technique")
+
+
 def _detections_for_cluster(data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Detections relevant to this cluster: anything in the shared
-    registry whose technique_ids overlap this cluster's TTP table, or
-    that explicitly names this cluster (e.g. filed before the TTP that
-    justifies it was added). Each result is annotated with exactly
-    which of this cluster's TTPs it covers."""
+    """Detections relevant to this cluster. A technique-scoped detection
+    (generic behavior - one Kerberoasting rule catches every adversary
+    that Kerberoasts) joins onto any cluster whose TTP table shares one
+    of its technique_ids. A cluster-scoped detection (keyed to one
+    actor's artifacts - a C2 port, a signer, a YARA rule for their
+    loader) appears only on the clusters it names, even when another
+    cluster logs the same technique, so it isn't shown as coverage it
+    doesn't provide. Either kind appears on a cluster it explicitly
+    names (e.g. filed before the TTP that justifies it was added). Each
+    result is annotated with which of this cluster's TTPs it covers."""
     registry = _load_detection_registry()
     ttp_ids = {t["id"].upper() for t in data["ttps"]}
     name = data["name"]
     result = []
     for det in registry["detections"]:
         covers = sorted({tid.upper() for tid in det["technique_ids"]} & ttp_ids)
-        if covers or name in det.get("clusters", []):
-            result.append({**det, "covers_ttps": covers})
+        scope = _detection_scope(det)
+        if name in det.get("clusters", []) or (covers and scope == "technique"):
+            result.append({**det, "scope": scope, "covers_ttps": covers})
     return result
 
 
 @_synchronized
 def add_detection(detection_id: str, description: str, technique_ids: list[str],
-                   status: str = "draft", cluster_name: str | None = None) -> dict[str, Any]:
-    """Upsert a detection into the shared, technique-keyed detection
-    registry (data/clusters/_registry/detections.json) rather than into
-    one cluster's own record - a Kerberoasting detection covers every
-    adversary that does Kerberoasting, so it's modeled once per
-    technique and joined onto clusters by technique_id, not
-    hand-duplicated into each cluster that happens to use it.
+                   status: str = "draft", cluster_name: str | None = None,
+                   scope: str | None = None) -> dict[str, Any]:
+    """Upsert a detection into the shared detection registry
+    (data/clusters/_registry/detections.json) rather than into one
+    cluster's own record.
+
+    scope decides which clusters the detection is joined onto:
+    "technique" for a generic behavioral detection that covers every
+    adversary using the technique (joined by technique_id), "cluster"
+    for one keyed to a specific actor's artifacts (shown only on the
+    clusters it names). Defaults to "cluster" when cluster_name is given
+    and "technique" otherwise; on an update it's left unchanged unless
+    passed. A cluster-scoped detection must name at least one cluster.
 
     technique_ids is required (at least one) - that's what makes the
-    detection discoverable from a cluster's TTP table and from
-    get_technique_usage(). cluster_name is optional provenance (which
-    investigation prompted writing this detection); pass it to also get
-    the refreshed cluster view back.
+    detection discoverable from get_technique_usage(). cluster_name adds
+    that cluster to the detection's clusters; pass it to also get the
+    refreshed cluster view back.
     """
     if not technique_ids:
         raise ValueError("add_detection requires at least one technique_id")
+    if scope is not None and scope not in DETECTION_SCOPES:
+        raise ValueError(f"scope must be one of {DETECTION_SCOPES}, got {scope!r}")
     if cluster_name is not None:
         load_cluster(cluster_name)  # raises ClusterNotFound if it doesn't exist
 
     registry = _load_detection_registry()
     now = _now()
-    for det in registry["detections"]:
-        if det["id"] == detection_id:
-            det["description"] = description
-            det["status"] = status
-            det["technique_ids"] = sorted(set(det["technique_ids"]) | set(technique_ids))
-            if cluster_name and cluster_name not in det["clusters"]:
-                det["clusters"].append(cluster_name)
-            det["updated"] = now
-            break
+    existing = next((d for d in registry["detections"] if d["id"] == detection_id), None)
+    new_scope = scope or (_detection_scope(existing) if existing
+                          else ("cluster" if cluster_name else "technique"))
+    new_clusters = list(existing["clusters"]) if existing else []
+    if cluster_name and cluster_name not in new_clusters:
+        new_clusters.append(cluster_name)
+    if new_scope == "cluster" and not new_clusters:
+        raise ValueError("a cluster-scoped detection needs cluster_name")
+
+    # Clusters it was joined onto before this update, so any it drops off
+    # (e.g. narrowed to cluster scope) get their views refreshed too.
+    before = {c for c in list_clusters()
+              if existing and any(d["id"] == detection_id
+                                  for d in load_cluster(c)["detections"])}
+
+    if existing:
+        existing.update(description=description, status=status, scope=new_scope,
+                        technique_ids=sorted(set(existing["technique_ids"]) | set(technique_ids)),
+                        clusters=new_clusters, updated=now)
     else:
         registry["detections"].append({
             "id": detection_id, "description": description, "status": status,
-            "technique_ids": sorted(set(technique_ids)),
-            "clusters": [cluster_name] if cluster_name else [],
-            "created": now, "updated": now,
+            "scope": new_scope, "technique_ids": sorted(set(technique_ids)),
+            "clusters": new_clusters, "created": now, "updated": now,
         })
     _save_detection_registry(registry)
 
     # The cluster JSON's `detections` field (and its rendered markdown)
     # is a snapshot from the last time that cluster was saved - refresh
-    # every cluster this detection now covers, not just cluster_name,
-    # so an update here doesn't leave other clusters' .md views stale.
-    technique_id_set = {tid.upper() for tid in technique_ids}
+    # every cluster this detection now joins onto or just left, not only
+    # cluster_name, so no cluster's .md view is left stale.
     for cname in list_clusters():
         data = load_cluster(cname)
-        if technique_id_set & {t["id"].upper() for t in data["ttps"]}:
+        joined = any(d["id"] == detection_id for d in data["detections"])
+        if joined or cname in before:
             save_cluster(data)
 
     if cluster_name:
@@ -2694,10 +2726,11 @@ def _write_markdown(data: dict[str, Any]) -> None:
     for t in data["ttps"]:
         lines.append(f"| {t['id']} | {t['name']} | {t['status']} | "
                       f"{t.get('notes', '')} | {t['updated']} |")
-    lines += ["", "## Detection inventory (shared registry, joined by technique)",
-              "| ID | Description | Status | Covers | Updated |", "|---|---|---|---|---|"]
+    lines += ["", "## Detection inventory (this cluster's detections plus technique-scoped ones from the shared registry)",
+              "| ID | Description | Status | Scope | Covers | Updated |", "|---|---|---|---|---|---|"]
     for det in data["detections"]:
         lines.append(f"| {det['id']} | {det['description']} | {det['status']} | "
+                      f"{det.get('scope', 'technique')} | "
                       f"{', '.join(det.get('covers_ttps', [])) or ', '.join(det['technique_ids'])} | "
                       f"{det['updated']} |")
     lines += ["", "## Relationships"]

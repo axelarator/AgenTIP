@@ -132,17 +132,29 @@ at runtime.
 
 ## Detections and technique usage
 
-Detections live in a shared, technique-keyed registry
-(`data/clusters/_registry/detections.json`), not duplicated per cluster —
-the same Kerberoasting detection covers every adversary that does
-Kerberoasting. `add_detection(detection_id, description, technique_ids,
-status="draft", cluster_name=None)` requires at least one technique_id;
-`cluster_name` is optional provenance for "which investigation prompted
-this," not a scoping key. A cluster's `detections` field (from
+Detections live in a shared registry
+(`data/clusters/_registry/detections.json`), not duplicated per cluster.
+`add_detection(detection_id, description, technique_ids, status="draft",
+cluster_name=None, scope=None)` requires at least one technique_id, and
+each detection has a `scope`:
+
+- `"technique"` — a generic behavioral detection (the same Kerberoasting
+  rule covers every adversary that Kerberoasts). It joins onto every
+  cluster whose TTP table shares one of its technique_ids.
+- `"cluster"` — keyed to one actor's artifacts (a C2 port, a code-signing
+  certificate, a YARA rule for their loader). It appears only on the
+  clusters it names, even when another cluster logs the same technique,
+  so it isn't shown as coverage it doesn't provide.
+
+`scope` defaults to `"cluster"` when `cluster_name` is given and
+`"technique"` otherwise, and is left unchanged on an update unless
+passed; a cluster-scoped detection must name at least one cluster.
+Registry entries without a `scope` field (written before scoping existed)
+behave as `"technique"`. A cluster's `detections` field (from
 `get_cluster` / `load_cluster`) is always a live join against the
-registry by technique_id — computed at read time, never trusted from
-whatever was last written to that cluster's own JSON file — so it never
-goes stale relative to the cluster's current TTP table.
+registry — computed at read time, never trusted from whatever was last
+written to that cluster's own JSON file — so it never goes stale
+relative to the cluster's current TTP table.
 
 `get_technique_usage(technique_id=None)` is the reverse index: given a
 technique, which tracked clusters use it and what detections cover it.

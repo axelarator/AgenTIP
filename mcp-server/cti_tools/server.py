@@ -77,13 +77,18 @@ def append_hunt_log(name: str, entry: str) -> dict:
 
 @mcp.tool()
 def add_detection(detection_id: str, description: str, technique_ids: list[str],
-                   status: str = "draft", cluster_name: str | None = None) -> dict:
-    """Upsert a detection into the shared, technique-keyed detection
-    registry (not into one cluster's own record) - the same detection
-    can cover every adversary that uses a given technique instead of
-    being duplicated per cluster. technique_ids is required. Pass
-    cluster_name to also get that cluster's refreshed view back."""
-    return core.add_detection(detection_id, description, technique_ids, status, cluster_name)
+                   status: str = "draft", cluster_name: str | None = None,
+                   scope: str | None = None) -> dict:
+    """Upsert a detection into the shared detection registry (not into
+    one cluster's own record). scope="technique" for a generic behavioral
+    detection that covers every cluster using the technique; scope=
+    "cluster" for one keyed to a specific actor's artifacts (C2 port,
+    signer, loader YARA), shown only on the clusters it names. Defaults
+    to "cluster" when cluster_name is given, else "technique"; unchanged
+    on update unless passed. technique_ids is required. cluster_name adds
+    that cluster to the detection and returns its refreshed view."""
+    return core.add_detection(detection_id, description, technique_ids, status,
+                               cluster_name, scope)
 
 
 @mcp.tool()

@@ -703,16 +703,29 @@ Intrusion Set by a `uses` Relationship on export.
 
 ## Detections and technique usage
 
-Detections are **not** stored per-cluster. They live in a shared,
-technique-keyed registry — the same Kerberoasting detection covers
-every adversary that does Kerberoasting, so it's modeled once and
-joined onto whichever clusters' TTP tables reference that technique_id,
-rather than hand-copied into each one. `add_detection` requires at
-least one `technique_id`; pass `cluster_name` too if you want that
-cluster's refreshed view back (optional — it's just provenance for
-"which investigation prompted writing this"). A cluster's `detections`
-field in `get_cluster` is always this live join, annotated with which
-of that cluster's own TTPs each detection covers.
+Detections are **not** stored per-cluster. They live in a shared
+registry, and each one has a `scope` that decides which clusters it is
+joined onto:
+
+- `scope="technique"` — a generic behavioral detection. The same
+  Kerberoasting rule covers every adversary that Kerberoasts, so it's
+  modeled once and joined onto every cluster whose TTP table references
+  that technique_id.
+- `scope="cluster"` — keyed to one actor's artifacts (a C2 port, a
+  code-signing certificate, a YARA rule for their loader). It shows only
+  on the clusters it names. Sharing an ATT&CK ID with another cluster
+  doesn't mean the rule would catch that actor, so it isn't shown there
+  as coverage.
+
+Pick the scope by asking whether the rule would fire on a *different*
+actor doing the same technique. If only this actor's IOCs or tooling
+would trip it, it's cluster-scoped. `add_detection` requires at least one
+`technique_id`. `scope` defaults to `"cluster"` when you pass
+`cluster_name` and to `"technique"` otherwise, so pass
+`scope="technique"` explicitly when filing a generic rule from inside
+an investigation. A cluster's `detections` field in `get_cluster` is
+always this live join, with each entry's `scope` and the cluster TTPs it
+covers.
 
 To go the other direction — given a technique, which adversaries use it
 and what covers it — use `get_technique_usage(technique_id)` (omit the
