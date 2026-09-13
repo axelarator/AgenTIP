@@ -429,12 +429,65 @@ def test_add_detection_shared_across_clusters():
     core.update_ttp("Detection Cluster B", "T1558.003", "Kerberoasting", 0)
 
     core.add_detection("DET-KERB", "Kerberoasting ticket request volume", ["T1558.003"],
-                        status="validated", cluster_name="Detection Cluster A")
+                        status="validated", cluster_name="Detection Cluster A",
+                        scope="technique")
 
     a = core.get_cluster("Detection Cluster A")
     b = core.get_cluster("Detection Cluster B")
     assert any(d["id"] == "DET-KERB" for d in a["detections"])
     assert any(d["id"] == "DET-KERB" for d in b["detections"])  # shared, not duplicated per cluster
+
+
+def test_cluster_scoped_detection_stays_on_its_cluster():
+    core.create_cluster("Scoped Owner")
+    core.create_cluster("Scoped Bystander")
+    core.update_ttp("Scoped Owner", "T1571", "Non-Standard Port", 0)
+    core.update_ttp("Scoped Bystander", "T1571", "Non-Standard Port", 0)
+
+    # cluster_name without an explicit scope defaults to cluster scope
+    core.add_detection("DET-PORT", "Owner's C2 on port 31337", ["T1571"],
+                        cluster_name="Scoped Owner")
+
+    owner = core.get_cluster("Scoped Owner")
+    bystander = core.get_cluster("Scoped Bystander")
+    assert [d["scope"] for d in owner["detections"] if d["id"] == "DET-PORT"] == ["cluster"]
+    assert not any(d["id"] == "DET-PORT" for d in bystander["detections"])
+    # still discoverable per technique
+    assert any(d["id"] == "DET-PORT" for d in core.get_technique_usage("T1571")["detections"])
+
+
+def test_narrowing_detection_scope_removes_it_from_other_clusters():
+    core.create_cluster("Narrow Owner")
+    core.create_cluster("Narrow Other")
+    core.update_ttp("Narrow Owner", "T1003", "OS Credential Dumping", 0)
+    core.update_ttp("Narrow Other", "T1003", "OS Credential Dumping", 0)
+    core.add_detection("DET-NARROW", "LSASS dump", ["T1003"], cluster_name="Narrow Owner",
+                        scope="technique")
+    assert any(d["id"] == "DET-NARROW" for d in core.get_cluster("Narrow Other")["detections"])
+
+    core.add_detection("DET-NARROW", "LSASS dump via owner's tool", ["T1003"], scope="cluster")
+    assert not any(d["id"] == "DET-NARROW" for d in core.get_cluster("Narrow Other")["detections"])
+    assert any(d["id"] == "DET-NARROW" for d in core.get_cluster("Narrow Owner")["detections"])
+
+
+def test_cluster_scoped_detection_requires_a_cluster():
+    with pytest.raises(ValueError):
+        core.add_detection("DET-ORPHAN", "desc", ["T1003"], scope="cluster")
+    with pytest.raises(ValueError):
+        core.add_detection("DET-BADSCOPE", "desc", ["T1003"], scope="global")
+
+
+def test_legacy_detection_without_scope_joins_by_technique(isolated_data_dir):
+    core.create_cluster("Legacy Join")
+    core.update_ttp("Legacy Join", "T1003", "OS Credential Dumping", 0)
+    reg = isolated_data_dir / "_registry" / "detections.json"
+    reg.parent.mkdir(parents=True, exist_ok=True)
+    reg.write_text(json.dumps({"detections": [{
+        "id": "DET-OLD", "description": "pre-scope entry", "status": "draft",
+        "technique_ids": ["T1003"], "clusters": ["Someone Else"],
+        "created": "2026-01-01T00:00:00+00:00", "updated": "2026-01-01T00:00:00+00:00"}]}))
+    dets = core.get_cluster("Legacy Join")["detections"]
+    assert [d["scope"] for d in dets if d["id"] == "DET-OLD"] == ["technique"]
 
 
 def test_add_detection_upsert_merges_technique_ids():
