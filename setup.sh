@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# One-shot setup: creates the mcp-server venv, installs cti_tools into it,
-# and (re)writes .mcp.json with absolute paths for this checkout.
+# One-shot setup: creates the venv, installs cti into it, and (re)writes
+# .mcp.json with absolute paths for this checkout.
 #
 # MCP stdio configs generally need a real, resolvable command path — not
 # every harness expands ${workspaceFolder}-style variables the same way
@@ -9,7 +9,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$ROOT/mcp-server"
+cd "$ROOT"
 
 if [ ! -d .venv ]; then
     python3 -m venv .venv
@@ -23,9 +23,9 @@ cat > "$ROOT/.mcp.json" <<EOF
   "mcpServers": {
     "cti-tools": {
       "type": "stdio",
-      "command": "$ROOT/mcp-server/.venv/bin/python",
-      "args": ["-m", "cti_tools.server"],
-      "cwd": "$ROOT/mcp-server",
+      "command": "$ROOT/.venv/bin/python",
+      "args": ["-m", "cti.mcp.server"],
+      "cwd": "$ROOT",
       "env": {"WEBAMON_API_KEY": "\${WEBAMON_API_KEY}",
               "HONEYLABS_API_KEY": "\${HONEYLABS_API_KEY}",
               "THREATFOX_API_KEY": "\${THREATFOX_API_KEY}",
@@ -56,9 +56,9 @@ cat > "$ROOT/.pi/mcp.json" <<EOF
   "mcpServers": {
     "cti-tools": {
       "transport": "stdio",
-      "command": "$ROOT/mcp-server/.venv/bin/python",
-      "args": ["-m", "cti_tools.server"],
-      "cwd": "$ROOT/mcp-server",
+      "command": "$ROOT/.venv/bin/python",
+      "args": ["-m", "cti.mcp.server"],
+      "cwd": "$ROOT",
       "env": {"WEBAMON_API_KEY": "\${WEBAMON_API_KEY}",
               "HONEYLABS_API_KEY": "\${HONEYLABS_API_KEY}",
               "THREATFOX_API_KEY": "\${THREATFOX_API_KEY}",
@@ -85,23 +85,36 @@ touch "$ROOT"/data/tracking/.gitkeep
 # copy, not a symlink -
 # same convention as .pi/skills/, and avoids relying on every harness
 # following symlinks the same way.
-mkdir -p "$ROOT"/.claude/skills/threat-cluster-tracking
-cp "$ROOT"/skills/threat-cluster-tracking/SKILL.md "$ROOT"/.claude/skills/threat-cluster-tracking/SKILL.md
+# Both skills, not just one: actor-tracking was never mirrored here, so
+# Claude Code loaded the cluster-tracking rules and never the time-series
+# ones - the DuckDB layer's vocabulary, budgets and query discipline were
+# reachable only through tool descriptions. The mirrors are generated and
+# gitignored now; skills/ is the only copy under version control, because
+# three committed copies drift.
+for skill in "$ROOT"/skills/*/; do
+    name=$(basename "$skill")
+    for target in "$ROOT/.claude/skills" "$ROOT/.pi/skills"; do
+        mkdir -p "$target/$name"
+        cp "$skill/SKILL.md" "$target/$name/SKILL.md"
+    done
+done
 
-echo "Installed cti_tools into $ROOT/mcp-server/.venv"
+echo "Installed cti + graph into $ROOT/.venv"
 echo "Wrote $ROOT/.mcp.json and $ROOT/.pi/mcp.json"
-echo "Mirrored skills/threat-cluster-tracking/ into .claude/skills/ (Claude Code) and .pi/skills/ (Pi)"
+echo "Mirrored every skills/*/ into .claude/skills/ (Claude Code) and .pi/skills/ (Pi)"
 echo
 echo "Sanity check:"
-python -c "from cti_tools import core; print(core.list_clusters())"
+python -c "from cti import core; print(core.list_clusters())"
 echo
 echo "Next: point GitHub Copilot at skills/threat-cluster-tracking/ (wherever"
 echo "its own Agent Skills loader reads from) and at .mcp.json."
-echo "See mcp-server/README.md."
+echo "See docs/architecture.md."
 echo
 echo "Daily actor-tracking loop (skills/actor-tracking/): add to crontab -e:"
-echo "  15 6 * * * cd $ROOT && mcp-server/.venv/bin/python mcp-server/scripts/daily_tracking.py >> data/tracking/logs/stage_a.log 2>&1"
-echo "  45 6 * * * cd $ROOT && bash mcp-server/scripts/daily_narrative.sh >> data/tracking/logs/stage_b.log 2>&1"
+echo "  15 6 * * * cd $ROOT && .venv/bin/python -m graph collect >> data/tracking/logs/stage_a.log 2>&1"
+echo "  45 6 * * * cd $ROOT && .venv/bin/python -m graph analyze >> data/tracking/logs/stage_b.log 2>&1"
+echo "  (both default to today, so no date arithmetic in the crontab;"
+echo "   one line for both: .venv/bin/python -m graph daily)"
 echo "Secrets (env, e.g. in ~/.bashrc - never committed): WEBAMON_API_KEY,"
 echo "  HONEYLABS_API_KEY, THREATFOX_API_KEY (optional)."
 echo "Probe VM (env): CTI_PROBE_HOST/USER/SSH_KEY/KNOWN_HOSTS/HELPER_CMD"
@@ -110,4 +123,9 @@ echo "Tunables (env): CTI_DUCKDB_PATH (default data/tracking/tracking.duckdb),"
 echo "  CTI_HL_BUDGET (HoneyLabs lookups/day, default 400),"
 echo "  CTI_WEBAMON_DAILY_BUDGET (default 1000), CTI_WEBAMON_RESCAN_DAYS (default 7)."
 echo "One-time seed from the cluster store:"
-echo "  mcp-server/.venv/bin/python mcp-server/scripts/daily_tracking.py --seed"
+echo "  .venv/bin/python scripts/daily_tracking.py --seed"
+echo
+echo "Pipeline diagrams (regenerate after changing the graph):"
+echo "  .venv/bin/python -m graph draw"
+echo "Per-run node timings:"
+echo "  .venv/bin/python -m graph trace --date YYYY-MM-DD"

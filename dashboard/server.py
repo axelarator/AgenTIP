@@ -12,6 +12,7 @@ starlette/uvicorn as transitive deps of the `mcp` package:
 """
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from starlette.staticfiles import StaticFiles
 
 from cti import core
 from cti.tracking import digest as tracking_digest
+from graph import trace as graph_trace
 from cti import store as tracking_store
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -151,6 +153,62 @@ async def tracking_narrative_detail(request):
     return JSONResponse({"date": day, "content": path.read_text()})
 
 
+async def runs(request):
+    """Which pipeline runs have a recorded trace.
+
+    The run trace is the piece the old design could not show at all:
+    Stage B was one opaque `claude -p` whose only artifact was the
+    finished narrative, so "which specialist decided that, and what did it
+    cost" had no answer.
+    """
+    rdir = graph_trace.runs_dir()
+    if not rdir.is_dir():
+        return JSONResponse({"dates": []})
+    dates = sorted((p.stem for p in rdir.glob("*.jsonl")
+                    if _NARRATIVE_DATE_RE.match(p.stem)), reverse=True)
+    return JSONResponse({"dates": dates})
+
+
+async def run_detail(request):
+    day = request.path_params["date"]
+    if not _NARRATIVE_DATE_RE.match(day):
+        return JSONResponse({"error": "invalid date"}, status_code=400)
+    path = graph_trace.runs_dir() / f"{day}.jsonl"
+    if not path.is_file():
+        return JSONResponse({"error": f"no run recorded for {day}"}, status_code=404)
+
+    records = graph_trace.read(path)
+    summary = graph_trace.summarize(path)
+
+    # What each node produced, in the shape the timeline renders: the
+    # ranker's suppression counts and per-family selection, and each
+    # specialist's findings.
+    detail = []
+    for record in records:
+        if record.get("event") != "node":
+            continue
+        output = record.get("output") or {}
+        entry = {"node": record["node"], "elapsed_s": record["elapsed_s"]}
+        if record["node"] == "rank":
+            items = output.get("items") or []
+            entry["items_seen"] = len(items)
+            entry["suppressed"] = [
+                {"indicator": i.get("indicator"), "attribute": i.get("attribute"),
+                 "reason": i.get("suppressed")} for i in items if i.get("suppressed")]
+            entry["selected"] = {
+                family: [{"indicator": i.get("indicator"),
+                          "attribute": i.get("attribute"),
+                          "score": i.get("score")} for i in chosen]
+                for family, chosen in (output.get("ranked") or {}).items()}
+        if output.get("findings"):
+            entry["findings"] = output["findings"]
+        if output.get("errors"):
+            entry["errors"] = output["errors"]
+        detail.append(entry)
+
+    return JSONResponse({"date": day, "summary": summary, "nodes": detail})
+
+
 routes = [
     Route("/api/stats", stats),
     Route("/api/clusters", list_clusters),
@@ -163,6 +221,8 @@ routes = [
     Route("/api/tracking/observables/{ip}", tracking_observable_detail),
     Route("/api/tracking/narratives", tracking_narratives),
     Route("/api/tracking/narratives/{date}", tracking_narrative_detail),
+    Route("/api/runs", runs),
+    Route("/api/runs/{date}", run_detail),
     Mount("/", app=StaticFiles(directory=str(STATIC_DIR), html=True), name="static"),
 ]
 
@@ -173,4 +233,5 @@ if __name__ == "__main__":
     import uvicorn
     # Headless lab VM — bind all interfaces so the dashboard is reachable by
     # the VM's LAN IP, not just from a shell on the box itself.
-    uvicorn.run(app, host="0.0.0.0", port=8420)
+    uvicorn.run(app, host=os.environ.get("CTI_DASHBOARD_HOST", "0.0.0.0"),
+                port=int(os.environ.get("CTI_DASHBOARD_PORT", "8420")))

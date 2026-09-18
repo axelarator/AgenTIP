@@ -950,6 +950,86 @@ async function viewNarrativeDetail(day) {
   return h("div", {}, header, h("div", { class: "card" }, renderMarkdownLite(res.content)));
 }
 
+/* ---------- pipeline runs ---------- */
+async function viewRuns() {
+  const res = await api("/api/runs");
+  const header = h("div", { class: "view-header" },
+    h("div", { class: "view-title" }, "Pipeline runs"),
+    h("div", { class: "view-sub" }, "What actually ran each day: which nodes fired, how long each took, and what the ranker dropped before any of them saw it."));
+  if (!res.dates.length) return h("div", {}, header, h("div", { class: "empty-state" }, "No runs recorded yet."));
+  return h("div", {}, header, h("div", { class: "card" },
+    ...res.dates.map((d) => h("div", { class: "timeline-item" },
+      h("div", { class: "timeline-item__head" },
+        h("a", { href: `#/runs/${d}`, style: "color:var(--accent);font-weight:600;text-decoration:none;" }, d))))));
+}
+
+function nodeBar(node, maxSeconds) {
+  // Width is proportional to the slowest node in the run, so the shape of
+  // the bar answers "what was slow" without reading any numbers.
+  const pct = maxSeconds > 0 ? Math.max(2, Math.round((node.elapsed_s / maxSeconds) * 100)) : 2;
+  return h("div", { class: "run-node" },
+    h("div", { class: "run-node__head" },
+      h("span", { class: "mono", style: "font-weight:600;" }, node.node),
+      h("span", { class: "mono", style: "opacity:.7;" }, `${node.elapsed_s.toFixed(2)}s`)),
+    h("div", { class: "run-bar" }, h("div", { class: "run-bar__fill", style: `width:${pct}%` })));
+}
+
+async function viewRunDetail(day) {
+  const header = h("div", { class: "view-header" },
+    h("div", { class: "view-title" }, `Run — ${day}`),
+    h("div", { class: "view-sub" }, h("a", { href: "#/runs", style: "color:var(--accent);" }, "← back to pipeline runs")));
+  let res;
+  try {
+    res = await api(`/api/runs/${encodeURIComponent(day)}`);
+  } catch (err) {
+    return h("div", {}, header, h("div", { class: "empty-state" }, `No run recorded for ${day}.`));
+  }
+
+  const maxSeconds = Math.max(...res.nodes.map((n) => n.elapsed_s), 0);
+  const cards = [];
+
+  cards.push(h("div", { class: "card" },
+    h("div", { class: "card__title" }, `Timeline — ${res.summary.total_s}s total, slowest: ${res.summary.slowest || "n/a"}`),
+    ...res.nodes.map((n) => nodeBar(n, maxSeconds))));
+
+  const rank = res.nodes.find((n) => n.node === "rank");
+  if (rank) {
+    const rows = (rank.suppressed || []).map((s) => h("tr", {},
+      h("td", { class: "mono" }, s.indicator),
+      h("td", { class: "mono" }, s.attribute),
+      h("td", {}, s.reason)));
+    cards.push(h("div", { class: "card" },
+      h("div", { class: "card__title" }, `Triage — ${rank.items_seen} rows seen, ${(rank.suppressed || []).length} suppressed before any model ran`),
+      ...Object.entries(rank.selected || {}).map(([family, picked]) =>
+        h("div", { class: "timeline-item" },
+          h("div", { class: "timeline-item__head" }, h("span", { class: "mono", style: "font-weight:600;" }, family)),
+          h("div", {}, picked.length
+            ? picked.map((i) => h("span", { class: "chip chip--neutral chip--mono" }, `${i.indicator} · ${i.attribute}`))
+            : h("span", { style: "opacity:.6;" }, "nothing to weigh")))),
+      rows.length ? h("div", { class: "table-wrap" }, h("table", { class: "data-table" },
+        h("thead", {}, h("tr", {}, h("th", {}, "Indicator"), h("th", {}, "Attribute"), h("th", {}, "Suppressed because"))),
+        h("tbody", {}, ...rows))) : h("div", { style: "opacity:.6;" }, "Nothing was suppressed.")));
+  }
+
+  for (const node of res.nodes) {
+    if (!node.findings && !node.errors) continue;
+    cards.push(h("div", { class: "card" },
+      h("div", { class: "card__title" }, node.node),
+      ...(node.findings || []).map((f) => h("div", { class: "timeline-item" },
+        h("div", { class: "timeline-item__head" }, h("strong", {}, f.headline)),
+        h("div", { class: "narrative-p" }, f.detail || ""),
+        h("div", {},
+          h("span", { class: "chip chip--neutral" }, `confidence: ${f.confidence}`),
+          f.correlation_type
+            ? h("span", { class: "chip chip--neutral" }, `saved as ${f.correlation_type}`)
+            : h("span", { class: "chip chip--neutral" }, "noted only"),
+          ...(f.indicators || []).map((i) => h("span", { class: "chip chip--neutral chip--mono" }, i))))),
+      ...(node.errors || []).map((e) => h("div", { class: "narrative-p" }, `error: ${e}`))));
+  }
+
+  return h("div", {}, header, ...cards);
+}
+
 /* ---------- observable search ---------- */
 function observableGroup(title, items) {
   return h("div", { class: "search-group" },
@@ -987,6 +1067,7 @@ function parseHash() {
   if (parts[0] === "queue") return { name: "queue" };
   if (parts[0] === "tracking") return { name: "tracking", ip: parts[1] };
   if (parts[0] === "narratives") return { name: "narratives", date: parts[1] };
+  if (parts[0] === "runs") return { name: "runs", date: parts[1] };
   if (parts[0] === "search") return { name: "search", query: parts.slice(1).join("/") };
   return { name: "overview" };
 }
@@ -1005,6 +1086,7 @@ async function render() {
     else if (route.name === "queue") node = await viewQueue();
     else if (route.name === "tracking") node = route.ip ? await viewTrackingDetail(route.ip) : await viewTracking();
     else if (route.name === "narratives") node = route.date ? await viewNarrativeDetail(route.date) : await viewNarratives();
+    else if (route.name === "runs") node = route.date ? await viewRunDetail(route.date) : await viewRuns();
     else if (route.name === "search") node = await viewSearch(route.query);
     else node = h("div", { class: "empty-state" }, "Not found.");
     view.textContent = "";

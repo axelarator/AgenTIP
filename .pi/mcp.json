@@ -2,9 +2,9 @@
   "mcpServers": {
     "cti-tools": {
       "transport": "stdio",
-      "command": "/home/agent/cti-agent/mcp-server/.venv/bin/python",
-      "args": ["-m", "cti_tools.server"],
-      "cwd": "/home/agent/cti-agent/mcp-server",
+      "command": "/home/agent/cti-graph/.venv/bin/python",
+      "args": ["-m", "cti.mcp.server"],
+      "cwd": "/home/agent/cti-graph",
       "env": {"WEBAMON_API_KEY": "${WEBAMON_API_KEY}",
               "HONEYLABS_API_KEY": "${HONEYLABS_API_KEY}",
               "THREATFOX_API_KEY": "${THREATFOX_API_KEY}",
