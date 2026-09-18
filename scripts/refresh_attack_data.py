@@ -19,7 +19,7 @@ from pathlib import Path
 
 SOURCE_URL = ("https://raw.githubusercontent.com/mitre-attack/attack-stix-data/"
               "master/enterprise-attack/enterprise-attack.json")
-OUTPUT_PATH = (Path(__file__).resolve().parents[1] / "cti_tools" / "attack_data"
+OUTPUT_PATH = (Path(__file__).resolve().parents[1] / "cti" / "attack" / "data"
                / "enterprise_attack_techniques.json")
 
 

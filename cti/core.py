@@ -31,6 +31,7 @@ from .sources import pivot, webamon
 from . import store as tracking_store
 from .tracking.analytics import SHARED_HOSTING_ASNS
 from .store.changes import STALE_BASELINE_DAYS as _ATTR_STALE_BASELINE_DAYS
+from .util import repo_root
 
 try:
     import fcntl  # POSIX-only; the lock degrades to a no-op elsewhere.
@@ -41,7 +42,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 # across every harness surface (MCP server, CLI, any future UI) rather
 # than nested inside mcp-server/. Override with CTI_DATA_DIR for tests
 # or alternate deployments (e.g. a separate private data repo).
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = repo_root()
 DATA_DIR = Path(os.environ.get("CTI_DATA_DIR", _REPO_ROOT / "data" / "clusters"))
 
 # Which newly-added observable categories get queued for fingerprinting.

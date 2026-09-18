@@ -21,8 +21,9 @@ from typing import Any
 import duckdb
 
 from .. import store
+from ..util import repo_root
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT = repo_root()
 
 
 def _inbox_dir() -> Path:

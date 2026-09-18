@@ -30,14 +30,13 @@ from typing import Any, Callable
 
 from ..errors import is_failure
 from ..util import atomic_write_text, read_json, write_json
+from ..util import data_dir
 
 DEFAULT_TTL = 3600
 
 
 def _root() -> Path:
-    base = os.environ.get("CTI_DATA_DIR")
-    root = Path(base) if base else Path(__file__).resolve().parents[2] / "data" / "clusters"
-    return root / "_registry" / "cache"
+    return data_dir() / "_registry" / "cache"
 
 
 def _ttl(env: str, default: int = DEFAULT_TTL) -> int:

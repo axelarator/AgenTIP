@@ -1,0 +1,43 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	__end__([<p>__end__</p>]):::last
+	__start__ --> collect\3aingest_inbox;
+	collect\3awrite_digest --> analyze\3arank;
+	analyze\3anarrate --> __end__;
+	subgraph collect
+	collect\3aingest_inbox(ingest_inbox)
+	collect\3asweep(sweep)
+	collect\3aenrich_and_write(enrich_and_write)
+	collect\3arun_analytics(run_analytics)
+	collect\3awrite_digest(write_digest)
+	collect\3aenrich_and_write --> collect\3arun_analytics;
+	collect\3aingest_inbox -.-> collect\3asweep;
+	collect\3arun_analytics --> collect\3awrite_digest;
+	collect\3asweep --> collect\3aenrich_and_write;
+	end
+	subgraph analyze
+	analyze\3arank(rank)
+	analyze\3ainfra_change(infra_change)
+	analyze\3acert_tls(cert_tls)
+	analyze\3ahosting(hosting)
+	analyze\3aopendir(opendir)
+	analyze\3apersist(persist)
+	analyze\3anarrate(narrate)
+	analyze\3acert_tls --> analyze\3apersist;
+	analyze\3ahosting --> analyze\3apersist;
+	analyze\3ainfra_change --> analyze\3apersist;
+	analyze\3aopendir --> analyze\3apersist;
+	analyze\3apersist --> analyze\3anarrate;
+	analyze\3arank --> analyze\3acert_tls;
+	analyze\3arank --> analyze\3ahosting;
+	analyze\3arank --> analyze\3ainfra_change;
+	analyze\3arank --> analyze\3aopendir;
+	end
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc

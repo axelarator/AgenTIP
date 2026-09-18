@@ -41,6 +41,29 @@ def is_stale(observed_at: datetime, days: int) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Paths
+# --------------------------------------------------------------------------- #
+
+def repo_root() -> Path:
+    """The checkout root.
+
+    Five modules computed this independently as Path(__file__).parents[N],
+    with N hand-counted per module. Moving a module one directory deeper
+    silently changed where it looked for data - three of the five broke in
+    exactly that way during this restructure, and the failure was a "no
+    digest for today" message pointing at a path outside the repo. One
+    definition, anchored on this file, which lives at cti/util.py.
+    """
+    return Path(__file__).resolve().parents[1]
+
+
+def data_dir() -> Path:
+    """The cluster JSON store. CTI_DATA_DIR overrides it (tests always do)."""
+    base = os.environ.get("CTI_DATA_DIR")
+    return Path(base) if base else repo_root() / "data" / "clusters"
+
+
+# --------------------------------------------------------------------------- #
 # Files
 # --------------------------------------------------------------------------- #
 

@@ -32,6 +32,7 @@ from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from typing import Iterator
+from ..util import data_dir
 
 # provider -> (env var naming the daily cap, default cap, min seconds
 # between calls). A min_interval of 0 means only the daily cap applies.
@@ -51,9 +52,7 @@ class BudgetExhausted(RuntimeError):
 
 
 def _dir() -> Path:
-    base = os.environ.get("CTI_DATA_DIR")
-    root = Path(base) if base else Path(__file__).resolve().parents[2] / "data" / "clusters"
-    d = root / "_registry" / "budgets"
+    d = data_dir() / "_registry" / "budgets"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

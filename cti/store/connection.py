@@ -18,8 +18,9 @@ from typing import Iterator
 import duckdb
 
 from ..errors import TrackingBusy
+from ..util import repo_root
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = repo_root()
 
 
 def db_path() -> Path:

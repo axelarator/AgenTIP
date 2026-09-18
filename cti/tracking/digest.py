@@ -14,8 +14,9 @@ import os
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from ..util import repo_root
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT = repo_root()
 
 MAX_ROWS = 15
 NO_ACTIVITY = "NO ACTIVITY"
