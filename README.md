@@ -11,7 +11,8 @@ cti/                    the library
   store/                DuckDB: schema, observations, the change-detector registry
   sources/              external data, one module each, over one transport
   probe/                everything that leaves this host toward an indicator
-  clusters/ report/ attack/ tracking/ mcp/ stix.py
+  core.py               cluster CRUD + enrichment orchestration (still one file)
+  report/ attack/ tracking/ mcp/ stix.py
 graph/                  the pipeline
   nodes/                rank, the four specialists, collect's Stage A nodes
   prompts/              one prompt per specialist + the shared rules
@@ -126,6 +127,21 @@ rows, 20 Cert Spotter rows). So are the five that measure 100% NULL —
 `campaign`, `source_url`, `abuse_contact`, `hl_events_7d` and
 `infostealer_urls` are all still written or read. Empty today is not the
 same as unused.
+
+## Known incomplete
+
+`cti/core.py` is still 2379 lines (from 2774). The store, sources, probe,
+report and ATT&CK layers were lifted out of it, and the ten change
+detectors it carried are gone — but the cluster-JSON half (CRUD,
+observables, the detection registry, the reverse index, markdown
+rendering, and the pivot/scan orchestration) has not been split by
+concern.
+
+That split is organizational rather than behavioural, and it is not free:
+`tests/test_core.py` monkeypatches `core.<attr>` in 134 tests, and a
+façade that re-exports from submodules silently breaks that kind of
+patching. It is worth doing, with the patch targets moved in the same
+change, and it was not worth doing quickly.
 
 ## Why this is still Python
 
