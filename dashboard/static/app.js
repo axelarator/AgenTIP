@@ -401,12 +401,12 @@ function renderObservableProfileCard(o, category, profile) {
     const asn = (d.asn || [])[0];
     if (asn != null) chips.push(h("span", { class: "chip chip--neutral" }, `AS${asn}` + (d.as_holder ? ` ${d.as_holder}` : "")));
     if (d.prefix) chips.push(h("span", { class: "chip chip--neutral chip--mono" }, d.prefix));
-    const shodan = latestObservationBySource(profile, "shodan");
-    if (shodan && (shodan.shodan_ports || []).length) {
-      chips.push(h("span", { class: "chip chip--neutral chip--mono" }, `ports: ${shodan.shodan_ports.join(", ")}`));
-    }
-    if (shodan && (shodan.shodan_tags || []).length) {
-      chips.push(...shodan.shodan_tags.map((t) => h("span", { class: "chip chip--neutral" }, t)));
+    // Ports come from the on-demand nmap scan. Shodan InternetDB was the
+    // source until it was retired; reading it here just showed whatever
+    // was last seen before the swap, with no hint it was stale.
+    const nmap = latestObservationBySource(profile, "nmap");
+    if (nmap && (nmap.nmap_ports || []).length) {
+      chips.push(h("span", { class: "chip chip--neutral chip--mono" }, `ports: ${nmap.nmap_ports.join(", ")}`));
     }
   } else if (category === "domains") {
     if ((d.nameservers || []).length) chips.push(h("span", { class: "chip chip--neutral chip--mono" }, d.nameservers[0]));
@@ -809,7 +809,7 @@ function trackingEventItem(ip, e) {
         `AS${c.old_asn ?? "?"} (${c.old_netname || "—"}) → AS${c.new_asn ?? "?"} (${c.new_netname || "—"})`));
   }
   const o = e.data;
-  // hl_ports/hl_tags (HoneyLabs) and shodan_ports/shodan_tags (Shodan
+  // hl_ports/hl_tags (HoneyLabs) and nmap_ports (on-demand active scan
   // InternetDB) are mutually exclusive per row (one source per
   // observation) - show whichever this row actually carries.
   //
@@ -818,8 +818,8 @@ function trackingEventItem(ip, e) {
   // there's no basis for expecting a local capture to exist for it (see
   // arkimeSessionUrl, which only ever fires from a genuine probe/Zeek-
   // passive provenance string).
-  const ports = (o.hl_ports && o.hl_ports.length) ? o.hl_ports : (o.shodan_ports || []);
-  const tags = (o.hl_tags && o.hl_tags.length) ? o.hl_tags : (o.shodan_tags || []);
+  const ports = (o.hl_ports && o.hl_ports.length) ? o.hl_ports : (o.nmap_ports || []);
+  const tags = o.hl_tags || [];
   const matches = (o.threatfox_matches || []).map((m) => m.malware || m.threat_type).filter(Boolean);
   const detail = [o.asn != null ? `AS${o.asn} ${o.netname || ""}` : null, o.country_code,
     ports.length ? `ports: ${ports.join(", ")}` : null,

@@ -30,3 +30,11 @@ data/tracking/*
 
 # Harness-local state
 .claude/settings.local.json
+
+# Generated skill mirrors - skills/ is canonical, setup.sh copies it into
+# the per-harness locations. Committing all three made them drift.
+.claude/skills/
+.pi/skills/
+
+# LangGraph run traces (one JSONL per run) - runtime state, not intel.
+data/runs/

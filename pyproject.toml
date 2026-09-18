@@ -1,0 +1,34 @@
+[project]
+name = "cti-graph"
+version = "0.1.0"
+description = "LangGraph-orchestrated threat cluster tracking over STIX + DuckDB"
+requires-python = ">=3.12"
+dependencies = [
+    # Pinned to v1: FastMCP was renamed to MCPServer in mcp 2.x and the
+    # streamable-http client moved. Migrating the 33-tool server surface
+    # is its own change, not part of the LangGraph rewrite.
+    "mcp>=1.2.0,<2",
+    "duckdb>=1.0",
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+    "claude-agent-sdk>=0.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.24"]
+viz = ["pygraphviz"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["cti*", "graph*"]
+
+[tool.setuptools.package-data]
+"cti.attack" = ["data/*.json"]
+"graph" = ["prompts/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

@@ -20,9 +20,9 @@ from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from cti_tools import core
-from cti_tools.tracking import digest as tracking_digest
-from cti_tools.tracking import store as tracking_store
+from cti import core
+from cti.tracking import digest as tracking_digest
+from cti import store as tracking_store
 
 STATIC_DIR = Path(__file__).parent / "static"
 _NARRATIVE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
