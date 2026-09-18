@@ -1,0 +1,805 @@
+<title>cti-agent Pipeline</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --ground: #eef1ef;
+    --surface: #ffffff;
+    --surface-2: #f6f8f7;
+    --ink: #121917;
+    --ink-2: #3b4744;
+    --muted: #64726e;
+    --line: #d5ded9;
+    --line-strong: #b3c2bb;
+    --accent: #0a6b60;
+    --accent-soft: #ddeeeb;
+    --hot: #a9501c;
+    --hot-soft: #f7e7db;
+    --sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    --cond: "IBM Plex Sans Condensed", "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0c1211;
+      --surface: #141b19;
+      --surface-2: #1a2220;
+      --ink: #e7ece9;
+      --ink-2: #c3cfcb;
+      --muted: #8fa09b;
+      --line: #24312e;
+      --line-strong: #3a4c47;
+      --accent: #52bdac;
+      --accent-soft: #10302c;
+      --hot: #e0914f;
+      --hot-soft: #2f2119;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0c1211;
+    --surface: #141b19;
+    --surface-2: #1a2220;
+    --ink: #e7ece9;
+    --ink-2: #c3cfcb;
+    --muted: #8fa09b;
+    --line: #24312e;
+    --line-strong: #3a4c47;
+    --accent: #52bdac;
+    --accent-soft: #10302c;
+    --hot: #e0914f;
+    --hot-soft: #2f2119;
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 1120px;
+    margin: 0 auto;
+    padding-inline: 22px;
+    padding-block: 0 72px;
+  }
+  .measure { max-width: 68ch; }
+
+  /* ---------- masthead ---------- */
+  header.top {
+    border-bottom: 1px solid var(--line-strong);
+    padding-block: 56px 26px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  h1 {
+    font-family: var(--cond);
+    font-weight: 700;
+    font-size: clamp(2.5rem, 6vw, 3.9rem);
+    line-height: 1.02;
+    letter-spacing: -0.015em;
+    text-wrap: balance;
+    margin: 0;
+  }
+  .dek {
+    font-size: 1.12rem;
+    color: var(--ink-2);
+    max-width: 60ch;
+    text-wrap: pretty;
+  }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 28px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .meta b { color: var(--ink-2); font-weight: 500; }
+
+  /* ---------- sections ---------- */
+  main { display: flex; flex-direction: column; gap: 64px; padding-top: 48px; }
+  section { display: flex; flex-direction: column; gap: 20px; }
+  .sec-head { display: flex; flex-direction: column; gap: 6px; }
+  .stage-no {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--accent);
+    letter-spacing: 0.08em;
+  }
+  h2 {
+    font-family: var(--cond);
+    font-weight: 600;
+    font-size: clamp(1.6rem, 3.2vw, 2.1rem);
+    line-height: 1.12;
+    letter-spacing: -0.01em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: var(--cond);
+    font-weight: 600;
+    font-size: 1.12rem;
+    letter-spacing: 0.005em;
+    margin: 0;
+  }
+  p { margin: 0; }
+  .measure p + p { margin-top: 14px; }
+  code, .m { font-family: var(--mono); font-size: 0.88em; }
+  code {
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 0.06em 0.34em;
+    white-space: nowrap;
+  }
+  a { color: var(--accent); }
+
+  /* ---------- figures ---------- */
+  figure {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .plate {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 2px;
+    padding: 20px 18px;
+    overflow-x: auto;
+  }
+  .plate svg { display: block; width: 100%; min-width: 560px; height: auto; }
+  figcaption {
+    font-size: 13.5px;
+    color: var(--muted);
+    max-width: 74ch;
+    text-wrap: pretty;
+  }
+  figcaption b { color: var(--ink-2); font-weight: 500; }
+
+  /* svg primitives */
+  .bx { fill: var(--surface-2); stroke: var(--line-strong); stroke-width: 1.2; }
+  .bx-a { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.3; }
+  .bx-h { fill: var(--hot-soft); stroke: var(--hot); stroke-width: 1.3; }
+  .bx-q { fill: none; stroke: var(--hot); stroke-width: 1.2; stroke-dasharray: 5 4; }
+  .zone { fill: none; stroke: var(--line-strong); stroke-width: 1.1; stroke-dasharray: 3 4; }
+  .edge { fill: none; stroke: var(--line-strong); stroke-width: 1.4; }
+  .edge-a { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+  .edge-h { fill: none; stroke: var(--hot); stroke-width: 1.5; }
+  .lbl { fill: var(--ink); font-family: var(--mono); font-size: 13px; font-weight: 500; }
+  .lbl-s { fill: var(--ink); font-family: var(--sans); font-size: 13px; font-weight: 600; }
+  .sub { fill: var(--muted); font-family: var(--sans); font-size: 11px; }
+  .elbl { fill: var(--muted); font-family: var(--sans); font-size: 11px; font-weight: 500; }
+  .elbl-a { fill: var(--accent); font-family: var(--sans); font-size: 11px; font-weight: 600; }
+  .elbl-h { fill: var(--hot); font-family: var(--sans); font-size: 11px; font-weight: 600; }
+  .ar { fill: var(--line-strong); }
+  .ar-a { fill: var(--accent); }
+  .ar-h { fill: var(--hot); }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 22px;
+    font-size: 12.5px;
+    color: var(--muted);
+    align-items: center;
+  }
+  .key { display: inline-flex; align-items: center; gap: 8px; }
+  .swatch { width: 22px; height: 10px; border-radius: 2px; border: 1px solid; }
+  .sw-a { background: var(--accent-soft); border-color: var(--accent); }
+  .sw-h { background: var(--hot-soft); border-color: var(--hot); }
+  .sw-q { background: transparent; border-color: var(--hot); border-style: dashed; }
+
+  /* ---------- tables ---------- */
+  .scroll { overflow-x: auto; border: 1px solid var(--line); background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; min-width: 520px; }
+  caption {
+    text-align: left;
+    font-family: var(--cond);
+    font-weight: 600;
+    font-size: 1.02rem;
+    padding: 14px 16px 10px;
+    color: var(--ink);
+  }
+  th, td { text-align: left; padding: 9px 16px; border-top: 1px solid var(--line); vertical-align: top; }
+  thead th {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 500;
+    border-top: 1px solid var(--line-strong);
+  }
+  tbody td:first-child { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+  .mark { text-align: center; font-variant-numeric: tabular-nums; }
+  .yes { color: var(--accent); font-weight: 600; }
+  .no { color: var(--line-strong); }
+  .route { font-family: var(--mono); font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  .gone { color: var(--muted); text-decoration: line-through; text-decoration-thickness: 1px; }
+
+  /* ---------- chips & lists ---------- */
+  .chips { display: flex; flex-wrap: wrap; gap: 7px; }
+  .chip {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    padding: 3px 9px;
+    border: 1px solid var(--line-strong);
+    border-radius: 999px;
+    color: var(--ink-2);
+    background: var(--surface);
+  }
+  .chip-h { border-color: var(--hot); color: var(--hot); background: var(--hot-soft); }
+
+  ul.tight { margin: 0; padding-left: 1.15em; display: flex; flex-direction: column; gap: 7px; }
+  ul.tight li::marker { color: var(--accent); }
+
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; }
+
+  /* rule blocks — the pivot/probe distinction */
+  .rule {
+    background: var(--surface);
+    border-left: 3px solid var(--accent);
+    padding: 16px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .rule.loud { border-left-color: var(--hot); }
+  .rule .tag {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .rule.loud .tag { color: var(--hot); }
+  .rule p { font-size: 14.5px; color: var(--ink-2); }
+
+  /* fixes */
+  .fix { display: grid; grid-template-columns: 88px 1fr; gap: 0 18px; padding: 18px 0; border-top: 1px solid var(--line); }
+  .fix:first-of-type { border-top: 1px solid var(--line-strong); }
+  .sha { font-family: var(--mono); font-size: 12px; color: var(--accent); padding-top: 2px; }
+  .fix-body { display: flex; flex-direction: column; gap: 8px; }
+  .fix-body h3 { font-size: 1.04rem; }
+  .fix-body p { font-size: 14.5px; color: var(--ink-2); }
+  .sym { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+
+  /* file map */
+  .map { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 2px; background: var(--line); border: 1px solid var(--line); }
+  .map div { background: var(--surface); padding: 11px 14px; display: flex; flex-direction: column; gap: 2px; }
+  .map .path { font-family: var(--mono); font-size: 12.5px; color: var(--ink); }
+  .map .what { font-size: 12.5px; color: var(--muted); }
+
+  footer {
+    margin-top: 64px;
+    padding-top: 18px;
+    border-top: 1px solid var(--line-strong);
+    font-size: 12.5px;
+    color: var(--muted);
+    font-family: var(--mono);
+  }
+
+  @media (max-width: 560px) {
+    .fix { grid-template-columns: 1fr; gap: 8px; }
+    header.top { padding-block: 36px 22px; }
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    a { transition: color 120ms ease; }
+  }
+</style>
+
+<div class="wrap">
+
+<header class="top">
+  <div class="eyebrow">branch rewrite-enrichment-webamon</div>
+  <h1>cti-agent Pipeline</h1>
+  <p class="dek">How an intel report becomes a tracked cluster, a live infrastructure snapshot, a day-over-day change log, and a one-page narrative — and where the traffic leaves from at each step.</p>
+  <div class="meta">
+    <span><b>HEAD</b> cc9adb0</span>
+    <span><b>Store</b> data/clusters/*.json + tracking.duckdb</span>
+    <span><b>Cron</b> 06:15 Stage A · 08:00 Stage B</span>
+    <span><b>Drawn</b> 2026-09-12</span>
+  </div>
+</header>
+
+<main>
+
+  <!-- ============ OVERVIEW ============ -->
+  <section>
+    <div class="sec-head">
+      <div class="stage-no">OVERVIEW</div>
+      <h2>One report, two paths out</h2>
+    </div>
+    <p class="measure">Everything downstream of ingestion splits along one line: lookups that any visitor could make run <b>automatically</b>, and traffic an attentive operator would notice runs <b>only when asked</b>. That split is the colour code below, and it holds through every diagram on this page.</p>
+
+    <div class="legend">
+      <span class="key"><span class="swatch sw-a"></span> automatic — passive lookups + light live checks</span>
+      <span class="key"><span class="swatch sw-h"></span> on explicit ask — crafted or loud traffic</span>
+      <span class="key"><span class="swatch sw-q"></span> queued, not yet run</span>
+    </div>
+
+    <figure>
+      <div class="plate">
+        <svg viewBox="0 0 1040 450" role="img" aria-label="Flow from a threat report through ingest_report into the cluster store, then branching into automatic pivoting and an on-ask probe queue, both writing into the DuckDB tracking store.">
+          <defs>
+            <marker id="a1" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto"><polygon class="ar" points="0,0 10,4 0,8"></polygon></marker>
+            <marker id="a1a" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto"><polygon class="ar-a" points="0,0 10,4 0,8"></polygon></marker>
+            <marker id="a1h" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto"><polygon class="ar-h" points="0,0 10,4 0,8"></polygon></marker>
+          </defs>
+
+          <!-- report -->
+          <rect class="bx" x="20" y="200" width="130" height="60" rx="2"></rect>
+          <text class="lbl-s" x="85" y="226" text-anchor="middle">Threat report</text>
+          <text class="sub" x="85" y="244" text-anchor="middle">URL · file · PDF</text>
+
+          <!-- ingest -->
+          <rect class="bx" x="210" y="178" width="170" height="104" rx="2"></rect>
+          <text class="lbl" x="295" y="204" text-anchor="middle">ingest_report</text>
+          <text class="sub" x="295" y="226" text-anchor="middle">defang → regex extract</text>
+          <text class="sub" x="295" y="244" text-anchor="middle">name check (no guessing)</text>
+          <text class="sub" x="295" y="262" text-anchor="middle">3-phase write</text>
+
+          <!-- cluster store -->
+          <rect class="bx" x="440" y="200" width="140" height="60" rx="2"></rect>
+          <text class="lbl-s" x="510" y="226" text-anchor="middle">Cluster store</text>
+          <text class="sub" x="510" y="244" text-anchor="middle">JSON + derived .md</text>
+
+          <!-- pivot (auto) -->
+          <rect class="bx-a" x="640" y="72" width="190" height="80" rx="2"></rect>
+          <text class="lbl" x="735" y="100" text-anchor="middle">pivot_cluster</text>
+          <text class="sub" x="735" y="120" text-anchor="middle">RDAP · RIPEstat · Webamon</text>
+          <text class="sub" x="735" y="138" text-anchor="middle">TLS · HTTP · DNS · PTR</text>
+
+          <!-- queue -->
+          <rect class="bx-q" x="230" y="330" width="170" height="52" rx="2"></rect>
+          <text class="lbl" x="315" y="352" text-anchor="middle">pending_fingerprints</text>
+          <text class="sub" x="315" y="370" text-anchor="middle">gated: probe-worthy only</text>
+
+          <!-- active (on ask) -->
+          <rect class="bx-h" x="640" y="318" width="190" height="80" rx="2"></rect>
+          <text class="lbl" x="735" y="346" text-anchor="middle">active_scan · JA4+</text>
+          <text class="sub" x="735" y="366" text-anchor="middle">nmap · dirsearch</text>
+          <text class="sub" x="735" y="384" text-anchor="middle">JARM + TLS handshake</text>
+
+          <!-- tracking -->
+          <rect class="bx" x="890" y="190" width="140" height="80" rx="2"></rect>
+          <text class="lbl" x="960" y="218" text-anchor="middle">tracking.duckdb</text>
+          <text class="sub" x="960" y="238" text-anchor="middle">observations</text>
+          <text class="sub" x="960" y="256" text-anchor="middle">attribute_changes</text>
+
+          <!-- edges -->
+          <line class="edge" x1="150" y1="230" x2="202" y2="230" marker-end="url(#a1)"></line>
+          <text class="elbl" x="176" y="221" text-anchor="middle">fetch</text>
+
+          <line class="edge" x1="380" y1="230" x2="432" y2="230" marker-end="url(#a1)"></line>
+          <text class="elbl" x="406" y="221" text-anchor="middle">file</text>
+
+          <polyline class="edge-a" points="580,222 610,222 610,112 632,112" marker-end="url(#a1a)"></polyline>
+          <text class="elbl-a" x="618" y="176" text-anchor="start">automatic</text>
+
+          <polyline class="edge-h" points="295,282 295,306 315,306 315,322" marker-end="url(#a1h)"></polyline>
+          <text class="elbl-h" x="306" y="300" text-anchor="start">if probe-worthy</text>
+
+          <line class="edge-h" x1="400" y1="356" x2="632" y2="356" marker-end="url(#a1h)"></line>
+          <text class="elbl-h" x="516" y="347" text-anchor="middle">on explicit ask</text>
+
+          <polyline class="edge-a" points="830,112 868,112 868,212 882,212" marker-end="url(#a1a)"></polyline>
+          <text class="elbl" x="862" y="162" text-anchor="end">diffs</text>
+
+          <polyline class="edge-h" points="830,356 868,356 868,250 882,250" marker-end="url(#a1h)"></polyline>
+          <text class="elbl" x="862" y="306" text-anchor="end">ports · files</text>
+
+          <!-- lifecycle write-back -->
+          <polyline class="edge-a" points="640,92 510,92 510,192" marker-end="url(#a1a)" stroke-dasharray="4 4"></polyline>
+          <text class="elbl-a" x="504" y="150" text-anchor="end">status + snapshot</text>
+
+          <!-- axis note -->
+          <text class="sub" x="20" y="424">Retired here: VirusTotal · Shodan InternetDB · Hackertarget · Cert Spotter · crt.sh</text>
+        </svg>
+      </div>
+      <figcaption><b>The whole pipeline.</b> The cluster JSON stays canonical for who/what; DuckDB holds when. Note the dashed return edge: pivoting is the only path that writes a lifecycle status back onto an observable — <code>pivot_observable</code> by contrast writes nothing at all.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============ STAGE 1 ============ -->
+  <section>
+    <div class="sec-head">
+      <div class="stage-no">STAGE 01</div>
+      <h2>Ingesting the report</h2>
+    </div>
+
+    <div class="measure">
+      <p><code>ingest_report(source, cluster_name=None)</code> fetches a URL or local file, strips HTML, runs PDFs through <code>pdftotext</code> when poppler is present, then re-fangs the text in memory — <span class="m">hxxp</span>, <span class="m">[.]</span>, <span class="m">[at]</span> — so the regexes can match.</p>
+      <p>Extraction pulls hashes, domains (TLD allowlist), IPs (private and reserved dropped), URLs, emails, CVEs, wallets and <span class="m">T1234.005</span> technique IDs. It also pairs ports to IPs two ways: direct <span class="m">1.2.3.4:886</span> adjacency, and prose like <i>"TCP port 886 (IPs: …)"</i> within one sentence-sized chunk — so a later probe hits the real C2 port instead of defaulting to 443.</p>
+      <p>The cluster name comes from the argument, or from a vendor-naming heuristic that <b>raises on zero or multiple candidates</b> rather than filing a report under the wrong actor.</p>
+    </div>
+
+    <figure>
+      <div class="plate">
+        <svg viewBox="0 0 960 290" role="img" aria-label="Timeline showing the data lock held during phase one, released during the concurrent enrichment sweep, and re-taken for phase two.">
+          <defs>
+            <marker id="a2" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto"><polygon class="ar" points="0,0 10,4 0,8"></polygon></marker>
+          </defs>
+
+          <!-- lock bar -->
+          <rect class="bx-a" x="30" y="34" width="250" height="14" rx="2"></rect>
+          <line class="edge" x1="280" y1="41" x2="640" y2="41" stroke-dasharray="5 5"></line>
+          <rect class="bx-a" x="640" y="34" width="290" height="14" rx="2"></rect>
+          <text class="elbl-a" x="155" y="26" text-anchor="middle">_data_lock held</text>
+          <text class="elbl" x="460" y="26" text-anchor="middle">lock released — no writer is blocked</text>
+          <text class="elbl-a" x="785" y="26" text-anchor="middle">_data_lock held</text>
+
+          <!-- phase 1 -->
+          <rect class="bx" x="30" y="76" width="250" height="128" rx="2"></rect>
+          <text class="lbl" x="46" y="100">phase 1</text>
+          <text class="sub" x="46" y="124">fetch the report (one URL hit)</text>
+          <text class="sub" x="46" y="144">extract observables + TTPs</text>
+          <text class="sub" x="46" y="164">resolve the cluster name</text>
+          <text class="sub" x="46" y="184">diff → genuinely new values</text>
+
+          <!-- middle: sweep -->
+          <rect class="bx" x="320" y="76" width="280" height="128" rx="2"></rect>
+          <text class="lbl" x="336" y="100">_sweep_lifecycle</text>
+          <text class="sub" x="336" y="118">6-thread pool, one job per indicator</text>
+          <line class="edge-a" x1="336" y1="136" x2="584" y2="136"></line>
+          <line class="edge-a" x1="336" y1="150" x2="584" y2="150"></line>
+          <line class="edge-a" x1="336" y1="164" x2="584" y2="164"></line>
+          <line class="edge-a" x1="336" y1="178" x2="584" y2="178"></line>
+          <text class="sub" x="336" y="196">RDAP · RIPEstat · TLS · HTTP · Webamon · ThreatFox</text>
+
+          <!-- phase 2 -->
+          <rect class="bx" x="640" y="76" width="290" height="128" rx="2"></rect>
+          <text class="lbl" x="656" y="100">phase 2</text>
+          <text class="sub" x="656" y="124">re-read the cluster (a writer may have raced)</text>
+          <text class="sub" x="656" y="144">merge observables + enrichment snapshot</text>
+          <text class="sub" x="656" y="164">merge TTPs at coverage 0, ATT&amp;CK-validated</text>
+          <text class="sub" x="656" y="184">save JSON, re-render the markdown view</text>
+
+          <line class="edge" x1="284" y1="140" x2="312" y2="140" marker-end="url(#a2)"></line>
+          <line class="edge" x1="604" y1="140" x2="632" y2="140" marker-end="url(#a2)"></line>
+
+          <!-- time axis -->
+          <line class="edge" x1="30" y1="234" x2="930" y2="234" marker-end="url(#a2)"></line>
+          <text class="sub" x="30" y="256">t</text>
+          <text class="sub" x="930" y="256" text-anchor="end">every other MCP tool call stays responsive through the middle band</text>
+        </svg>
+      </div>
+      <figcaption><b>Why ingestion is three phases.</b> A batch of RDAP, Webamon and probe-VM round-trips can run for minutes; holding the store lock across them would block every other tool call for the duration. So the network phase sits between two short locked phases, and phase 2 re-reads from disk rather than trusting the snapshot phase 1 took.</figcaption>
+    </figure>
+
+    <div class="grid-2">
+      <div class="rule">
+        <div class="tag">tracked always</div>
+        <h3>Every extracted value is filed</h3>
+        <p>Dedup is by value: a repeat just appends the new source to that observable's provenance and bumps <span class="m">last_seen</span>. A domain's live certificate SHA256 is auto-filed alongside as <code>cert-sha256:…</code> with <span class="m">hash_kind: certificate</span>, so it is pivotable from the moment the domain is tracked.</p>
+      </div>
+      <div class="rule loud">
+        <div class="tag">queued selectively</div>
+        <h3>Only probe-worthy values reach the queue</h3>
+        <p>Extraction is a blind regex — it will match a version string, a public resolver, or a vendor's own site. <code>_is_probe_worthy</code> drops private, reserved, loopback and link-local addresses, all IPv6 (the probe VM has no v6 route), known resolvers and vendor/sinkhole domains. Each skip is recorded with its reason and can be forced back with <code>requeue_fingerprint</code>.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ STAGE 2 ============ -->
+  <section>
+    <div class="sec-head">
+      <div class="stage-no">STAGE 02</div>
+      <h2>What enrichment is now</h2>
+    </div>
+
+    <p class="measure">The scan-platform layer is gone. What replaced it is one passive index plus live interaction with the indicator itself — a handshake made right now can't be weeks stale the way a scan platform's record of a host can.</p>
+
+    <div class="scroll">
+      <table>
+        <caption>Sources by observable kind, and where each call originates</caption>
+        <thead>
+          <tr><th scope="col">Source</th><th scope="col" class="mark">domain</th><th scope="col" class="mark">ip</th><th scope="col">Egress</th><th scope="col">What it answers</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>RDAP</td><td class="mark yes">●</td><td class="mark yes">●</td><td class="route">probe VM</td><td>registrar, holder, events, nameservers</td></tr>
+          <tr><td>RIPEstat</td><td class="mark no">—</td><td class="mark yes">●</td><td class="route">probe VM</td><td>ASN, prefix, AS holder, geo</td></tr>
+          <tr><td>dns resolve</td><td class="mark yes">●</td><td class="mark no">—</td><td class="route">probe VM</td><td>liveness; null-route sentinels stripped</td></tr>
+          <tr><td>tls_grab</td><td class="mark yes">●</td><td class="mark no">—</td><td class="route">probe VM</td><td>the certificate as of right now</td></tr>
+          <tr><td>http_probe</td><td class="mark yes">●</td><td class="mark no">—</td><td class="route">probe VM</td><td>status, title, server, autoindex</td></tr>
+          <tr><td>ptr</td><td class="mark no">—</td><td class="mark yes">●</td><td class="route">probe VM</td><td>the IP's own reverse name</td></tr>
+          <tr><td>subfinder + wayback</td><td class="mark yes">●</td><td class="mark no">—</td><td class="route">probe VM</td><td>passive subdomains (flag-only)</td></tr>
+          <tr><td>threatfox</td><td class="mark yes">●</td><td class="mark yes">●</td><td class="route">probe VM</td><td>known malware-C2 IOC match</td></tr>
+          <tr><td>webamon scan</td><td class="mark yes">●</td><td class="mark no">—</td><td class="route">direct</td><td>cert, ASN, tech, DOM/SSL kit fingerprints</td></tr>
+          <tr><td>webamon infostealers</td><td class="mark yes">●</td><td class="mark no">—</td><td class="route">direct</td><td>credential-log hits (password masked)</td></tr>
+          <tr><td>webamon search_ip</td><td class="mark no">—</td><td class="mark yes">●</td><td class="route">direct</td><td>domains scanned on this IP</td></tr>
+          <tr><td>honeylabs</td><td class="mark no">—</td><td class="mark yes">●</td><td class="route">direct</td><td>honeypot volume, ports, CVEs, verdict</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="scroll">
+      <table>
+        <caption>What was retired, and what carries the signal now</caption>
+        <thead><tr><th scope="col">Retired</th><th scope="col">Carried by</th><th scope="col">Note</th></tr></thead>
+        <tbody>
+          <tr><td class="gone">VirusTotal</td><td>ThreatFox IOC match</td><td>free API, own Auth-Key</td></tr>
+          <tr><td class="gone">Shodan InternetDB</td><td>nmap via <span class="m">active_scan</span></td><td>on explicit ask only</td></tr>
+          <tr><td class="gone">Hackertarget</td><td>Webamon <span class="m">search_ip</span></td><td>hosted domains, shared-hosting suppressed</td></tr>
+          <tr><td class="gone">Cert Spotter</td><td>live TLS grab</td><td>current cert, not CT history</td></tr>
+          <tr><td class="gone">crt.sh</td><td>—</td><td>service shut down</td></tr>
+          <tr><td class="gone">passive port discovery</td><td>—</td><td>ports come from report text or nmap</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <figure>
+      <div class="plate">
+        <svg viewBox="0 0 960 420" role="img" aria-label="Three zones: the cti host, the probe VM, and the outside. All indicator-facing lookups leave from the probe VM over SSH; only Webamon and HoneyLabs are called directly from the host.">
+          <defs>
+            <marker id="a3" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto"><polygon class="ar" points="0,0 10,4 0,8"></polygon></marker>
+            <marker id="a3a" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto"><polygon class="ar-a" points="0,0 10,4 0,8"></polygon></marker>
+          </defs>
+
+          <!-- zone A: cti host -->
+          <rect class="zone" x="20" y="70" width="220" height="230" rx="3"></rect>
+          <text class="elbl" x="30" y="62">cti host</text>
+          <rect class="bx" x="40" y="100" width="180" height="56" rx="2"></rect>
+          <text class="lbl" x="130" y="124" text-anchor="middle">MCP server</text>
+          <text class="sub" x="130" y="142" text-anchor="middle">+ Stage A cron</text>
+          <rect class="bx" x="40" y="186" width="180" height="56" rx="2"></rect>
+          <text class="lbl" x="130" y="210" text-anchor="middle">vm_proxy</text>
+          <text class="sub" x="130" y="228" text-anchor="middle">the only egress chokepoint</text>
+
+          <!-- zone B: probe VM -->
+          <rect class="zone" x="340" y="70" width="220" height="230" rx="3"></rect>
+          <text class="elbl" x="350" y="62">probe VM — VPN egress, mirrored NIC</text>
+          <rect class="bx" x="360" y="100" width="180" height="56" rx="2"></rect>
+          <text class="lbl" x="450" y="124" text-anchor="middle">probe_helper.py</text>
+          <text class="sub" x="450" y="142" text-anchor="middle">SSH forced command</text>
+          <rect class="bx" x="360" y="176" width="180" height="106" rx="2"></rect>
+          <text class="sub" x="450" y="198" text-anchor="middle">http_fetch · resolve_dns</text>
+          <text class="sub" x="450" y="216" text-anchor="middle">tls_grab · http_probe</text>
+          <text class="sub" x="450" y="234" text-anchor="middle">subfinder · wayback_cdx</text>
+          <text class="sub" x="450" y="252" text-anchor="middle">jarm_probe</text>
+          <text class="sub" x="450" y="270" text-anchor="middle">nmap · dirsearch</text>
+
+          <!-- zone C: vendors (top right) -->
+          <rect class="bx" x="700" y="86" width="240" height="70" rx="2"></rect>
+          <text class="lbl-s" x="820" y="112" text-anchor="middle">Vendor SaaS</text>
+          <text class="sub" x="820" y="132" text-anchor="middle">Webamon · HoneyLabs</text>
+
+          <!-- zone D: targets -->
+          <rect class="zone" x="700" y="190" width="240" height="110" rx="3"></rect>
+          <text class="elbl" x="710" y="182">outside</text>
+          <text class="sub" x="820" y="220" text-anchor="middle">rdap.org · RIPEstat · ThreatFox</text>
+          <text class="sub" x="820" y="248" text-anchor="middle">— and —</text>
+          <text class="sub" x="820" y="276" text-anchor="middle">the tracked domain / IP itself</text>
+
+          <!-- host -> VM -->
+          <line class="edge" x1="240" y1="214" x2="332" y2="214" marker-end="url(#a3)"></line>
+          <text class="elbl" x="286" y="204" text-anchor="middle">SSH forced cmd</text>
+          <text class="elbl" x="286" y="232" text-anchor="middle">JSON in / out</text>
+
+          <!-- VM -> outside -->
+          <line class="edge" x1="560" y1="230" x2="692" y2="230" marker-end="url(#a3)"></line>
+          <text class="elbl" x="626" y="220" text-anchor="middle">names or touches</text>
+          <text class="elbl" x="626" y="248" text-anchor="middle">a tracked indicator</text>
+
+          <!-- host -> vendors, over the top -->
+          <polyline class="edge-a" points="130,70 130,30 820,30 820,78" marker-end="url(#a3a)"></polyline>
+          <text class="elbl-a" x="475" y="22" text-anchor="middle">direct — the vendor's API, never the indicator's own host</text>
+
+          <!-- tap -->
+          <rect class="bx" x="360" y="340" width="240" height="52" rx="2"></rect>
+          <text class="lbl" x="480" y="362" text-anchor="middle">zeek-* · Arkime pcap</text>
+          <text class="sub" x="480" y="380" text-anchor="middle">every packet captured</text>
+          <line class="edge" x1="450" y1="300" x2="450" y2="332" marker-end="url(#a3)"></line>
+          <text class="elbl" x="460" y="322" text-anchor="start">mirrored</text>
+        </svg>
+      </div>
+      <figcaption><b>Where the traffic leaves from.</b> An RDAP lookup on a malicious domain still <i>names</i> that domain to a third party, so it belongs on the lab VM along with the handshakes. The two exceptions are exceptions for a reason: Webamon and HoneyLabs calls reach a vendor's index, never the target, so routing them through the VM would buy nothing.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============ STAGE 3 ============ -->
+  <section>
+    <div class="sec-head">
+      <div class="stage-no">STAGE 03</div>
+      <h2>Pivoting and probing are different operations</h2>
+    </div>
+
+    <div class="grid-2">
+      <div class="rule">
+        <div class="tag">pivot — run it without being asked</div>
+        <h3>Three entry points</h3>
+        <ul class="tight">
+          <li><code>pivot_observable</code> — display only, writes nothing anywhere.</li>
+          <li><code>pivot_and_expand</code> — files subdomain siblings; hosted domains only with <span class="m">include_cohosted=True</span>; kit-fingerprint siblings go to <span class="m">review</span>, never auto-filed.</li>
+          <li><code>pivot_cluster</code> — sweeps every tracked value, stamps lifecycle + snapshot back, and writes the dated history row.</li>
+        </ul>
+      </div>
+      <div class="rule loud">
+        <div class="tag">probe — only on an explicit ask</div>
+        <h3>Two tools</h3>
+        <ul class="tight">
+          <li><code>probe_pending_fingerprints.py</code> — drains the queue, probes every port the report recorded, dispatches all targets concurrently over one ControlMaster connection, then reads JA4+/JARM back out of OpenSearch.</li>
+          <li><code>active_scan</code> — nmap top-100 <span class="m">-sV</span> plus dirsearch with 404-baseline suppression and recursive open-directory listing. Blocks up to 900s.</li>
+        </ul>
+      </div>
+    </div>
+
+    <p class="measure">The fingerprint drain avoids cross-host clock comparison entirely: it snapshots the newest <span class="m">ts</span> already indexed in OpenSearch <i>before</i> the batch fires, then accepts only documents newer than that. Every timestamp compared is stamped by Zeek's own clock — which is what actually caused the original bug, so a fixed window would not have been a fix. Each <code>active_scan</code> is audited in <span class="m">active_scans</span> with its Zeek window, so the packets stay findable in Arkime afterwards.</p>
+  </section>
+
+  <!-- ============ STAGE 4 ============ -->
+  <section>
+    <div class="sec-head">
+      <div class="stage-no">STAGE 04</div>
+      <h2>The time-series layer</h2>
+    </div>
+    <p class="measure">The cluster JSON answers <i>who and what</i>. DuckDB at <span class="m">data/tracking/tracking.duckdb</span> answers <i>when</i> — one dated observation row per indicator per source, linked back only by <span class="m">actors.cluster_slug</span>. Eight tables: <span class="m">observations</span>, <span class="m">asn_changes</span>, <span class="m">attribute_changes</span>, <span class="m">actors</span>, <span class="m">correlations</span>, <span class="m">opendir_files</span>, <span class="m">active_scans</span>, <span class="m">zeek_matches</span>.</p>
+
+    <h3>Change detectors, day over day</h3>
+    <div class="chips">
+      <span class="chip">certificate</span>
+      <span class="chip">cert sha256</span>
+      <span class="chip">http title / server</span>
+      <span class="chip">webamon kit fingerprint</span>
+      <span class="chip">subdomains</span>
+      <span class="chip">infostealer count</span>
+      <span class="chip">PTR</span>
+      <span class="chip">resolved IPs</span>
+      <span class="chip">hosted domains</span>
+      <span class="chip">ASN / netname</span>
+      <span class="chip chip-h">open ports</span>
+      <span class="chip chip-h">open-dir files</span>
+    </div>
+    <p class="measure">The two amber ones move only when someone runs an active scan; everything else moves on the automatic sweep. A change detected against a baseline older than 90 days is recorded at lower confidence, and a first sighting is written as <span class="m">first_seen</span> — a baseline, not an event, so a seeding day can't wake the agent.</p>
+  </section>
+
+  <!-- ============ STAGE 5 ============ -->
+  <section>
+    <div class="sec-head">
+      <div class="stage-no">STAGE 05</div>
+      <h2>The daily loop</h2>
+    </div>
+
+    <figure>
+      <div class="plate">
+        <svg viewBox="0 0 960 330" role="img" aria-label="Stage A runs five phases at 06:15 and writes a digest; at 08:00 Stage B exits without starting the agent when the digest says NO ACTIVITY, otherwise runs one headless Claude pass.">
+          <defs>
+            <marker id="a4" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto"><polygon class="ar" points="0,0 10,4 0,8"></polygon></marker>
+            <marker id="a4a" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto"><polygon class="ar-a" points="0,0 10,4 0,8"></polygon></marker>
+          </defs>
+
+          <text class="elbl-a" x="30" y="32">06:15 — Stage A · daily_tracking.py · zero tokens</text>
+
+          <rect class="bx" x="30" y="46" width="120" height="58" rx="2"></rect>
+          <text class="lbl" x="90" y="70" text-anchor="middle">ingest</text>
+          <text class="sub" x="90" y="88" text-anchor="middle">inbox csv/json</text>
+
+          <rect class="bx" x="172" y="46" width="120" height="58" rx="2"></rect>
+          <text class="lbl" x="232" y="70" text-anchor="middle">register</text>
+          <text class="sub" x="232" y="88" text-anchor="middle">new clusters</text>
+
+          <rect class="bx-a" x="314" y="46" width="120" height="58" rx="2"></rect>
+          <text class="lbl" x="374" y="70" text-anchor="middle">pivot sweep</text>
+          <text class="sub" x="374" y="88" text-anchor="middle">every cluster</text>
+
+          <rect class="bx-a" x="456" y="46" width="120" height="58" rx="2"></rect>
+          <text class="lbl" x="516" y="70" text-anchor="middle">enrich</text>
+          <text class="sub" x="516" y="88" text-anchor="middle">HoneyLabs + RDAP</text>
+
+          <rect class="bx" x="598" y="46" width="120" height="58" rx="2"></rect>
+          <text class="lbl" x="658" y="70" text-anchor="middle">analytics</text>
+          <text class="sub" x="658" y="88" text-anchor="middle">8 canned queries</text>
+
+          <rect class="bx" x="756" y="42" width="160" height="66" rx="2"></rect>
+          <text class="lbl" x="836" y="68" text-anchor="middle">digest .md</text>
+          <text class="sub" x="836" y="88" text-anchor="middle">capped at 15 rows</text>
+
+          <line class="edge" x1="152" y1="75" x2="166" y2="75" marker-end="url(#a4)"></line>
+          <line class="edge" x1="294" y1="75" x2="308" y2="75" marker-end="url(#a4)"></line>
+          <line class="edge" x1="436" y1="75" x2="450" y2="75" marker-end="url(#a4)"></line>
+          <line class="edge" x1="578" y1="75" x2="592" y2="75" marker-end="url(#a4)"></line>
+          <line class="edge" x1="720" y1="75" x2="748" y2="75" marker-end="url(#a4)"></line>
+
+          <text class="sub" x="30" y="132">Each phase failure is recorded in the digest and the run continues; the exit code is nonzero only if the digest itself can't be written.</text>
+
+          <!-- gate -->
+          <text class="elbl-a" x="560" y="170">08:00 — Stage B · daily_narrative.sh</text>
+          <rect class="bx" x="756" y="182" width="160" height="48" rx="2" stroke-dasharray="5 4"></rect>
+          <text class="lbl" x="836" y="204" text-anchor="middle">NO ACTIVITY?</text>
+          <text class="sub" x="836" y="221" text-anchor="middle">one grep</text>
+          <line class="edge" x1="836" y1="112" x2="836" y2="174" marker-end="url(#a4)"></line>
+
+          <!-- yes branch -->
+          <polyline class="edge" points="836,230 836,254 600,254 600,274" marker-end="url(#a4)"></polyline>
+          <text class="elbl" x="700" y="246" text-anchor="middle">yes</text>
+          <rect class="bx" x="440" y="278" width="320" height="46" rx="2"></rect>
+          <text class="lbl-s" x="600" y="300" text-anchor="middle">exit 0 — the agent never starts</text>
+          <text class="sub" x="600" y="317" text-anchor="middle">a quiet day costs nothing</text>
+
+          <!-- no branch -->
+          <polyline class="edge-a" points="880,230 880,254 880,272" marker-end="url(#a4a)"></polyline>
+          <text class="elbl" x="890" y="250" text-anchor="start">no</text>
+          <rect class="bx-a" x="790" y="276" width="160" height="48" rx="2"></rect>
+          <text class="lbl" x="870" y="298" text-anchor="middle">claude -p</text>
+          <text class="sub" x="870" y="315" text-anchor="middle">→ narratives/&lt;day&gt;.md</text>
+        </svg>
+      </div>
+      <figcaption><b>Two stages, one gate.</b> Stage B runs on Sonnet 5 with four read-mostly tools and <span class="m">--max-turns 15</span>, and only ever sees the capped digest — not the database. The <span class="m">NO ACTIVITY</span> short-circuit is what makes a quiet day free.</figcaption>
+    </figure>
+
+    <p class="measure">Deliberately outside this loop: nmap and dirsearch (loud), and the Zeek/OpenSearch cross-reference — those indices only hold data when the VM originated traffic, so a daily check would mostly find nothing and add noise. Run <code>opensearch_xref.run_daily_xref</code> by hand after a probe or detonation session. Digests and logs are pruned at 180 days.</p>
+  </section>
+
+  <!-- ============ FIXES ============ -->
+  <section>
+    <div class="sec-head">
+      <div class="stage-no">RECENTLY CORRECTED</div>
+      <h2>Three failures worth remembering</h2>
+    </div>
+    <p class="measure">Each of these was silent — the pipeline kept reporting confidently while the answer was wrong. That shape is the reason they're listed here rather than left in the log.</p>
+
+    <div>
+      <div class="fix">
+        <div class="sha">cc9adb0</div>
+        <div class="fix-body">
+          <h3>Infostealer hits that named nothing</h3>
+          <p class="sym">symptom → 12 JadeProx domains flagged as compromised; every one reporting exactly 25 hits</p>
+          <p>An unquoted <span class="m">username:@&lt;term&gt;</span> clause was token-analyzed by the index and OR'd into most of the corpus — a nonsense domain returned 572,358 "hits" on aarp.org and netflix.com. The reported count was <span class="m">len(results)</span>, i.e. the page size, which is why everything read 25. Both clauses are now phrase-quoted and every row is re-checked against the term client-side; <span class="m">total_hits</span> is the matched count, with <span class="m">raw_total_hits</span> and <span class="m">capped</span> alongside. False rows were purged from the store and the poisoned entries from the pivot cache.</p>
+        </div>
+      </div>
+      <div class="fix">
+        <div class="sha">e305704</div>
+        <div class="fix-body">
+          <h3>A cached failure served as the answer</h3>
+          <p class="sym">symptom → every sweep returning status "unknown", asn null, no error anywhere to explain it</p>
+          <p>The cache gate skipped only a top-level <span class="m">error</span> key, but <code>ripestat_lookup</code> reports per-sub-call <span class="m">&lt;name&gt;_error</span> keys so a partial answer still comes back. A run where every RIPEstat call failed cached <span class="m">{"network_info_error": …}</span> as the result for the whole TTL. Seen live after the MCP server started without <span class="m">CTI_PROBE_*</span> set — it passed the literal <span class="m">${CTI_PROBE_HOST}</span> through to ssh.</p>
+        </div>
+      </div>
+      <div class="fix">
+        <div class="sha">98ddc7b</div>
+        <div class="fix-body">
+          <h3>Suppression that never fired</h3>
+          <p class="sym">symptom → 50 AWS co-tenant domains stamped onto each of two tracked Fox Tempest IPs</p>
+          <p>RIPEstat returns an ASN as a string — <span class="m">"16509"</span> — while <span class="m">SHARED_HOSTING_ASNS</span> holds ints, so the membership test never matched and shared-hosting suppression silently did nothing. Every existing test stubbed the ASN as an int, so they all passed. <code>_asn_int</code> now normalizes <span class="m">"16509"</span>, <span class="m">"AS16509"</span> and list forms at both sites. The same commit made the suite hermetic — sockets blocked, probe transport blocked, API keys unset — so an unstubbed path fails loudly instead of quietly SSHing to the lab. Runtime 86s → 10s.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ MAP ============ -->
+  <section>
+    <div class="sec-head">
+      <div class="stage-no">WHERE THINGS LIVE</div>
+      <h2>File map</h2>
+    </div>
+    <div class="map">
+      <div><span class="path">cti_tools/core.py</span><span class="what">source of truth — ingest, pivot, active_scan, change detection</span></div>
+      <div><span class="path">cti_tools/report_ingest.py</span><span class="what">fetch, defang, regex extraction, name heuristics</span></div>
+      <div><span class="path">cti_tools/pivot.py</span><span class="what">RDAP, RIPEstat, ThreatFox, HoneyLabs, lifecycle classifiers</span></div>
+      <div><span class="path">cti_tools/webamon.py</span><span class="what">scan index, infostealers, hosted domains, daily budget</span></div>
+      <div><span class="path">cti_tools/vm_proxy.py</span><span class="what">the single egress chokepoint, env-configured</span></div>
+      <div><span class="path">scripts/probe_helper.py</span><span class="what">runs on the probe VM behind the forced command</span></div>
+      <div><span class="path">cti_tools/tracking/</span><span class="what">DuckDB store, enrichment, analytics, digest</span></div>
+      <div><span class="path">scripts/daily_tracking.py</span><span class="what">Stage A — the whole 06:15 sequence</span></div>
+      <div><span class="path">scripts/daily_narrative.sh</span><span class="what">Stage B — the gated headless pass</span></div>
+      <div><span class="path">scripts/setup_probe_vm.sh</span><span class="what">Debian/Ubuntu probe VM bootstrap + self-check</span></div>
+    </div>
+  </section>
+
+</main>
+
+<footer>cti-agent · rewrite-enrichment-webamon @ cc9adb0 · keys live in ~/.bashrc, never in the repo</footer>
+
+</div>

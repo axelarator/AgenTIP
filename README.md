@@ -1,0 +1,93 @@
+# cti-agent
+
+Portable capabilities for cross-harness testing (Claude Code, GitHub
+Copilot, Pi), split the way the harnesses expect:
+
+```
+skills/threat-cluster-tracking/SKILL.md   # procedural knowledge, portable as-is
+.pi/skills/threat-cluster-tracking/       # same skill, mirrored for Pi's skill loader
+mcp-server/                               # tools: core logic + MCP + CLI surfaces
+  cti_tools/core.py                       # source of truth, no protocol code
+  cti_tools/stix.py                       # STIX 2.1 bundle (de)serialization
+  cti_tools/server.py                     # MCP surface (Claude Code, Copilot, Pi)
+  tests/                                  # pytest against core.py
+data/clusters/                            # local JSON + generated markdown, gitignored
+docs/pipeline.html                        # diagram-led walkthrough of the whole pipeline
+setup.sh                                  # creates the venv, wires .mcp.json
+```
+
+## How the pipeline fits together
+
+`docs/pipeline.html` is a self-contained page (no build step — open it
+in a browser) walking the path an intel report takes: `ingest_report`'s
+three-phase write, what enrichment is now that the scan platforms are
+retired, which calls leave from this host versus the probe VM, the
+DuckDB change-detection layer, and the two-stage daily cron. Four
+diagrams carry it; read it before the prose in `mcp-server/README.md`
+if you want the shape before the detail.
+
+## Quick start
+
+```bash
+./setup.sh
+```
+
+This creates `mcp-server/.venv`, installs `cti_tools` into it, and
+rewrites `.mcp.json` with absolute paths for your checkout (MCP stdio
+configs need real paths — see `mcp-server/README.md` for why
+`${workspaceFolder}`-style variables aren't relied on here). Re-run it
+after cloning to a new machine or moving the repo.
+
+API keys are passed through as env vars (keep them in `~/.bashrc`,
+which cron sources too — never in the repo; `.env` is gitignored):
+`WEBAMON_API_KEY` (Webamon scan-index/infostealer enrichment — the
+passive layer that replaced VirusTotal/Shodan/Hackertarget/Cert
+Spotter), `HONEYLABS_API_KEY` (HoneyLabs honeypot telemetry — both the
+per-IP pivot enrichment and the `honeylabs` remote MCP server that
+`.mcp.json` wires up), and optionally `THREATFOX_API_KEY`. A missing
+key degrades to a skip note or error dict, never a crash.
+
+Live interaction with an indicator (TLS grab, HTTP probe, DNS,
+subfinder/Wayback, and the on-demand nmap/dirsearch `active_scan`)
+runs from a lab probe VM over SSH, configured via `CTI_PROBE_HOST`,
+`CTI_PROBE_USER`, `CTI_PROBE_SSH_KEY`, `CTI_PROBE_KNOWN_HOSTS`, and
+`CTI_PROBE_HELPER_CMD` — see "Probe VM build" in `mcp-server/README.md`.
+
+Then, per harness:
+
+- **Claude Code** — native MCP support. `.mcp.json` and
+  `.claude/skills/threat-cluster-tracking/` are both already wired by
+  `setup.sh` (the latter is a mirror of `skills/threat-cluster-tracking/`,
+  refreshed on every run).
+- **GitHub Copilot** — native MCP support via `.mcp.json` (already
+  wired by `setup.sh`); put `skills/threat-cluster-tracking/` wherever
+  its own Agent Skills loader reads from.
+- **Pi** — MCP support via the `pi-mcp-adapter` package
+  (https://pi.dev/packages/pi-mcp-adapter), wired up through
+  `.pi/mcp.json` (already written by `setup.sh`).
+  `.pi/skills/threat-cluster-tracking/` is already in place.
+
+See `mcp-server/README.md` for full install/wiring details, provider
+notes (Ollama / Anthropic subscription), and how clustering maps onto
+STIX 2.1 for sharing outside this tool.
+
+## Threat cluster tracking, briefly
+
+Each cluster is a Diamond-Model-shaped JSON record (adversary,
+capability, infrastructure, victim) plus STIX-flavored profile fields
+(aliases, confidence, first/last seen), an ATT&CK TTP coverage table, a
+detection inventory, a gaps backlog, and an append-only hunt log. A
+markdown view is regenerated alongside the JSON on every write — don't
+hand-edit the `.md`, it's derived.
+
+Clusters export as STIX 2.1 bundles (Intrusion Set + Attack Pattern +
+Relationship + Note) and can ingest bundles from other tools, so a
+cluster tracked here is portable to any STIX-consuming platform without
+a bespoke converter.
+
+Clusters can also be populated directly from a threat report (URL or
+local file): `ingest_report` extracts hashes/domains/IPs/URLs/TTPs and
+files them into an existing or new cluster (inferring the cluster name
+from the report text when not given explicitly), and `get_observables`
+lists everything gathered for a cluster so far. See
+`mcp-server/README.md` for the extraction/attribution caveats.
