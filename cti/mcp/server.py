@@ -302,6 +302,41 @@ def active_scan(target: str, cluster: str | None = None,
 
 
 @mcp.tool()
+def analyze_opendir_samples(indicator: str, urls: list[str],
+                            cluster: str | None = None) -> dict:
+    """Download specific open-directory files on the probe VM and triage
+    them in an isolated container there, returning JSON verdicts only.
+
+    LOUD and explicit. `active_scan` lists what is in an open directory;
+    this fetches named files from it. Listing is reconnaissance,
+    downloading is collection - a separate decision, so a separate tool.
+    Only ever call it when the analyst has asked for specific files.
+
+    Each file is fetched on the lab probe VM, analyzed in a container with
+    no network access and no capabilities, and deleted. What comes back is
+    sha256, detected type, YARA matches, a strings sample and extracted
+    URLs/addresses. No sample bytes reach this host.
+    """
+    from .. import core
+    from ..probe import sandbox
+
+    return sandbox.analyze_urls(urls, indicator=indicator, actor=cluster)
+
+
+@mcp.tool()
+def get_opendir_samples(indicator: str) -> dict:
+    """Sandbox verdicts already recorded for an indicator's open-directory
+    files. Read-only - it never fetches anything."""
+    from ..store import run_readonly_query
+
+    return run_readonly_query(
+        "SELECT path, url, sha256, size, magic, mime, verdict, yara_hits, "
+        "analyzed_at FROM opendir_samples "
+        f"WHERE indicator_value = '{indicator.replace(chr(39), chr(39) * 2)}' "
+        "ORDER BY analyzed_at DESC")
+
+
+@mcp.tool()
 def analyze_report(source: str) -> dict:
     """Fetch a threat report (URL or local file path) and extract
     observables/ATT&CK TTPs/candidate cluster names WITHOUT writing

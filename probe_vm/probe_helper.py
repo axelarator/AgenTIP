@@ -45,9 +45,11 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 try:
     import certifi
@@ -63,6 +65,7 @@ DIRSEARCH_CMD = ["dirsearch"]
 OPENSSL_CMD = ["openssl"]
 DIG_CMD = ["dig"]
 
+USER_AGENT = "Mozilla/5.0 (cti-agent probe)"
 HTTP_TIMEOUT = 20
 TCP_PRECHECK_TIMEOUT = 3
 JARM_SUBPROCESS_TIMEOUT = 20
@@ -72,6 +75,15 @@ WAYBACK_TIMEOUT = 30
 NMAP_TIMEOUT = 600
 DIRSEARCH_TIMEOUT = 600
 OPENDIR_DIR_TIMEOUT = 20              # per-directory autoindex fetch
+
+# --- fetch_and_analyze -------------------------------------------------------
+DOCKER_CMD = ["docker"]
+SANDBOX_IMAGE = os.environ.get("CTI_SANDBOX_IMAGE", "cti-sbx:latest")
+SANDBOX_TIMEOUT = 300                 # whole container run
+SAMPLE_FETCH_TIMEOUT = 60             # per file
+SAMPLE_MAX_BYTES = 32 * 1024 * 1024   # per file
+SAMPLE_MAX_TOTAL = 128 * 1024 * 1024  # per request
+SAMPLE_MAX_FILES = 40
 # -----------------------------------------------------------------------------
 
 _HTTPS_CONTEXT = (ssl.create_default_context(cafile=_CA_FILE)
@@ -291,7 +303,7 @@ _AUTOINDEX_MARKERS = ("Index of /", "<title>Index of", "Directory Listing For",
 def _fetch(url: str, insecure: bool = False, max_bytes: int = HTTP_PROBE_MAX_BYTES,
            timeout: int = HTTP_TIMEOUT) -> dict:
     context = _INSECURE_CONTEXT if insecure else _HTTPS_CONTEXT
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (cti-agent probe)"})
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
             body = resp.read(max_bytes)
@@ -324,7 +336,14 @@ def parse_autoindex(body: str, base_url: str) -> list[dict] | None:
     # http.server's bare `<li><a>` (no trailing metadata at all).
     date_re = re.compile(r"(\d{4}-\d{2}-\d{2}[ T]?\d{0,2}:?\d{0,2}|\d{1,2}-\w{3}-\d{4}\s+\d{2}:\d{2})")
     size_re = re.compile(r"(\d[\d.,]*\s?[KMGT]?B?|\d+|-)\s*(?:</td>|$)")
-    for m in re.finditer(r'<a\s+href="([^"?#]+)"[^>]*>([^<]+)</a>(.*?)(?:</tr>|\n|<br|$)',
+    # The trailing group is what carries size/date in <pre> and table
+    # listings. It must stop at the end of the entry - and `</li>` has to
+    # be one of the terminators, not just `</tr>`/newline/`<br>`: a
+    # listing served without newlines between its <li> elements otherwise
+    # let the first entry's trailing group swallow every later anchor, so
+    # a whole open directory silently reduced to one file. Silently losing
+    # files from an open directory is the worst failure this parser has.
+    for m in re.finditer(r'<a\s+href="([^"?#]+)"[^>]*>([^<]+)</a>(.*?)(?:</li>|</tr>|\n|<br|$)',
                          body, re.IGNORECASE | re.DOTALL):
         href, name, tail = m.group(1), html.unescape(m.group(2).strip()), m.group(3)
         if href in ("../", "..", "/") or name in ("Parent Directory", ".."):
@@ -548,12 +567,135 @@ def action_dirsearch(request: dict) -> dict:
         if len(files_acc) >= max_files:
             break
     return {"hits": hits, "opendirs": opendirs, "baseline_404": baseline, "error": None}
+# --------------------------------------------------------------------------- #
+# fetch_and_analyze - download open-directory samples and triage them inside a
+# container, ON THIS VM. Only the JSON verdicts travel back over SSH, so no
+# sample byte ever reaches the analyst's host or the repository.
+# --------------------------------------------------------------------------- #
+def _safe_name(url: str, index: int) -> str:
+    """A staging filename derived from the URL that cannot escape the dir.
+
+    The name comes from an adversary-controlled URL, so it is reduced to a
+    basename, filtered to a safe character set, stripped of leading dots
+    and prefixed with an index to keep collisions apart. Path traversal
+    here would write outside the directory the container mounts.
+    """
+    tail = urllib.parse.unquote(urllib.parse.urlsplit(url).path).rsplit("/", 1)[-1]
+    tail = re.sub(r"[^A-Za-z0-9._-]", "_", tail)[:80].lstrip(".")
+    return f"{index:03d}_{tail or 'sample'}"
+
+
+def _download(url: str, dest: Path, budget: int) -> dict:
+    """One capped download. Returns {"bytes": n} or {"error": ...}."""
+    cap = min(SAMPLE_MAX_BYTES, budget)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=SAMPLE_FETCH_TIMEOUT,
+                                    context=_HTTPS_CONTEXT) as resp:
+            written = 0
+            with dest.open("wb") as fh:
+                while written < cap:
+                    chunk = resp.read(min(65536, cap - written))
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    written += len(chunk)
+        return {"bytes": written}
+    except Exception as e:
+        dest.unlink(missing_ok=True)
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def action_fetch_and_analyze(request: dict) -> dict:
+    """{urls: [...], max_files, max_total_bytes}
+       -> {results, errors, fetched, analyzed, error}
+
+    Downloads each URL into a staging directory on this VM, runs the
+    analysis container over it with no network and no capabilities, and
+    returns the container's JSON verdicts.
+
+    The staging directory is removed in a finally block whether or not the
+    container ran, so a failed analysis does not leave adversary files on
+    the probe VM either.
+    """
+    requested = int(request.get("max_files") or SAMPLE_MAX_FILES)
+    limit = max(1, min(requested, SAMPLE_MAX_FILES))
+    urls = [u for u in (request.get("urls") or []) if isinstance(u, str)][:limit]
+    if not urls:
+        return {"results": [], "errors": [], "fetched": 0, "analyzed": 0,
+                "error": "no urls given"}
+
+    budget = min(int(request.get("max_total_bytes") or SAMPLE_MAX_TOTAL),
+                 SAMPLE_MAX_TOTAL)
+    staging = Path(tempfile.mkdtemp(prefix="cti-sbx-"))
+    fetched, errors, name_to_url = 0, [], {}
+    try:
+        for index, url in enumerate(urls):
+            if budget <= 0:
+                errors.append({"url": url, "error": "total byte budget exhausted"})
+                continue
+            name = _safe_name(url, index)
+            outcome = _download(url, staging / name, budget)
+            if "error" in outcome:
+                errors.append({"url": url, "error": outcome["error"]})
+                continue
+            budget -= outcome["bytes"]
+            fetched += 1
+            name_to_url[name] = url
+
+        if not fetched:
+            return {"results": [], "errors": errors, "fetched": 0, "analyzed": 0,
+                    "error": "nothing could be downloaded"}
+
+        proc = subprocess.run(
+            DOCKER_CMD + [
+                "run", "--rm",
+                "--network=none",        # nothing it does can reach the network
+                "--read-only",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
+                "--memory=512m", "--pids-limit=64", "--cpus=1",
+                "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+                "-v", f"{staging}:/in:ro",
+                SANDBOX_IMAGE, "/in",
+            ],
+            capture_output=True, text=True, timeout=SANDBOX_TIMEOUT)
+        if proc.returncode != 0:
+            return {"results": [], "errors": errors, "fetched": fetched,
+                    "analyzed": 0,
+                    "error": f"sandbox exited {proc.returncode}: "
+                             f"{proc.stderr.strip()[:400]}"}
+        payload = json.loads(proc.stdout)
+    except subprocess.TimeoutExpired:
+        return {"results": [], "errors": errors, "fetched": fetched, "analyzed": 0,
+                "error": f"sandbox timed out after {SANDBOX_TIMEOUT}s"}
+    except Exception as e:
+        return {"results": [], "errors": errors, "fetched": fetched, "analyzed": 0,
+                "error": f"{type(e).__name__}: {e}"}
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    # The container only ever saw the staged names; map its records back to
+    # the URLs they came from and restore the original filenames.
+    for record in payload.get("results", []):
+        staged = record.get("path") or ""
+        record["url"] = name_to_url.get(staged)
+        record["path"] = staged.split("_", 1)[-1]
+
+    return {"results": payload.get("results", []),
+            "errors": errors + payload.get("errors", []),
+            "fetched": fetched, "analyzed": payload.get("analyzed", 0),
+            "error": None}
+
+
+
 
 
 # --------------------------------------------------------------------------- #
 # dispatch
 # --------------------------------------------------------------------------- #
 _ACTIONS = {
+    "fetch_and_analyze": action_fetch_and_analyze,
     "jarm_probe": action_jarm_probe,
     "http_fetch": action_http_fetch,
     "resolve_dns": action_resolve_dns,

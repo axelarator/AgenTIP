@@ -48,6 +48,9 @@ response shapes per action). Actions:
 - "nmap": top-ports service scan (on-demand only - long).
 - "dirsearch": web path map + recursive open-directory listing
   (on-demand only - long).
+- "fetch_and_analyze": download named open-directory files ON THE VM and
+  triage them in a --network=none container there, returning JSON
+  verdicts only (on-demand, explicitly requested - see sandbox()).
 
 Same key/host for every action - the VM-side forced command already
 has to trust this key with live network access on the analyst's behalf,
@@ -224,3 +227,28 @@ def dirsearch(url: str, extensions: list[str] | None = None, rate: int = 20,
         "extensions": extensions or ["php", "html", "js", "json", "txt", "bak", "zip"],
         "rate": rate, "max_depth": max_depth, "max_files": max_files,
     }, timeout=LONG_TIMEOUT)
+
+
+def fetch_and_analyze(urls: list[str], *, max_files: int = 20,
+                      max_total_bytes: int = 64 * 1024 * 1024) -> dict[str, object]:
+    """Download and statically triage open-directory files on the probe VM.
+
+    This is the loudest action in this module and the only one that pulls
+    adversary-authored bytes anywhere. It is deliberately separate from
+    "dirsearch", which only lists a directory: listing is reconnaissance,
+    downloading is collection, and they deserve separate decisions.
+
+    What comes back is JSON - sha256, detected type, YARA matches, a
+    strings sample, extracted URLs and addresses. The files themselves stay
+    on the VM and are deleted when the container exits, so nothing
+    downloadable ever reaches the analyst's host or this repository.
+
+    Raises VMProxyError on transport failure; a failed *analysis* comes
+    back as an "error" key, because a container that could not start is a
+    different thing from an SSH hop that is down.
+    """
+    response = _ssh_json_rpc({
+        "action": "fetch_and_analyze", "urls": list(urls),
+        "max_files": max_files, "max_total_bytes": max_total_bytes,
+    }, timeout=LONG_TIMEOUT)
+    return response

@@ -13,6 +13,7 @@ set -euo pipefail
 
 PROBE_USER=detonate            # matches vm_proxy.py's CTI_PROBE_USER default
 PUBKEY=""
+SANDBOX_SRC="${SANDBOX_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sandbox}"
 HELPER_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/probe_helper.py"
 SUBFINDER_VERSION="${SUBFINDER_VERSION:-2.6.6}"
 
@@ -70,6 +71,32 @@ else
   git clone -q https://github.com/salesforce/jarm /opt/jarm
 fi
 
+echo "== docker + the analysis sandbox image"
+# The sandbox runs HERE, on the probe VM, not on the cti host. This VM
+# already did the download that found the open directory and already has
+# the network position we are willing to point at adversary
+# infrastructure; shipping samples back to analyze them would undo that.
+if ! command -v docker >/dev/null 2>&1; then
+  apt-get install -y -q docker.io
+fi
+systemctl enable --now docker >/dev/null 2>&1 || true
+
+if [[ -d "$SANDBOX_SRC" ]]; then
+  docker build -q -t cti-sbx:latest "$SANDBOX_SRC" >/dev/null
+  echo "   built cti-sbx:latest"
+  # Prove the isolation flags actually isolate. A sandbox that can reach
+  # the network is not a sandbox, and the failure would be silent.
+  if docker run --rm --network=none --cap-drop=ALL \
+       --security-opt=no-new-privileges --entrypoint python cti-sbx:latest \
+       -c "import socket; socket.create_connection(('1.1.1.1',53),2)" 2>/dev/null; then
+    echo "   ERROR: the sandbox container reached the network with --network=none" >&2
+    exit 1
+  fi
+  echo "   verified: --network=none blocks egress"
+else
+  echo "   WARNING: $SANDBOX_SRC not found - copy sandbox/ next to this script"
+fi
+
 echo "== helper -> /opt/cti/probe_helper.py"
 # Root-owned so the probe user (whose key is forced to run it) can't edit it.
 install -d -m 0755 -o root -g root /opt/cti
@@ -80,6 +107,10 @@ if ! id "$PROBE_USER" >/dev/null 2>&1; then
   useradd --create-home --shell /bin/bash "$PROBE_USER"
 fi
 usermod -p '*' "$PROBE_USER"                     # no password; key-only, not "locked"
+# Needed for fetch_and_analyze. Note this is effectively root-equivalent on
+# this VM - which is why the probe VM is disposable, isolated on its own
+# VLAN, and unable to initiate a connection back to the cti host.
+getent group docker >/dev/null && usermod -aG docker "$PROBE_USER"
 home=$(getent passwd "$PROBE_USER" | cut -d: -f6)
 install -d -m 0700 -o "$PROBE_USER" -g "$PROBE_USER" "$home/.ssh"
 # Written from scratch, not appended: sshd uses the FIRST line matching a
@@ -93,6 +124,8 @@ chmod 0600 "$home/.ssh/authorized_keys"
 echo "== self-check (as $PROBE_USER)"
 runuser -u "$PROBE_USER" -- python3 /opt/cti/probe_helper.py --check-access; echo
 dirsearch --help >/dev/null 2>&1 || echo "WARNING: dirsearch is installed but won't run - check its Python deps"
+runuser -u "$PROBE_USER" -- docker info >/dev/null 2>&1 \
+  || echo "WARNING: $PROBE_USER cannot run docker - fetch_and_analyze will fail"
 
 ip=$(hostname -I | awk '{print $1}')
 cat <<EOF
@@ -106,5 +139,5 @@ Done. On the cti host:
        export CTI_PROBE_SSH_KEY=~/.ssh/id_ed25519_probe
        export CTI_PROBE_KNOWN_HOSTS=~/.ssh/known_hosts_probe
   3. Re-run ./setup.sh, restart the harness, then:
-       mcp-server/.venv/bin/python mcp-server/scripts/probe_pending_fingerprints.py --check-access
+       .venv/bin/python scripts/probe_pending_fingerprints.py --check-access
 EOF
