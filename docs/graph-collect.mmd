@@ -13,6 +13,7 @@ graph TD;
 	__end__([<p>__end__</p>]):::last
 	__start__ --> ingest_inbox;
 	enrich_and_write --> run_analytics;
+	ingest_inbox -.-> enrich_and_write;
 	ingest_inbox -.-> sweep;
 	run_analytics --> write_digest;
 	sweep --> enrich_and_write;

@@ -16,6 +16,7 @@ graph TD;
 	collect\3arun_analytics(run_analytics)
 	collect\3awrite_digest(write_digest)
 	collect\3aenrich_and_write --> collect\3arun_analytics;
+	collect\3aingest_inbox -.-> collect\3aenrich_and_write;
 	collect\3aingest_inbox -.-> collect\3asweep;
 	collect\3arun_analytics --> collect\3awrite_digest;
 	collect\3asweep --> collect\3aenrich_and_write;

@@ -29,7 +29,8 @@ def build_collect():
     g.add_edge(START, "ingest_inbox")
     # One `sweep` per cluster, all dispatched together. This is the loop
     # that used to be strictly sequential across eight clusters.
-    g.add_conditional_edges("ingest_inbox", collect.fan_out_clusters, ["sweep"])
+    g.add_conditional_edges("ingest_inbox", collect.fan_out_clusters,
+                            ["sweep", "enrich_and_write"])
     g.add_edge("sweep", "enrich_and_write")
     g.add_edge("enrich_and_write", "run_analytics")
     g.add_edge("run_analytics", "write_digest")

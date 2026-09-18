@@ -71,9 +71,23 @@ def fan_out_clusters(state: dict) -> list[Send]:
     sweep is minutes of probe-VM round-trips that do not touch any other
     cluster's data, and they were serialized only because a for-loop is
     the obvious way to write it.
+
+    `skip_enrich` stops the fan-out entirely, not just the enrichment
+    phase. Its help text promises "no network calls", and the sweep is
+    where most of the network calls are - the first port of this kept only
+    the enrichment half of that guard, so --skip-enrich still spent
+    minutes probing.
     """
-    return [Send("sweep", {"cluster": slug, "day": state.get("day")})
-            for slug in state.get("clusters") or []]
+    if state.get("skip_enrich"):
+        return ["enrich_and_write"]
+    sends = [Send("sweep", {"cluster": slug, "day": state.get("day")})
+             for slug in state.get("clusters") or []]
+    # A conditional fan-out that returns nothing does not "skip the fan-out"
+    # - it strands the rest of the graph, because the edges downstream hang
+    # off the node that never ran. With --skip-enrich, or with no clusters
+    # registered yet, that silently produced no digest at all and reported
+    # success. Route past the sweep instead of returning an empty list.
+    return sends or ["enrich_and_write"]
 
 
 def sweep(payload: dict) -> dict:
@@ -105,6 +119,8 @@ def enrich_and_write(state: dict) -> dict:
     }
 
     if state.get("skip_enrich"):
+        sections["pivot_sweep"] = {"clusters_swept": 0, "errors": {},
+                                   "skipped": "skip_enrich"}
         sections["enrich"] = {"skipped": True}
         return {"sections": sections}
 
