@@ -10,7 +10,7 @@ import ipaddress
 import json
 import os
 import re
-import tempfile
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -19,6 +19,11 @@ from typing import Any, Iterator
 
 import duckdb
 
+from .errors import ClusterNotFound as _ClusterNotFound  # noqa: F401
+from .errors import is_failure, normalize_probe, ok
+from .sources import cache
+from .util import (asn_int, atomic_write_text, new_values, now_iso,
+                   read_json, slugify, write_json)
 from . import attack, stix
 from .probe import vm_proxy
 from .report import ingest as report_ingest
@@ -174,28 +179,9 @@ def _pending_fingerprints_path() -> Path:
     return DATA_DIR.parent / "pending_fingerprints.json"
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Write text so readers never see a partial file: write to a temp
-    file in the same directory, then os.replace (atomic on the same
-    filesystem). Prevents a crash mid-write from leaving a truncated
-    JSON, and prevents the .json/.md pair from going out of sync on a
-    torn write."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(text)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+# _atomic_write_text moved to cti/util.py (webamon had its own inline copy).
 
 
 # Serializes mutating operations across processes (the MCP server and
@@ -203,8 +189,6 @@ def _atomic_write_text(path: Path, text: str) -> None:
 # can't interleave and clobber each other. Reads (load/list/find) don't
 # take it. Reentrant within a thread so a locked op calling another
 # locked helper won't deadlock on flock.
-import threading  # noqa: E402  (kept next to the lock it serves)
-
 _lock_state = threading.local()
 
 
@@ -252,7 +236,7 @@ def _new_cluster(name: str, description: str) -> dict[str, Any]:
     return {
         "name": name,
         "description": description,
-        "created": _now(),
+        "created": now_iso(),
         # Stable STIX 2.1 Intrusion Set identifier, minted once and kept
         # for the life of the cluster so shared bundles stay dedupable.
         "stix_id": stix.new_intrusion_set_id(),
@@ -315,7 +299,7 @@ def load_cluster(name: str) -> dict[str, Any]:
 
 def save_cluster(data: dict[str, Any]) -> None:
     p = _path(data["name"])
-    _atomic_write_text(p, json.dumps(data, indent=2))
+    atomic_write_text(p, json.dumps(data, indent=2))
     _write_markdown(data)
 
 
@@ -386,11 +370,11 @@ def update_ttp(name: str, technique_id: str, technique_name: str,
     for t in ttps:
         if t["id"] == technique_id:
             t.update(name=technique_name, status=status, notes=notes,
-                      updated=_now())
+                      updated=now_iso())
             break
     else:
         ttps.append({"id": technique_id, "name": technique_name,
-                      "status": status, "notes": notes, "updated": _now()})
+                      "status": status, "notes": notes, "updated": now_iso()})
     save_cluster(data)
     # Advisory only, checked against the bundled MITRE corpus - never
     # blocks the write, since a stale bundle or a legitimately custom ID
@@ -422,7 +406,7 @@ def remove_ttp(name: str, technique_id: str) -> dict[str, Any]:
 @_synchronized
 def append_hunt_log(name: str, entry: str) -> dict[str, Any]:
     data = load_cluster(name)
-    data["hunt_log"].append({"date": _now(), "entry": entry})
+    data["hunt_log"].append({"date": now_iso(), "entry": entry})
     save_cluster(data)
     return data
 
@@ -443,7 +427,7 @@ def _load_detection_registry() -> dict[str, Any]:
 
 
 def _save_detection_registry(registry: dict[str, Any]) -> None:
-    _atomic_write_text(_registry_path(), json.dumps(registry, indent=2))
+    atomic_write_text(_registry_path(), json.dumps(registry, indent=2))
 
 
 # --- reverse index cache ----------------------------------------------------
@@ -533,7 +517,7 @@ def _reverse_index() -> dict[str, Any]:
             return cached
     idx = _build_reverse_index()
     try:
-        _atomic_write_text(p, json.dumps(idx))
+        atomic_write_text(p, json.dumps(idx))
     except OSError:
         pass  # cache is best-effort; a read-only store still answers correctly
     return idx
@@ -600,7 +584,7 @@ def add_detection(detection_id: str, description: str, technique_ids: list[str],
         load_cluster(cluster_name)  # raises ClusterNotFound if it doesn't exist
 
     registry = _load_detection_registry()
-    now = _now()
+    now = now_iso()
     existing = next((d for d in registry["detections"] if d["id"] == detection_id), None)
     new_scope = scope or (_detection_scope(existing) if existing
                           else ("cluster" if cluster_name else "technique"))
@@ -681,7 +665,7 @@ def add_relationship(name: str, relationship_type: str, target_cluster: str,
         "target_stix_id": target["stix_id"],
         "description": description,
         "source": source,
-        "created": _now(),
+        "created": now_iso(),
     })
     save_cluster(data)
     return data
@@ -691,7 +675,7 @@ def add_relationship(name: str, relationship_type: str, target_cluster: str,
 def add_gap(name: str, description: str, priority: str = "medium") -> dict[str, Any]:
     data = load_cluster(name)
     data["gaps"].append({
-        "description": description, "priority": priority, "created": _now(),
+        "description": description, "priority": priority, "created": now_iso(),
     })
     save_cluster(data)
     return data
@@ -718,7 +702,7 @@ def update_gap(name: str, description: str, new_description: str | None = None,
                 g["description"] = new_description
             if priority is not None:
                 g["priority"] = priority
-            g["updated"] = _now()
+            g["updated"] = now_iso()
             save_cluster(data)
             return data
     raise ValueError(f"no gap matching that description in cluster {name!r}")
@@ -909,100 +893,23 @@ _PIVOT_CACHE_TTL_ENV = "CTI_PIVOT_CACHE_TTL"
 _PIVOT_CACHE_TTL_DEFAULT = 3600
 
 
-def _pivot_cache_path() -> Path:
-    return DATA_DIR / "_registry" / "pivot_cache.json"
-
-
-def _pivot_cache_ttl() -> int:
-    try:
-        return int(os.environ.get(_PIVOT_CACHE_TTL_ENV, _PIVOT_CACHE_TTL_DEFAULT))
-    except ValueError:
-        return _PIVOT_CACHE_TTL_DEFAULT
-
-
-def _load_pivot_cache() -> dict[str, Any]:
-    p = _pivot_cache_path()
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-_pivot_cache_lock = threading.Lock()
-
-
-def _is_soft_failure(result: Any) -> bool:
-    """True for a source result that reports failure instead of raising.
-
-    Sources signal failure two ways: a top-level "error", or a per-sub-call
-    "<name>_error" (pivot.ripestat_lookup returns one per sub-call so a
-    partial answer still comes back). Only the first used to keep a result
-    out of the cache, so a run where every RIPEstat sub-call failed cached
-    {"network_info_error": ...} as if it were the answer - and for the whole
-    TTL afterwards every sweep reported the IP as "unknown" with no error
-    anywhere to explain it. Seen for real when the MCP server started
-    without CTI_PROBE_* set.
-    """
-    if not isinstance(result, dict):
-        return False
-    return any(k == "error" or str(k).endswith("_error") for k in result)
-
+# The pivot cache used to live here: one 8.8 MB JSON dict, fully re-read
+# and fully re-written on every miss, under a lock, from a six-thread pool.
+# It is now sources/cache.py, one file per key - no read-modify-write, no
+# lock, and a corrupt entry costs one lookup instead of the whole cache.
+#
+# _is_soft_failure and _norm_live moved to cti/errors.py as is_failure and
+# normalize_probe, joining the inline `"error" not in x` guard that was
+# repeated seventeen times in this file.
 
 def _cached_pivot(source: str, value: str, fetch) -> Any:
-    """Return a cached source result for `value` if it's fresh, else call
-    `fetch()`, cache a successful result, and return it. `fetch` may
-    raise - exceptions propagate uncached so a transient outage isn't
-    remembered as the answer.
-
-    The read and the write are each taken under _pivot_cache_lock so the
-    6-thread _sweep_lifecycle pool can't lose entries to an interleaved
-    read-modify-write of the shared pivot_cache.json (the write re-reads
-    the file so a concurrent writer's entry survives). fetch() itself runs
-    OUTSIDE the lock - it's a network round trip and mustn't serialize the
-    whole pool. Cross-process races (cron vs MCP server) still exist but
-    _atomic_write_text keeps each write internally consistent, so the worst
-    case is a dropped cache entry, not corruption."""
-    import time
-    ttl = _pivot_cache_ttl()
-    if ttl <= 0:
-        return fetch()
-    key = f"{source}:{value}"
-    now = time.time()
-    with _pivot_cache_lock:
-        entry = _load_pivot_cache().get(key)
-    if entry and now - entry.get("ts", 0) < ttl:
-        return entry["result"]
-    result = fetch()
-    # Don't cache soft failures; a later retry should be able to succeed.
-    if not _is_soft_failure(result):
-        with _pivot_cache_lock:
-            cache = _load_pivot_cache()  # re-read so a concurrent writer isn't clobbered
-            cache[key] = {"ts": now, "result": result}
-            try:
-                _atomic_write_text(_pivot_cache_path(), json.dumps(cache))
-            except OSError:
-                pass
-    return result
-
-
-def _norm_live(result: dict[str, Any] | Any) -> dict[str, Any]:
-    """Normalize a vm_proxy live-grab response (tls_grab/http_probe/
-    dns_lookup) - which always carries an `error` key, None on success -
-    into the {...}|{"error": ...} shape the enrichment consumers gate on
-    (`"error" not in result`). Drops the `error: None` key on success so a
-    good result isn't misread as a failure or refused by _cached_pivot."""
-    if not isinstance(result, dict):
-        return {"error": "unexpected probe response"}
-    if result.get("error"):
-        return {"error": str(result["error"])}
-    return {k: v for k, v in result.items() if k != "error"}
+    """Cache a source lookup for `value`. See sources/cache.py."""
+    return cache.cached(source, value, fetch)
 
 
 def _live_tls(host: str) -> dict[str, Any]:
     try:
-        return _cached_pivot("tls_live", host, lambda: _norm_live(vm_proxy.tls_grab(host)))
+        return _cached_pivot("tls_live", host, lambda: normalize_probe(vm_proxy.tls_grab(host)))
     except vm_proxy.VMProxyError as e:
         return {"error": str(e)}
 
@@ -1010,7 +917,7 @@ def _live_tls(host: str) -> dict[str, Any]:
 def _live_http(host: str) -> dict[str, Any]:
     try:
         return _cached_pivot("http_live", host,
-                             lambda: _norm_live(vm_proxy.http_probe(f"https://{host}")))
+                             lambda: normalize_probe(vm_proxy.http_probe(f"https://{host}")))
     except vm_proxy.VMProxyError as e:
         return {"error": str(e)}
 
@@ -1036,7 +943,7 @@ def _subdomains_for(domain: str) -> dict[str, Any]:
     errors = []
     for source, fn in (("subfinder", vm_proxy.subfinder), ("wayback", vm_proxy.wayback_cdx)):
         try:
-            r = _cached_pivot(source, domain, lambda fn=fn: _norm_live(fn(domain)))
+            r = _cached_pivot(source, domain, lambda fn=fn: normalize_probe(fn(domain)))
         except vm_proxy.VMProxyError as e:
             errors.append(str(e))
             continue
@@ -1246,13 +1153,14 @@ def _sweep_lifecycle(domains: list[str], ips: list[str]
 
 
 def _new_values(data: dict[str, Any], category: str, values: list[str]) -> list[str]:
-    """Values in `values` not already tracked on the cluster in `category`,
-    deduped, order-preserving - the "what actually needs an enrichment
-    lookup" filter shared by add_observable/ingest_report/pivot_and_expand,
-    kept in sync with _file_new_observables' own dedup logic."""
-    existing = {o["value"] for o in data["observables"][category]}
-    return [v for v in dict.fromkeys(values) if v and v not in existing]
+    """Values not already tracked on this cluster in this category.
 
+    A thin bind of util.new_values to the cluster-record shape. The
+    same two lines were also inlined in _file_new_observables (whose
+    docstring said they were "kept in sync"), in _add_observable_locked
+    and in _merge_observables.
+    """
+    return new_values({o["value"] for o in data["observables"][category]}, values)
 
 def _stamp_webamon_summary(entry: dict[str, Any], webamon: dict[str, Any]) -> None:
     """Stamp a compact Webamon snapshot (report_id, last scan date, risk
@@ -1260,7 +1168,7 @@ def _stamp_webamon_summary(entry: dict[str, Any], webamon: dict[str, Any]) -> No
     result (carries `latest`) and an IP result (carries only `total_hits`/
     `domains`)."""
     latest = webamon.get("latest")
-    summary: dict[str, Any] = {"checked": _now(), "total_hits": webamon.get("total_hits")}
+    summary: dict[str, Any] = {"checked": now_iso(), "total_hits": webamon.get("total_hits")}
     if isinstance(latest, dict):
         summary.update({
             "report_id": latest.get("report_id"),
@@ -1272,26 +1180,8 @@ def _stamp_webamon_summary(entry: dict[str, Any], webamon: dict[str, Any]) -> No
     entry["webamon"] = summary
 
 
-def _asn_int(value: Any) -> int | None:
-    """Normalize an ASN to int. RIPEstat reports ASNs as strings ("16509",
-    occasionally "AS16509") and hands back a list when an IP is announced by
-    more than one; SHARED_HOSTING_ASNS and the tracking store use ints.
-    Coercing once, here, is what keeps `asn in SHARED_HOSTING_ASNS` honest -
-    comparing the raw string never matched, so shared-hosting suppression
-    silently did nothing and stamped 50 other tenants' domains onto tracked
-    AWS IPs. Returns None for anything unparseable, so callers can keep the
-    raw value instead."""
-    if isinstance(value, list):
-        value = value[0] if value else None
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    text = str(value).strip().upper()
-    if text.startswith("AS"):
-        text = text[2:]
-    return int(text) if text.isdigit() else None
-
+# _asn_int moved to cti/util.py, where it replaced tracking.enrich._as_int
+# too - the two disagreed on leading whitespace.
 
 def _apply_enrichment_snapshot(entry: dict[str, Any], category: str,
                                 detail: dict[str, Any], enrichment: dict[str, Any]) -> None:
@@ -1318,7 +1208,7 @@ def _apply_enrichment_snapshot(entry: dict[str, Any], category: str,
         # (_as_int(asns[0])) and the DuckDB observations.asn column.
         asn_list = detail.get("asn")
         if asn_list:
-            asn_value = _asn_int(asn_list)
+            asn_value = asn_int(asn_list)
             entry["asn"] = (asn_value if asn_value is not None else
                             (asn_list[0] if isinstance(asn_list, list) else asn_list))
         if detail.get("as_holder"):
@@ -1344,7 +1234,7 @@ def _apply_enrichment_snapshot(entry: dict[str, Any], category: str,
                               "not_before": cert.get("not_before"),
                               "not_after": cert.get("not_after"),
                               "sha256": cert.get("sha256"),
-                              "checked": _now(), "source": "tls_live"}
+                              "checked": now_iso(), "source": "tls_live"}
         http = enrichment.get("http")
         if isinstance(http, dict) and "error" not in http and http.get("status") is not None:
             entry["http"] = {"status": http.get("status"), "title": http.get("title"),
@@ -1563,7 +1453,7 @@ def pivot_cluster(name: str) -> dict[str, Any]:
     results = _sweep_lifecycle(domains, ips)
 
     # Write phase: brief lock, applied onto a fresh read of the cluster.
-    now = _now()
+    now = now_iso()
     with _data_lock():
         data = load_cluster(name)
         summary: dict[str, Any] = {"name": data["name"], "checked": now, "domains": [], "ips": []}
@@ -1677,7 +1567,7 @@ def pivot_and_expand(value: str, cluster_name: str,
         # VM has no IPv6 route, so nothing downstream can act on the result.
         return _pivot_and_expand_ipv6_skip(value, cluster_name, kind)
 
-    now = _now()
+    now = now_iso()
     candidates: list[tuple[str, list[str], str]] = []  # (category, values, source)
     review: dict[str, Any] = {}
 
@@ -1719,7 +1609,7 @@ def pivot_and_expand(value: str, cluster_name: str,
         # actor's infra - suppress before they can be filed or reviewed.
         ripe = _cached_pivot("ripestat", value, lambda: pivot.ripestat_lookup(value))
         asn_list = ripe.get("asn") if isinstance(ripe, dict) else None
-        asn = _asn_int(asn_list)  # RIPEstat gives strings; see _asn_int
+        asn = asn_int(asn_list)  # RIPEstat gives strings; see _asn_int
         if hosted and asn in SHARED_HOSTING_ASNS:
             review["cohosted_domains_suppressed"] = (
                 f"{len(hosted)} co-hosted domains suppressed - "
@@ -1744,7 +1634,7 @@ def pivot_and_expand(value: str, cluster_name: str,
 def _pivot_and_expand_ipv6_skip(value: str, cluster_name: str, kind: str) -> dict[str, Any]:
     data = load_cluster(cluster_name)
     entry = f"pivot_and_expand on {value}: skipped (IPv6, not pivoted)"
-    data["hunt_log"].append({"date": _now(), "entry": entry})
+    data["hunt_log"].append({"date": now_iso(), "entry": entry})
     save_cluster(data)
     return {"value": value, "kind": kind, "cluster": cluster_name,
             "filed": {}, "review": {}, "cluster_state": load_cluster(cluster_name)}
@@ -1828,7 +1718,7 @@ def active_scan(target: str, cluster: str | None = None,
     if unknown:
         raise ValueError(f"unknown active_scan tool(s): {unknown}; valid: {_ACTIVE_SCAN_TOOLS}")
 
-    ran_at = _now()
+    ran_at = now_iso()
     observed_at = datetime.fromisoformat(ran_at).replace(tzinfo=None)
     before_ts = _opensearch_max_ts()
 
@@ -1957,46 +1847,14 @@ _REPORT_CACHE_TTL_ENV = "CTI_REPORT_CACHE_TTL"
 _REPORT_CACHE_TTL_DEFAULT = 3600
 
 
-def _report_cache_path() -> Path:
-    return DATA_DIR / "_registry" / "report_fetch_cache.json"
-
-
-def _report_cache_ttl() -> int:
-    try:
-        return int(os.environ.get(_REPORT_CACHE_TTL_ENV, _REPORT_CACHE_TTL_DEFAULT))
-    except ValueError:
-        return _REPORT_CACHE_TTL_DEFAULT
-
-
 def _fetch_report_text(source: str) -> str:
-    """report_ingest.fetch_text(source), cached briefly so analyze_report
-    followed by ingest_report on the same source reuses one fetch instead
-    of two. Keyed by source string (URL or local path) - a local file
-    edited between the two calls within the TTL window would read stale,
-    but that gap is normally seconds, not the file's edit cadence."""
-    import time
-    ttl = _report_cache_ttl()
-    if ttl <= 0:
+    """Fetched report body, cached so analyze_report and a following
+    ingest_report share one fetch. Was a third hand-rolled TTL cache; now
+    sources/cache.py like the other two."""
+    if not source.startswith(("http://", "https://")):
         return report_ingest.fetch_text(source)
-    path = _report_cache_path()
-    cache: dict[str, Any] = {}
-    if path.exists():
-        try:
-            cache = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            cache = {}
-    now = time.time()
-    entry = cache.get(source)
-    if entry and now - entry.get("ts", 0) < ttl:
-        return entry["text"]
-    text = report_ingest.fetch_text(source)
-    cache[source] = {"ts": now, "text": text}
-    try:
-        _atomic_write_text(path, json.dumps(cache))
-    except OSError:
-        pass
-    return text
-
+    return cache.cached_text("report", source,
+                             lambda: report_ingest.fetch_text(source))
 
 def analyze_report(source: str) -> dict[str, Any]:
     """Fetch a report (URL or local file path) and extract observables,
@@ -2039,7 +1897,7 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
     a bulk multi-value call (ingest_report, import_stix_bundle) never
     passes this, since one metadata dict can't sensibly apply to every
     value being filed at once."""
-    now = _now()
+    now = now_iso()
     counts = {}
     newly_tracked: list[tuple[str, str]] = []  # (category, value), for the fingerprint queue
     skipped: list[dict[str, str]] = []  # entries tracked but not queued, with why
@@ -2116,10 +1974,10 @@ def _enqueue_pending_fingerprints(cluster_name: str, items: list[tuple[str, str]
     # caller already holding _data_lock (add_observable/ingest_report/
     # import_stix_bundle are all @_synchronized), so no lock of its own.
     entries = _load_pending_fingerprints()
-    now = _now()
+    now = now_iso()
     entries.extend({"cluster": cluster_name, "category": category, "value": value,
                      "queued_at": now} for category, value in items)
-    _atomic_write_text(_pending_fingerprints_path(), json.dumps(entries, indent=2))
+    atomic_write_text(_pending_fingerprints_path(), json.dumps(entries, indent=2))
 
 
 def list_pending_fingerprints() -> list[dict[str, Any]]:
@@ -2140,7 +1998,7 @@ def pop_pending_fingerprints() -> list[dict[str, Any]]:
     list_pending_fingerprints instead to check without consuming."""
     entries = _load_pending_fingerprints()
     if entries:
-        _atomic_write_text(_pending_fingerprints_path(), "[]")
+        atomic_write_text(_pending_fingerprints_path(), "[]")
     return entries
 
 
@@ -2189,7 +2047,7 @@ def _merge_ttps(data: dict[str, Any], technique_ids: list[str], source: str) -> 
         data["ttps"].append({
             "id": tid, "name": attack.canonical_name(tid) or tid, "status": 0,
             "notes": f"auto-extracted from report: {source}",
-            "updated": _now(),
+            "updated": now_iso(),
         })
         added.append(tid)
     return added
@@ -2301,7 +2159,7 @@ def _ingest_report_phase2(cluster_name: str, source: str, extracted: dict[str, A
         data, extracted, source, ip_ports=extracted.get("ip_ports"), enrichment=enrichment)
     _merge_ttps(data, extracted["ttps"], source)
     data["report_sources"].append({
-        "source": source, "ingested": _now(),
+        "source": source, "ingested": now_iso(),
         "observables_found": observable_counts,
         "ttps_found": extracted["ttps"],
         "fingerprint_queue_skipped": skipped,
@@ -2426,7 +2284,7 @@ def _date_only(value: str | None) -> str | None:
     """Normalize an ISO-ish date/datetime/year-month string to plain
     YYYY-MM-DD, or return the value unchanged if it doesn't start with
     at least YYYY-MM. Observable-level first_seen/last_seen/
-    status_checked are always machine-generated via _now() so this is a
+    status_checked are always machine-generated via now_iso() so this is a
     no-op slice for them, but cluster-level first_seen/last_seen
     (update_profile's free-text params) show up in the wild as "2025-09"
     (month precision only) or "2022-12-01T00:00:00Z" (full datetime) as
@@ -2517,4 +2375,4 @@ def _write_markdown(data: dict[str, Any]) -> None:
     for h in data["hunt_log"]:
         lines.append(f"- **{h['date']}** — {h['entry']}")
     md_path = _path(data["name"]).with_suffix(".md")
-    _atomic_write_text(md_path, "\n".join(lines) + "\n")
+    atomic_write_text(md_path, "\n".join(lines) + "\n")

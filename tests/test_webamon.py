@@ -1,4 +1,4 @@
-"""Tests for cti_tools.webamon. No real network - webamon._get is
+"""Tests for cti.sources.webamon. No real network - webamon._get is
 monkeypatched so the suite runs offline."""
 from __future__ import annotations
 
@@ -6,15 +6,20 @@ import json
 
 import pytest
 
-from cti.sources import webamon
+from cti.sources import budget, http, webamon
 
 
 @pytest.fixture(autouse=True)
 def _isolate_quota(tmp_path, monkeypatch):
+    # The quota counter moved out of this module into sources/budget.py,
+    # which locates itself under CTI_DATA_DIR - so redirecting that env var
+    # is now the whole isolation, and there is no module-level path
+    # constant left to patch.
     monkeypatch.setenv("CTI_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(webamon, "_DATA_DIR", tmp_path)
     monkeypatch.setenv("WEBAMON_API_KEY", "test-key")
+    budget.reset("webamon")
     yield
+    budget.reset("webamon")
 
 
 # --- a representative scan document, trimmed from a real API response ------
@@ -137,13 +142,19 @@ def test_get_respects_daily_budget(monkeypatch):
 
 
 def test_get_bumps_quota_and_maps_http_errors(monkeypatch):
+    # The transport now lives in sources/http.py, so the stub patches
+    # urlopen there and mirrors the real urllib response interface
+    # (read(size), .status, .headers) rather than a narrower one.
     class _Resp:
         def __init__(self, body): self._b = body
-        def read(self): return self._b.encode()
+        def read(self, size=None): return self._b.encode()
+        status = 200
+        headers: dict = {}
+        def geturl(self): return "https://pro.webamon.com/search"
         def __enter__(self): return self
         def __exit__(self, *a): return False
 
-    monkeypatch.setattr(webamon.urllib.request, "urlopen",
+    monkeypatch.setattr(http.urllib.request, "urlopen",
                         lambda *a, **k: _Resp(json.dumps({"total_hits": 1, "results": []})))
     assert webamon.quota_used_today() == 0
     webamon._get("/search", {"search": "x"})
@@ -153,6 +164,6 @@ def test_get_bumps_quota_and_maps_http_errors(monkeypatch):
 
     def raise_403(*a, **k):
         raise urllib.error.HTTPError("u", 403, "Forbidden", {}, None)
-    monkeypatch.setattr(webamon.urllib.request, "urlopen", raise_403)
+    monkeypatch.setattr(http.urllib.request, "urlopen", raise_403)
     assert webamon._get("/search", {"search": "x"}) == {"error": "webamon forbidden (plan/quota)"}
     assert webamon.quota_used_today() == 2  # a rejected call still counts against the wire attempt

@@ -63,7 +63,7 @@ def test_get_json_transport_failure_becomes_pivoterror(monkeypatch):
     # transport failure; _get_json must still surface a PivotError so
     # callers return {"error": ...} rather than letting the exception
     # escape mid-pivot.
-    def boom(url, headers=None, method="GET"):
+    def boom(url, headers=None, method="GET", data=None, insecure=False):
         raise pivot.vm_proxy.VMProxyError("ssh transport failed")
     monkeypatch.setattr(pivot.vm_proxy, "http_fetch", boom)
     with pytest.raises(pivot.PivotError):
@@ -72,7 +72,7 @@ def test_get_json_transport_failure_becomes_pivoterror(monkeypatch):
 
 def test_get_json_unparseable_body_becomes_pivoterror(monkeypatch):
     monkeypatch.setattr(pivot.vm_proxy, "http_fetch",
-                        lambda url, headers=None, method="GET":
+                        lambda url, headers=None, method="GET", data=None, insecure=False:
                             {"status": 200, "body": "<html>rate limited</html>", "error": None})
     with pytest.raises(pivot.PivotError):
         pivot._get_json("https://api.certspotter.com/v1/issuances?domain=x")
@@ -80,7 +80,7 @@ def test_get_json_unparseable_body_becomes_pivoterror(monkeypatch):
 
 def test_get_text_http_error_status_becomes_pivoterror(monkeypatch):
     monkeypatch.setattr(pivot.vm_proxy, "http_fetch",
-                        lambda url, headers=None, method="GET":
+                        lambda url, headers=None, method="GET", data=None, insecure=False:
                             {"status": 429, "body": "rate limited", "error": None})
     with pytest.raises(pivot.PivotError):
         pivot._get_text("https://api.hackertarget.com/reverseiplookup/?q=1.2.3.4")

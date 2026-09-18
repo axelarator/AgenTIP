@@ -115,10 +115,14 @@ def fetch(url: str, *, via: Via, method: str = "GET",
 
 
 def _fetch_probe(url, method, headers, data, timeout) -> Response:
+    """`timeout` is deliberately unused here: the probe hop's deadline is
+    the SSH timeout (vm_proxy.SSH_TIMEOUT / LONG_TIMEOUT), not a per-request
+    HTTP one, because the request is executed on the far side of the hop.
+    Passing it through would be a TypeError against the real signature."""
     from ..probe import vm_proxy
     try:
         result = vm_proxy.http_fetch(url, headers=headers, method=method,
-                                     data=data, timeout=timeout)
+                                     data=data)
     except VMProxyError as e:
         raise HttpError(f"failed to reach {url} via the probe VM: {e}") from e
     return Response(status=result.get("status"),

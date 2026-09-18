@@ -186,7 +186,23 @@ def fetch_text(source: str) -> str:
     """Return plain text for a URL or local file path. HTML is stripped
     to text; PDFs are extracted via `pdftotext` if poppler-utils is
     installed (otherwise a clear error asks you to extract the text
-    first). Other binary formats are unsupported."""
+    first). Other binary formats are unsupported.
+
+    ## The one egress exception that was not written down
+
+    This fetch leaves from THIS host, not the probe VM. Webamon and
+    HoneyLabs are documented exceptions to the chokepoint rule (they
+    query a vendor index, not the indicator); this one never was, so it
+    read as an oversight. It is a deliberate exception, for two reasons:
+    the URL is one an analyst explicitly handed us - typically a vendor
+    blog, not adversary infrastructure - and it is the only fetch in the
+    codebase that needs the raw bytes and the declared charset, because a
+    PDF has to reach pdftotext intact. sources/http.py hands back decoded
+    text, which would corrupt exactly that case.
+
+    If you ever point this at a URL on infrastructure you are tracking,
+    route it through the probe VM instead.
+    """
     is_pdf = source.lower().endswith(".pdf")
 
     if source.startswith(("http://", "https://")):

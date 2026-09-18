@@ -58,9 +58,10 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
+from ..errors import VMProxyError
 from ..probe import vm_proxy
+from . import http
 
-USER_AGENT = "cti-agent-pivot/1.0 (+local analysis tool, on-demand only)"
 HONEYLABS_API_KEY_ENV = "HONEYLABS_API_KEY"
 THREATFOX_API_KEY_ENV = "THREATFOX_API_KEY"
 
@@ -74,60 +75,44 @@ _SINKHOLE_NS_PATTERNS = (
 
 
 class PivotError(Exception):
-    pass
+    """A source lookup failed.
 
+    Kept as a distinct type because callers turn it into an {"error": ...}
+    entry rather than propagating - a single dead source must not fail a
+    whole cluster sweep.
+    """
+
+
+# The three hand-rolled transports that used to live here (_get_text,
+# _get_json, _post_json) are gone. Everything goes through sources/http.py
+# now, with via="probe" naming the OPSEC decision explicitly: an RDAP
+# lookup on a malicious domain is still traffic that tells a third party
+# this host is interested in that domain.
 
 def _get_json(url: str, headers: dict[str, str] | None = None) -> Any:
-    body = _get_text(url, headers)
     try:
-        return json.loads(body)
-    except ValueError as e:
-        raise PivotError(f"{url} returned an unparseable response: {e}") from e
+        return http.get_json(url, via="probe", headers=headers)
+    except http.HttpError as e:
+        raise PivotError(str(e)) from e
 
 
 def _get_text(url: str, headers: dict[str, str] | None = None) -> str:
-    """Fetch a response body (some free enrichment endpoints return
-    newline-delimited text rather than JSON, hence text rather than
-    always decoding JSON here). Proxied through the probe VM - see the
-    module docstring."""
+    """Some free enrichment endpoints return newline-delimited text
+    rather than JSON, which is why this exists alongside _get_json."""
     try:
-        result = vm_proxy.http_fetch(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
-    except vm_proxy.VMProxyError as e:
-        raise PivotError(f"failed to reach {url}: {e}") from e
-    status = result.get("status")
-    if status is not None and status >= 400:
-        raise PivotError(f"{url} returned HTTP {status}")
-    return str(result.get("body") or "")
+        return http.get_text(url, via="probe", headers=headers)
+    except http.HttpError as e:
+        raise PivotError(str(e)) from e
 
 
 def _post_json(url: str, payload: dict[str, Any],
-                headers: dict[str, str] | None = None) -> Any:
+               headers: dict[str, str] | None = None) -> Any:
     """POST a JSON body and parse a JSON response - the ThreatFox-shaped
-    counterpart to _get_json. Proxied through the probe VM like every
-    other pivot call; see the module docstring."""
+    counterpart to _get_json."""
     try:
-        result = vm_proxy.http_fetch(
-            url, headers={"User-Agent": USER_AGENT, "Content-Type": "application/json",
-                          **(headers or {})},
-            method="POST", data=json.dumps(payload))
-    except vm_proxy.VMProxyError as e:
-        raise PivotError(f"failed to reach {url}: {e}") from e
-    status = result.get("status")
-    body = str(result.get("body") or "")
-    if status is not None and status >= 400:
-        # Error responses here (e.g. ThreatFox's {"query_status":
-        # "unknown_auth_key"}) are themselves small JSON documents whose
-        # detail is far more actionable than the bare status code - surface
-        # it when present instead of just "returned HTTP 403".
-        try:
-            detail = json.loads(body)
-        except ValueError:
-            detail = body or None
-        raise PivotError(f"{url} returned HTTP {status}" + (f": {detail}" if detail else ""))
-    try:
-        return json.loads(body)
-    except ValueError as e:
-        raise PivotError(f"{url} returned an unparseable response: {e}") from e
+        return http.post_json(url, payload, via="probe", headers=headers)
+    except http.HttpError as e:
+        raise PivotError(str(e)) from e
 
 
 def resolve_host(host: str) -> list[str] | None:
@@ -152,7 +137,7 @@ def resolve_host(host: str) -> list[str] | None:
     other pivot lookup in this module."""
     try:
         raw_addrs = vm_proxy.resolve_dns(host)
-    except vm_proxy.VMProxyError:
+    except VMProxyError:
         return None
     if raw_addrs is None or not raw_addrs:
         return raw_addrs
@@ -322,7 +307,7 @@ def ptr_lookup(ip: str) -> dict[str, Any]:
     are co-hosting and noisy on shared infrastructure."""
     try:
         hostname = vm_proxy.resolve_ptr(ip)
-    except vm_proxy.VMProxyError as e:
+    except VMProxyError as e:
         return {"error": str(e)}
     return {"hostname": hostname}
 

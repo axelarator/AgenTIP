@@ -61,7 +61,7 @@ even starting the next) is what a real 17-target run measured at close
 to 15 minutes; concurrency here is the main lever against that, on top
 of batching the polling itself and reusing one OpenSearch connection for
 the whole run instead of opening a fresh one per query
-(_opensearch_connection()).
+(cti/sources/opensearch.py).
 
 Direction still matters for the one remaining SSH hop: the OPNsense LAN
 (VLAN30, where the probe VM lives) is firewalled so it can never
@@ -95,7 +95,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import datetime
-import http.client
 import ipaddress
 import json
 import os
@@ -109,6 +108,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cti import core
 from cti.probe import vm_proxy  # noqa: E402
+from cti.sources.opensearch import OpenSearchClient  # noqa: E402
 
 # --- adjust for your environment --------------------------------------------
 # SSH connection details for the lab probe VM (CTI_PROBE_HOST/USER/
@@ -117,12 +117,10 @@ from cti.probe import vm_proxy  # noqa: E402
 # also routes through, so there's one source of truth for how this
 # process reaches the VM instead of two copies drifting apart.
 
-OPENSEARCH_URL = "http://10.20.0.18:9200"
-OPENSEARCH_INDEX = "zeek-*"
 # Field this lab's ingestion pipeline maps Zeek's `id.resp_p` to.
 # Confirmed live (2026-07-20) by sampling real documents across
 # ssh.log/ssl.log/conn.log/dns.log/notice.log/files.log via this same
-# _opensearch_search() path - every one carries a flat integer `dst_port`
+# _client.search() path - every one carries a flat integer `dst_port`
 # (alongside `src_port` for the initiator's side), consistent with the
 # already-confirmed `id.resp_h` -> `dst_ip` rename. Only load-bearing for
 # a target with more than one queued port (see
@@ -229,74 +227,17 @@ def _lookup_ports(cluster: str, target: str) -> list[int]:
     return found or [443]
 
 
-def probe_win(target: str, port: int) -> dict[str, object]:
-    try:
-        return vm_proxy.probe_win(target, port)
-    except vm_proxy.VMProxyError as e:
-        raise ProbeError(str(e)) from e
+# The probe_win() wrapper that used to sit here existed solely to
+# convert VMProxyError into ProbeError - and _dispatch_one catches both
+# anyway. Callers use vm_proxy.probe_win directly.
 
-
-_opensearch_host = urlsplit(OPENSEARCH_URL).hostname
-_opensearch_port = urlsplit(OPENSEARCH_URL).port or 9200
-_opensearch_path = f"/{OPENSEARCH_INDEX}/_search"
-# One HTTP connection reused for every OpenSearch query in a run, instead
-# of a fresh urllib.request.urlopen (and so a fresh TCP handshake) per
-# call - previously paid up to ~9 times per target (one _current_max_ts
-# snapshot plus up to 8 poll attempts), which added up across a real
-# multi-target run to dozens of redundant handshakes to the same host in
-# a tight loop. Batching the poll loop itself (collect_zeek_fingerprints_batch)
-# already cut the call count from O(targets) to O(poll attempts) for a
-# whole run; this cuts the remaining per-call setup cost on top of that.
-_opensearch_conn: http.client.HTTPConnection | None = None
-
-
-def _opensearch_connection() -> http.client.HTTPConnection:
-    global _opensearch_conn
-    if _opensearch_conn is None:
-        _opensearch_conn = http.client.HTTPConnection(
-            _opensearch_host, _opensearch_port, timeout=15)
-    return _opensearch_conn
-
-
-def _reset_opensearch_connection() -> None:
-    global _opensearch_conn
-    if _opensearch_conn is not None:
-        try:
-            _opensearch_conn.close()
-        except Exception:
-            pass
-        _opensearch_conn = None
-
-
-def _opensearch_search(query: dict[str, object], size: int = 50) -> list[dict[str, object]]:
-    """POST a query to OpenSearch's _search endpoint, sorted newest-first,
-    and return the list of _source documents. Raises ProbeError on any
-    transport/HTTP failure - callers treat that the same as the SSH hop
-    failing. No auth - this VM's OpenSearch has no login in front of it.
-
-    Retries once over a fresh connection if the reused one was dropped
-    from under us (an idle keep-alive connection closed server-side, or
-    any other transport hiccup) - this function is only ever called
-    single-threaded (dispatch and polling are separate phases in main(),
-    never concurrent with each other), so there's no concurrent access to
-    guard against, just a connection that can go stale between calls."""
-    body = json.dumps({"size": size, "sort": [{"ts": "desc"}], "query": query}).encode()
-    headers = {"Content-Type": "application/json"}
-
-    last_error: Exception | None = None
-    for attempt in range(2):
-        conn = _opensearch_connection()
-        try:
-            conn.request("POST", _opensearch_path, body=body, headers=headers)
-            resp = conn.getresponse()
-            payload = json.loads(resp.read())
-            if resp.status >= 400:
-                raise ProbeError(f"OpenSearch query failed: HTTP {resp.status}: {payload}")
-            return [hit["_source"] for hit in payload["hits"]["hits"]]
-        except (http.client.HTTPException, TimeoutError, OSError, ValueError) as e:
-            last_error = e
-            _reset_opensearch_connection()
-    raise ProbeError(f"OpenSearch query failed: {last_error}") from last_error
+# The keep-alive connection, the retry-once-on-stale logic and the
+# newest-indexed-ts query that used to be reimplemented here are now
+# cti/sources/opensearch.py. That module was generalized from this file
+# and said so in its own docstring, while this copy stayed behind and
+# drifted: it hardcoded the URL and index where the package version
+# reads CTI_OPENSEARCH_URL / CTI_OPENSEARCH_INDEX.
+_client = OpenSearchClient()
 
 
 def _current_max_ts() -> float:
@@ -305,8 +246,8 @@ def _current_max_ts() -> float:
     this (not a wall-clock reading, not a fixed window) is the freshness
     baseline. Returns 0.0 if the index is empty - everything found later
     then counts as fresh."""
-    hits = _opensearch_search({"match_all": {}}, size=1)
-    return float(hits[0]["ts"]) if hits else 0.0
+    return _client.current_max_ts()
+
 
 
 def collect_zeek_fingerprints_batch(resolved: list[tuple[str, int]], baseline_ts: float,
@@ -382,7 +323,7 @@ def collect_zeek_fingerprints_batch(resolved: list[tuple[str, int]], baseline_ts
             break
         ips = {ip for ip, _ in remaining}
         size = min(len(remaining) * 50, 5000)  # OpenSearch's default max_result_window
-        for hit in _opensearch_search({"terms": {"dst_ip": sorted(ips)}}, size=size):
+        for hit in _client.sources({"terms": {"dst_ip": sorted(ips)}}, size=size):
             ip = hit.get("dst_ip")
             candidate_ports = ports_by_ip.get(ip)
             if candidate_ports is None or hit.get("ts", 0) <= baseline_ts:
@@ -510,9 +451,9 @@ def check_access() -> list[str]:
     except vm_proxy.VMProxyError as e:
         problems.append(f"probe VM ({vm_proxy.PROBE_HOST}): {e}")
     try:
-        _opensearch_search({"match_all": {}}, size=1)
+        _client.sources({"match_all": {}}, size=1)
     except ProbeError as e:
-        problems.append(f"OpenSearch ({OPENSEARCH_URL}): {e}")
+        problems.append(f"OpenSearch ({_client.url}): {e}")
     return problems
 
 

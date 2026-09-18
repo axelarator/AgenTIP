@@ -135,6 +135,20 @@ def asn_int(value: Any) -> int | None:
     return int(text) if text.isdigit() else None
 
 
+def to_int(value: Any) -> int | None:
+    """Coerce to int, or None. The plain-integer sibling of asn_int, for
+    values that are ports rather than ASNs - HoneyLabs reports top_ports
+    as dicts of stringly-typed numbers. Naming it separately keeps
+    `asn_int` meaning "this value is an ASN", which is what makes the
+    SHARED_HOSTING_ASNS comparison readable."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    return int(text) if text.isdigit() else None
+
+
 def asn_ints(values: Any) -> list[int]:
     """asn_int over a list, dropping the unparseable."""
     if values is None:

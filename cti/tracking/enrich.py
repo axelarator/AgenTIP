@@ -31,6 +31,8 @@ import duckdb
 
 from ..sources import pivot
 from .. import store
+from ..store.changes import STALE_BASELINE_DAYS, asn_confidence
+from ..util import asn_int, to_int
 from . import hl_mcp
 
 log = logging.getLogger(__name__)
@@ -45,7 +47,7 @@ HL_MAX_CONSECUTIVE_ERRORS = 5
 RDAP_DAILY_CAP = int(os.environ.get("CTI_RDAP_CAP", "150"))
 RECHECK_AFTER_DAYS = 7      # HoneyLabs re-check window
 RDAP_RECHECK_DAYS = 30      # registry data moves much slower
-STALE_BASELINE_DAYS = 90    # older baselines downgrade change confidence
+
 
 
 @dataclass
@@ -115,20 +117,16 @@ def _port_list(ports: Any) -> list[int]:
     bare ints too, mirroring summarize_honeylabs's defensiveness."""
     out = []
     for p in ports or []:
-        n = _as_int(p.get("port") if isinstance(p, dict) else p)
+        n = to_int(p.get("port") if isinstance(p, dict) else p)
         if n is not None:
             out.append(n)
     return out
 
 
-def _as_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    s = str(value).upper().lstrip("AS").strip()
-    return int(s) if s.isdigit() else None
-
+# _as_int lived here and used .upper().lstrip("AS") where core used a
+# strip-then-slice. lstrip takes a character SET, so the two disagreed on
+# leading whitespace - " AS16509" parsed as 16509 in one and None in the
+# other. One implementation now, in cti/util.py, with a test for that input.
 
 def _registry_lookup(ip: str) -> dict[str, Any]:
     """ASN from RIPEstat (authoritative, includes holder), netname from
@@ -138,7 +136,7 @@ def _registry_lookup(ip: str) -> dict[str, Any]:
     try:
         ripe = pivot.ripestat_lookup(ip)
         asns = ripe.get("asn") or []
-        result["asn"] = _as_int(asns[0]) if asns else None
+        result["asn"] = asn_int(asns[0]) if asns else None
         result["as_holder"] = ripe.get("as_holder")
         geo = ripe.get("geolocation") or {}
         result["country_code"] = geo.get("country")
@@ -261,7 +259,7 @@ def enrich_ips(ips: list[str], rdap_due: set[str],
             notes["hl_session_error"] = str(e)
             log.warning("HoneyLabs MCP session failed: %s", e)
     for res in results:
-        hl_asn = _as_int((res.honeylabs or {}).get("asn"))
+        hl_asn = asn_int((res.honeylabs or {}).get("asn"))
         want_registry = (res.ip in rdap_due
                          or (res.honeylabs is not None and hl_asn is None))
         if want_registry and notes["registry_calls"] < RDAP_DAILY_CAP:
@@ -285,16 +283,10 @@ def _actor_map(con: duckdb.DuckDBPyConnection, ips: list[str]) -> dict[str, str]
     return dict(rows)
 
 
-def _confidence(new_source: str, baseline: dict[str, Any],
-                corroborated: bool) -> str:
-    conf = "high" if (new_source == "rdap"
-                      and (baseline["source"] == "rdap" or corroborated)) \
-        else "medium"
-    age = datetime.now() - baseline["observed_at"]
-    if age > timedelta(days=STALE_BASELINE_DAYS) and conf != "low":
-        conf = {"high": "medium", "medium": "low"}[conf]
-    return conf
-
+# _confidence lived here and ended in the same downgrade line as core's
+# _attribute_confidence. Both are now cti/store/changes.py: asn_confidence
+# for this one (it has a corroboration branch) and confidence() for the
+# single-source attributes.
 
 def apply_results(con: duckdb.DuckDBPyConnection, results: list[EnrichResult],
                   today: date) -> dict[str, Any]:
@@ -307,7 +299,7 @@ def apply_results(con: duckdb.DuckDBPyConnection, results: list[EnrichResult],
     for res in results:
         actor = actors.get(res.ip)
         hl = res.honeylabs
-        hl_asn = _as_int((hl or {}).get("asn"))
+        hl_asn = asn_int((hl or {}).get("asn"))
         reg = res.registry or {}
         new_asn = reg.get("asn") or hl_asn
         new_netname = reg.get("netname") or (hl or {}).get("as_org")
@@ -349,7 +341,7 @@ def apply_results(con: duckdb.DuckDBPyConnection, results: list[EnrichResult],
         elif baseline["asn"] != new_asn:
             corroborated = hl_asn is not None and hl_asn == reg.get("asn")
             change = {"change_type": "asn_change",
-                      "confidence": _confidence(new_source, baseline, corroborated),
+                      "confidence": asn_confidence(new_source, baseline, corroborated),
                       "old_asn": baseline["asn"], "old_netname": baseline["netname"]}
         elif (baseline["netname"] and new_netname
               and baseline["netname"] != new_netname):

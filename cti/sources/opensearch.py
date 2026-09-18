@@ -34,6 +34,7 @@ class OpenSearchClient:
         self._host = parts.hostname or url
         self._port = parts.port or 9200
         self._timeout = timeout
+        self.url = url
         self.index = index
         self._conn: http.client.HTTPConnection | None = None
 
@@ -85,6 +86,18 @@ class OpenSearchClient:
                 last_error = e
                 self._reset()
         raise OpenSearchError(f"OpenSearch query failed: {last_error}") from last_error
+
+    def sources(self, query: dict[str, Any], *, size: int = 50) -> list[dict[str, Any]]:
+        """The newest-first list of `_source` documents for a query.
+
+        The shape scripts/probe_pending_fingerprints.py needs. It had its
+        own copy of this whole client returning exactly this; search()
+        returns the full body instead because the daily Zeek cross-
+        reference needs aggregations. One client, two accessors.
+        """
+        body = self.search(query, size=size, sort=[{"ts": "desc"}])
+        return [hit["_source"] for hit in body["hits"]["hits"]]
+
 
     def current_max_ts(self) -> float:
         """Newest indexed `ts` (epoch seconds), 0.0 if the index is empty."""

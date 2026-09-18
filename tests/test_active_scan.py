@@ -35,14 +35,14 @@ def test_active_scan_nmap_records_ports_and_change(monkeypatch):
     monkeypatch.setattr(core.vm_proxy, "dirsearch", lambda url, **kw: {"hits": [], "opendirs": [],
                                                                        "baseline_404": {}, "error": None})
     # Two scans must land on distinct days so the second diffs against the
-    # first's baseline (real runs are days apart; _now() is second-granular).
-    monkeypatch.setattr(core, "_now", lambda: "2026-09-10T00:00:00+00:00")
+    # first's baseline (real runs are days apart; now_iso() is second-granular).
+    monkeypatch.setattr(core, "now_iso", lambda: "2026-09-10T00:00:00+00:00")
     r1 = core.active_scan("203.0.113.7", tools=["nmap"])
     assert r1["nmap"]["ports"][0]["port"] == 80
 
     # a later scan with a different port set is a recorded port change
     _stub_nmap(monkeypatch, [8080])
-    monkeypatch.setattr(core, "_now", lambda: "2026-09-11T00:00:00+00:00")
+    monkeypatch.setattr(core, "now_iso", lambda: "2026-09-11T00:00:00+00:00")
     core.active_scan("203.0.113.7", tools=["nmap"])
     with tracking_store.connect(read_only=True) as con:
         row = con.execute(

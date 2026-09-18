@@ -24,6 +24,8 @@ import ipaddress
 import re
 import uuid
 from datetime import datetime, timezone
+
+from .util import now_stix
 from typing import Any
 
 SPEC_VERSION = "2.1"
@@ -40,9 +42,10 @@ _HASH_LEN_TO_STIX = {32: "MD5", 40: "SHA-1", 64: "SHA-256"}
 _NAMESPACE = uuid.UUID("d2e5a6f0-2b8e-4f7a-9b1a-6c9a2f3e7b4d")
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
+# now_stix() lived here too, emitting "...000Z" where core.py's emitted
+# "...+00:00" - two formats for timestamps on the same objects. Both are
+# now cti/util.py, named for their output target so the choice is
+# deliberate: now_stix() here, now_iso() for the cluster JSON store.
 
 def new_intrusion_set_id() -> str:
     return f"intrusion-set--{uuid.uuid4()}"
@@ -143,8 +146,8 @@ def pattern_to_observable(pattern: str) -> tuple[str, str] | None:
 def to_bundle(data: dict[str, Any]) -> dict[str, Any]:
     """Render a tracked cluster as a STIX 2.1 Bundle."""
     intrusion_set_id = data["stix_id"]
-    created = data.get("created") or _now()
-    modified = _now()
+    created = data.get("created") or now_stix()
+    modified = now_stix()
 
     intrusion_set: dict[str, Any] = {
         "type": "intrusion-set",
@@ -329,7 +332,7 @@ def from_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
             "name": ap.get("name", technique_id),
             "status": ap.get("x_cti_agent_coverage_status", 0),
             "notes": rel.get("description", ""),
-            "updated": rel.get("modified") or _now(),
+            "updated": rel.get("modified") or now_stix(),
         })
 
     relationships = [
@@ -339,13 +342,13 @@ def from_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
             "target_stix_id": rel["target_ref"],
             "description": rel.get("description", ""),
             "source": "",
-            "created": rel.get("created") or _now(),
+            "created": rel.get("created") or now_stix(),
         }
         for rel in cross_cluster_relationships
     ]
 
     hunt_notes = [
-        {"date": n.get("created") or _now(), "entry": n.get("content", "")}
+        {"date": n.get("created") or now_stix(), "entry": n.get("content", "")}
         for n in notes
     ]
 

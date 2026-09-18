@@ -31,14 +31,12 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from datetime import date
-from pathlib import Path
 from typing import Any
+
+from . import budget, http
 
 BASE_URL = os.environ.get("CTI_WEBAMON_BASE", "https://pro.webamon.com")
 USER_AGENT = "cti-agent"
@@ -57,11 +55,6 @@ _SCAN_FIELDS = ("report_id,date,scan_status,resolved_url,resolved_domain,"
                 "page_title,meta,certificate,domain,server,technology,fingerprint,tag")
 
 # Mirror core.DATA_DIR without importing core (core imports this module).
-_DATA_DIR = Path(os.environ.get(
-    "CTI_DATA_DIR", Path(__file__).resolve().parents[2] / "data" / "clusters"))
-_quota_lock = threading.Lock()
-
-
 def _api_key() -> str | None:
     return os.environ.get(WEBAMON_API_KEY_ENV)
 
@@ -74,78 +67,55 @@ def rescan_days() -> int:
 
 
 # --------------------------------------------------------------------------- #
-# daily budget counter (file-based; see module docstring)
+# transport
 # --------------------------------------------------------------------------- #
-def _quota_path() -> Path:
-    return _DATA_DIR / "_registry" / "webamon_quota.json"
+# The daily counter that used to live here - its own JSON file, its own
+# read-modify-write, its own inline atomic write - is now
+# sources/budget.py, shared with RDAP and HoneyLabs and safe under the
+# parallel fan-out. The urllib transport is now sources/http.py.
+#
+# Webamon is one of the two documented via="direct" exceptions: it queries
+# the vendor's own scan index, not the indicator's own infrastructure, so
+# routing it through the probe VM would spend that host's egress allowance
+# for no OPSEC benefit.
+
+def quota_used_today() -> int:
+    return budget.used_today("webamon")
 
 
 def _daily_budget() -> int:
-    try:
-        return int(os.environ.get(_DAILY_BUDGET_ENV, _DAILY_BUDGET_DEFAULT))
-    except ValueError:
-        return _DAILY_BUDGET_DEFAULT
+    return budget.cap("webamon")
 
 
-def quota_used_today() -> int:
-    try:
-        data = json.loads(_quota_path().read_text())
-    except (OSError, json.JSONDecodeError):
-        return 0
-    return int(data.get(date.today().isoformat(), 0)) if isinstance(data, dict) else 0
-
-
-def _bump_quota(n: int = 1) -> None:
-    today = date.today().isoformat()
-    with _quota_lock:
-        try:
-            data = json.loads(_quota_path().read_text())
-            if not isinstance(data, dict):
-                data = {}
-        except (OSError, json.JSONDecodeError):
-            data = {}
-        data = {today: int(data.get(today, 0)) + n}  # drop other days - counter is per-today
-        try:
-            p = _quota_path()
-            p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(data))
-            tmp.replace(p)
-        except OSError:
-            pass
-
-
-# --------------------------------------------------------------------------- #
-# transport
-# --------------------------------------------------------------------------- #
 def _get(path: str, params: dict[str, Any]) -> Any:
     key = _api_key()
     if not key:
         return {"error": f"no {WEBAMON_API_KEY_ENV} configured"}
-    if quota_used_today() >= _daily_budget():
+    try:
+        budget.spend("webamon", 1)
+    except budget.BudgetExhausted:
         return {"error": "webamon daily budget exhausted"}
+
     query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
     url = f"{BASE_URL.rstrip('/')}/{path.lstrip('/')}?{query}"
-    req = urllib.request.Request(url, headers={"x-api-key": key, "User-Agent": USER_AGENT})
-    _bump_quota(1)
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        code = e.code
-        if code == 401:
+        return http.get_json(url, via="direct", headers={"x-api-key": key},
+                             timeout=HTTP_TIMEOUT)
+    except http.HttpError as e:
+        # These three are worth naming rather than collapsing into one
+        # error: they are the difference between "fix your key", "upgrade
+        # your plan" and "wait a minute".
+        if e.status == 401:
             return {"error": "webamon auth failed (check WEBAMON_API_KEY)"}
-        if code == 403:
+        if e.status == 403:
             return {"error": "webamon forbidden (plan/quota)"}
-        if code == 429:
+        if e.status == 429:
             return {"error": "webamon rate limited"}
-        return {"error": f"webamon HTTP {code}"}
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        if e.status is not None:
+            return {"error": f"webamon HTTP {e.status}"}
         return {"error": f"failed to reach webamon: {e}"}
-    try:
-        return json.loads(body)
-    except ValueError as e:
-        return {"error": f"webamon returned an unparseable response: {e}"}
+
+
 
 
 def _search(params: dict[str, Any]) -> Any:

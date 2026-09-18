@@ -168,16 +168,6 @@ CREATE TABLE IF NOT EXISTS active_scans (
     zeek_last_ts  TIMESTAMP
 );
 
--- NEW: every rate/credit budget in one place. These used to be three
--- separate on-disk counters (webamon_quota.json, an in-process RDAP
--- counter, HoneyLabs' pacing loop) which raced as soon as anything ran
--- in parallel.
-CREATE TABLE IF NOT EXISTS budgets (
-    day       DATE NOT NULL,
-    provider  TEXT NOT NULL,
-    used      BIGINT NOT NULL DEFAULT 0,
-    UNIQUE (day, provider)
-);
 """
 
 # Payload keys projected by observations_wide, in the order the old table
