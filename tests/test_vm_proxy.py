@@ -265,10 +265,44 @@ def test_a_failed_call_releases_its_slot(monkeypatch):
 
     monkeypatch.setattr(vm_proxy.subprocess, "run", boom)
     for _ in range(5):        # more attempts than slots
-        with pytest.raises(subprocess.TimeoutExpired):
+        with pytest.raises(vm_proxy.VMProxyError):
             vm_proxy._ssh_json_rpc({})
 
 
 def test_the_cap_defaults_to_what_the_old_design_implied():
     """The old sweep peaked at its 6-worker pool."""
     assert vm_proxy._MAX_CONCURRENT == 6
+
+
+def test_an_ssh_timeout_is_a_vmproxyerror_not_a_raw_timeoutexpired(monkeypatch):
+    """Every handler in core catches VMProxyError. TimeoutExpired is not one,
+    so it escaped them all and turned a whole domain 'unknown'."""
+    import subprocess
+
+    def boom(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 60)
+    monkeypatch.setattr(vm_proxy.subprocess, "run", boom)
+    with pytest.raises(vm_proxy.VMProxyError) as exc:
+        vm_proxy._ssh_json_rpc({"action": "subfinder"}, timeout=42)
+    assert "subfinder" in str(exc.value) and "42s" in str(exc.value)
+
+
+def test_subfinder_is_given_more_time_than_the_ssh_default(monkeypatch):
+    """Its helper-side budget on the VM is 180s. Waiting only 60s meant the
+    SSH side gave up while the enumeration kept running on the VM."""
+    seen = {}
+    monkeypatch.setattr(vm_proxy, "_ssh_json_rpc",
+                        lambda req, timeout=None: seen.update(timeout=timeout) or {})
+    vm_proxy.subfinder("example.com")
+    assert seen["timeout"] == vm_proxy.SUBFINDER_TIMEOUT > vm_proxy.SSH_TIMEOUT
+
+
+def test_subfinders_budget_covers_the_helpers_own_limit():
+    """The helper is the authority on how long subfinder may run; the SSH
+    side must outlast it or the two disagree about when a run is dead."""
+    import re
+    from pathlib import Path
+    helper = (Path(__file__).resolve().parents[1] / "probe_vm" / "probe_helper.py").read_text()
+    body = helper[helper.index("def action_subfinder"):helper.index("def action_wayback_cdx")]
+    helper_limit = int(re.search(r"timeout=(\d+)", body).group(1))
+    assert vm_proxy.SUBFINDER_TIMEOUT > helper_limit

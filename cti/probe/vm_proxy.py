@@ -87,6 +87,14 @@ PROBE_HELPER_CMD = (shlex.split(os.environ.get("CTI_PROBE_HELPER_CMD", ""))
 # a blocking multi-minute SSH channel is acceptable and much simpler than a
 # job server on the VM.
 SSH_TIMEOUT = int(os.environ.get("CTI_PROBE_SSH_TIMEOUT", "60"))
+# subfinder is the one quick-path action whose helper-side budget (180s in
+# probe_helper.action_subfinder) exceeds the 60s SSH default; every other
+# helper budget fits inside it (TLS 15, HTTP 20, Wayback 30). Timing two
+# domains that failed took 32s and 42s uncontended, so with several running
+# at once it crosses 60s - the SSH side gave up while the helper kept running
+# on the VM, which also left orphaned enumerations loading it. Margin over the
+# helper's 180 so the helper's own limit is what ends a slow run.
+SUBFINDER_TIMEOUT = int(os.environ.get("CTI_PROBE_SUBFINDER_TIMEOUT", "200"))
 LONG_TIMEOUT = int(os.environ.get("CTI_PROBE_LONG_TIMEOUT", "900"))
 
 # Reuse one already-authenticated connection across calls instead of paying
@@ -122,18 +130,29 @@ _slots = threading.BoundedSemaphore(_MAX_CONCURRENT)
 
 
 def _ssh_json_rpc(request: dict[str, object], timeout: int | None = None) -> dict[str, object]:
-    with _slots:
-        proc = subprocess.run(
-            ["ssh", "-i", PROBE_SSH_KEY,
-             "-o", "BatchMode=yes",
-             "-o", "StrictHostKeyChecking=yes",
-             "-o", f"UserKnownHostsFile={PROBE_KNOWN_HOSTS}",
-             "-o", "ControlMaster=auto",
-             "-o", f"ControlPersist={SSH_CONTROL_PERSIST}",
-             "-o", f"ControlPath={SSH_CONTROL_PATH}",
-             f"{PROBE_USER}@{PROBE_HOST}", *PROBE_HELPER_CMD],
-            input=json.dumps(request), capture_output=True, text=True,
-            timeout=timeout if timeout is not None else SSH_TIMEOUT)
+    limit = timeout if timeout is not None else SSH_TIMEOUT
+    try:
+        with _slots:
+            proc = subprocess.run(
+                ["ssh", "-i", PROBE_SSH_KEY,
+                 "-o", "BatchMode=yes",
+                 "-o", "StrictHostKeyChecking=yes",
+                 "-o", f"UserKnownHostsFile={PROBE_KNOWN_HOSTS}",
+                 "-o", "ControlMaster=auto",
+                 "-o", f"ControlPersist={SSH_CONTROL_PERSIST}",
+                 "-o", f"ControlPath={SSH_CONTROL_PATH}",
+                 f"{PROBE_USER}@{PROBE_HOST}", *PROBE_HELPER_CMD],
+                input=json.dumps(request), capture_output=True, text=True,
+                timeout=limit)
+    except subprocess.TimeoutExpired as e:
+        # subprocess.TimeoutExpired is not a VMProxyError, so it used to escape
+        # every handler in core (they all catch VMProxyError) and land in
+        # _sweep_lifecycle's catch-all, which turned the WHOLE domain into
+        # 'unknown' and discarded the RDAP and DNS results already gathered.
+        # One slow optional lookup - subfinder, say - cost a domain its status.
+        # This module's contract is that transport failures raise VMProxyError.
+        raise VMProxyError(
+            f"probe call {request.get('action', '?')!r} timed out after {limit}s") from e
     if proc.returncode != 0 and not proc.stdout:
         raise VMProxyError(f"ssh transport to {PROBE_HOST!r} failed: {proc.stderr.strip()}")
     try:
@@ -220,7 +239,8 @@ def http_probe(url: str, insecure: bool = False) -> dict[str, object]:
 def subfinder(domain: str) -> dict[str, object]:
     """Passive subdomain enumeration on the VM:
     {"subdomains": [...], "error": str|None}."""
-    return _ssh_json_rpc({"action": "subfinder", "domain": domain})
+    return _ssh_json_rpc({"action": "subfinder", "domain": domain},
+                         timeout=SUBFINDER_TIMEOUT)
 
 
 def wayback_cdx(domain: str) -> dict[str, object]:

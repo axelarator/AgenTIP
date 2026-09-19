@@ -405,3 +405,44 @@ def test_the_unknown_share_is_reported_per_category():
     sections = collect.enrich_and_write(_state([_swept("a", ["unknown", "active", "dead"])]))["sections"]
     assert sections["pivot_sweep"]["unknown"] == {
         "domains": {"unknown": 1, "checked": 3}, "ips": {"unknown": 0, "checked": 0}}
+
+
+
+def test_a_slow_optional_lookup_does_not_cost_a_domain_its_status(monkeypatch):
+    """The actual bug behind 20 'unknown' domains: a subfinder timeout
+    escaped as a raw TimeoutExpired, reached _sweep_lifecycle's catch-all, and
+    discarded the RDAP and DNS results the domain's status was computed from."""
+    import subprocess
+
+    monkeypatch.setattr(core.pivot, "rdap_lookup",
+                        lambda v, kind: {"handle": "H", "events": [], "nameservers": ["ns1.example"],
+                                         "status": ["active"]})
+    monkeypatch.setattr(core.pivot, "resolve_host", lambda h: ["93.184.216.34"])
+    for fn in ("tls_grab", "http_probe", "wayback_cdx"):
+        monkeypatch.setattr(core.vm_proxy, fn, lambda *a, **k: {"error": None})
+    monkeypatch.setattr(core.webamon, "search_domain", lambda d: {"error": "skipped"})
+    monkeypatch.setattr(core.webamon, "infostealers", lambda d: {"error": "skipped"})
+
+    # Go through the REAL transport: subprocess.run itself times out. Stubbing
+    # vm_proxy.subfinder to raise VMProxyError - as an earlier version of this
+    # test did - passed on the broken code, because that exception was always
+    # handled. The bug was a raw TimeoutExpired.
+    #
+    # conftest replaces vm_proxy._ssh_json_rpc with a raiser for every test, so
+    # the real one - where the bug lives - has to be loaded fresh. The first
+    # attempt at this test never reached it and passed on the broken code.
+    spec = importlib.util.spec_from_file_location(
+        "cti.probe.vm_proxy_real", REPO / "cti" / "probe" / "vm_proxy.py")
+    real = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(real)
+    monkeypatch.setattr(core.vm_proxy, "_ssh_json_rpc", real._ssh_json_rpc)
+
+    def ssh_that_times_out(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 60)
+    monkeypatch.setattr(real.subprocess, "run", ssh_that_times_out)
+    monkeypatch.setattr(core, "_cached_pivot", lambda source, value, fetch: fetch())   # no cache here
+
+    status, detail, enrichment = core._domain_lifecycle("example.com")
+    assert status != "unknown", "the domain lost its status to one slow optional lookup"
+    assert detail["resolved"] == ["93.184.216.34"]
+    assert "error" in enrichment["subdomains"], "the slow source should be reported as failed"
