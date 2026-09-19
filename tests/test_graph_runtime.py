@@ -246,6 +246,8 @@ async def test_eight_clusters_fanned_out_all_record_their_history(monkeypatch, t
 
     from graph.build import build_collect
 
+    for name in (*collect.PROBE_ENV, *collect.KEY_ENV):
+        monkeypatch.setenv(name, "x")   # the sweep is gated on preflight
     slugs = [f"cluster-{n}" for n in range(8)]
     monkeypatch.setattr(core, "list_clusters", lambda: slugs)
     monkeypatch.setattr(collect.ingest, "register_new_clusters", lambda con: {})
@@ -281,3 +283,98 @@ async def test_eight_clusters_fanned_out_all_record_their_history(monkeypatch, t
             "SELECT count(DISTINCT actor) FROM observations WHERE source = 'http_live'"
         ).fetchone()[0]
     assert written == 8, f"only {written} of 8 clusters recorded any history"
+
+
+# --------------------------------------------------------------------------- #
+# The first scheduled run collected nothing and said nothing
+# --------------------------------------------------------------------------- #
+
+_FULL_ENV = {v: "x" for v in (*collect.PROBE_ENV, *collect.KEY_ENV)}
+
+
+def test_preflight_is_ok_with_the_full_environment():
+    assert collect.preflight(_FULL_ENV) == ("ok", [])
+
+
+def test_preflight_blocks_the_sweep_when_the_probe_settings_are_missing():
+    """Cron ran with an empty environment, so the probe transport fell back
+    to a default address that is not this lab's VM. Every lookup failed, and
+    pivot_cluster wrote the resulting 'unknown' over 82 real statuses."""
+    verdict, missing = collect.preflight({})
+    assert verdict.startswith("blocked") and "CTI_PROBE_HOST" in verdict
+    assert set(collect.PROBE_ENV) <= set(missing)
+    assert "bashrc" in verdict, "the message should name the likely cause"
+
+
+def test_a_missing_api_key_warns_but_does_not_block():
+    """The keys only degrade a sweep - those sources are skipped - whereas a
+    missing probe host poisons every result."""
+    env = {v: "x" for v in collect.PROBE_ENV}
+    verdict, missing = collect.preflight(env)
+    assert verdict.startswith("warning") and "WEBAMON_API_KEY" in verdict
+    assert not verdict.startswith("blocked")
+
+
+def test_a_partial_probe_configuration_is_still_blocked():
+    env = dict(_FULL_ENV)
+    del env["CTI_PROBE_KNOWN_HOSTS"]
+    assert collect.preflight(env)[0].startswith("blocked")
+
+
+def test_a_blocked_preflight_routes_past_the_sweep():
+    state = {"clusters": ["a", "b"], "sections": {"status": {"preflight": "blocked: x"}}}
+    assert collect.fan_out_clusters(state) == ["enrich_and_write"]
+
+
+def test_a_warning_preflight_still_sweeps():
+    state = {"clusters": ["a"], "day": "2026-09-19",
+             "sections": {"status": {"preflight": "warning: keys"}}}
+    sends = collect.fan_out_clusters(state)
+    assert len(sends) == 1 and sends[0] != "enrich_and_write"
+
+
+def test_the_blocked_sweep_is_reported_in_the_phase_status():
+    state = {"sweep_results": [], "skip_enrich": True,
+             "sections": {"status": {"preflight": "blocked: x"}}}
+    assert "preflight" in collect.enrich_and_write(state)["sections"]["status"]["pivot_sweep"]
+
+
+def _swept(cluster, statuses):
+    rows = [{"value": f"{cluster}-{n}", "status": s} for n, s in enumerate(statuses)]
+    return {"cluster": cluster, "ok": True, "history_note": None,
+            "result": {"domains": rows, "ips": []}}
+
+
+def test_a_sweep_where_everything_came_back_unknown_is_flagged():
+    """The real 2026-09-19 06:15 run: 82 of 82 observables 'unknown', every
+    cluster 'swept', and a digest whose phase block read all-ok."""
+    sections = collect.enrich_and_write(_state([
+        _swept("jadeprox", ["unknown"] * 27), _swept("stac4749", ["unknown"] * 36)]
+    ))["sections"]
+    status = sections["status"]["pivot_sweep"]
+    assert status != "ok" and "63 of 63" in status and "outage" in status
+
+
+def test_a_normal_mix_of_statuses_is_not_flagged():
+    """Yesterday's real distribution had 1 'unknown' in 148."""
+    sections = collect.enrich_and_write(_state([
+        _swept("a", ["active"] * 60 + ["dead"] * 30 + ["sinkholed"] * 3 + ["unknown"])
+    ]))["sections"]
+    assert sections["status"]["pivot_sweep"] == "ok"
+
+
+def test_genuinely_dead_infrastructure_is_not_mistaken_for_an_outage():
+    """'dead' and 'sinkholed' are definitive answers. Only 'unknown' - could
+    not check - counts toward the alarm."""
+    sections = collect.enrich_and_write(_state([_swept("a", ["dead"] * 20)]))["sections"]
+    assert sections["status"]["pivot_sweep"] == "ok"
+
+
+def test_the_printed_cron_lines_source_bashrc():
+    """The printed lines were the root cause: they dropped the prefix the old
+    crontab had, and cron ran with an empty environment."""
+    lines = [l for l in (REPO / "setup.sh").read_text().splitlines()
+             if 'echo "  ' in l and ("graph collect" in l or "graph analyze" in l)
+             and "* * *" in l]
+    assert len(lines) == 2
+    assert all("$HOME/.bashrc" in l for l in lines), lines

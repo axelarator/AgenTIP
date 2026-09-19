@@ -111,10 +111,16 @@ echo "its own Agent Skills loader reads from) and at .mcp.json."
 echo "See docs/architecture.md."
 echo
 echo "Daily actor-tracking loop (skills/actor-tracking/): add to crontab -e:"
-echo "  15 6 * * * cd $ROOT && .venv/bin/python -m graph collect >> data/tracking/logs/stage_a.log 2>&1"
-echo "  45 6 * * * cd $ROOT && .venv/bin/python -m graph analyze >> data/tracking/logs/stage_b.log 2>&1"
-echo "  (both default to today, so no date arithmetic in the crontab;"
-echo "   one line for both: .venv/bin/python -m graph daily)"
+# The `. $HOME/.bashrc &&` prefix is not optional. Every API key and every
+# CTI_PROBE_* setting lives in ~/.bashrc, and cron starts with an empty
+# environment. An earlier version of these lines left it off; the first
+# scheduled run then went to a default probe address that is not this lab's
+# VM, collected nothing, and overwrote cluster statuses with "unknown".
+echo "  15 6 * * * . \$HOME/.bashrc && cd $ROOT && .venv/bin/python -m graph collect >> data/tracking/logs/stage_a.log 2>&1"
+echo "  45 6 * * * . \$HOME/.bashrc && cd $ROOT && .venv/bin/python -m graph analyze >> data/tracking/logs/stage_b.log 2>&1"
+echo "  (both default to today; one line for both: ... -m graph daily)"
+echo "  Verify cron's view of the environment before trusting it:"
+echo "    env -i HOME=\$HOME SHELL=/bin/bash PATH=/usr/bin:/bin bash -c '. \$HOME/.bashrc; echo \$CTI_PROBE_HOST'"
 echo "Secrets (env, e.g. in ~/.bashrc - never committed): WEBAMON_API_KEY,"
 echo "  HONEYLABS_API_KEY, THREATFOX_API_KEY (optional)."
 echo "Probe VM (env): CTI_PROBE_HOST/USER/SSH_KEY/KNOWN_HOSTS/HELPER_CMD"

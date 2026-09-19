@@ -17,6 +17,7 @@ thing that was hardest to see at runtime.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import date
 from typing import Any
 
@@ -26,6 +27,41 @@ from cti import core, store
 from cti.tracking import analytics, digest, enrich, ingest
 
 log = logging.getLogger("graph.collect")
+
+
+# What the sweep needs from the environment. The probe settings gate it: with
+# them missing, every lookup goes to a default address that is not this lab's
+# probe VM, fails, and is recorded as "unknown" - and pivot_cluster writes
+# that status back over the cluster's real one. The keys only degrade it.
+PROBE_ENV = ("CTI_PROBE_HOST", "CTI_PROBE_USER", "CTI_PROBE_SSH_KEY",
+             "CTI_PROBE_KNOWN_HOSTS")
+KEY_ENV = ("WEBAMON_API_KEY", "HONEYLABS_API_KEY")
+
+
+def preflight(env=None) -> tuple[str, list[str]]:
+    """("ok" | "warning: ..." | "blocked: ...", the missing variable names).
+
+    Added after the first scheduled run (2026-09-19) collected nothing. The
+    crontab lines this project printed omitted `. $HOME/.bashrc &&`, which the
+    old crontab had and which is where every key and probe setting lives, so
+    cron ran with none of them. The sweep "succeeded" for 7 of 8 clusters,
+    wrote zero observations (406 the day before), and overwrote 82 observables'
+    statuses with "unknown". Nothing in the digest said so: a lookup that
+    cannot reach its source fails into an error dict, which the sweep treats
+    as a result.
+    """
+    env = os.environ if env is None else env
+    probe_missing = [v for v in PROBE_ENV if not env.get(v)]
+    key_missing = [v for v in KEY_ENV if not env.get(v)]
+    hint = "is cron sourcing ~/.bashrc?"
+    if probe_missing:
+        return (f"blocked: sweep skipped, missing {', '.join(probe_missing)} - "
+                f"every lookup would fail and overwrite real statuses with "
+                f"'unknown' ({hint})", probe_missing + key_missing)
+    if key_missing:
+        return (f"warning: missing {', '.join(key_missing)} - those sources "
+                f"will be skipped ({hint})", key_missing)
+    return "ok", []
 
 
 def _day(state: dict) -> date:
@@ -61,6 +97,10 @@ def ingest_inbox(state: dict) -> dict:
 
     sections["ingest"] = _phase(sections, "ingest", _ingest) or {}
     sections["register"] = _phase(sections, "register", _register) or {}
+    verdict, missing = preflight()
+    sections.setdefault("status", {})["preflight"] = verdict
+    if verdict != "ok":
+        log.error("preflight: %s", verdict)
     return {"sections": sections, "clusters": core.list_clusters()}
 
 
@@ -80,6 +120,8 @@ def fan_out_clusters(state: dict) -> list[Send]:
     """
     if state.get("skip_enrich"):
         return ["enrich_and_write"]
+    if _sweep_blocked(state):
+        return ["enrich_and_write"]
     sends = [Send("sweep", {"cluster": slug, "day": state.get("day")})
              for slug in state.get("clusters") or []]
     # A conditional fan-out that returns nothing does not "skip the fan-out"
@@ -88,6 +130,29 @@ def fan_out_clusters(state: dict) -> list[Send]:
     # registered yet, that silently produced no digest at all and reported
     # success. Route past the sweep instead of returning an empty list.
     return sends or ["enrich_and_write"]
+
+
+# Above this share of "unknown" lifecycle statuses, a sweep is treated as
+# having failed rather than as reporting on the infrastructure. Yesterday's
+# real distribution had 1 unknown in 148; the failed run had 82 of 82.
+UNKNOWN_ALARM = 0.5
+
+
+def _unknown_share(results: list[dict]) -> tuple[int, int]:
+    unknown = checked = 0
+    for r in results:
+        if not r.get("ok"):
+            continue
+        for cat in ("domains", "ips"):
+            for row in (r.get("result") or {}).get(cat) or []:
+                checked += 1
+                unknown += row.get("status") == "unknown"
+    return unknown, checked
+
+
+def _sweep_blocked(state: dict) -> bool:
+    status = ((state.get("sections") or {}).get("status") or {}).get("preflight", "")
+    return str(status).startswith("blocked")
 
 
 def sweep(payload: dict) -> dict:
@@ -140,11 +205,22 @@ def enrich_and_write(state: dict) -> dict:
     # used to set no status at all, so a cluster that failed (fox-tempest,
     # 2026-09-19) sat in pivot_sweep.errors while the phase block read
     # all-ok - visible only to someone who opened the JSON.
+    unknown, checked = _unknown_share(results)
+    sections["pivot_sweep"]["unknown"] = {"unknown": unknown, "checked": checked}
     problems = len(errors) + len(history_errors)
-    sections.setdefault("status", {})["pivot_sweep"] = (
-        "ok" if not problems else
-        f"{len(errors)} cluster(s) failed, {len(history_errors)} without "
-        f"recorded history: {', '.join(sorted({*errors, *history_errors}))}")
+    if _sweep_blocked(state):
+        status = "blocked by preflight - see the preflight line above"
+    elif checked and unknown / checked >= UNKNOWN_ALARM:
+        status = (f"{unknown} of {checked} observables came back 'unknown' - "
+                  f"that is a source outage or a bad environment, not "
+                  f"infrastructure going dark; the cluster statuses were "
+                  f"overwritten")
+    elif problems:
+        status = (f"{len(errors)} cluster(s) failed, {len(history_errors)} without "
+                  f"recorded history: {', '.join(sorted({*errors, *history_errors}))}")
+    else:
+        status = "ok"
+    sections.setdefault("status", {})["pivot_sweep"] = status
 
     if state.get("skip_enrich"):
         # Annotate, don't replace: replacing threw away the errors computed
