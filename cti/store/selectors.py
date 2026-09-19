@@ -1,0 +1,412 @@
+"""Selectors: the facts that link one indicator to another.
+
+## Why this exists
+
+Everything else in this store is *indicator-centric*: a fact is recorded
+against one indicator and compared only against that indicator's own past.
+That answers "what changed?" and cannot answer "who else has this?".
+
+Infrastructure hunting is the second question. The SilkParasite reporting
+that prompted this module worked entirely that way: one cloned decoy page's
+SHA-256 body hash appeared on 13 hosts, one TLS certificate on 8, and three
+malware families were tied together by a shared domain *registration* rather
+than a shared server. Each of those is a value that several indicators have
+in common, which is exactly what this table indexes.
+
+Six of the ten change specs in `changes.py` already hold such values -
+`cert_hash`, `webamon_fingerprint`, `ptr`, `resolved_ip`, `cert`.sans and
+`ip_hostnames`. They are stored per-indicator and compared only to
+themselves, so the links they imply have never been visible.
+
+## Why selectors are classed
+
+The obvious failure mode is noise. In this repo's own live data, the values
+most widely shared between indicators are `Server: cloudflare` (8
+indicators, 3 actors), `Apache`, and `Let's Encrypt` issuers (5 indicators,
+3 actors). Those are not leads. Meanwhile `nginx/1.29.3` - specific enough
+to look meaningful, and cited in the source reporting - returns more than
+10,000 hits on a global scan index.
+
+So a selector's *type* carries a class, fixed once, here, and the class caps
+how much that value can ever prove. A contextual selector cannot promote a
+candidate no matter how many indicators share it. This is the same
+discipline as `graph/nodes/rank.py`: decide it in code, before anything
+spends tokens reasoning about it.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Iterable
+
+import duckdb
+
+from ..util import rows
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS selectors (
+    selector_type   TEXT NOT NULL,
+    selector_value  TEXT NOT NULL,
+    indicator_value TEXT NOT NULL,
+    indicator_type  TEXT,
+    actor           TEXT,
+    source          TEXT,
+    first_seen      TIMESTAMP,
+    last_seen       TIMESTAMP,
+    UNIQUE (selector_type, selector_value, indicator_value)
+);
+-- The whole point: "who else has this value" must be an index seek.
+CREATE INDEX IF NOT EXISTS sel_lookup ON selectors (selector_type, selector_value);
+CREATE INDEX IF NOT EXISTS sel_indicator ON selectors (indicator_value);
+
+CREATE TABLE IF NOT EXISTS selector_stats (
+    selector_type  TEXT NOT NULL,
+    selector_value TEXT NOT NULL,
+    local_count    BIGINT,
+    global_count   BIGINT,
+    global_source  TEXT,
+    checked_at     TIMESTAMP,
+    UNIQUE (selector_type, selector_value)
+);
+"""
+
+
+# --------------------------------------------------------------------------- #
+# The taxonomy
+# --------------------------------------------------------------------------- #
+
+# Ordered weakest to strongest so comparisons read naturally.
+CLASS_ORDER = ("contextual", "behavioural", "structural", "identity")
+
+
+@dataclass(frozen=True)
+class SelectorType:
+    """One kind of linking fact.
+
+    name      dotted, `<domain>.<attribute>`, stable - it is a stored value
+    cls       what a shared value can prove (see CLASS_ORDER)
+    means     what it means when two indicators share this value
+    never     what it does NOT prove, which is the part that gets forgotten
+    """
+    name: str
+    cls: str
+    means: str
+    never: str = ""
+
+
+def _t(name: str, cls: str, means: str, never: str = "") -> SelectorType:
+    return SelectorType(name, cls, means, never)
+
+
+TYPES: dict[str, SelectorType] = {t.name: t for t in (
+
+    # --- identity: a shared value is close to conclusive -------------------
+    # These are content or key digests. Two hosts holding the same one did not
+    # arrive there by coincidence; they were configured from the same source.
+    _t("tls.cert_sha256", "identity",
+       "the same leaf certificate is installed on both hosts - the operator "
+       "copied a keypair, so they share a deployment",
+       "that the hosts are the same machine, or that the cert is not shared "
+       "hosting boilerplate - check the issuer and rarity first"),
+    _t("http.body_sha256", "identity",
+       "byte-identical response bodies: the same page is being served. The "
+       "strongest rotation-proof link there is, because it survives the "
+       "domain, the IP and the provider all changing",
+       "anything at all when the body is an empty response, a default nginx "
+       "or Apache welcome page, or a shared CDN error page"),
+    _t("http.favicon_mmh3", "identity",
+       "the same favicon - typically the same panel, kit or product build",
+       "operator identity for a widely deployed product's stock favicon"),
+    _t("tls.spki_sha256", "identity",
+       "the same public key across certificates - the operator reused a "
+       "keypair when reissuing, which survives certificate rotation",
+       "anything when the key belongs to a hosting provider's shared cert"),
+    _t("file.sha256", "identity",
+       "the same file was staged on both hosts",
+       "that both hosts are adversary-controlled - it may be a common tool"),
+
+    # --- structural: strong, but coincidence is possible --------------------
+    # Configuration and registration facts. Two of these, of different types,
+    # is the bar for promoting a candidate.
+    _t("tls.serial", "structural",
+       "the same certificate serial from the same issuer - a reissue of one "
+       "certificate rather than two independent ones"),
+    _t("tls.subject_cn", "structural",
+       "certificates issued for the same name"),
+    _t("tls.san", "structural",
+       "both hosts appear on a certificate naming the other - the operator "
+       "requested them together"),
+    _t("dns.apex", "structural",
+       "subdomains of one registered domain. This is the registration-level "
+       "link: separate hosts, separate servers, one purchase",
+       "a shared server - and nothing at all on a domain that sells "
+       "subdomains to the public"),
+    _t("dns.ns_set", "structural",
+       "the same nameserver set - the same DNS provider and often the same "
+       "account",
+       "a link when the nameservers belong to a mass provider such as "
+       "Cloudflare"),
+    _t("dns.soa_email", "structural",
+       "the same zone contact address"),
+    _t("whois.registrant_email", "structural",
+       "the same registrant contact registered both domains"),
+    _t("whois.registrar", "structural",
+       "both registered through the same registrar",
+       "much on its own: registrars have millions of customers. Useful only "
+       "as the second selector beside a stronger one"),
+    _t("net.reverse_dns", "structural",
+       "the same PTR hostname - often the same physical or virtual host"),
+    _t("net.resolved_ip", "structural",
+       "both names resolve to the same address",
+       "co-tenancy on shared hosting, which is not a link - check cdncheck "
+       "or the ASN first"),
+
+
+    # --- behavioural: corroborates, never promotes alone --------------------
+    # How the service behaves. Distinctive in combination, individually shared
+    # by every host running the same stack.
+    _t("tls.jarm", "behavioural",
+       "the same TLS stack and configuration - consistent with the same C2 "
+       "family or the same build",
+       "operator identity: JARM identifies software, not owners"),
+    _t("tls.ja4s", "behavioural",
+       "the server side of the handshake matches"),
+    _t("net.port_set", "behavioural",
+       "the same open-port pattern. Unusual high ports are the interesting "
+       "case - the source reporting keyed on RDP-over-TLS at 64350, 64330, "
+       "65535 and 65111",
+       "a link on a common set such as 22/80/443"),
+    _t("http.header_set", "behavioural",
+       "the same unusual response-header combination - typically the same "
+       "server build or reverse proxy config"),
+    _t("net.cohosted_domain", "behavioural",
+       "a third-party index sees both names on one address. Corroborates a "
+       "link established some other way; on its own it is a statement about "
+       "the hosting, not the operator",
+       "a link on shared hosting, where every pair of addresses shares "
+       "thousands of tenants. Backfilling it without that gate produced 5320 "
+       "selectors from this repo's own data, nearly all Cloudflare tenants"),
+    _t("http.title", "behavioural",
+       "the same page title. Weak alone, useful when the title is itself "
+       "distinctive and the body hash differs only by a timestamp"),
+
+    # --- contextual: colour only, structurally unable to promote ------------
+    # These exist so findings can be described, not so leads can be made.
+    _t("net.asn", "contextual",
+       "hosted in the same autonomous system",
+       "a link. Millions of hosts share an ASN; this is background"),
+    _t("net.prefix", "contextual",
+       "the same announced prefix - tighter than an ASN, still shared "
+       "infrastructure"),
+    _t("http.server", "contextual",
+       "the same Server header",
+       "a link, ever. Even a specific version string such as nginx/1.29.3 "
+       "matches more than 10,000 hosts on a public index"),
+    _t("tls.issuer", "contextual",
+       "certificates from the same CA",
+       "a link: almost everything is Let's Encrypt"),
+    _t("http.tech", "contextual",
+       "the same detected technology"),
+    _t("net.country", "contextual", "hosted in the same country"),
+)}
+
+
+def selector_class(selector_type: str) -> str:
+    """The class of a type. Unknown types are contextual: a new selector has
+    to be classed deliberately before it can carry weight."""
+    spec = TYPES.get(selector_type)
+    return spec.cls if spec else "contextual"
+
+
+def can_promote(selector_type: str) -> bool:
+    """Whether a shared value of this type may promote a candidate at all.
+
+    Contextual and behavioural types return False no matter how rare the
+    value or how many indicators share it. That is the guard against a
+    finding built on `Server: cloudflare`.
+    """
+    return selector_class(selector_type) in ("identity", "structural")
+
+
+def rank(selector_type: str) -> int:
+    return CLASS_ORDER.index(selector_class(selector_type))
+
+
+# --------------------------------------------------------------------------- #
+# Writing
+# --------------------------------------------------------------------------- #
+
+def record(con: duckdb.DuckDBPyConnection, *, indicator_value: str,
+           selector_type: str, selector_value: Any, observed_at,
+           indicator_type: str | None = None, actor: str | None = None,
+           source: str | None = None) -> bool:
+    """Record one selector. Returns True if it was new.
+
+    Values are normalized by `normalize()` so that a hash written in upper
+    case by one tool and lower case by another does not become two selectors
+    that fail to link.
+    """
+    value = normalize(selector_type, selector_value)
+    if value is None:
+        return False
+    existed = con.execute(
+        "SELECT 1 FROM selectors WHERE selector_type = ? AND selector_value = ? "
+        "AND indicator_value = ?", [selector_type, value, indicator_value]).fetchone()
+    con.execute(
+        """INSERT INTO selectors (selector_type, selector_value, indicator_value,
+               indicator_type, actor, source, first_seen, last_seen)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (selector_type, selector_value, indicator_value) DO UPDATE SET
+               last_seen = excluded.last_seen,
+               actor = coalesce(excluded.actor, selectors.actor),
+               indicator_type = coalesce(excluded.indicator_type, selectors.indicator_type)""",
+        [selector_type, value, indicator_value, indicator_type, actor, source,
+         observed_at, observed_at])
+    return existed is None
+
+
+def record_many(con: duckdb.DuckDBPyConnection, *, indicator_value: str,
+                found: Iterable[tuple[str, Any]], observed_at,
+                indicator_type: str | None = None, actor: str | None = None,
+                source: str | None = None) -> list[str]:
+    """Record many selectors for one indicator. Returns the types that were new."""
+    fresh = []
+    for selector_type, value in found:
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        for one in values:
+            if record(con, indicator_value=indicator_value, selector_type=selector_type,
+                      selector_value=one, observed_at=observed_at,
+                      indicator_type=indicator_type, actor=actor, source=source):
+                fresh.append(selector_type)
+    return fresh
+
+
+# Values that are technically present but link nothing. Recording them would
+# bury the real selectors under thousands of rows pointing at the same
+# well-known emptiness.
+_EMPTY_BODY_SHA256 = {
+    # sha256 of b"" - a host that answered with no body at all
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+}
+
+_JUNK = {"", "-", "none", "null", "unknown", "n/a", "localhost"}
+
+
+def normalize(selector_type: str, value: Any) -> str | None:
+    """Canonical string form, or None if the value carries no signal.
+
+    Case and whitespace are normalized so the same fact from two tools
+    becomes one selector. Hex digests are lowercased; hostnames are
+    lowercased and stripped of a trailing dot.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (list, tuple, set)):
+        # A set-valued selector (ports, nameservers) is one selector whose
+        # value is the sorted set, so two hosts match only on the whole set.
+        parts = sorted(str(v).strip().lower() for v in value if str(v).strip())
+        if not parts:
+            return None
+        return ",".join(parts)
+
+    text = str(value).strip()
+    if not text or text.lower() in _JUNK:
+        return None
+
+    if selector_type.endswith(("_sha256", "_mmh3", "jarm", "ja4s", "serial")):
+        text = text.lower()
+    if selector_type.startswith(("dns.", "net.reverse_dns", "tls.subject_cn", "tls.san")):
+        text = text.lower().rstrip(".")
+    if selector_type in ("whois.registrant_email", "dns.soa_email"):
+        text = text.lower()
+
+    if selector_type == "http.body_sha256" and text in _EMPTY_BODY_SHA256:
+        return None
+    return text
+
+
+# --------------------------------------------------------------------------- #
+# Reading - the question the old store could not answer
+# --------------------------------------------------------------------------- #
+
+def sharing(con: duckdb.DuckDBPyConnection, selector_type: str,
+            selector_value: Any) -> list[dict[str, Any]]:
+    """Every indicator carrying this selector value."""
+    value = normalize(selector_type, selector_value)
+    if value is None:
+        return []
+    return rows(con,
+                "SELECT indicator_value, indicator_type, actor, source, "
+                "first_seen, last_seen FROM selectors "
+                "WHERE selector_type = ? AND selector_value = ? "
+                "ORDER BY first_seen", [selector_type, value])
+
+
+def for_indicator(con: duckdb.DuckDBPyConnection,
+                  indicator_value: str) -> list[dict[str, Any]]:
+    return rows(con,
+                "SELECT selector_type, selector_value, source, first_seen, last_seen "
+                "FROM selectors WHERE indicator_value = ? "
+                "ORDER BY selector_type", [indicator_value])
+
+
+def shared(con: duckdb.DuckDBPyConnection, *, min_indicators: int = 2,
+           promotable_only: bool = True) -> list[dict[str, Any]]:
+    """Selector values held by more than one indicator - the link candidates.
+
+    `promotable_only` keeps contextual and behavioural types out by default,
+    because otherwise the answer is dominated by `Server: cloudflare` and
+    `Let's Encrypt` and the real links are buried.
+    """
+    result = rows(con, """
+        SELECT selector_type, selector_value,
+               count(DISTINCT indicator_value) AS indicators,
+               count(DISTINCT actor) FILTER (WHERE actor IS NOT NULL) AS actors,
+               string_agg(DISTINCT indicator_value, ', ') AS values,
+               string_agg(DISTINCT actor, ', ') AS who,
+               min(first_seen) AS first_seen, max(last_seen) AS last_seen
+        FROM selectors
+        GROUP BY 1, 2
+        HAVING count(DISTINCT indicator_value) >= ?
+        ORDER BY 3 DESC, 1""", [min_indicators])
+    if promotable_only:
+        result = [r for r in result if can_promote(r["selector_type"])]
+    for r in result:
+        r["selector_class"] = selector_class(r["selector_type"])
+    return result
+
+
+def neighbours(con: duckdb.DuckDBPyConnection, indicator_value: str, *,
+               promotable_only: bool = True) -> list[dict[str, Any]]:
+    """Indicators linked to this one, and by which selectors.
+
+    One row per neighbour, with the selector types that connect them and the
+    strongest class among those - which is what the corroboration rule needs.
+    """
+    result = rows(con, """
+        WITH mine AS (
+            SELECT selector_type, selector_value FROM selectors
+            WHERE indicator_value = ?
+        )
+        SELECT s.indicator_value, s.actor,
+               count(DISTINCT s.selector_type) AS via_types,
+               string_agg(DISTINCT s.selector_type, ', ') AS via,
+               max(s.last_seen) AS last_seen
+        FROM selectors s JOIN mine m
+          ON s.selector_type = m.selector_type AND s.selector_value = m.selector_value
+        WHERE s.indicator_value <> ?
+        GROUP BY 1, 2
+        ORDER BY 3 DESC""", [indicator_value, indicator_value])
+    out = []
+    for r in result:
+        types = [t.strip() for t in (r["via"] or "").split(",") if t.strip()]
+        if promotable_only:
+            types = [t for t in types if can_promote(t)]
+            if not types:
+                continue
+        r["via"] = types
+        r["strongest"] = max((selector_class(t) for t in types),
+                             key=CLASS_ORDER.index, default="contextual")
+        out.append(r)
+    return out

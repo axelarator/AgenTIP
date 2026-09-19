@@ -20,6 +20,7 @@ from .observations import upsert_observation
 from .query import (QUERY_MAX_BYTES, QUERY_MAX_ROWS, actor_summary,
                     observable_history, run_readonly_query, save_correlation,
                     tracked_observables)
+from . import selectors
 from .schema import init_schema
 from .writes import (CORRELATION_TYPES, insert_correlation, latest_asn_for,
                      record_active_scan, record_asn_change, upsert_actor,
@@ -32,6 +33,7 @@ __all__ = [
     "confidence", "connect", "connect_retry", "db_path", "detect",
     "init_schema", "insert_correlation", "latest_asn_for",
     "observable_history", "record_active_scan", "record_asn_change",
+    "selectors",
     "record_attribute_change", "run_readonly_query", "save_correlation",
     "tracked_observables", "upsert_actor", "upsert_observation",
     "upsert_opendir_files", "upsert_opendir_samples", "upsert_zeek_match",
