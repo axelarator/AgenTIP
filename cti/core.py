@@ -1381,8 +1381,16 @@ def _log_cluster_enrichment_history(
                         resolved_ip=resolved)
                     tracking_store.detect(con, "resolved_ip", indicator_value=value, actor=actor,
                                           observed_at=observed_at, new=resolved)
-    except (tracking_store.TrackingBusy, duckdb.IOException) as e:
-        return f"enrichment history not recorded: {e}"
+    except (tracking_store.TrackingBusy, duckdb.Error) as e:
+        # duckdb.Error, not just IOException: this write is documented
+        # best-effort - the cluster JSON write has already landed - but the
+        # clause only covered lock contention, so a TransactionException
+        # (the catalog conflict that hit fox-tempest) escaped, failed the
+        # whole sweep, and reported a cluster as unswept whose data was in
+        # fact written. The note it returns is surfaced in the digest's
+        # phase status by graph/nodes/collect.py, so widening this does not
+        # make the failure quiet.
+        return f"enrichment history not recorded: {type(e).__name__}: {e}"
     return None
 
 
@@ -1793,8 +1801,8 @@ def active_scan(target: str, cluster: str | None = None,
                 con, ran_at=observed_at, indicator_value=target, actor=cluster,
                 tools=requested, summary=summary,
                 zeek_first_ts=_ts_to_dt(before_ts), zeek_last_ts=_ts_to_dt(after_ts))
-    except (tracking_store.TrackingBusy, duckdb.IOException) as e:
-        summary["history_note"] = f"active-scan history not recorded: {e}"
+    except (tracking_store.TrackingBusy, duckdb.Error) as e:
+        summary["history_note"] = f"active-scan history not recorded: {type(e).__name__}: {e}"
 
     summary["new_open_dir_files"] = new_files
     if cluster is not None:

@@ -91,12 +91,27 @@ def fan_out_clusters(state: dict) -> list[Send]:
 
 
 def sweep(payload: dict) -> dict:
-    """One cluster's enrichment sweep. Runs with no DB connection held -
-    the writes happen in write_batch."""
+    """One cluster's enrichment sweep.
+
+    The network phase holds no DB connection, but the sweep is NOT
+    write-free: core.pivot_cluster records enrichment history itself at the
+    end. An earlier version of this docstring said all writes happen in
+    write_batch, which was wrong, and the design leaned on it. Concurrent
+    writers are safe because the store serialises read-write connections
+    (cti/store/connection.py), not because sweeps don't write.
+    """
     slug = payload["cluster"]
     try:
         result = core.pivot_cluster(slug)
-        return {"sweep_results": [{"cluster": slug, "ok": True, "result": result}]}
+        return {"sweep_results": [{
+            "cluster": slug, "ok": True, "result": result,
+            # pivot_cluster's history write is best-effort and reports its
+            # failure as a note rather than raising. It has to be lifted out
+            # here or it vanishes: the sweep "succeeded", the cluster JSON is
+            # current, and the DuckDB history that change detection depends
+            # on quietly is not.
+            "history_note": (result or {}).get("history_note"),
+        }]}
     except Exception as e:                      # noqa: BLE001
         log.exception("sweep failed for %s", slug)
         return {"sweep_results": [{"cluster": slug, "ok": False, "error": str(e)}]}
@@ -113,14 +128,29 @@ def enrich_and_write(state: dict) -> dict:
     """
     sections = dict(state.get("sections") or {})
     results = state.get("sweep_results") or []
+    errors = {r["cluster"]: r["error"] for r in results if not r["ok"]}
+    history_errors = {r["cluster"]: r["history_note"] for r in results
+                      if r["ok"] and r.get("history_note")}
     sections["pivot_sweep"] = {
         "clusters_swept": sum(1 for r in results if r["ok"]),
-        "errors": {r["cluster"]: r["error"] for r in results if not r["ok"]},
+        "errors": errors,
+        "history_errors": history_errors,
     }
+    # The digest only renders phases whose status is not "ok". The sweep
+    # used to set no status at all, so a cluster that failed (fox-tempest,
+    # 2026-09-19) sat in pivot_sweep.errors while the phase block read
+    # all-ok - visible only to someone who opened the JSON.
+    problems = len(errors) + len(history_errors)
+    sections.setdefault("status", {})["pivot_sweep"] = (
+        "ok" if not problems else
+        f"{len(errors)} cluster(s) failed, {len(history_errors)} without "
+        f"recorded history: {', '.join(sorted({*errors, *history_errors}))}")
 
     if state.get("skip_enrich"):
-        sections["pivot_sweep"] = {"clusters_swept": 0, "errors": {},
-                                   "skipped": "skip_enrich"}
+        # Annotate, don't replace: replacing threw away the errors computed
+        # a few lines up. It only looked right because skipping normally
+        # means there were no sweep results to lose.
+        sections["pivot_sweep"]["skipped"] = "skip_enrich"
         sections["enrich"] = {"skipped": True}
         return {"sections": sections}
 

@@ -5,14 +5,23 @@ fired, in what order, how long each took, what each produced. That is the
 question the old design could not answer at all - Stage B was one opaque
 `claude -p` whose only artifact was the finished narrative.
 
-One JSONL file per run under data/runs/. JSONL because a run is appended
-to as it happens, so a crashed run still leaves everything up to the
-crash, which is exactly when you want it.
+One JSONL file per STAGE per day under data/runs/, named
+`<day>.<stage>.jsonl`. JSONL because a run is appended to as it happens, so
+a crashed run still leaves everything up to the crash, which is exactly
+when you want it.
+
+Per stage, not per day, because the first version keyed on the day alone
+and opened the file in write mode: the 06:45 analyze run silently replaced
+the 06:15 collect run's trace, so the day's record held no collect nodes
+and the fan-out timing it was built to show was gone. Files written that
+way (`<day>.jsonl`, no stage) are still readable and are reported as the
+stage "legacy".
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -48,16 +57,49 @@ def _plain(value: Any, depth: int = 0) -> Any:
     return str(value)
 
 
+STAGES = ("collect", "analyze", "daily", "legacy")
+_FILE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:\.([a-z]+))?\.jsonl$")
+
+
+def run_path(day: str, stage: str) -> Path:
+    return runs_dir() / f"{day}.{stage}.jsonl"
+
+
+def run_files(day: str) -> list[tuple[str, Path]]:
+    """Every recorded stage for a day, in pipeline order."""
+    found = []
+    rdir = runs_dir()
+    if not rdir.is_dir():
+        return found
+    for path in rdir.glob(f"{day}*.jsonl"):
+        m = _FILE_RE.match(path.name)
+        if m and m.group(1) == day:
+            found.append((m.group(2) or "legacy", path))
+    order = {name: i for i, name in enumerate(STAGES)}
+    return sorted(found, key=lambda item: order.get(item[0], len(order)))
+
+
+def run_days() -> list[str]:
+    """Days with at least one recorded stage, newest first."""
+    rdir = runs_dir()
+    if not rdir.is_dir():
+        return []
+    days = {m.group(1) for p in rdir.glob("*.jsonl") if (m := _FILE_RE.match(p.name))}
+    return sorted(days, reverse=True)
+
+
 class Trace:
     """Consumes a LangGraph update stream and writes the run record."""
 
-    def __init__(self, day: str, path: Path | None = None):
+    def __init__(self, day: str, stage: str = "run", path: Path | None = None):
         self.day = day
-        self.path = path or (runs_dir() / f"{day}.jsonl")
+        self.stage = stage
+        self.path = path or run_path(day, stage)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.started = time.time()
         self._fh = self.path.open("w")
-        self._write({"event": "run_start", "day": day, "ts": self.started})
+        self._write({"event": "run_start", "day": day, "stage": stage,
+                     "ts": self.started})
 
     def _write(self, record: dict) -> None:
         self._fh.write(json.dumps(record, default=str) + "\n")
@@ -74,22 +116,39 @@ class Trace:
         return self.path
 
 
-async def run_traced(compiled, state: dict, *, day: str,
+def _label(namespace: tuple[str, ...], node: str) -> str:
+    """`collect:sweep` for a node inside the `collect` subgraph.
+
+    LangGraph namespaces look like ("collect:<task-uuid>",); the uuid is
+    noise for a reader and different every run.
+    """
+    parents = [part.split(":", 1)[0] for part in namespace]
+    return ":".join([*parents, node])
+
+
+async def run_traced(compiled, state: dict, *, day: str, stage: str,
                      path: Path | None = None) -> tuple[dict, Path]:
     """Run a compiled graph, writing a trace and returning the final state.
 
-    `stream_mode="updates"` gives one event per node as it finishes,
-    which is what makes the per-node timing real rather than inferred.
+    `stream_mode="updates"` gives one event per node as it finishes, which
+    is what makes the per-node timing real rather than inferred.
+    `subgraphs=True` makes that include nodes inside a composed subgraph;
+    without it a `daily` run records two events, `collect` and `analyze`,
+    and nothing about what happened inside either.
     """
-    trace = Trace(day, path)
+    trace = Trace(day, stage, path)
     final: dict = dict(state)
     last = time.time()
     try:
-        async for chunk in compiled.astream(state, stream_mode="updates"):
+        async for namespace, chunk in compiled.astream(
+                state, stream_mode="updates", subgraphs=True):
             now = time.time()
             for node_name, output in chunk.items():
-                trace.node(node_name, output, now - last)
-                if isinstance(output, dict):
+                trace.node(_label(namespace, node_name), output, now - last)
+                # Only top-level updates are the graph's own state. A
+                # subgraph's node outputs are a subset of what the subgraph
+                # returns to its parent as one top-level update at the end.
+                if not namespace and isinstance(output, dict):
                     final.update(output)
             last = now
     finally:
@@ -111,13 +170,14 @@ def read(path: Path) -> list[dict]:
 
 
 def summarize(path: Path) -> dict:
-    """Per-node timings and the run total - the shape the dashboard renders."""
+    """Per-node timings and the run total for one stage's file."""
     records = read(path)
     nodes = [r for r in records if r.get("event") == "node"]
     start = next((r for r in records if r.get("event") == "run_start"), {})
     end = next((r for r in records if r.get("event") == "run_end"), {})
     return {
         "day": start.get("day"),
+        "stage": start.get("stage") or "legacy",
         "total_s": end.get("elapsed_s"),
         "nodes": [{"node": n["node"], "elapsed_s": n["elapsed_s"]} for n in nodes],
         "slowest": max(nodes, key=lambda n: n["elapsed_s"])["node"] if nodes else None,

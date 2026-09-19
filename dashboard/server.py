@@ -154,58 +154,61 @@ async def tracking_narrative_detail(request):
 
 
 async def runs(request):
-    """Which pipeline runs have a recorded trace.
+    """Which days have a recorded pipeline trace.
 
     The run trace is the piece the old design could not show at all:
     Stage B was one opaque `claude -p` whose only artifact was the
     finished narrative, so "which specialist decided that, and what did it
     cost" had no answer.
     """
-    rdir = graph_trace.runs_dir()
-    if not rdir.is_dir():
-        return JSONResponse({"dates": []})
-    dates = sorted((p.stem for p in rdir.glob("*.jsonl")
-                    if _NARRATIVE_DATE_RE.match(p.stem)), reverse=True)
-    return JSONResponse({"dates": dates})
+    return JSONResponse({"dates": graph_trace.run_days()})
 
 
 async def run_detail(request):
     day = request.path_params["date"]
     if not _NARRATIVE_DATE_RE.match(day):
         return JSONResponse({"error": "invalid date"}, status_code=400)
-    path = graph_trace.runs_dir() / f"{day}.jsonl"
-    if not path.is_file():
+    files = graph_trace.run_files(day)
+    if not files:
         return JSONResponse({"error": f"no run recorded for {day}"}, status_code=404)
-
-    records = graph_trace.read(path)
-    summary = graph_trace.summarize(path)
 
     # What each node produced, in the shape the timeline renders: the
     # ranker's suppression counts and per-family selection, and each
-    # specialist's findings.
-    detail = []
-    for record in records:
-        if record.get("event") != "node":
-            continue
-        output = record.get("output") or {}
-        entry = {"node": record["node"], "elapsed_s": record["elapsed_s"]}
-        if record["node"] == "rank":
-            items = output.get("items") or []
-            entry["items_seen"] = len(items)
-            entry["suppressed"] = [
-                {"indicator": i.get("indicator"), "attribute": i.get("attribute"),
-                 "reason": i.get("suppressed")} for i in items if i.get("suppressed")]
-            entry["selected"] = {
-                family: [{"indicator": i.get("indicator"),
-                          "attribute": i.get("attribute"),
-                          "score": i.get("score")} for i in chosen]
-                for family, chosen in (output.get("ranked") or {}).items()}
-        if output.get("findings"):
-            entry["findings"] = output["findings"]
-        if output.get("errors"):
-            entry["errors"] = output["errors"]
-        detail.append(entry)
+    # specialist's findings. One list across the day's stages, each node
+    # tagged with the stage it ran in.
+    detail, stages = [], []
+    for stage, path in files:
+        summary = graph_trace.summarize(path)
+        stages.append(summary)
+        for record in graph_trace.read(path):
+            if record.get("event") != "node":
+                continue
+            output = record.get("output") or {}
+            node = record["node"]
+            entry = {"stage": stage, "node": node, "elapsed_s": record["elapsed_s"]}
+            if node.split(":")[-1] == "rank":
+                items = output.get("items") or []
+                entry["items_seen"] = len(items)
+                entry["suppressed"] = [
+                    {"indicator": i.get("indicator"), "attribute": i.get("attribute"),
+                     "reason": i.get("suppressed")} for i in items if i.get("suppressed")]
+                entry["selected"] = {
+                    family: [{"indicator": i.get("indicator"),
+                              "attribute": i.get("attribute"),
+                              "score": i.get("score")} for i in chosen]
+                    for family, chosen in (output.get("ranked") or {}).items()}
+            if output.get("findings"):
+                entry["findings"] = output["findings"]
+            if output.get("errors"):
+                entry["errors"] = output["errors"]
+            detail.append(entry)
 
+    slowest = max(detail, key=lambda n: n["elapsed_s"], default=None)
+    summary = {
+        "total_s": round(sum(s["total_s"] or 0 for s in stages), 3),
+        "slowest": slowest["node"] if slowest else None,
+        "stages": [{"stage": s["stage"], "total_s": s["total_s"]} for s in stages],
+    }
     return JSONResponse({"date": day, "summary": summary, "nodes": detail})
 
 

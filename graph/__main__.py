@@ -20,8 +20,7 @@ from pathlib import Path
 from cti.tracking import digest as digest_mod
 
 from .build import build_analyze, build_collect, build_daily
-from .trace import runs_dir, summarize
-from .trace import run_traced
+from .trace import run_files, run_traced, summarize
 from .viz import write_all
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -46,7 +45,7 @@ async def _run(which: str, day: str, *, dry_run: bool, skip_enrich: bool) -> int
     else:
         compiled = build_daily()
 
-    final, trace_path = await run_traced(compiled, state, day=day)
+    final, trace_path = await run_traced(compiled, state, day=day, stage=which)
 
     narrative = final.get("narrative")
     if narrative:
@@ -87,14 +86,15 @@ def main() -> int:
         return 0
 
     if args.command == "trace":
-        path = runs_dir() / f"{args.date}.jsonl"
-        summary = summarize(path)
-        if not summary["nodes"]:
-            raise SystemExit(f"no trace at {path}")
-        print(f"run {summary['day']}  total {summary['total_s']}s  "
-              f"slowest: {summary['slowest']}")
-        for n in summary["nodes"]:
-            print(f"  {n['node']:22s} {n['elapsed_s']:>8.2f}s")
+        files = run_files(args.date)
+        if not files:
+            raise SystemExit(f"no trace for {args.date} under data/runs/")
+        for stage, path in files:
+            summary = summarize(path)
+            print(f"{stage:8s} total {summary['total_s']}s  "
+                  f"slowest: {summary['slowest']}")
+            for n in summary["nodes"]:
+                print(f"  {n['node']:26s} {n['elapsed_s']:>8.2f}s")
         return 0
 
     return asyncio.run(_run(args.command, args.date,

@@ -969,7 +969,8 @@ function nodeBar(node, maxSeconds) {
   const pct = maxSeconds > 0 ? Math.max(2, Math.round((node.elapsed_s / maxSeconds) * 100)) : 2;
   return h("div", { class: "run-node" },
     h("div", { class: "run-node__head" },
-      h("span", { class: "mono", style: "font-weight:600;" }, node.node),
+      h("span", { class: "mono", style: "font-weight:600;" },
+        node.stage && node.stage !== "legacy" ? `${node.stage} · ${node.node}` : node.node),
       h("span", { class: "mono", style: "opacity:.7;" }, `${node.elapsed_s.toFixed(2)}s`)),
     h("div", { class: "run-bar" }, h("div", { class: "run-bar__fill", style: `width:${pct}%` })));
 }
@@ -989,10 +990,10 @@ async function viewRunDetail(day) {
   const cards = [];
 
   cards.push(h("div", { class: "card" },
-    h("div", { class: "card__title" }, `Timeline — ${res.summary.total_s}s total, slowest: ${res.summary.slowest || "n/a"}`),
+    h("div", { class: "card__title" }, `Timeline — ${res.summary.total_s}s total (${(res.summary.stages || []).map((s) => `${s.stage} ${s.total_s}s`).join(", ")}), slowest: ${res.summary.slowest || "n/a"}`),
     ...res.nodes.map((n) => nodeBar(n, maxSeconds))));
 
-  const rank = res.nodes.find((n) => n.node === "rank");
+  const rank = res.nodes.find((n) => n.node.split(":").pop() === "rank");
   if (rank) {
     const rows = (rank.suppressed || []).map((s) => h("tr", {},
       h("td", { class: "mono" }, s.indicator),

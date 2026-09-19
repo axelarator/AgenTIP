@@ -47,6 +47,12 @@ write lock is process-exclusive and `connect_retry` retries only the
 connect, never the body, so four specialists calling `save_correlation`
 would surface as "tracking DB busy" rather than queueing.
 
+Stage A is not write-free either, which an earlier version of this README
+implied: each cluster's sweep records its own enrichment history at the end.
+That is safe because the store serialises read-write connections within a
+process (`cti/store/connection.py`), not because sweeps don't write. The
+first scheduled run lost a cluster to exactly that assumption.
+
 ### Triage happens in code, before any token is spent
 
 `rank` normalizes the digest, scores each row and drops what is provably
@@ -67,10 +73,14 @@ from the graph object. It replaces `docs/pipeline.html`, which was good
 and had already drifted — drawn against a commit that has since moved,
 with a header that disagreed with `setup.sh` about when Stage B runs.
 
-Every run writes `data/runs/<day>.jsonl`: one record per node with
-timings, outputs and errors. `python -m graph trace --date <day>` prints
-the timeline; the dashboard's **Pipeline runs** view renders it with what
-the ranker suppressed and why.
+Every run writes `data/runs/<day>.<stage>.jsonl` (`collect`, `analyze` or
+`daily`): one record per node, including nodes inside a composed subgraph,
+with timings, outputs and errors. `python -m graph trace --date <day>`
+prints each stage's timeline; the dashboard's **Pipeline runs** view
+renders them together with what the ranker suppressed and why.
+
+One file per stage matters: the first version keyed on the day alone, so
+the 06:45 analyze run silently replaced the 06:15 collect run's trace.
 
 Stage A is in the same graph even though no model runs in it. The
 question at runtime is "which of these twenty things ran, and which was
@@ -176,7 +186,7 @@ python -m graph collect         # Stage A  (defaults to today)
 python -m graph analyze         # Stage B
 python -m graph analyze --dry-run --date 2026-09-18   # no writes
 python -m graph trace --date 2026-09-18               # node timings
-pytest                          # 377 tests
+pytest                          # 409 tests
 ```
 
 Secrets stay in the environment (`~/.bashrc`, which cron sources):
