@@ -71,6 +71,42 @@ else
   git clone -q https://github.com/salesforce/jarm /opt/jarm
 fi
 
+echo "== observation tools (ProjectDiscovery + whois)"
+# These are what the `observe` action runs. All are single static binaries or
+# apt packages, all free, none needs an API key - which is the point: capture
+# as much as possible with CLI tools before reaching for a vendor API.
+#
+# httpx alone replaces several hand-rolled probes and adds two things this
+# pipeline never had: a response-body SHA-256 (the rotation-proof link) and a
+# favicon mmh3 hash. tlsx adds the certificate serial and SPKI digest. whois
+# parses the registrar and registrant fields RDAP buries in vcardArray.
+apt-get install -y -q whois || echo "   WARNING: whois unavailable from apt"
+
+PD_TOOLS="httpx tlsx dnsx naabu cdncheck asnmap"
+if command -v go >/dev/null 2>&1; then
+  for tool in $PD_TOOLS; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      echo "   $tool already present"
+      continue
+    fi
+    echo "   installing $tool"
+    GOBIN=/usr/local/bin go install -v \
+      "github.com/projectdiscovery/$tool/cmd/$tool@latest" >/dev/null 2>&1 \
+      || echo "   WARNING: $tool failed to install"
+  done
+else
+  echo "   WARNING: go not installed - skipping $PD_TOOLS"
+  echo "   install golang-go, or drop the binaries into /usr/local/bin by hand."
+  echo "   The observe action degrades to what is present and reports the rest."
+fi
+
+# naabu needs raw sockets for SYN scanning; without the capability it falls
+# back to connect() scans, which work but are slower and noisier.
+if command -v naabu >/dev/null 2>&1; then
+  setcap cap_net_raw+eip "$(command -v naabu)" 2>/dev/null \
+    || echo "   note: naabu lacks cap_net_raw, will use connect() scans"
+fi
+
 echo "== docker + the analysis sandbox image"
 # The sandbox runs HERE, on the probe VM, not on the cti host. This VM
 # already did the download that found the open directory and already has
@@ -126,6 +162,17 @@ runuser -u "$PROBE_USER" -- python3 /opt/cti/probe_helper.py --check-access; ech
 dirsearch --help >/dev/null 2>&1 || echo "WARNING: dirsearch is installed but won't run - check its Python deps"
 runuser -u "$PROBE_USER" -- docker info >/dev/null 2>&1 \
   || echo "WARNING: $PROBE_USER cannot run docker - fetch_and_analyze will fail"
+
+# Report the observe toolchain explicitly. A half-provisioned VM that silently
+# collects less is worse than one that says what is missing.
+echo "   observe toolchain:"
+for tool in httpx tlsx dnsx naabu cdncheck whois; do
+  if runuser -u "$PROBE_USER" -- command -v "$tool" >/dev/null 2>&1; then
+    printf "     %-10s ok\n" "$tool"
+  else
+    printf "     %-10s MISSING - observe will skip it and say so\n" "$tool"
+  fi
+done
 
 ip=$(hostname -I | awk '{print $1}')
 cat <<EOF

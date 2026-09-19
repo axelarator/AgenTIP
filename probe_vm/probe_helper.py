@@ -686,6 +686,307 @@ def action_fetch_and_analyze(request: dict) -> dict:
             "errors": errors + payload.get("errors", []),
             "fetched": fetched, "analyzed": payload.get("analyzed", 0),
             "error": None}
+# --------------------------------------------------------------------------- #
+# observe - one CLI pass that yields selectors
+#
+# The existing actions each answer one question and the caller stitches the
+# answers together. `observe` instead returns the facts another host could
+# SHARE, because that is what the selector index is built from.
+#
+# It prefers the CLI tools over hand-rolled Python: httpx already computes a
+# body SHA-256 and a favicon mmh3 hash, tlsx already extracts a certificate
+# serial and SPKI digest, and whois already parses registrar and registrant
+# fields that RDAP hides inside vcardArray. Each is a single static binary
+# with no API key.
+#
+# Every tool is optional. A missing one is reported in `tools_missing` and
+# the pass continues, so this degrades to roughly what the old actions gave
+# rather than failing outright on a VM that has not been re-provisioned.
+# --------------------------------------------------------------------------- #
+HTTPX_CMD = ["httpx"]
+TLSX_CMD = ["tlsx"]
+DNSX_CMD = ["dnsx"]
+WHOIS_CMD = ["whois"]
+NAABU_CMD = ["naabu"]
+CDNCHECK_CMD = ["cdncheck"]
+
+OBSERVE_TOOL_TIMEOUT = 90
+NAABU_TIMEOUT = 300
+
+
+def _run_json(cmd: list, stdin_text: str, timeout: int) -> tuple[list, str | None]:
+    """Run a tool that emits JSON lines. Returns (records, error)."""
+    if not _tool_present(cmd):
+        return [], f"{cmd[0]} not installed"
+    try:
+        proc = subprocess.run(cmd, input=stdin_text, capture_output=True,
+                              text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return [], f"{cmd[0]} timed out after {timeout}s"
+    except Exception as e:
+        return [], f"{cmd[0]}: {type(e).__name__}: {e}"
+    out = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    if not out and proc.returncode != 0:
+        return [], f"{cmd[0]} exited {proc.returncode}: {proc.stderr.strip()[:200]}"
+    return out, None
+
+
+def _observe_http(target: str) -> tuple[dict, str | None]:
+    """httpx: body hash, favicon hash, title, server, headers, tech, JARM.
+
+    -favicon fetches /favicon.ico, so it is one extra request to a host we
+    are already contacting - not a new class of traffic.
+    """
+    records, error = _run_json(
+        HTTPX_CMD + ["-json", "-silent", "-no-color",
+                     "-hash", "sha256",      # body digest: the rotation-proof link
+                     "-favicon",             # mmh3, Shodan/urlscan compatible
+                     "-title", "-web-server", "-tech-detect",
+                     "-include-response-header",
+                     "-jarm",
+                     "-timeout", "15", "-retries", "1",
+                     "-disable-update-check"],
+        stdin_text=target, timeout=OBSERVE_TOOL_TIMEOUT)
+    if error:
+        return {}, error
+    if not records:
+        return {}, None
+    r = records[0]
+    hashes = r.get("hash") or {}
+    return {
+        "url": r.get("url"),
+        "status": r.get("status_code"),
+        "title": r.get("title"),
+        "server": r.get("webserver"),
+        "body_sha256": hashes.get("body_sha256") or hashes.get("body-sha256"),
+        "favicon_mmh3": r.get("favicon"),
+        "favicon_path": r.get("favicon_path"),
+        "tech": r.get("tech") or [],
+        "headers": r.get("header") or {},
+        "jarm": r.get("jarm"),
+        "content_length": r.get("content_length"),
+        "final_url": r.get("final_url") or r.get("url"),
+        "cdn": r.get("cdn_name"),
+        "asn": (r.get("asn") or {}).get("as_number"),
+    }, None
+
+
+def _observe_tls(target: str) -> tuple[dict, str | None]:
+    """tlsx: the certificate fields the live TLS grab never extracted.
+
+    `serial` and the SPKI hash are the additions that matter - a serial ties
+    a reissue to its original, and an SPKI hash survives certificate
+    rotation entirely because the operator kept the keypair.
+    """
+    records, error = _run_json(
+        TLSX_CMD + ["-json", "-silent", "-no-color",
+                    "-san", "-cn", "-so", "-serial", "-hash", "sha256",
+                    "-expired", "-self-signed", "-mismatched",
+                    "-tls-version", "-cipher", "-ja3s",
+                    "-timeout", "10", "-disable-update-check"],
+        stdin_text=target, timeout=OBSERVE_TOOL_TIMEOUT)
+    if error:
+        return {}, error
+    if not records:
+        return {}, None
+    r = records[0]
+    fingerprint = r.get("fingerprint_hash") or {}
+    return {
+        "issuer": r.get("issuer_dn"),
+        "subject_cn": r.get("subject_cn"),
+        "subject_dn": r.get("subject_dn"),
+        "sans": r.get("subject_an") or [],
+        "serial": r.get("serial"),
+        "cert_sha256": fingerprint.get("sha256"),
+        "spki_sha256": fingerprint.get("spki_sha256"),
+        "not_before": r.get("not_before"),
+        "not_after": r.get("not_after"),
+        "self_signed": r.get("self_signed"),
+        "expired": r.get("expired"),
+        "mismatched": r.get("mismatched"),
+        "tls_version": r.get("tls_version"),
+        "cipher": r.get("cipher"),
+        "ja3s": r.get("ja3s_hash"),
+        "resolved_ip": r.get("ip"),
+    }, None
+
+
+def _observe_dns(target: str) -> tuple[dict, str | None]:
+    """dnsx: the record types nothing has ever collected here.
+
+    vm_proxy.dns_lookup implements MX/NS/TXT and has zero callers, so NS
+    sets and SOA contacts - both registration-level selectors - have never
+    been recorded.
+    """
+    records, error = _run_json(
+        DNSX_CMD + ["-json", "-silent", "-no-color",
+                    "-a", "-aaaa", "-cname", "-ns", "-mx", "-txt", "-soa",
+                    "-resp", "-disable-update-check"],
+        stdin_text=target, timeout=OBSERVE_TOOL_TIMEOUT)
+    if error:
+        return {}, error
+    if not records:
+        return {}, None
+    r = records[0]
+    soa = r.get("soa") or []
+    return {
+        "a": r.get("a") or [],
+        "aaaa": r.get("aaaa") or [],
+        "cname": r.get("cname") or [],
+        "ns": r.get("ns") or [],
+        "mx": r.get("mx") or [],
+        "txt": r.get("txt") or [],
+        "soa_email": (soa[0].get("email") if soa and isinstance(soa[0], dict) else None),
+    }, None
+
+
+_WHOIS_FIELDS = {
+    "registrar": ("registrar:", "sponsoring registrar:"),
+    "registrant_email": ("registrant email:", "registrant contact email:"),
+    "abuse_email": ("registrar abuse contact email:", "abuse-mailbox:"),
+    "registrant_org": ("registrant organization:", "registrant organisation:", "org:"),
+    "created": ("creation date:", "created:", "registered on:"),
+    "expires": ("registry expiry date:", "expiry date:", "expires:"),
+    "updated": ("updated date:", "last updated:"),
+}
+
+
+def _observe_whois(target: str) -> tuple[dict, str | None]:
+    """whois: registrar and registrant fields.
+
+    RDAP hides these inside entities[].vcardArray, which pivot.rdap_lookup
+    discards - so the registration-level link the source reporting turned on
+    has not been extractable at all. The CLI parses it for us.
+    """
+    if not _tool_present(WHOIS_CMD):
+        return {}, "whois not installed"
+    try:
+        proc = subprocess.run(WHOIS_CMD + [target], capture_output=True,
+                              text=True, timeout=OBSERVE_TOOL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {}, f"whois timed out after {OBSERVE_TOOL_TIMEOUT}s"
+    except Exception as e:
+        return {}, f"whois: {type(e).__name__}: {e}"
+
+    found: dict = {}
+    for raw in proc.stdout.splitlines():
+        line = raw.strip()
+        lowered = line.lower()
+        for field, prefixes in _WHOIS_FIELDS.items():
+            if field in found:
+                continue
+            for prefix in prefixes:
+                if lowered.startswith(prefix):
+                    value = line[len(prefix):].strip()
+                    # Registries redact contacts wholesale; a redaction
+                    # marker is not a selector and must not become one that
+                    # links every redacted domain to every other.
+                    if value and "redacted" not in value.lower() \
+                            and "privacy" not in value.lower() \
+                            and "not disclosed" not in value.lower() \
+                            and "data protected" not in value.lower():
+                        found[field] = value
+                    break
+    return found, None
+
+
+def _observe_ports(target: str, top_ports: int) -> tuple[list, str | None]:
+    """naabu: open ports without a full nmap run.
+
+    The source reporting keyed on RDP-over-TLS at 64350, 64330, 65535 and
+    65111 - ports a top-100 scan never reaches.
+    """
+    records, error = _run_json(
+        NAABU_CMD + ["-json", "-silent", "-no-color",
+                     "-top-ports", str(top_ports), "-disable-update-check"],
+        stdin_text=target, timeout=NAABU_TIMEOUT)
+    if error:
+        return [], error
+    return sorted({r["port"] for r in records if r.get("port")}), None
+
+
+def _observe_cdn(target: str) -> tuple[dict, str | None]:
+    """cdncheck: is this shared infrastructure?
+
+    This replaces a hardcoded three-ASN list. Getting it wrong in either
+    direction is costly: treating a CDN address as dedicated manufactures
+    links between unrelated tenants, and treating a dedicated address as a
+    CDN hides real clusters.
+    """
+    records, error = _run_json(
+        CDNCHECK_CMD + ["-json", "-silent", "-no-color", "-resp"],
+        stdin_text=target, timeout=OBSERVE_TOOL_TIMEOUT)
+    if error:
+        return {}, error
+    if not records:
+        return {"is_cdn": False}, None
+    r = records[0]
+    return {"is_cdn": bool(r.get("cdn") or r.get("waf") or r.get("cloud")),
+            "provider": r.get("cdn_name") or r.get("waf_name") or r.get("cloud_name"),
+            "kind": "cdn" if r.get("cdn") else ("waf" if r.get("waf") else
+                    ("cloud" if r.get("cloud") else None))}, None
+
+
+def action_observe(request: dict) -> dict:
+    """{target, kind, ports=False, top_ports=100}
+       -> {target, kind, http, tls, dns, whois, ports, cdn, errors,
+           tools_missing, error}
+
+    One pass over a single indicator, returning the facts another host could
+    share. Port scanning is opt-in because it is active traffic; everything
+    else is the same light-touch contact the existing probe already makes.
+    """
+    target = (request.get("target") or "").strip()
+    if not target:
+        return {"error": "no target given"}
+    kind = request.get("kind") or ("ip" if _looks_like_ip(target) else "domain")
+
+    result: dict = {"target": target, "kind": kind, "http": {}, "tls": {},
+                    "dns": {}, "whois": {}, "ports": [], "cdn": {},
+                    "errors": {}, "tools_missing": [], "error": None}
+
+    def stage(name, fn, *args):
+        data, error = fn(*args)
+        if error:
+            result["errors"][name] = error
+            if "not installed" in error:
+                result["tools_missing"].append(error.split()[0])
+        return data
+
+    result["http"] = stage("http", _observe_http, target)
+    result["tls"] = stage("tls", _observe_tls, target)
+    if kind == "domain":
+        result["dns"] = stage("dns", _observe_dns, target)
+        result["whois"] = stage("whois", _observe_whois, target)
+    result["cdn"] = stage("cdn", _observe_cdn, target)
+    if request.get("ports"):
+        result["ports"] = stage("ports", _observe_ports, target,
+                                int(request.get("top_ports") or 100)) or []
+
+    if result["tools_missing"] and not any(
+            result[k] for k in ("http", "tls", "dns", "whois")):
+        result["error"] = ("no observation tools available on the probe VM - "
+                           "re-run setup_probe_vm.sh")
+    return result
+
+
+def _looks_like_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+
 
 
 
@@ -695,6 +996,7 @@ def action_fetch_and_analyze(request: dict) -> dict:
 # dispatch
 # --------------------------------------------------------------------------- #
 _ACTIONS = {
+    "observe": action_observe,
     "fetch_and_analyze": action_fetch_and_analyze,
     "jarm_probe": action_jarm_probe,
     "http_fetch": action_http_fetch,
@@ -720,7 +1022,12 @@ def _tool_present(cmd: list[str]) -> bool:
 def check_access() -> dict:
     tools = {name: _tool_present(cmd) for name, cmd in {
         "jarm": JARM_CMD, "subfinder": SUBFINDER_CMD, "nmap": NMAP_CMD,
-        "dirsearch": DIRSEARCH_CMD, "openssl": OPENSSL_CMD, "dig": DIG_CMD}.items()}
+        "dirsearch": DIRSEARCH_CMD, "openssl": OPENSSL_CMD, "dig": DIG_CMD,
+        # the observe pass - each optional, each reported so a half-provisioned
+        # VM says so instead of quietly returning less
+        "httpx": HTTPX_CMD, "tlsx": TLSX_CMD, "dnsx": DNSX_CMD,
+        "whois": WHOIS_CMD, "naabu": NAABU_CMD,
+        "cdncheck": CDNCHECK_CMD, "docker": DOCKER_CMD}.items()}
     return {"ok": True, "certifi": _CA_FILE is not None, "tools": tools}
 
 

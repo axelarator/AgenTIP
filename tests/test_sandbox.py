@@ -267,3 +267,53 @@ def test_python_http_server_listings_genuinely_have_no_size_or_mtime():
 def test_a_page_that_is_not_a_listing_returns_none():
     assert helper["parse_autoindex"]("<html><body>hello</body></html>",
                                      "http://1.2.3.4/") is None
+
+
+# --------------------------------------------------------------------------- #
+# The observe action - it must degrade, not fail, on an un-provisioned VM
+# --------------------------------------------------------------------------- #
+
+def test_observe_on_a_vm_without_the_tools_reports_instead_of_crashing():
+    """The probe VM cannot be re-provisioned from here, so the action has to
+    be safe to call before setup_probe_vm.sh has ever installed httpx."""
+    result = helper["action_observe"]({"target": "example.com", "kind": "domain"})
+    assert result["error"] and "setup_probe_vm.sh" in result["error"]
+    assert "httpx" in result["tools_missing"]
+    assert result["http"] == {} and result["tls"] == {}
+
+
+def test_observe_rejects_an_empty_target():
+    assert helper["action_observe"]({"target": "  "})["error"] == "no target given"
+
+
+def test_observe_infers_the_kind_from_the_target():
+    ip = helper["action_observe"]({"target": "193.29.58.192"})
+    domain = helper["action_observe"]({"target": "example.com"})
+    assert ip["kind"] == "ip" and domain["kind"] == "domain"
+
+
+def test_observe_does_not_scan_ports_unless_asked():
+    """A port scan is active traffic; everything else in the pass is the same
+    light-touch contact the ordinary sweep already makes."""
+    result = helper["action_observe"]({"target": "example.com"})
+    assert result["ports"] == []
+    assert "ports" not in result["errors"], "naabu must not even be attempted"
+
+
+def test_observe_skips_registration_lookups_for_an_ip():
+    result = helper["action_observe"]({"target": "193.29.58.192", "kind": "ip"})
+    assert "dns" not in result["errors"] and "whois" not in result["errors"]
+
+
+def test_check_access_reports_every_observe_tool():
+    """A half-provisioned VM that silently collects less is worse than one
+    that says what is missing."""
+    tools = helper["check_access"]()["tools"]
+    for tool in ("httpx", "tlsx", "dnsx", "whois", "naabu", "cdncheck"):
+        assert tool in tools, f"{tool} not reported by --check-access"
+
+
+def test_the_bootstrap_installs_what_observe_needs():
+    bootstrap = (REPO / "probe_vm" / "setup_probe_vm.sh").read_text()
+    for tool in ("httpx", "tlsx", "dnsx", "naabu", "cdncheck", "whois"):
+        assert tool in bootstrap, f"setup_probe_vm.sh never installs {tool}"

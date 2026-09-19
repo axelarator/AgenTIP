@@ -50,6 +50,10 @@ response shapes per action). Actions:
 - "nmap": top-ports service scan (on-demand only - long).
 - "dirsearch": web path map + recursive open-directory listing
   (on-demand only - long).
+- "observe": one CLI pass (httpx/tlsx/dnsx/whois/cdncheck, plus naabu when
+  asked) returning the facts another host could SHARE - body and favicon
+  hashes, certificate serial and SPKI digest, nameserver set, registrar.
+  This is what the selector index is built from.
 - "fetch_and_analyze": download named open-directory files ON THE VM and
   triage them in a --network=none container there, returning JSON
   verdicts only (on-demand, explicitly requested - see sandbox()).
@@ -294,3 +298,21 @@ def fetch_and_analyze(urls: list[str], *, max_files: int = 20,
         "max_files": max_files, "max_total_bytes": max_total_bytes,
     }, timeout=LONG_TIMEOUT)
     return response
+
+
+def observe(target: str, *, kind: str | None = None, ports: bool = False,
+            top_ports: int = 100) -> dict[str, object]:
+    """One observation pass over an indicator, returning shareable facts.
+
+    This is the capture half of the selector design. The existing actions
+    each answer one question about a host; this returns the values another
+    host could have in common, which is what links get made from.
+
+    `ports` is opt-in and off by default: a port scan is active traffic,
+    while everything else here is the same light-touch contact the ordinary
+    sweep already makes. When it is on, the call gets the long timeout.
+    """
+    return _ssh_json_rpc(
+        {"action": "observe", "target": target, "kind": kind,
+         "ports": bool(ports), "top_ports": top_ports},
+        timeout=LONG_TIMEOUT if ports else SUBFINDER_TIMEOUT)

@@ -263,3 +263,110 @@ def test_dedicated_addresses_are_not_suppressed(address):
 def test_a_non_address_is_not_a_cdn():
     assert not cdn.is_cdn("not-an-ip")
     assert not cdn.is_cdn("")
+
+
+# --------------------------------------------------------------------------- #
+# Extraction from an observe pass
+# --------------------------------------------------------------------------- #
+
+from cti.sources import observe  # noqa: E402
+
+# A realistic result, shaped like the source reporting's own findings: a
+# cloned decoy page, a certificate impersonating a state entity, RDP-over-TLS
+# on an unusual high port.
+_OBSERVED = {
+    "target": "azure.uzrailwaystax.com", "kind": "domain",
+    "http": {"status": 200, "title": "RTX Corporation",
+             "body_sha256": "b" * 64, "favicon_mmh3": -1234567890,
+             "server": "nginx/1.29.3", "tech": ["nginx"], "asn": 12345,
+             "jarm": "29d3fd00029d29d00042d43d00041d" + "a" * 32},
+    "tls": {"issuer": "CN = TLC DV TLS CA", "subject_cn": "azure.uzrailwaystax.com",
+            "subject_dn": "CN = azure.uzrailwaystax.com",
+            "sans": ["azure.uzrailwaystax.com", "help.hoster-kg.com"],
+            "serial": "0A1B2C", "cert_sha256": "c" * 64, "spki_sha256": "d" * 64,
+            "ja3s": "e" * 32, "resolved_ip": "193.29.58.192"},
+    "dns": {"a": ["193.29.58.192"], "aaaa": [], "ns": ["ns2.example", "ns1.example"],
+            "soa_email": "admin@example.com"},
+    "whois": {"registrar": "Example Registrar", "registrant_email": "op@mail.example"},
+    "cdn": {"is_cdn": False}, "ports": [443, 64350],
+    "errors": {}, "tools_missing": [],
+}
+
+
+def _extracted(result, target=None, kind="domain"):
+    return dict(observe.selectors_from(
+        result, target=target or result["target"], kind=kind))
+
+
+def test_the_report_style_pass_yields_the_pivots_that_mattered():
+    got = _extracted(_OBSERVED)
+    assert got["http.body_sha256"] == "b" * 64      # the 13-host decoy page
+    assert got["tls.cert_sha256"] == "c" * 64       # the 8-host certificate
+    assert got["net.port_set"] == [443, 64350]      # RDP-over-TLS high port
+    assert got["dns.apex"] == "uzrailwaystax.com"   # registration level
+    assert got["whois.registrant_email"] == "op@mail.example"
+
+
+def test_every_emitted_selector_type_is_declared():
+    """A typo'd type would silently become class contextual and quietly lose
+    its ability to promote anything."""
+    for selector_type in _extracted(_OBSERVED):
+        assert selector_type in observe.known_types(), selector_type
+
+
+def test_a_certificate_naming_only_itself_is_not_a_link():
+    got = list(observe.selectors_from(
+        {"tls": {"sans": ["azure.uzrailwaystax.com"]}},
+        target="azure.uzrailwaystax.com", kind="domain"))
+    assert not [v for t, v in got if t == "tls.san"]
+
+
+def test_a_san_naming_another_host_is_a_link():
+    assert "help.hoster-kg.com" in [
+        v for t, v in observe.selectors_from(_OBSERVED, target=_OBSERVED["target"],
+                                             kind="domain") if t == "tls.san"]
+
+
+def test_resolution_is_not_recorded_on_cdn_infrastructure():
+    """Two domains behind one CDN address share a provider, not an operator."""
+    behind_cdn = {**_OBSERVED, "cdn": {"is_cdn": True, "provider": "cloudflare"}}
+    assert "net.resolved_ip" not in _extracted(behind_cdn)
+    assert "net.resolved_ip" in _extracted(_OBSERVED), "and IS recorded otherwise"
+
+
+def test_a_default_openssl_certificate_subject_is_not_a_selector():
+    """Every unconfigured OpenSSL install shares this subject."""
+    default = {"tls": {"subject_dn": "O = Internet Widgits Pty Ltd, CN = localhost"}}
+    assert "tls.subject_cn" not in _extracted(default, target="x.example")
+
+
+def test_a_stock_server_landing_page_title_is_not_a_selector():
+    for title in ("Welcome to nginx!", "404 Not Found", "It works!"):
+        got = _extracted({"http": {"title": title}}, target="x.example")
+        assert "http.title" not in got, title
+
+
+def test_the_nameserver_set_is_one_selector_not_several():
+    """One nameserver shared with a mass provider means nothing; the whole
+    set is an account."""
+    got = _extracted(_OBSERVED)
+    assert isinstance(got["dns.ns_set"], list)
+    assert S.normalize("dns.ns_set", got["dns.ns_set"]) == "ns1.example,ns2.example"
+
+
+def test_an_ip_observation_yields_no_registration_selectors():
+    got = _extracted({**_OBSERVED, "kind": "ip"}, target="193.29.58.192", kind="ip")
+    for registration_only in ("dns.apex", "whois.registrar", "dns.ns_set"):
+        assert registration_only not in got
+
+
+def test_contextual_facts_are_still_recorded_just_powerless():
+    """They are needed to describe a finding, they simply cannot make one."""
+    got = _extracted(_OBSERVED)
+    assert got["http.server"] == "nginx/1.29.3"
+    assert not S.can_promote("http.server")
+
+
+def test_summarize_reports_missing_tools_rather_than_pretending():
+    text = observe.summarize({"http": {}, "tls": {}, "tools_missing": ["httpx"]})
+    assert "missing" in text and "httpx" in text
