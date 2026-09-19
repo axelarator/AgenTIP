@@ -30,10 +30,42 @@ from cti.store.schema import OBS_JSON_KEYS, OBS_PAYLOAD_KEYS, init_schema  # noq
 SPINE = ("observed_at", "indicator_type", "indicator_value", "actor", "source")
 COPY_TABLES = ("asn_changes", "actors", "correlations", "zeek_matches",
                "attribute_changes", "opendir_files", "active_scans")
+# Tables whose `id` comes from a `<table>_seq` sequence. The copy carries the
+# old ids over explicitly, which leaves the sequence behind them.
+SEQUENCE_TABLES = ("observations", "asn_changes", "correlations",
+                   "attribute_changes", "active_scans")
 
 
 def _source_columns(con: duckdb.DuckDBPyConnection) -> list[str]:
     return [r[0] for r in con.execute("DESCRIBE observations").fetchall()]
+
+
+def advance_sequences(con: duckdb.DuckDBPyConnection) -> None:
+    """Move each id sequence past the highest copied id. Without this the
+    first new insert takes nextval=1 and collides with a migrated row
+    (DuckDB has no setval, so the sequence is stepped forward).
+
+    Stepping nextval on its own reads back correctly on this connection but
+    is NOT persisted: a transaction with no write to commit drops the
+    sequence state on close. The throwaway CREATE/DROP makes the
+    transaction a writer so the new positions reach the WAL."""
+    con.execute("BEGIN")
+    try:
+        for table in SEQUENCE_TABLES:
+            top = con.execute(
+                f"SELECT coalesce(max(id), 0) FROM {table}").fetchone()[0]
+            if not top:
+                continue
+            current = con.execute(f"SELECT nextval('{table}_seq')").fetchone()[0]
+            if current < top:
+                con.execute(f"SELECT count(nextval('{table}_seq')) "
+                            f"FROM range({top - current})")
+        con.execute("CREATE TABLE _seqfix (x INTEGER)")
+        con.execute("DROP TABLE _seqfix")
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
 
 
 def migrate(source: Path, dest: Path) -> dict:
@@ -94,6 +126,7 @@ def migrate(source: Path, dest: Path) -> dict:
                 f"VALUES ({', '.join('?' for _ in shared)})", data)
         copied[table] = len(data)
 
+    advance_sequences(dst)
     src.close()
     dst.close()
     return copied
@@ -138,6 +171,15 @@ def verify(source: Path, dest: Path) -> int:
         if a != b:
             problems.append(f"{table}: {a} -> {b}")
         print(f"{table:22s} {a:>6} -> {b}")
+
+    for table in SEQUENCE_TABLES:
+        top = dst.execute(f"SELECT coalesce(max(id), 0) FROM {table}").fetchone()[0]
+        last = dst.execute("SELECT last_value FROM duckdb_sequences() "
+                           "WHERE sequence_name = ?", [f"{table}_seq"]).fetchone()
+        last = last[0] if last else None
+        if top and (last is None or last < top):
+            problems.append(f"{table}_seq at {last} but max id is {top}: "
+                            f"the next insert will collide")
 
     src.close()
     dst.close()
