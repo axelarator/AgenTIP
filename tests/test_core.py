@@ -1508,7 +1508,7 @@ def test_pivot_cluster_logs_ptr_history(stub_cluster_sweep_net):
 
 def test_pivot_cluster_logs_resolved_ip_history(stub_cluster_sweep_net):
     stub_cluster_sweep_net.setattr(
-        core.pivot, "resolve_host", lambda host: ["203.0.113.7"])
+        core.pivot, "resolve_host", lambda host: ["185.99.4.12"])
     core.create_cluster("Resolve Sweep")
     core.add_observable("Resolve Sweep", "domains", "c2.example", "r")
 
@@ -1520,7 +1520,7 @@ def test_pivot_cluster_logs_resolved_ip_history(stub_cluster_sweep_net):
             """SELECT resolved_ip FROM observations_wide
                WHERE indicator_value = ? AND source = 'dns_resolve'""",
             ["c2.example"]).fetchone()
-    assert json.loads(row[0]) == ["203.0.113.7"]
+    assert json.loads(row[0]) == ["185.99.4.12"]
 
 
 def test_pivot_cluster_logs_threatfox_history_when_keyed(stub_cluster_sweep_net):
@@ -1690,3 +1690,82 @@ def test_requeue_fingerprint_rejects_ipv6():
     core.add_observable("Requeue IPv6", "ips", "2a10:1fc0:6::de96:9634", "seed")
     with pytest.raises(ValueError):
         core.requeue_fingerprint("Requeue IPv6", "ips", "2a10:1fc0:6::de96:9634")
+
+
+# --------------------------------------------------------------------------- #
+# ingest_report(exclude=...) - keep false positives away from the probe VM
+# --------------------------------------------------------------------------- #
+
+_VENDOR_REPORT = (
+    "FamousSparrow used a loader. Contact threatintel@eset.com or see eset.com. "
+    "Hosted at Latitude.sh; C2 at 185.99.4.12 and evil-c2[.]xyz, "
+    "sha1 44f0a22b143b79fa760bf31e14c8fff714c8a2a1."
+)
+
+
+@pytest.fixture
+def seen_by_enrichment(monkeypatch):
+    """Record what the ingest hands to the live-enrichment step - the one
+    that generates traffic - instead of letting it run."""
+    seen = {"domains": [], "ips": []}
+
+    def fake(domains, ips):
+        seen["domains"], seen["ips"] = list(domains), list(ips)
+        return {}
+    monkeypatch.setattr(core, "_sweep_lifecycle", fake)
+    return seen
+
+
+def test_excluded_values_never_reach_live_enrichment(tmp_path, seen_by_enrichment):
+    """Extraction matched the vendor's own domain and a hosting provider.
+    Each new domain gets a live TLS/HTTP grab from the probe VM, and
+    pruning afterwards with remove_observable is too late - the traffic has
+    already left."""
+    report = tmp_path / "r.txt"; report.write_text(_VENDOR_REPORT)
+    core.ingest_report(str(report), cluster_name="FamousSparrow",
+                       exclude=["eset.com", "Latitude.sh"])
+    assert "eset.com" not in seen_by_enrichment["domains"]
+    assert "latitude.sh" not in [d.lower() for d in seen_by_enrichment["domains"]]
+    assert "evil-c2.xyz" in seen_by_enrichment["domains"], "real infrastructure must still be enriched"
+    assert "185.99.4.12" in seen_by_enrichment["ips"]
+
+
+def test_without_exclude_the_false_positives_are_enriched(tmp_path, seen_by_enrichment):
+    """The control: proves the test above is testing the parameter, and
+    that the default behaviour is unchanged."""
+    report = tmp_path / "r.txt"; report.write_text(_VENDOR_REPORT)
+    core.ingest_report(str(report), cluster_name="FamousSparrow")
+    assert "eset.com" in seen_by_enrichment["domains"]
+
+
+def test_excluded_values_are_not_filed_and_are_reported_back(tmp_path, seen_by_enrichment):
+    report = tmp_path / "r.txt"; report.write_text(_VENDOR_REPORT)
+    data = core.ingest_report(str(report), cluster_name="FamousSparrow",
+                              exclude=["eset.com", "threatintel@eset.com"])
+    filed = {o["value"] for cat in ("domains", "ips", "emails") for o in data["observables"][cat]}
+    assert "eset.com" not in filed and "threatintel@eset.com" not in filed
+    assert set(data["excluded"]) == {"eset.com", "threatintel@eset.com"}
+
+
+def test_the_exclusion_report_is_not_persisted_into_the_cluster(tmp_path, seen_by_enrichment):
+    report = tmp_path / "r.txt"; report.write_text(_VENDOR_REPORT)
+    core.ingest_report(str(report), cluster_name="FamousSparrow", exclude=["eset.com"])
+    assert "excluded" not in core.load_cluster("FamousSparrow")
+
+
+def test_exclude_is_case_insensitive_and_hashes_match_with_or_without_prefix(tmp_path, seen_by_enrichment):
+    report = tmp_path / "r.txt"; report.write_text(_VENDOR_REPORT)
+    data = core.ingest_report(str(report), cluster_name="A", exclude=["ESET.COM"])
+    assert "eset.com" in [v.lower() for v in data["excluded"]]
+
+    data2 = core.ingest_report(str(report), cluster_name="B",
+                               exclude=["44F0A22B143B79FA760BF31E14C8FFF714C8A2A1"])
+    assert any("44f0a22b" in v.lower() for v in data2["excluded"])
+    assert not any("44f0a22b" in o["value"].lower() for o in data2["observables"]["hashes"])
+
+
+def test_excluding_something_that_was_not_extracted_is_harmless(tmp_path, seen_by_enrichment):
+    report = tmp_path / "r.txt"; report.write_text(_VENDOR_REPORT)
+    data = core.ingest_report(str(report), cluster_name="FamousSparrow",
+                              exclude=["not-in-the-report.example", "", "   "])
+    assert data["excluded"] == []

@@ -347,15 +347,22 @@ def analyze_report(source: str) -> dict:
 
 @mcp.tool()
 def ingest_report(source: str, cluster_name: str | None = None,
-                   create_if_missing: bool = True) -> dict:
+                   create_if_missing: bool = True,
+                   exclude: list[str] | None = None) -> dict:
     """Fetch a threat report (URL or local file path), extract
     observables and ATT&CK TTPs, and file them into a cluster —
     creating it if needed. If cluster_name is omitted, tries to infer
     the threat actor/malware name from the report text and raises if
     that's ambiguous (pass cluster_name explicitly in that case). Every
     genuinely new domain/ip extracted also gets a live asn/ports/cert/
-    tags enrichment lookup before it's filed."""
-    return core.ingest_report(source, cluster_name, create_if_missing)
+    tags enrichment lookup before it's filed.
+
+    Run analyze_report first and pass `exclude` for anything that is not
+    adversary infrastructure - the vendor's own domain, a hosting provider
+    named in the text, a contact email. Extraction over-matches, and each
+    new domain/ip gets a live probe-VM lookup, so pruning afterwards is too
+    late. Dropped values come back under `excluded`."""
+    return core.ingest_report(source, cluster_name, create_if_missing, exclude)
 
 
 @mcp.tool()

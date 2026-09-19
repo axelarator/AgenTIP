@@ -2063,7 +2063,8 @@ def _merge_ttps(data: dict[str, Any], technique_ids: list[str], source: str) -> 
 
 
 def ingest_report(source: str, cluster_name: str | None = None,
-                   create_if_missing: bool = True) -> dict[str, Any]:
+                   create_if_missing: bool = True,
+                   exclude: list[str] | None = None) -> dict[str, Any]:
     """Fetch a report, extract observables/TTPs, and file them into a
     cluster — creating it if it doesn't exist yet.
 
@@ -2106,16 +2107,58 @@ def ingest_report(source: str, cluster_name: str | None = None,
     write - see _sweep_lifecycle's docstring for why that has to happen
     outside _data_lock. The single report-URL fetch itself still runs
     under the lock, unchanged from before.
+
+    `exclude` drops extracted values BEFORE anything else happens to them,
+    which matters more than it sounds. Extraction over-matches - a vendor's
+    own domain, a hosting provider named in the prose, the contact email in
+    the footer - and every new domain and IP gets a live TLS/HTTP grab from
+    the probe VM. The fingerprint-queue guard above only stops the
+    *fingerprint* probe; without this, filing the report would still send
+    lookups and a live connection at the vendor's and the provider's own
+    servers, which is not what the probe VM is for. Pruning afterwards with
+    remove_observable is too late: the traffic has already left. Matching is
+    case-insensitive on the value as shown by analyze_report, and a hash may
+    be given with or without its algorithm prefix. What was dropped comes
+    back under `excluded` so the exclusion can be recorded in the hunt log.
     """
-    cluster_name, extracted, new_domains, new_ips = _ingest_report_phase1(
-        source, cluster_name, create_if_missing)
+    cluster_name, extracted, new_domains, new_ips, excluded = _ingest_report_phase1(
+        source, cluster_name, create_if_missing, exclude)
     enrichment = _sweep_lifecycle(new_domains, new_ips)  # unlocked
-    return _ingest_report_phase2(cluster_name, source, extracted, enrichment, create_if_missing)
+    result = _ingest_report_phase2(cluster_name, source, extracted, enrichment, create_if_missing)
+    result["excluded"] = excluded   # the returned dict only; it is not re-saved
+    return result
+
+
+def _apply_exclusions(extracted: dict[str, Any], exclude: list[str] | None
+                      ) -> tuple[dict[str, Any], list[str]]:
+    """Remove `exclude`d values from an extraction. Returns (kept, removed)."""
+    wanted = {e.strip().lower() for e in (exclude or []) if e and e.strip()}
+    if not wanted:
+        return extracted, []
+    kept: dict[str, Any] = {}
+    removed: list[str] = []
+    for category, values in extracted.items():
+        if not isinstance(values, list):
+            kept[category] = values
+            continue
+        survivors = []
+        for value in values:
+            if not isinstance(value, str):
+                survivors.append(value)
+                continue
+            bare = value.split(":", 1)[1] if category == "hashes" and ":" in value else value
+            if value.lower() in wanted or bare.lower() in wanted:
+                removed.append(value)
+            else:
+                survivors.append(value)
+        kept[category] = survivors
+    return kept, removed
 
 
 @_synchronized
-def _ingest_report_phase1(source: str, cluster_name: str | None, create_if_missing: bool
-                          ) -> tuple[str, dict[str, Any], list[str], list[str]]:
+def _ingest_report_phase1(source: str, cluster_name: str | None, create_if_missing: bool,
+                          exclude: list[str] | None = None
+                          ) -> tuple[str, dict[str, Any], list[str], list[str], list[str]]:
     """Locked: fetch the report (one bounded URL fetch, as before) and
     extract/resolve the cluster name - no per-indicator network calls
     happen in this phase. Returns what phase 2 needs to finish the write,
@@ -2123,7 +2166,7 @@ def _ingest_report_phase1(source: str, cluster_name: str | None, create_if_missi
     that runs between the two phases."""
     text = _fetch_report_text(source)
     text = report_ingest.defang_normalize(text)
-    extracted = report_ingest.extract_observables(text)
+    extracted, excluded = _apply_exclusions(report_ingest.extract_observables(text), exclude)
 
     if cluster_name is None:
         candidates = report_ingest.suggest_cluster_names(text)
@@ -2147,7 +2190,7 @@ def _ingest_report_phase1(source: str, cluster_name: str | None, create_if_missi
 
     new_domains = _new_values(data, "domains", extracted["domains"])
     new_ips = _new_values(data, "ips", extracted["ips"])
-    return cluster_name, extracted, new_domains, new_ips
+    return cluster_name, extracted, new_domains, new_ips, excluded
 
 
 @_synchronized
