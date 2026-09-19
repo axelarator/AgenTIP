@@ -198,3 +198,43 @@ def test_html_stripped(tmp_path):
     assert "ignored()" not in text
     assert "Fox Tempest" in text
     assert "T1059.001" in text
+
+
+# --------------------------------------------------------------------------- #
+# <wbr> inside a hash - the SparroWocky report, where 4 of 5 SHA-1s were lost
+# --------------------------------------------------------------------------- #
+
+_SPLIT_HASH_ROW = (
+    '<td><span style="font-family: courier new;">3209689E509205CCDB7E<wbr />'
+    '49062B7B407DDC23CAC1</span></td><td>winfsp-x64.dll</td>')
+
+
+def test_wbr_inside_a_hash_does_not_split_it():
+    """A word-break hint is not a boundary. Turning it into a space split
+    each hash in the report's IoC table into two fragments that matched
+    nothing."""
+    text = report_ingest._strip_html(_SPLIT_HASH_ROW)
+    assert "3209689E509205CCDB7E49062B7B407DDC23CAC1" in text
+
+
+def test_the_split_hashes_are_extracted_as_sha1s():
+    text = report_ingest._strip_html(_SPLIT_HASH_ROW)
+    found = report_ingest.extract_observables(text)["hashes"]
+    assert "sha1:3209689e509205ccdb7e49062b7b407ddc23cac1" in [h.lower() for h in found]
+
+
+def test_wbr_variants_are_all_handled():
+    for tag in ("<wbr>", "<wbr/>", "<wbr />", "<WBR>", '<wbr class="x">'):
+        assert report_ingest._strip_html(f"ab{tag}cd") == "abcd", tag
+
+
+def test_soft_hyphens_and_zero_width_spaces_do_not_split_a_hash():
+    assert report_ingest._strip_html("aaaa&shy;bbbb&#8203;cccc") == "aaaabbbbcccc"
+
+
+def test_ordinary_tags_still_separate_words():
+    """The fix must be narrow: everything else stays a boundary, or
+    adjacent table cells would run together into one token."""
+    assert report_ingest._strip_html("<td>one</td><td>two</td>").split() == ["one", "two"]
+    assert report_ingest._strip_html("a<br>b").split() == ["a", "b"]
+    assert report_ingest._strip_html("<b>x</b><i>y</i>").split() == ["x", "y"]

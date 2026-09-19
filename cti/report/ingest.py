@@ -153,10 +153,25 @@ def defang_normalize(text: str) -> str:
     return text
 
 
+# Characters that exist only to give a browser somewhere to break a long
+# string, and so must vanish rather than become a separator.
+_INVISIBLE_BREAKS = ("\u00ad", "\u200b")   # soft hyphen, zero-width space
+
+
 def _strip_html(raw: str) -> str:
     raw = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", raw)
+    # <wbr> is a zero-width word-break HINT, not a boundary. Vendors put it
+    # inside long hashes so table cells wrap - ESET's IoC tables do - and
+    # turning it into a space (as every other tag becomes) splits the hash in
+    # two. That silently dropped 4 of the 5 SHA-1s in the SparroWocky report:
+    # "3209689E509205CCDB7E<wbr />49062B7B407DDC23CAC1" read as two fragments
+    # and matched neither the sha1 nor any other pattern.
+    raw = re.sub(r"(?i)<wbr\b[^>]*>", "", raw)
     raw = re.sub(r"(?s)<[^>]+>", " ", raw)
-    return html.unescape(raw)
+    text = html.unescape(raw)
+    for ch in _INVISIBLE_BREAKS:   # &shy; / &#8203;, the entity forms of the same hint
+        text = text.replace(ch, "")
+    return text
 
 
 def _pdftotext(path: str) -> str:
