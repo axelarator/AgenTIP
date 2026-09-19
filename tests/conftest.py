@@ -42,6 +42,10 @@ def isolated_data(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("CTI_DATA_DIR", str(tmp_path / "clusters"))
     monkeypatch.setenv("CTI_DUCKDB_PATH", str(tmp_path / "tracking.duckdb"))
+    # Pipeline traces too. This was missing, and a test that ran the real
+    # collect graph wrote its 8 stub clusters into the live data/runs/ as if
+    # they were today's collect run; the dashboard showed them as real.
+    monkeypatch.setenv("CTI_RUNS_DIR", str(tmp_path / "runs"))
     for var in ("CTI_TRACKING_INBOX", "CTI_TRACKING_ARCHIVE",
                 "CTI_TRACKING_DIGESTS", "CTI_TRACKING_NARRATIVES"):
         monkeypatch.setenv(var, str(tmp_path / var.lower()))

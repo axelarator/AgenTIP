@@ -378,3 +378,11 @@ def test_the_printed_cron_lines_source_bashrc():
              and "* * *" in l]
     assert len(lines) == 2
     assert all("$HOME/.bashrc" in l for l in lines), lines
+
+
+def test_no_test_can_write_pipeline_traces_into_the_live_data_dir():
+    """conftest redirects CTI_RUNS_DIR for every test. Without it, running the
+    suite silently overwrote data/runs/<today>.collect.jsonl with fake stub
+    clusters, which the dashboard then presented as a real run."""
+    live = Path(__file__).resolve().parents[1] / "data" / "runs"
+    assert live not in trace.runs_dir().parents and trace.runs_dir() != live
