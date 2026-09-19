@@ -138,16 +138,24 @@ def fan_out_clusters(state: dict) -> list[Send]:
 UNKNOWN_ALARM = 0.5
 
 
-def _unknown_share(results: list[dict]) -> tuple[int, int]:
-    unknown = checked = 0
+def _unknown_share(results: list[dict]) -> dict[str, dict[str, int]]:
+    """{"domains": {"unknown": n, "checked": m}, "ips": {...}}.
+
+    Per category, not blended. Domains and IPs fail independently - domain
+    lifecycle needs several probe-VM calls each where an IP needs a couple -
+    so a blend hides exactly the failure that matters: the first full run
+    had 49 of 57 domains "unknown" against 47 healthy IPs, which averages to
+    47% and slipped under the 50% line.
+    """
+    out = {"domains": {"unknown": 0, "checked": 0}, "ips": {"unknown": 0, "checked": 0}}
     for r in results:
         if not r.get("ok"):
             continue
-        for cat in ("domains", "ips"):
+        for cat in out:
             for row in (r.get("result") or {}).get(cat) or []:
-                checked += 1
-                unknown += row.get("status") == "unknown"
-    return unknown, checked
+                out[cat]["checked"] += 1
+                out[cat]["unknown"] += row.get("status") == "unknown"
+    return out
 
 
 def _sweep_blocked(state: dict) -> bool:
@@ -205,16 +213,19 @@ def enrich_and_write(state: dict) -> dict:
     # used to set no status at all, so a cluster that failed (fox-tempest,
     # 2026-09-19) sat in pivot_sweep.errors while the phase block read
     # all-ok - visible only to someone who opened the JSON.
-    unknown, checked = _unknown_share(results)
-    sections["pivot_sweep"]["unknown"] = {"unknown": unknown, "checked": checked}
+    shares = _unknown_share(results)
+    sections["pivot_sweep"]["unknown"] = shares
+    alarmed = {cat: v for cat, v in shares.items()
+               if v["checked"] and v["unknown"] / v["checked"] >= UNKNOWN_ALARM}
     problems = len(errors) + len(history_errors)
     if _sweep_blocked(state):
         status = "blocked by preflight - see the preflight line above"
-    elif checked and unknown / checked >= UNKNOWN_ALARM:
-        status = (f"{unknown} of {checked} observables came back 'unknown' - "
-                  f"that is a source outage or a bad environment, not "
-                  f"infrastructure going dark; the cluster statuses were "
-                  f"overwritten")
+    elif alarmed:
+        detail = "; ".join(f"{v['unknown']} of {v['checked']} {cat}"
+                           for cat, v in alarmed.items())
+        status = (f"{detail} came back 'unknown' - that is a source outage or "
+                  f"an overloaded probe VM, not infrastructure going dark; the "
+                  f"cluster statuses were overwritten")
     elif problems:
         status = (f"{len(errors)} cluster(s) failed, {len(history_errors)} without "
                   f"recorded history: {', '.join(sorted({*errors, *history_errors}))}")

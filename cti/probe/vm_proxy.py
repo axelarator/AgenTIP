@@ -24,6 +24,8 @@ Windows box historically) without editing this file:
                          defaults to `python3 /opt/cti/probe_helper.py`
   CTI_PROBE_SSH_TIMEOUT  per-call SSH timeout for the quick actions (s)
   CTI_PROBE_LONG_TIMEOUT SSH timeout for the long actions (nmap/dirsearch, s)
+  CTI_PROBE_MAX_CONCURRENT  cap on simultaneous calls (default 6; sshd's
+                         MaxSessions is ~10 per multiplexed connection)
 
 Protocol: one JSON object on stdin, one JSON object on stdout, handled
 by probe_helper.py on the VM (see that module for the full request/
@@ -64,6 +66,7 @@ import json
 import os
 import shlex
 import subprocess
+import threading
 
 # --- probe VM connection (from the environment - see module docstring) ------
 PROBE_USER = os.environ.get("CTI_PROBE_USER", "detonate")
@@ -100,18 +103,37 @@ SSH_CONTROL_PERSIST = os.environ.get("CTI_PROBE_CONTROL_PERSIST", "300")
 # ----------------------------------------------------------------------------
 
 
+# A process-wide ceiling on concurrent probe-VM calls.
+#
+# Every call here is a separate `ssh` command multiplexed over ONE
+# ControlMaster connection, and sshd allows roughly 10 sessions per
+# connection (MaxSessions, default 10). The old design never got near that:
+# clusters were swept one at a time, each with a 6-worker pool, so 6 at most.
+# Fanning the clusters out multiplied it to 9 x 6 = 54, and the first full run
+# lost 49 of 57 domain lookups to "timed out after 60 seconds" - the excess
+# sessions queued behind the limit and their clocks ran out. Every one came
+# back "unknown", which pivot_cluster then wrote over the real status.
+#
+# The default of 6 is what the old design's pool size implied. Raise it only
+# after raising MaxSessions on the VM. The slot is taken BEFORE the timeout
+# starts, so time spent waiting for a slot is not charged against the call.
+_MAX_CONCURRENT = int(os.environ.get("CTI_PROBE_MAX_CONCURRENT", "6"))
+_slots = threading.BoundedSemaphore(_MAX_CONCURRENT)
+
+
 def _ssh_json_rpc(request: dict[str, object], timeout: int | None = None) -> dict[str, object]:
-    proc = subprocess.run(
-        ["ssh", "-i", PROBE_SSH_KEY,
-         "-o", "BatchMode=yes",
-         "-o", "StrictHostKeyChecking=yes",
-         "-o", f"UserKnownHostsFile={PROBE_KNOWN_HOSTS}",
-         "-o", "ControlMaster=auto",
-         "-o", f"ControlPersist={SSH_CONTROL_PERSIST}",
-         "-o", f"ControlPath={SSH_CONTROL_PATH}",
-         f"{PROBE_USER}@{PROBE_HOST}", *PROBE_HELPER_CMD],
-        input=json.dumps(request), capture_output=True, text=True,
-        timeout=timeout if timeout is not None else SSH_TIMEOUT)
+    with _slots:
+        proc = subprocess.run(
+            ["ssh", "-i", PROBE_SSH_KEY,
+             "-o", "BatchMode=yes",
+             "-o", "StrictHostKeyChecking=yes",
+             "-o", f"UserKnownHostsFile={PROBE_KNOWN_HOSTS}",
+             "-o", "ControlMaster=auto",
+             "-o", f"ControlPersist={SSH_CONTROL_PERSIST}",
+             "-o", f"ControlPath={SSH_CONTROL_PATH}",
+             f"{PROBE_USER}@{PROBE_HOST}", *PROBE_HELPER_CMD],
+            input=json.dumps(request), capture_output=True, text=True,
+            timeout=timeout if timeout is not None else SSH_TIMEOUT)
     if proc.returncode != 0 and not proc.stdout:
         raise VMProxyError(f"ssh transport to {PROBE_HOST!r} failed: {proc.stderr.strip()}")
     try:

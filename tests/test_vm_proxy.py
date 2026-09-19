@@ -185,3 +185,90 @@ def test_probe_host_reads_environment(monkeypatch):
     finally:
         monkeypatch.undo()
         importlib.reload(vm_proxy)
+
+
+# --------------------------------------------------------------------------- #
+# The concurrency cap - the first full fan-out lost 49 of 57 domain lookups
+# --------------------------------------------------------------------------- #
+
+def test_concurrent_probe_calls_never_exceed_the_cap(monkeypatch):
+    """Every call is an ssh command multiplexed over ONE connection, and sshd
+    allows ~10 sessions per connection. Nothing capped it, and fanning 9
+    clusters x 6 workers out put up to 54 through at once."""
+    import json
+    import subprocess
+    import threading
+    import time
+
+    cap = 3
+    monkeypatch.setattr(vm_proxy, "_slots", threading.BoundedSemaphore(cap))
+    lock, live, peak = threading.Lock(), [0], [0]
+
+    def fake_run(cmd, **kw):
+        with lock:
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+        time.sleep(0.03)
+        with lock:
+            live[0] -= 1
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"ok": True}), stderr="")
+
+    monkeypatch.setattr(vm_proxy.subprocess, "run", fake_run)
+    results, errors = [], []
+
+    def call():
+        try:
+            results.append(vm_proxy._ssh_json_rpc({"action": "x"}))
+        except Exception as e:                          # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=call) for _ in range(30)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    assert errors == [] and len(results) == 30, "every call must still complete"
+    assert peak[0] <= cap, f"{peak[0]} concurrent calls with a cap of {cap}"
+    assert peak[0] > 1, "the cap must not serialise everything"
+
+
+def test_the_ssh_timeout_is_not_charged_for_time_spent_waiting_for_a_slot(monkeypatch):
+    """The slot is taken before subprocess.run's clock starts. Otherwise a
+    queue behind the cap would itself cause the timeouts it exists to
+    prevent."""
+    import json
+    import subprocess
+    import threading
+
+    monkeypatch.setattr(vm_proxy, "_slots", threading.BoundedSemaphore(1))
+    seen = []
+
+    def fake_run(cmd, **kw):
+        seen.append(kw.get("timeout"))
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({}), stderr="")
+
+    monkeypatch.setattr(vm_proxy.subprocess, "run", fake_run)
+    vm_proxy._ssh_json_rpc({}, timeout=42)
+    vm_proxy._ssh_json_rpc({})
+    assert seen == [42, vm_proxy.SSH_TIMEOUT]
+
+
+def test_a_failed_call_releases_its_slot(monkeypatch):
+    """A leaked slot would starve the pool a call at a time until the whole
+    sweep hangs."""
+    import subprocess
+    import threading
+
+    monkeypatch.setattr(vm_proxy, "_slots", threading.BoundedSemaphore(1))
+
+    def boom(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 60)
+
+    monkeypatch.setattr(vm_proxy.subprocess, "run", boom)
+    for _ in range(5):        # more attempts than slots
+        with pytest.raises(subprocess.TimeoutExpired):
+            vm_proxy._ssh_json_rpc({})
+
+
+def test_the_cap_defaults_to_what_the_old_design_implied():
+    """The old sweep peaked at its 6-worker pool."""
+    assert vm_proxy._MAX_CONCURRENT == 6

@@ -352,7 +352,7 @@ def test_a_sweep_where_everything_came_back_unknown_is_flagged():
         _swept("jadeprox", ["unknown"] * 27), _swept("stac4749", ["unknown"] * 36)]
     ))["sections"]
     status = sections["status"]["pivot_sweep"]
-    assert status != "ok" and "63 of 63" in status and "outage" in status
+    assert status != "ok" and "63 of 63 domains" in status and "outage" in status
 
 
 def test_a_normal_mix_of_statuses_is_not_flagged():
@@ -386,3 +386,22 @@ def test_no_test_can_write_pipeline_traces_into_the_live_data_dir():
     clusters, which the dashboard then presented as a real run."""
     live = Path(__file__).resolve().parents[1] / "data" / "runs"
     assert live not in trace.runs_dir().parents and trace.runs_dir() != live
+
+
+def test_domains_failing_are_flagged_even_when_the_ips_are_healthy():
+    """The real 2026-09-19 18:41 run: 49 of 57 domains 'unknown' (every one an
+    SSH timeout) beside 47 healthy IPs. Blended, that is 49/104 = 47% and
+    slipped under the 50% alarm, so the phase status read 'ok'."""
+    domains = _swept("jadeprox", ["unknown"] * 49 + ["active"] * 8)
+    ips = {"cluster": "sliver", "ok": True, "history_note": None,
+           "result": {"domains": [], "ips": [{"value": f"1.1.1.{n}", "status": "routed"}
+                                             for n in range(47)]}}
+    status = collect.enrich_and_write(_state([domains, ips]))["sections"]["status"]["pivot_sweep"]
+    assert status != "ok" and "49 of 57 domains" in status
+    assert "ips" not in status.split("came back")[0], "healthy IPs must not be named"
+
+
+def test_the_unknown_share_is_reported_per_category():
+    sections = collect.enrich_and_write(_state([_swept("a", ["unknown", "active", "dead"])]))["sections"]
+    assert sections["pivot_sweep"]["unknown"] == {
+        "domains": {"unknown": 1, "checked": 3}, "ips": {"unknown": 0, "checked": 0}}
