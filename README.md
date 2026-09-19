@@ -153,6 +153,35 @@ façade that re-exports from submodules silently breaks that kind of
 patching. It is worth doing, with the patch targets moved in the same
 change, and it was not worth doing quickly.
 
+**The analysis stage is blind to a newly ingested report.** Found on the first
+real end-to-end run (the ESET FamousSparrow report). `rank` reads only
+`attribute_changes`, `asn_pivots` and `open_directories`, and it deliberately
+drops `first_seen` rows as "a baseline, not a change" - right for daily churn,
+wrong for the day a whole cluster arrives. The new cluster appears in the digest
+once (`recent_actor_activity`, which nothing reads), so the narrative said
+nothing about it. Fixing it needs a signal for "cluster newly registered or
+newly filed today" and a specialist to read it; it is a design decision, not a
+patch.
+
+**Per-node timings are inter-completion gaps, not durations.** `trace.py`
+records the time since the *previous* event. That is exact for sequential nodes
+and misleading for parallel ones: the 9 `sweep` entries in a collect trace sum
+to the stage total (276s) because each is measured from the last one finishing,
+and "slowest: sweep" says nothing about which cluster was slow. Real durations
+need a start timestamp taken inside each node, which LangGraph's update stream
+does not provide.
+
+## Operating notes
+
+- **`CTI_PROBE_MAX_CONCURRENT`** (default 6) caps simultaneous probe-VM calls.
+  They share one multiplexed SSH connection and sshd allows ~10 sessions per
+  connection; raise it only after raising `MaxSessions` on the VM.
+- **`CTI_PROBE_SUBFINDER_TIMEOUT`** (default 200s) must stay above the helper's
+  own 180s subfinder limit; a test enforces it.
+- **`ingest_report(exclude=[...])`**: run `analyze_report` first and exclude the
+  vendor's own domain, hosting providers named in prose, and contact emails.
+  Each new domain gets a live probe-VM lookup, so pruning afterwards is too late.
+
 ## Why this is still Python
 
 The HTTP work was already parallel (`ThreadPoolExecutor` in the cluster
@@ -186,7 +215,7 @@ python -m graph collect         # Stage A  (defaults to today)
 python -m graph analyze         # Stage B
 python -m graph analyze --dry-run --date 2026-09-18   # no writes
 python -m graph trace --date 2026-09-18               # node timings
-pytest                          # 409 tests
+pytest                          # 442 tests
 ```
 
 Secrets stay in the environment (`~/.bashrc`, which cron sources):
