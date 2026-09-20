@@ -35,9 +35,18 @@ _DEFAULT_TITLES = {
 
 
 def _is_default_cert(subject: str | None) -> bool:
+    """Whether a certificate subject identifies a stock build.
+
+    Spacing is normalised first: tools emit both "CN = localhost" and
+    "CN=localhost", and matching on one form let the other straight
+    through. A live sweep recorded "cn=localhost, ou=it, o=myorg,
+    l=default, st=default, c=ru" as a structural link past this filter.
+
+    That one is kept deliberately - see _DEFAULT_CERT_MARKERS.
+    """
     if not subject:
         return False
-    lowered = subject.lower()
+    lowered = " ".join(subject.lower().replace("=", " = ").split())
     return any(marker in lowered for marker in _DEFAULT_CERT_MARKERS)
 
 
@@ -57,9 +66,16 @@ def selectors_from(result: dict[str, Any], *, target: str,
 
     # --- identity ---------------------------------------------------------
     # The rotation-proof link: the same bytes served from somewhere else.
-    if http.get("body_sha256"):
+    #
+    # Except off a CDN edge address. Probing an IP that belongs to a CDN
+    # returns the CDN's own default response, and its digest is identical on
+    # every edge node - a live sweep linked three Cloudflare addresses to
+    # each other that way. A DOMAIN behind a CDN is different: the bytes are
+    # the operator's, so only the IP case is suppressed.
+    probing_cdn_edge = kind == "ip" and (on_shared_infra or cdn_failed)
+    if http.get("body_sha256") and not probing_cdn_edge:
         yield "http.body_sha256", http["body_sha256"]
-    if http.get("favicon_mmh3") not in (None, "", 0):
+    if http.get("favicon_mmh3") not in (None, "", 0) and not probing_cdn_edge:
         yield "http.favicon_mmh3", http["favicon_mmh3"]
     if tls.get("cert_sha256"):
         yield "tls.cert_sha256", tls["cert_sha256"]
@@ -71,9 +87,17 @@ def selectors_from(result: dict[str, Any], *, target: str,
     # --- structural -------------------------------------------------------
     if tls.get("serial"):
         yield "tls.serial", tls["serial"]
+    # A stock subject is not nothing - two tracked hosts sharing one are
+    # running the same build - but it is not a structural link either, since
+    # every unconfigured deployment of that software carries it. So it is
+    # recorded at behavioural strength rather than discarded, which is what
+    # an earlier version did to "cn=localhost, ou=it, o=myorg, l=default,
+    # st=default, c=ru" - a subject shared by two tracked 7-Eleven
+    # impersonation domains.
     subject = tls.get("subject_dn") or tls.get("subject_cn")
-    if subject and not _is_default_cert(subject):
-        yield "tls.subject_cn", subject
+    if subject:
+        yield ("tls.default_subject" if _is_default_cert(subject)
+               else "tls.subject_cn"), subject
     for san in tls.get("sans") or []:
         # A certificate naming its own host links nothing.
         if san and san.lower().lstrip("*.") != target.lower():

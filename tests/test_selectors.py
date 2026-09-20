@@ -630,3 +630,71 @@ def test_a_pass_where_the_tools_failed_is_not_called_silent(tmp_path, monkeypatc
             "SELECT source FROM observations WHERE indicator_value = 'unknown.example'"
         ).fetchall()}
         assert "observe_silent" not in sources
+
+
+# --------------------------------------------------------------------------- #
+# What a live sweep of 27 real observables taught us
+# --------------------------------------------------------------------------- #
+
+def test_a_set_valued_selector_is_stored_whole_not_per_member(con):
+    """The live sweep recorded ns1, ns2 and ns3.dnsowl.com as three separate
+    links. That turns "the same nameserver set" into "shares any one
+    nameserver with a mass DNS provider" - the exact match the set form
+    exists to prevent."""
+    S.record_many(con, indicator_value="a.example",
+                  found=[("dns.ns_set", ["ns2.dnsowl.com", "ns1.dnsowl.com"])],
+                  observed_at=DAY, actor="A")
+    stored = S.for_indicator(con, "a.example")
+    assert len(stored) == 1
+    assert stored[0]["selector_value"] == "ns1.dnsowl.com,ns2.dnsowl.com"
+
+
+def test_a_partial_nameserver_overlap_is_not_a_link(con):
+    """Two hosts at the same provider share individual nameservers without
+    sharing an account."""
+    S.record_many(con, indicator_value="a.example",
+                  found=[("dns.ns_set", ["ns1.dnsowl.com", "ns2.dnsowl.com"])],
+                  observed_at=DAY, actor="A")
+    S.record_many(con, indicator_value="b.example",
+                  found=[("dns.ns_set", ["ns2.dnsowl.com", "ns9.dnsowl.com"])],
+                  observed_at=DAY, actor="B")
+    assert S.neighbours(con, "a.example") == []
+
+
+def test_a_cdn_edge_addresss_page_hash_is_not_a_link():
+    """Probing a CDN address directly returns the CDN's own default page, and
+    its digest is identical on every edge node. The live sweep linked
+    104.21.60.96, 104.21.60.187 and 172.67.200.55 to each other that way."""
+    edge = {"http": {"body_sha256": "c" * 64, "favicon_mmh3": -1},
+            "cdn": {"is_cdn": True}, "errors": {}}
+    got = dict(observe.selectors_from(edge, target="104.21.60.96", kind="ip"))
+    assert "http.body_sha256" not in got and "http.favicon_mmh3" not in got
+
+
+def test_a_domain_behind_a_cdn_still_has_a_meaningful_page_hash():
+    """The bytes are the operator's content, not the CDN's error page - only
+    the IP case is suppressed."""
+    behind = {"http": {"body_sha256": "c" * 64},
+              "cdn": {"is_cdn": True}, "errors": {}}
+    got = dict(observe.selectors_from(behind, target="shop.example", kind="domain"))
+    assert got.get("http.body_sha256") == "c" * 64
+
+
+def test_a_stock_certificate_subject_corroborates_but_cannot_promote():
+    """Found live on two 7-Eleven impersonation domains. Discarding it lost a
+    real signal; calling it structural would have over-claimed - it
+    identifies the software build, the way JARM does."""
+    stock = {"tls": {"subject_dn": "cn=localhost, ou=it, o=myorg, l=default, "
+                                   "st=default, c=ru"}, "errors": {}}
+    got = dict(observe.selectors_from(stock, target="x.example", kind="domain"))
+    assert "tls.default_subject" in got and "tls.subject_cn" not in got
+    assert not S.can_promote("tls.default_subject")
+
+
+def test_cert_subject_spacing_does_not_decide_the_class():
+    """Tools emit both "CN = localhost" and "CN=localhost"; matching one form
+    let the other through as a structural link."""
+    for subject in ("CN = localhost, O = MyOrg", "cn=localhost, o=myorg"):
+        got = dict(observe.selectors_from({"tls": {"subject_dn": subject}},
+                                          target="x.example", kind="domain"))
+        assert "tls.default_subject" in got, subject

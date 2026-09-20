@@ -77,6 +77,13 @@ CREATE TABLE IF NOT EXISTS selector_stats (
 # Ordered weakest to strongest so comparisons read naturally.
 CLASS_ORDER = ("contextual", "behavioural", "structural", "identity")
 
+# Selectors whose value is a whole SET, matched only in its entirety. A list
+# handed to record_many is otherwise stored one member at a time, which
+# quietly turns "the same nameserver set" into "shares any one nameserver" -
+# the mass-provider match the set form exists to prevent. Seen for real: a
+# live sweep recorded ns1, ns2 and ns3.dnsowl.com as three separate links.
+SET_VALUED = frozenset({"dns.ns_set", "net.port_set", "http.header_set"})
+
 
 @dataclass(frozen=True)
 class SelectorType:
@@ -170,6 +177,13 @@ TYPES: dict[str, SelectorType] = {t.name: t for t in (
        "operator identity: JARM identifies software, not owners"),
     _t("tls.ja4s", "behavioural",
        "the server side of the handshake matches"),
+    _t("tls.default_subject", "behavioural",
+       "the same stock certificate subject - a self-signed cert left at its "
+       "install-time defaults. Identifies the software build, the way JARM "
+       "does, and is genuinely useful: two tracked hosts carrying the same "
+       "one are running the same tool",
+       "operator identity. Every unconfigured deployment of that software "
+       "shares it, so it corroborates a link and cannot make one"),
     _t("net.port_set", "behavioural",
        "the same open-port pattern. Unusual high ports are the interesting "
        "case - the source reporting keyed on RDP-over-TLS at 64350, 64330, "
@@ -271,7 +285,10 @@ def record_many(con: duckdb.DuckDBPyConnection, *, indicator_value: str,
     """Record many selectors for one indicator. Returns the types that were new."""
     fresh = []
     for selector_type, value in found:
-        values = value if isinstance(value, (list, tuple, set)) else [value]
+        if selector_type in SET_VALUED:
+            values = [value]          # the set IS the value
+        else:
+            values = value if isinstance(value, (list, tuple, set)) else [value]
         for one in values:
             if record(con, indicator_value=indicator_value, selector_type=selector_type,
                       selector_value=one, observed_at=observed_at,
