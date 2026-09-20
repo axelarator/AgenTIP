@@ -1895,3 +1895,57 @@ def test_an_unchecked_certificate_is_not_recorded_as_clean(monkeypatch):
         "observe": {"tls": {}},
     })
     assert "revoked" not in entry["cert"]
+
+
+# --------------------------------------------------------------------------- #
+# The split: what must keep working
+# --------------------------------------------------------------------------- #
+
+def test_the_moved_functions_are_still_reachable_through_core():
+    """21 modules import core and several tests patch its attributes. The
+    split is only safe because core re-exports what moved."""
+    for name in ("_log_observation", "_record_opendir", "_record_enrichment",
+                 "_log_cluster_enrichment_history", "_file_cert_hash",
+                 "write_markdown"):
+        assert hasattr(core, name), name
+
+
+def test_patching_the_history_writer_on_core_still_takes_effect(monkeypatch):
+    """The load-bearing property of the split.
+
+    _record_enrichment stays in core precisely so its call to
+    _log_cluster_enrichment_history resolves in core's namespace. Moved
+    alongside the function it calls, this patch silently stops applying and
+    every test that relies on it goes green for the wrong reason.
+    """
+    seen = []
+    monkeypatch.setattr(core, "_log_cluster_enrichment_history",
+                        lambda *a, **k: seen.append(a) or None)
+    core._record_enrichment("Any", {("domains", "x.example"): ("active", {}, {})})
+    assert seen, "the patch did not reach the call"
+
+
+def test_the_renderer_takes_its_destination_rather_than_computing_it():
+    """Pure by construction: it cannot be caught out by DATA_DIR being
+    patched to one directory while CTI_DATA_DIR names another, which is the
+    state the suite actually runs in."""
+    import inspect
+
+    from cti import clusters_render
+    params = list(inspect.signature(clusters_render.write_markdown).parameters)
+    assert params == ["data", "md_path"]
+    # No code reference to the store location - the docstring explains why,
+    # so match on use rather than on the word appearing anywhere.
+    code = "\n".join(l for l in inspect.getsource(clusters_render).splitlines()
+                     if not l.lstrip().startswith("#"))
+    assert "DATA_DIR /" not in code and "data_dir()" not in code
+
+
+def test_the_date_regex_was_copied_not_rewritten():
+    """Its behaviour on a partial date is not what a fresh reading suggests:
+    a year-month with no day is completed to the first, not left short. A
+    rewritten regex would have dropped that, silently, in every cluster's
+    rendered markdown."""
+    from cti import clusters_render
+    assert clusters_render._date_only("2026-09") == "2026-09-01"
+    assert clusters_render._date_only("2026-09-20T06:00:00+00:00") == "2026-09-20"
