@@ -15,6 +15,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .. import core
 from .. import store as tracking
+from ..sources import validin
 
 mcp = FastMCP("cti-tools")
 
@@ -419,6 +420,76 @@ def get_actor_summary(actor: str) -> dict:
     known ASNs/ports, recent ASN changes and Zeek matches, correlation
     count. Prefer this over composing the same via query_duckdb."""
     return tracking.actor_summary(actor)
+
+
+# --------------------------------------------------------------------------- #
+# Validin - manual only, and metered
+# --------------------------------------------------------------------------- #
+#
+# These four are the ONLY way Validin is reachable. They are tools rather
+# than pipeline steps on purpose: a tool is invoked because somebody asked
+# for it, which is the condition this source is allowed under. Each spends
+# one of fifty monthly lookups, so each takes a `reason` and reports what is
+# left.
+
+@mcp.tool()
+def validin_status() -> dict:
+    """Validin quota: lookups left today and this month, ours and theirs.
+
+    Costs nothing. Call this before any validin_* lookup - the source is
+    capped at 10 a day and 50 a month, and the monthly cap is the binding
+    one. `drift` means our count and the provider's disagree; run
+    validin_sync to adopt theirs."""
+    return validin.status()
+
+
+@mcp.tool()
+def validin_sync() -> dict:
+    """Adopt Validin's own count of what this key has spent this month.
+
+    Costs nothing. Needed because the local counter starts at zero and the
+    account does not - lookups made through Validin's web UI are invisible
+    here until this runs."""
+    return validin.sync()
+
+
+@mcp.tool()
+def validin_reverse_selector(selector_type: str, value: str, reason: str) -> dict:
+    """Who else has this selector value, according to Validin. ONE lookup.
+
+    Use it for the two things nothing else here can do: `tls.cert_sha256`,
+    which Webamon cannot reverse because it publishes no leaf-certificate
+    digest, and `whois.registrant_email` / `whois.registrar`, which
+    Webamon's index does not carry at all. For everything else prefer
+    webamon - it is effectively unmetered by comparison.
+
+    selector_type must be one of validin.REVERSE_FIELDS; `reason` is
+    required and is recorded with the result."""
+    with validin.manual_invocation(reason):
+        return validin.reverse_selector(selector_type, value)
+
+
+@mcp.tool()
+def validin_history(indicator: str, kind: str = "dns", reason: str = "") -> dict:
+    """Passive history for one indicator. ONE lookup.
+
+    kind: "dns" (resolution history - what this resolved to before, which
+    no CLI on the probe VM can answer), "dns_ip" (the reverse, for an IP),
+    "certificates" (Certificate Transparency - the crt.sh replacement, since
+    crt.sh serves a frozen archive and no longer ingests), or "registration"
+    (WHOIS/RDAP history, where a registrant who has since gone private is
+    still visible)."""
+    with validin.manual_invocation(reason or "history lookup"):
+        if kind == "dns":
+            return validin.dns_history(indicator)
+        if kind == "dns_ip":
+            return validin.dns_history(indicator, is_ip=True)
+        if kind == "certificates":
+            return validin.certificates(indicator)
+        if kind == "registration":
+            return validin.registration_history(indicator)
+    return {"error": f"unknown kind {kind!r}: use dns, dns_ip, "
+                     "certificates or registration"}
 
 
 if __name__ == "__main__":
