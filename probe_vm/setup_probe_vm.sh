@@ -13,6 +13,8 @@ set -euo pipefail
 
 PROBE_USER=detonate            # matches vm_proxy.py's CTI_PROBE_USER default
 PUBKEY=""
+PROVISION_SRC="${PROVISION_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cti-provision}"
+PROVISION_PUBKEY="${PROVISION_PUBKEY:-}"
 SANDBOX_SRC="${SANDBOX_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sandbox}"
 HELPER_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/probe_helper.py"
 SUBFINDER_VERSION="${SUBFINDER_VERSION:-2.6.6}"
@@ -20,6 +22,7 @@ SUBFINDER_VERSION="${SUBFINDER_VERSION:-2.6.6}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --pubkey) PUBKEY="$2"; shift 2 ;;
+    --provision-pubkey) PROVISION_PUBKEY="$2"; shift 2 ;;
     --user)   PROBE_USER="$2"; shift 2 ;;
     --helper) HELPER_SRC="$2"; shift 2 ;;
     -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
@@ -69,6 +72,23 @@ if [[ -d /opt/jarm/.git ]]; then
   git -C /opt/jarm pull -q --ff-only || echo "   (jarm update skipped)"
 else
   git clone -q https://github.com/salesforce/jarm /opt/jarm
+fi
+
+echo "== cti-provision (the bounded provisioning command)"
+# A SECOND key, pinned to its own forced command, lets the tooling install
+# scanners without a human round trip. It deliberately cannot deploy code:
+# there is no verb that writes probe_helper.py or a Dockerfile, because that
+# would make the key equivalent to arbitrary code execution as $PROBE_USER.
+# Helper and sandbox changes stay with this script, which you run.
+if [[ -f "$PROVISION_SRC" ]]; then
+  install -m 0755 -o root -g root "$PROVISION_SRC" /usr/local/sbin/cti-provision
+  echo "   installed /usr/local/sbin/cti-provision"
+  # The key is pinned further down, AFTER the probe key's write - that one
+  # truncates the file on purpose (sshd matches the first line for a key, so
+  # a stale unrestricted entry would void the forced command), and appending
+  # here would simply be erased by it.
+else
+  echo "   WARNING: $PROVISION_SRC not found - skipping"
 fi
 
 echo "== observation tools (ProjectDiscovery + whois)"
@@ -154,6 +174,18 @@ install -d -m 0700 -o "$PROBE_USER" -g "$PROBE_USER" "$home/.ssh"
 # forced command. This user exists only for the probe key.
 opts='command="python3 /opt/cti/probe_helper.py",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty'
 printf '%s %s\n' "$opts" "$KEY_LINE" > "$home/.ssh/authorized_keys"
+
+# Second line: the provisioning key, its own forced command. Appended after
+# the truncating write above, never before it.
+if [[ -n "${PROVISION_PUBKEY:-}" && -f "$PROVISION_PUBKEY" ]]; then
+  prov_line=$(grep -v '^[[:space:]]*#' "$PROVISION_PUBKEY" | grep -m1 . || true)
+  prov_opts='command="/usr/local/sbin/cti-provision",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty'
+  printf '%s %s\n' "$prov_opts" "$prov_line" >> "$home/.ssh/authorized_keys"
+  echo "   pinned the provisioning key to /usr/local/sbin/cti-provision"
+elif [[ -n "${PROVISION_PUBKEY:-}" ]]; then
+  echo "   WARNING: --provision-pubkey $PROVISION_PUBKEY not found" >&2
+fi
+
 chown "$PROBE_USER:$PROBE_USER" "$home/.ssh/authorized_keys"
 chmod 0600 "$home/.ssh/authorized_keys"
 

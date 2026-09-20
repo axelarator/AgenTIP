@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# cti-provision - the only thing the provisioning key may run.
+#
+# Installed root-owned at /usr/local/sbin/cti-provision and pinned as the
+# forced command for a second key in the probe user's authorized_keys:
+#
+#   command="/usr/local/sbin/cti-provision",no-port-forwarding,\
+#   no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA...
+#
+# ## What this deliberately cannot do
+#
+# It installs named tools from the allowlist below and reports status. It
+# does NOT deploy code. There is no verb that writes probe_helper.py, the
+# sandbox Dockerfile, or anything else executable, because a script that
+# could do that would make the key equivalent to arbitrary code execution as
+# the probe user - a larger grant than "install the scanners", and not what
+# was agreed. Helper and sandbox changes go through setup_probe_vm.sh, which
+# a human runs after reading the diff.
+#
+# The tool list is fixed here rather than taken from the caller. Adding a
+# tool means deploying a new copy of this script, which is the review step.
+#
+# Every invocation is logged to /var/log/cti-provision.log with the client
+# address, so the audit trail does not depend on the caller being honest.
+set -euo pipefail
+
+LOG=/var/log/cti-provision.log
+GOBIN=/usr/local/bin
+PROBE_USER="${CTI_PROBE_USER:-detonate}"
+
+# name -> how to install it. Nothing here is parameterised by the caller.
+declare -A APT_TOOLS=(
+  [whois]="whois"
+  [dnsutils]="dnsutils"
+  [nmap]="nmap"
+  [openssl]="openssl"
+)
+declare -A GO_TOOLS=(
+  [httpx]="github.com/projectdiscovery/httpx/cmd/httpx@latest"
+  [tlsx]="github.com/projectdiscovery/tlsx/cmd/tlsx@latest"
+  [dnsx]="github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
+  [naabu]="github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
+  [cdncheck]="github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest"
+  [asnmap]="github.com/projectdiscovery/asnmap/cmd/asnmap@latest"
+)
+
+ALL_TOOLS="${!APT_TOOLS[*]} ${!GO_TOOLS[*]}"
+
+log() { printf '%s [%s] %s\n' "$(date -Is)" "${SSH_CLIENT%% *}" "$*" >>"$LOG"; }
+
+usage() {
+  cat <<EOF
+cti-provision - bounded provisioning for the CTI probe VM
+
+  status              report installed versions (read-only)
+  install <tool>      install one tool from the allowlist
+  install all         install every allowlisted tool
+  update <tool>       reinstall a tool (Go tools only; apt tools use install)
+
+allowlist: $ALL_TOOLS
+
+This command cannot deploy code. Run setup_probe_vm.sh for helper or
+sandbox changes.
+EOF
+}
+
+require_root() {
+  [[ $EUID -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
+}
+
+tool_version() {
+  local tool=$1 path
+  path=$(command -v "$tool" 2>/dev/null) || { echo "missing"; return; }
+  # Every one of these supports -version or --version; keep it to one line
+  # and never let a hanging tool wedge the connection.
+  local v
+  v=$(timeout 10 "$path" -version 2>&1 | head -1) \
+    || v=$(timeout 10 "$path" --version 2>&1 | head -1) \
+    || v="present"
+  printf '%s (%s)' "${v:-present}" "$path"
+}
+
+do_status() {
+  echo "probe VM provisioning status"
+  echo "  host:  $(hostname)"
+  echo "  go:    $(command -v go >/dev/null && go version || echo 'not installed')"
+  echo
+  for tool in $ALL_TOOLS; do
+    printf '  %-10s %s\n' "$tool" "$(tool_version "$tool")"
+  done
+  echo
+  printf '  %-10s %s\n' "docker" "$(command -v docker >/dev/null && docker --version || echo missing)"
+  printf '  %-10s %s\n' "sandbox" "$(docker image inspect cti-sbx:latest >/dev/null 2>&1 && echo 'cti-sbx:latest present' || echo 'not built')"
+  printf '  %-10s %s\n' "helper" "$([[ -f /opt/cti/probe_helper.py ]] && stat -c '%y (%s bytes)' /opt/cti/probe_helper.py || echo missing)"
+}
+
+install_apt() {
+  local tool=$1 pkg=${APT_TOOLS[$1]}
+  log "apt install $pkg"
+  DEBIAN_FRONTEND=noninteractive apt-get update -q >/dev/null 2>&1 || true
+  if DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$pkg" >/dev/null 2>&1; then
+    echo "  $tool: installed ($pkg)"
+  else
+    echo "  $tool: FAILED - apt could not install $pkg" >&2
+    return 1
+  fi
+}
+
+install_go() {
+  local tool=$1 module=${GO_TOOLS[$1]}
+  if ! command -v go >/dev/null 2>&1; then
+    log "go missing, installing golang-go for $tool"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q golang-go >/dev/null 2>&1 \
+      || { echo "  $tool: FAILED - go is not installed and golang-go would not install" >&2; return 1; }
+  fi
+  log "go install $module"
+  # GOFLAGS/GOPATH kept out of the caller's control; GOBIN fixed above.
+  if GOBIN="$GOBIN" GOPATH=/root/go GOCACHE=/root/.cache/go-build \
+     timeout 600 go install -v "$module" >/dev/null 2>&1; then
+    echo "  $tool: installed -> $GOBIN/$tool"
+    # naabu wants raw sockets for SYN scans; without the capability it falls
+    # back to connect() scans, which work and are just slower and louder.
+    if [[ $tool == naabu ]]; then
+      setcap cap_net_raw+eip "$GOBIN/naabu" 2>/dev/null \
+        && echo "    cap_net_raw granted (SYN scans)" \
+        || echo "    note: no cap_net_raw, naabu will use connect() scans"
+    fi
+  else
+    echo "  $tool: FAILED - go install did not complete" >&2
+    return 1
+  fi
+}
+
+do_install() {
+  local requested=$1 failed=0
+  local targets
+  if [[ $requested == all ]]; then
+    targets="$ALL_TOOLS"
+  else
+    # Strict allowlist check. The caller never names a package or a module,
+    # only a key of one of the maps above.
+    if [[ -z ${APT_TOOLS[$requested]:-} && -z ${GO_TOOLS[$requested]:-} ]]; then
+      echo "not in the allowlist: $requested" >&2
+      echo "allowed: $ALL_TOOLS" >&2
+      exit 2
+    fi
+    targets="$requested"
+  fi
+
+  echo "installing: $targets"
+  for tool in $targets; do
+    if [[ -n ${APT_TOOLS[$tool]:-} ]]; then
+      install_apt "$tool" || failed=1
+    else
+      install_go "$tool" || failed=1
+    fi
+  done
+
+  echo
+  echo "the probe user sees:"
+  for tool in $targets; do
+    if runuser -u "$PROBE_USER" -- command -v "$tool" >/dev/null 2>&1; then
+      printf '  %-10s ok\n' "$tool"
+    else
+      printf '  %-10s NOT ON PATH for %s\n' "$tool" "$PROBE_USER"
+      failed=1
+    fi
+  done
+  return $failed
+}
+
+main() {
+  require_root
+  touch "$LOG" && chmod 0640 "$LOG"
+
+  # Under a forced command the client's request arrives here, not in "$@".
+  # Split it ourselves rather than eval-ing it.
+  local request="${SSH_ORIGINAL_COMMAND:-${*:-status}}"
+  read -r -a argv <<<"$request"
+  local verb="${argv[0]:-status}"
+  local arg="${argv[1]:-}"
+
+  log "request: ${request:-<empty>}"
+
+  case "$verb" in
+    status)  do_status ;;
+    install) [[ -n $arg ]] || { echo "install needs a tool name or 'all'" >&2; exit 2; }
+             do_install "$arg" ;;
+    update)  [[ -n ${GO_TOOLS[$arg]:-} ]] || { echo "update only applies to Go tools: ${!GO_TOOLS[*]}" >&2; exit 2; }
+             install_go "$arg" ;;
+    help|-h|--help) usage ;;
+    *)       echo "unknown verb: $verb" >&2; usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

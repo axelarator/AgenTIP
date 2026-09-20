@@ -317,3 +317,121 @@ def test_the_bootstrap_installs_what_observe_needs():
     bootstrap = (REPO / "probe_vm" / "setup_probe_vm.sh").read_text()
     for tool in ("httpx", "tlsx", "dnsx", "naabu", "cdncheck", "whois"):
         assert tool in bootstrap, f"setup_probe_vm.sh never installs {tool}"
+
+
+# --------------------------------------------------------------------------- #
+# The provisioning path - a second key, deliberately weaker than a shell
+# --------------------------------------------------------------------------- #
+
+def _provision_script() -> str:
+    return (REPO / "probe_vm" / "cti-provision").read_text()
+
+
+def _provision_verbs() -> set[str]:
+    """The verbs the case statement actually dispatches on.
+
+    Testing this rather than grepping for scary substrings: the first version
+    of this test matched "probe_helper.py" in the status report and "eval" in
+    the phrase "rather than eval-ing it", which proved nothing either way.
+    """
+    script = _provision_script()
+    body = script[script.index("case \"$verb\" in"):script.index("esac")]
+    verbs = set()
+    for line in body.splitlines():
+        line = line.strip()
+        if ")" in line and not line.startswith(("#", "*")):
+            label = line.split(")")[0].strip()
+            if label and all(c.isalnum() or c in "|-_" for c in label):
+                verbs.update(part for part in label.split("|") if part)
+    return verbs
+
+
+def test_the_provisioning_script_dispatches_only_known_verbs():
+    """A verb that wrote probe_helper.py or a Dockerfile would make this key
+    equivalent to arbitrary code execution as the probe user - a bigger grant
+    than 'install the scanners'. Helper changes stay with setup_probe_vm.sh,
+    which a human runs after reading the diff."""
+    assert _provision_verbs() <= {"status", "install", "update", "help", "-h", "--help"}
+
+
+def test_no_provisioning_verb_writes_an_executable():
+    """`install` here means apt/go, never writing a file we supplied."""
+    script = _provision_script()
+    for writer in ("install -m", "cat >", "tee ", "dd of="):
+        assert writer not in script, f"cti-provision could write files via {writer!r}"
+
+
+def test_the_provisioning_script_never_evals_the_request():
+    import re
+    script = _provision_script()
+    assert not re.search(r"^\s*eval\b", script, re.M), "the request must never be eval'd"
+    assert "read -r -a argv" in script, "the request must be split, not interpreted"
+
+
+def test_the_tool_allowlist_is_closed_and_not_caller_supplied():
+    """The caller names a KEY of a hardcoded map, never a package or module."""
+    script = _provision_script()
+    assert "APT_TOOLS[$requested]" in script and "GO_TOOLS[$requested]" in script
+    assert "not in the allowlist" in script
+
+
+def test_the_client_allowlist_matches_the_scripts():
+    """Two copies, deliberately - the VM enforces, the client fails fast. They
+    must not drift, or a valid tool starts erroring locally."""
+    from cti.probe import provision
+
+    script = _provision_script()
+    for tool in provision.TOOLS:
+        assert f"[{tool}]=" in script, f"{tool} is in the client list but not the script"
+
+
+def test_the_client_rejects_a_tool_outside_the_allowlist():
+    from cti.probe import provision
+
+    for attempt in ("golang-go", "docker.io", "../../bin/sh", "httpx; rm -rf /"):
+        with pytest.raises(ValueError, match="allowlist"):
+            provision.install(attempt)
+
+
+def test_provisioning_uses_its_own_key_not_the_probe_key():
+    """A bug here must not be able to borrow the helper's credential."""
+    from cti.probe import provision, vm_proxy as vp
+
+    assert provision.PROVISION_SSH_KEY != vp.PROBE_SSH_KEY
+
+
+def test_provisioning_fails_closed_when_the_key_is_absent(monkeypatch):
+    from cti.errors import VMProxyError as VMErr
+    from cti.probe import provision
+
+    monkeypatch.setattr(provision, "PROVISION_SSH_KEY", "/nonexistent/key")
+    with pytest.raises(VMErr, match="no provisioning key"):
+        provision.status()
+
+
+def test_missing_tools_reports_everything_when_the_vm_is_unreachable(monkeypatch):
+    """Fail safe: if we cannot ask, assume nothing is installed rather than
+    reporting a healthy VM."""
+    from cti.errors import VMProxyError as VMErr
+    from cti.probe import provision
+
+    monkeypatch.setattr(provision, "status",
+                        lambda: (_ for _ in ()).throw(VMErr("unreachable")))
+    assert set(provision.missing_tools()) == set(provision.TOOLS)
+
+
+def test_the_provisioning_key_is_pinned_after_the_truncating_write():
+    """setup_probe_vm.sh writes the probe key with '>' on purpose - sshd
+    matches the FIRST line for a key, so a stale unrestricted entry would
+    void the forced command. Appending the provisioning key before that write
+    means it is silently erased."""
+    script = (REPO / "probe_vm" / "setup_probe_vm.sh").read_text()
+    truncating = script.index('"$opts" "$KEY_LINE" > "$home/.ssh/authorized_keys"')
+    appending = script.index('"$prov_opts" "$prov_line" >> "$home/.ssh/authorized_keys"')
+    assert appending > truncating, "the provisioning key would be wiped by the probe key write"
+
+
+def test_both_keys_are_pinned_to_different_forced_commands():
+    script = (REPO / "probe_vm" / "setup_probe_vm.sh").read_text()
+    assert 'command="python3 /opt/cti/probe_helper.py"' in script
+    assert 'command="/usr/local/sbin/cti-provision"' in script
