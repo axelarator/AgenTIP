@@ -210,12 +210,19 @@ def selectors_from(result: dict[str, Any], *, target: str,
     # each address, and when cdncheck failed the local list is the only
     # thing standing between us and that noise.
     if not on_shared_infra:
+        # Deduplicated: the DNS answer and the address tlsx connected to are
+        # normally the same, so without this every domain yielded its own
+        # address twice. Harmless in the store - record() is keyed on
+        # (type, value, indicator) - but it made the extractor's output read
+        # as two facts, and anything counting yields would have believed it.
         addresses = list(dns.get("a") or []) + list(dns.get("aaaa") or [])
         if tls.get("resolved_ip"):
             addresses.append(tls["resolved_ip"])
+        seen_addresses = set()
         for address in addresses:
-            if cdn_ranges.is_cdn(address):
+            if address in seen_addresses or cdn_ranges.is_cdn(address):
                 continue
+            seen_addresses.add(address)
             yield "net.resolved_ip", address
 
     # --- behavioural ------------------------------------------------------

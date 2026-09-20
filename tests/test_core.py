@@ -1871,3 +1871,27 @@ def test_an_empty_enrichment_writes_nothing(monkeypatch):
                         lambda *a, **k: opened.append(1))
     assert core._record_enrichment("Any", {}) is None
     assert opened == []
+
+
+def test_a_revoked_certificate_reaches_the_cluster_snapshot(monkeypatch):
+    """The field existed, was persisted, and was permanently None. It is
+    filled from the observe pass, because the openssl grab has never
+    produced it."""
+    entry: dict = {}
+    core._apply_enrichment_snapshot(entry, "domains", {}, {
+        "tls": {"cert": {"issuer": "CN = Test CA", "sha256": "c" * 64}},
+        "observe": {"tls": {"revoked": True, "untrusted": False}},
+    })
+    assert entry["cert"]["revoked"] is True
+    assert entry["cert"]["untrusted"] is False
+
+
+def test_an_unchecked_certificate_is_not_recorded_as_clean(monkeypatch):
+    """None means "not checked", not "not revoked" - so an absent answer
+    must leave the field absent rather than writing False."""
+    entry: dict = {}
+    core._apply_enrichment_snapshot(entry, "domains", {}, {
+        "tls": {"cert": {"issuer": "CN = Test CA", "sha256": "c" * 64}},
+        "observe": {"tls": {}},
+    })
+    assert "revoked" not in entry["cert"]

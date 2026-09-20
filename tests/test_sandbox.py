@@ -752,3 +752,13 @@ def test_a_real_tls_failure_is_still_an_error():
     ns["_run_json"] = lambda cmd, stdin_text, timeout: ([], "tlsx timed out")
     result, error = ns["_observe_tls"]("example.com")
     assert result == {} and error == "tlsx timed out"
+
+
+def test_tlsx_is_asked_to_check_revocation():
+    """cert_revoked had been permanently None since Cert Spotter was
+    retired: the openssl grab never produced it and nothing replaced it.
+    tlsx checks revocation itself, which costs traffic to the CA's
+    responder, not to the target."""
+    body = _helper_function("_observe_tls")
+    assert '"-revoked"' in body and '"-untrusted"' in body
+    assert '"revoked": r.get("revoked")' in body

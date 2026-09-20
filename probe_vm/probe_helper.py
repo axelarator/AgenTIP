@@ -863,7 +863,13 @@ def _observe_tls(target: str, known_ports: list | None = None) -> tuple[dict, st
                        # with other probes"). -json returns the whole
                        # certificate regardless, so they were never needed.
                        "-serial", "-hash", "sha256",
+                       # -revoked and -untrusted were missing, so
+                       # cert_revoked had been permanently None since Cert
+                       # Spotter was retired and nothing replaced it. tlsx
+                       # checks revocation itself; this costs no extra
+                       # traffic to the target, only to the CA's responder.
                        "-expired", "-self-signed", "-mismatched",
+                       "-revoked", "-untrusted",
                        "-tls-version", "-cipher",
                        "-timeout", "10", "-disable-update-check"] \
         + _port_args(known_ports)
@@ -900,6 +906,8 @@ def _observe_tls(target: str, known_ports: list | None = None) -> tuple[dict, st
         "self_signed": r.get("self_signed"),
         "expired": r.get("expired"),
         "mismatched": r.get("mismatched"),
+        "revoked": r.get("revoked"),
+        "untrusted": r.get("untrusted"),
         "tls_version": r.get("tls_version"),
         "cipher": r.get("cipher"),
         "ja3s": r.get("ja3s_hash"),

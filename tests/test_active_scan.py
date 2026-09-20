@@ -147,3 +147,67 @@ def test_active_scan_records_the_port_set_as_a_selector(monkeypatch):
     # three selectors, or two hosts would "share" a port set by both having
     # 443 open.
     assert row == ("443,64350,65111", "TestActor", "nmap")
+
+
+# --------------------------------------------------------------------------- #
+# Open directories, found without the loud path
+# --------------------------------------------------------------------------- #
+
+_LISTING = {"url": "https://evil.example/files/",
+            "files": [{"path": "/files/loader.exe", "size": 1024},
+                      {"path": "/files/readme.txt", "size": 12}]}
+
+
+def _opendir_rows(indicator: str) -> list[str]:
+    with tracking_store.connect(read_only=True) as con:
+        return sorted(r[0] for r in con.execute(
+            "SELECT path FROM opendir_files WHERE indicator_value = ?",
+            [indicator]).fetchall())
+
+
+def _log(http: dict, *, actor="TestActor", value="evil.example", when="2026-09-20T06:00:00"):
+    from datetime import datetime
+    core._log_cluster_enrichment_history(
+        actor, datetime.fromisoformat(when),
+        {("domains", value): ("active", {}, {"http": http})})
+
+
+def test_an_autoindex_page_files_open_directories_without_a_scan():
+    """The probe already parsed the listing on a page it fetched anyway.
+    It was returned and thrown away, so open directories could only ever be
+    found by active_scan's dirsearch - a path brute-force, on request only."""
+    _log({"status": 200, "autoindex": _LISTING})
+    assert _opendir_rows("evil.example") == ["/files/loader.exe", "/files/readme.txt"]
+
+
+def test_the_first_passive_listing_is_a_baseline_not_an_event():
+    """Every file in a first-ever listing is 'new' and none of them is a
+    change - the same rule the loud path applies."""
+    _log({"status": 200, "autoindex": _LISTING})
+    with tracking_store.connect(read_only=True) as con:
+        assert con.execute(
+            "SELECT count(*) FROM attribute_changes WHERE attribute = 'opendir_files'"
+        ).fetchone()[0] == 0
+
+
+def test_a_file_added_to_a_known_directory_is_an_event():
+    _log({"status": 200, "autoindex": _LISTING})
+    grown = {**_LISTING, "files": _LISTING["files"] + [{"path": "/files/new.dll", "size": 9}]}
+    _log({"status": 200, "autoindex": grown}, when="2026-09-21T06:00:00")
+    with tracking_store.connect(read_only=True) as con:
+        row = con.execute(
+            "SELECT new_value FROM attribute_changes "
+            "WHERE attribute = 'opendir_files'").fetchone()
+    assert row is not None and "/files/new.dll" in row[0]
+
+
+def test_a_page_with_no_listing_files_nothing():
+    _log({"status": 200, "autoindex": None})
+    _log({"status": 200})
+    _log({"status": 200, "autoindex": {"url": "https://evil.example/", "files": []}})
+    assert _opendir_rows("evil.example") == []
+
+
+def test_a_failed_probe_files_nothing():
+    _log({"error": "connection reset"})
+    assert _opendir_rows("evil.example") == []

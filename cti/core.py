@@ -1286,6 +1286,15 @@ def _apply_enrichment_snapshot(entry: dict[str, Any], category: str,
                               "not_after": cert.get("not_after"),
                               "sha256": cert.get("sha256"),
                               "checked": now_iso(), "source": "tls_live"}
+            # Revocation comes from the observe pass, not this one: the
+            # openssl grab has never produced it, so cert_revoked had been
+            # permanently None since Cert Spotter was retired. tlsx checks
+            # it, and a None here still means "not checked" rather than
+            # "not revoked" - which is why it is only set when known.
+            observed_tls = (enrichment.get("observe") or {}).get("tls") or {}
+            for field in ("revoked", "untrusted"):
+                if observed_tls.get(field) is not None:
+                    entry["cert"][field] = observed_tls[field]
         http = enrichment.get("http")
         if isinstance(http, dict) and "error" not in http and http.get("status") is not None:
             entry["http"] = {"status": http.get("status"), "title": http.get("title"),
@@ -1349,6 +1358,7 @@ def _log_observation(con, value: str, indicator_type: str, actor: str | None,
             tls_serial=tls.get("serial"),
             tls_spki_sha256=tls.get("spki_sha256"),
             tls_self_signed=tls.get("self_signed"),
+            cert_revoked=tls.get("revoked"),
             tls_version=tls.get("tls_version"),
             tls_not_before=tls.get("not_before"), tls_not_after=tls.get("not_after"))
 
@@ -1381,6 +1391,37 @@ def _log_observation(con, value: str, indicator_type: str, actor: str | None,
         found=observe_source.selectors_from(observed, target=value, kind=kind),
         observed_at=observed_at, indicator_type=indicator_type, actor=actor,
         source="observe")
+
+
+def _record_opendir(con, *, indicator_value: str, listing: dict[str, Any],
+                    observed_at, actor: str | None,
+                    indicator_type: str | None = None) -> list[dict[str, Any]]:
+    """File one open-directory listing. Returns the genuinely new entries.
+
+    Shared by the loud path (active_scan's dirsearch) and the quiet one
+    (an autoindex page the ordinary HTTP probe already fetched), so the
+    baseline rule lives once: the first-ever listing for an indicator is a
+    baseline where every file is "new" and none of them are an event, and
+    only additions against an existing baseline are flagged.
+    """
+    url = listing.get("url")
+    files = listing.get("files") or []
+    if not url:
+        return []
+    had_prior = con.execute(
+        "SELECT 1 FROM opendir_files WHERE indicator_value = ? LIMIT 1",
+        [indicator_value]).fetchone()
+    added = tracking_store.upsert_opendir_files(
+        con, indicator_value=indicator_value, url=url, files=files,
+        observed_at=observed_at, actor=actor)
+    if not (had_prior and added):
+        return []
+    tracking_store.record_attribute_change(
+        con, detected_at=observed_at, indicator_value=indicator_value, actor=actor,
+        attribute="opendir_files", change_type="opendir_files",
+        confidence="medium", old_value=None,
+        new_value={"url": url, "added": [f["path"] for f in added]})
+    return added
 
 
 def _record_enrichment(actor: str, enrichment: dict, *, when: str | None = None
@@ -1486,6 +1527,18 @@ def _log_cluster_enrichment_history(
                         http_server=http.get("server"), http_final_url=http.get("final_url"))
                     tracking_store.detect(con, "http", indicator_value=value, actor=actor,
                                           observed_at=observed_at, new=http)
+                    # The probe already parsed any directory listing on that
+                    # page. It was returned and discarded, so open directories
+                    # were only ever found by active_scan's dirsearch - a
+                    # path brute-force, on request only. Recording it here
+                    # costs no extra traffic: the page was fetched either
+                    # way, and the quiet path finds what the loud one was
+                    # needed for.
+                    autoindex = http.get("autoindex")
+                    if isinstance(autoindex, dict) and autoindex.get("files"):
+                        _record_opendir(con, indicator_value=value,
+                                        listing=autoindex, observed_at=observed_at,
+                                        actor=actor, indicator_type="domain")
 
                 webamon = enrichment.get("webamon")
                 if isinstance(webamon, dict) and "error" not in webamon:
@@ -1952,25 +2005,10 @@ def active_scan(target: str, cluster: str | None = None,
                     indicator_value=target, indicator_type=indicator_type,
                     actor=cluster, source="nmap", observed_at=observed_at)
             for listing in opendirs:
-                url = listing.get("url")
-                files = listing.get("files") or []
-                if not url:
-                    continue
-                had_prior = con.execute(
-                    "SELECT 1 FROM opendir_files WHERE indicator_value = ? LIMIT 1",
-                    [target]).fetchone()
-                added = tracking_store.upsert_opendir_files(
-                    con, indicator_value=target, url=url, files=files,
-                    observed_at=observed_at, actor=cluster)
-                # First-ever scan is a baseline (every file is "new") - only
-                # flag genuinely new files against an existing baseline.
-                if had_prior and added:
-                    new_files.extend(added)
-                    tracking_store.record_attribute_change(
-                        con, detected_at=observed_at, indicator_value=target, actor=cluster,
-                        attribute="opendir_files", change_type="opendir_files",
-                        confidence="medium", old_value=None,
-                        new_value={"url": url, "added": [f["path"] for f in added]})
+                new_files.extend(_record_opendir(
+                    con, indicator_value=target, listing=listing,
+                    observed_at=observed_at, actor=cluster,
+                    indicator_type=indicator_type))
             tracking_store.record_active_scan(
                 con, ran_at=observed_at, indicator_value=target, actor=cluster,
                 tools=requested, summary=summary,

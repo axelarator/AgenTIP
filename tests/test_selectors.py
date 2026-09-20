@@ -836,3 +836,27 @@ def test_a_favicon_from_an_error_page_is_not_recorded():
     """There is no favicon on an origin-down page; whatever was fetched
     belongs to the CDN."""
     assert "http.favicon_mmh3" not in _with_status(521)
+
+
+def test_one_address_is_yielded_once_not_once_per_source():
+    """The DNS answer and the address tlsx connected to are normally the
+    same. record() deduplicates on its unique key, so the store was fine -
+    but the extractor reported one fact as two, and anything counting
+    yields would have believed it."""
+    observed = dict(_OBSERVED)
+    observed["dns"] = {"a": ["193.29.58.192"], "aaaa": []}
+    observed["tls"] = dict(_OBSERVED["tls"], resolved_ip="193.29.58.192")
+    got = [v for t, v in observe.selectors_from(
+        observed, target=observed["target"], kind="domain")
+        if t == "net.resolved_ip"]
+    assert got == ["193.29.58.192"]
+
+
+def test_genuinely_different_addresses_are_both_kept():
+    observed = dict(_OBSERVED)
+    observed["dns"] = {"a": ["193.29.58.192", "193.29.58.193"], "aaaa": []}
+    observed["tls"] = dict(_OBSERVED["tls"], resolved_ip="198.51.100.7")
+    got = sorted(v for t, v in observe.selectors_from(
+        observed, target=observed["target"], kind="domain")
+        if t == "net.resolved_ip")
+    assert got == ["193.29.58.192", "193.29.58.193", "198.51.100.7"]
