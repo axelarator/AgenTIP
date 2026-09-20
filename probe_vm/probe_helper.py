@@ -893,6 +893,26 @@ def _observe_tls(target: str, known_ports: list | None = None) -> tuple[dict, st
         return {}, None
     r = records[0]
     fingerprint = r.get("fingerprint_hash") or {}
+    # tlsx tags every certificate flag `omitempty`, so `false` is never
+    # emitted and a perfectly valid certificate comes back with expired,
+    # self_signed, mismatched, untrusted and revoked all absent. Read
+    # naively that is indistinguishable from "nobody checked", which makes
+    # the fields useless: revoked.badssl.com answers True and every healthy
+    # host answers None.
+    #
+    # Four of the five are computed locally from the certificate and its
+    # chain, so once tlsx has returned a record, absent really does mean
+    # False.
+    #
+    # `revoked` is deliberately NOT coerced. It needs an external check
+    # against the CA's responder, which can fail for reasons that have
+    # nothing to do with the certificate, and recording "not revoked"
+    # because we could not ask is the one direction that misleads. None
+    # there keeps meaning "not known to be revoked".
+    def _flag(name: str) -> bool:
+        return bool(r.get(name))
+
+
     return {
         "issuer": r.get("issuer_dn"),
         "subject_cn": r.get("subject_cn"),
@@ -903,11 +923,12 @@ def _observe_tls(target: str, known_ports: list | None = None) -> tuple[dict, st
         "spki_sha256": _spki_sha256(r.get("certificate")),
         "not_before": r.get("not_before"),
         "not_after": r.get("not_after"),
-        "self_signed": r.get("self_signed"),
-        "expired": r.get("expired"),
-        "mismatched": r.get("mismatched"),
-        "revoked": r.get("revoked"),
-        "untrusted": r.get("untrusted"),
+        "self_signed": _flag("self_signed"),
+        "expired": _flag("expired"),
+        "mismatched": _flag("mismatched"),
+        "untrusted": _flag("untrusted"),
+        "revoked": r.get("revoked"),     # None = not known to be revoked
+
         "tls_version": r.get("tls_version"),
         "cipher": r.get("cipher"),
         "ja3s": r.get("ja3s_hash"),

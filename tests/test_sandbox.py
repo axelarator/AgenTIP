@@ -762,3 +762,41 @@ def test_tlsx_is_asked_to_check_revocation():
     body = _helper_function("_observe_tls")
     assert '"-revoked"' in body and '"-untrusted"' in body
     assert '"revoked": r.get("revoked")' in body
+
+
+def _tls_with(record: dict) -> dict:
+    ns = _helper()
+    ns["_run_json"] = lambda cmd, stdin_text, timeout: ([record], None)
+    result, error = ns["_observe_tls"]("example.com")
+    assert error is None
+    return result
+
+
+def test_a_valid_certificate_reports_false_not_unknown():
+    """tlsx tags every certificate flag `omitempty`, so `false` is never
+    emitted. Read naively, a perfectly valid certificate is
+    indistinguishable from an unchecked one - revoked.badssl.com answers
+    True and every healthy host answers None."""
+    result = _tls_with({"subject_cn": "example.com",
+                        "fingerprint_hash": {"sha256": "c" * 64}})
+    assert result["expired"] is False
+    assert result["self_signed"] is False
+    assert result["mismatched"] is False
+    assert result["untrusted"] is False
+
+
+def test_revocation_stays_unknown_rather_than_claiming_clean():
+    """The one flag not coerced. It needs an external check against the
+    CA's responder, which can fail for reasons unrelated to the
+    certificate, and recording "not revoked" because we could not ask is
+    the direction that misleads."""
+    result = _tls_with({"subject_cn": "example.com",
+                        "fingerprint_hash": {"sha256": "c" * 64}})
+    assert result["revoked"] is None
+
+
+def test_a_flagged_certificate_still_reports_true():
+    result = _tls_with({"subject_cn": "revoked.badssl.com", "revoked": True,
+                        "expired": True, "self_signed": True})
+    assert result["revoked"] is True
+    assert result["expired"] is True and result["self_signed"] is True
