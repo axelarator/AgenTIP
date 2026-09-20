@@ -71,8 +71,8 @@ A content or key digest. Two hosts holding the same one did not arrive there by 
   - *Never:* operator identity for a widely deployed product's stock favicon.
 - **`tls.cert_sha256`** — the same leaf certificate is installed on both hosts - the operator copied a keypair, so they share a deployment.
   - *Never:* that the hosts are the same machine, or that the cert is not shared hosting boilerplate - check the issuer and rarity first.
-- **`tls.spki_sha256`** — the same public key across certificates - the operator reused a keypair when reissuing, which survives certificate rotation.
-  - *Never:* anything when the key belongs to a hosting provider's shared cert.
+- **`tls.spki_sha256`** — the same public key across certificates - the operator reused a keypair when reissuing, so it holds where tls.cert_sha256 and tls.serial both change. Computed locally from the certificate; tlsx has no SPKI output and reading one from it left this selector empty for its whole existence.
+  - *Never:* anything when the key belongs to a hosting provider's shared certificate - and note that neither index can reverse-look-up an SPKI digest, so this is the one identity selector that can never be priced. It rests on its class and the local gates alone.
 - **`webamon.fp_dom`** — Webamon's DOM digest matches - the same rendered page, as their scanner normalizes it. Survives the cosmetic edits that change a raw body hash.
   - *Never:* the same thing as http.body_sha256. It is a different digest over a different input: example.com's body hashes to ff67a9d7... while its fingerprint.dom is f4726eb4..., so the two never match and must never share a selector type.
 - **`webamon.fp_ssl`** — Webamon's certificate digest matches. Rare by construction - example.com's value returns 2 scans index-wide.

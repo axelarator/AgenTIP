@@ -125,8 +125,14 @@ TYPES: dict[str, SelectorType] = {t.name: t for t in (
        "operator identity for a widely deployed product's stock favicon"),
     _t("tls.spki_sha256", "identity",
        "the same public key across certificates - the operator reused a "
-       "keypair when reissuing, which survives certificate rotation",
-       "anything when the key belongs to a hosting provider's shared cert"),
+       "keypair when reissuing, so it holds where tls.cert_sha256 and "
+       "tls.serial both change. Computed locally from the certificate; "
+       "tlsx has no SPKI output and reading one from it left this selector "
+       "empty for its whole existence",
+       "anything when the key belongs to a hosting provider's shared "
+       "certificate - and note that neither index can reverse-look-up an "
+       "SPKI digest, so this is the one identity selector that can never "
+       "be priced. It rests on its class and the local gates alone"),
     _t("file.sha256", "identity",
        "the same file was staged on both hosts",
        "that both hosts are adversary-controlled - it may be a common tool"),
