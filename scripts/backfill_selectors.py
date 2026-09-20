@@ -24,6 +24,7 @@ import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from cti.sources import observe as observe_source  # noqa: E402
 from cti.store import cdn, psl, selectors as S  # noqa: E402
 from cti.store.connection import db_path  # noqa: E402
 from cti.store.schema import init_schema  # noqa: E402
@@ -94,13 +95,29 @@ def shared_value(selector_type: str, value: object, shared_ips: set[str]) -> boo
 
 def extract(row: dict, *, shared_hosting: bool = False,
             shared_ips: set[str] | None = None) -> list[tuple[str, object]]:
-    """Selectors implied by one observations_wide row."""
+    """Selectors implied by one legacy observations_wide row.
+
+    Rows written by the observe pass are handled by backfill_observe, which
+    replays them through observe.selectors_from - the one place the
+    extraction rules live. Letting this column mapping see them too produced
+    BOTH results: a stock certificate subject arrived here as a structural
+    tls.subject_cn and there as a behavioural tls.default_subject, and the
+    structural one is exactly what the demotion exists to prevent.
+    """
+    if (row.get("source") or "") in _OBSERVE_SOURCES:
+        return []
+
     found: list[tuple[str, object]] = []
 
     for column, selector_type in SCALAR_MAP.items():
         value = row.get(column)
-        if value not in (None, ""):
-            found.append((selector_type, value))
+        if value in (None, ""):
+            continue
+        # The same rule the live path applies, from the same function.
+        if selector_type == "tls.subject_cn" and \
+                observe_source._is_default_cert(str(value)):
+            selector_type = "tls.default_subject"
+        found.append((selector_type, value))
 
     for column, selector_type in LIST_MAP.items():
         raw = row.get(column)
@@ -141,6 +158,89 @@ def extract(row: dict, *, shared_hosting: bool = False,
     if shared_ips is not None:
         found = [(t, v) for t, v in found if not shared_value(t, v, shared_ips)]
     return found
+
+
+# Columns written by the observe pass, grouped back into the shape
+# observe.selectors_from expects. Reconstructing the pass and reusing that
+# function is deliberate: it is the ONE place the extraction rules live -
+# the CDN-edge suppression, the stock-subject demotion, the self-naming SAN
+# check - and a second copy here would drift from it silently.
+_OBSERVE_SOURCES = ("observe_http", "observe_tls", "observe_dns")
+
+
+def _as_observe_result(rows_for_indicator: list[dict]) -> dict:
+    """Rebuild an observe-shaped dict from stored observation rows."""
+    http, tls, dns, whois, cdn_info = {}, {}, {}, {}, {}
+    for row in rows_for_indicator:
+        source = row.get("source")
+        if source == "observe_http":
+            http = {"status": row.get("http_status"), "title": row.get("http_title"),
+                    "server": row.get("http_server"),
+                    "body_sha256": row.get("body_sha256"),
+                    "favicon_mmh3": row.get("favicon_mmh3"),
+                    "content_type": row.get("content_type"),
+                    "final_url": row.get("http_final_url"),
+                    "tech": _json_list(row.get("http_tech")),
+                    "headers": _json_list(row.get("http_headers"))}
+        elif source == "observe_tls":
+            tls = {"cert_sha256": row.get("tls_sha256"), "issuer": row.get("tls_issuer"),
+                   "subject_dn": row.get("tls_subject"),
+                   "sans": _json_list(row.get("tls_sans")),
+                   "serial": row.get("tls_serial"),
+                   "spki_sha256": row.get("tls_spki_sha256"),
+                   "self_signed": row.get("tls_self_signed"),
+                   "tls_version": row.get("tls_version")}
+        elif source == "observe_dns":
+            dns = {"a": [], "aaaa": [], "ns": _json_list(row.get("dns_ns")),
+                   "mx": _json_list(row.get("dns_mx")),
+                   "txt": _json_list(row.get("dns_txt"))}
+            whois = {"registrar": row.get("whois_registrar"),
+                     "registrant_email": row.get("whois_registrant_email"),
+                     "created": row.get("whois_created")}
+            if row.get("cdn_provider"):
+                cdn_info = {"is_cdn": True, "provider": row["cdn_provider"]}
+    return {"http": http, "tls": tls, "dns": dns, "whois": whois,
+            "cdn": cdn_info, "errors": {}}
+
+
+def _json_list(raw):
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, ValueError):
+        return []
+    return value if isinstance(value, (list, dict)) else []
+
+
+def backfill_observe(con: duckdb.DuckDBPyConnection) -> int:
+    """Replay stored observe passes through the live extraction rules.
+
+    Needed because the observation rows outlive the selectors: a rule change
+    means the selectors should be rebuilt, and rebuilding them from the store
+    costs no probe traffic at all.
+    """
+    columns = [r[0] for r in con.execute("DESCRIBE observations_wide").fetchall()]
+    placeholders = ", ".join(f"'{s}'" for s in _OBSERVE_SOURCES)
+    grouped: dict[tuple, list[dict]] = {}
+    for row in con.execute(
+            f"SELECT {', '.join(columns)} FROM observations_wide "
+            f"WHERE source IN ({placeholders}) ORDER BY observed_at").fetchall():
+        record = dict(zip(columns, row))
+        key = (record["indicator_value"], record["indicator_type"],
+               record["actor"], record["observed_at"])
+        grouped.setdefault(key, []).append(record)
+
+    written = 0
+    for (value, indicator_type, actor, observed_at), rows_ in grouped.items():
+        kind = "ip" if (indicator_type or "").startswith("ipv") else "domain"
+        result = _as_observe_result(rows_)
+        written += len(S.record_many(
+            con, indicator_value=value,
+            found=observe_source.selectors_from(result, target=value, kind=kind),
+            observed_at=observed_at, indicator_type=indicator_type,
+            actor=actor, source="observe"))
+    return written
 
 
 def backfill(con: duckdb.DuckDBPyConnection, *, dry_run: bool = False) -> dict:
@@ -192,6 +292,8 @@ def backfill(con: duckdb.DuckDBPyConnection, *, dry_run: bool = False) -> dict:
                         actor=record.get("actor"),
                         source=f"backfill:{record.get('source')}"):
                 written += 1
+    if not dry_run:
+        written += backfill_observe(con)
     return {"observations_read": seen, "selectors_written": written,
             "by_type": by_type, "shared_hosting_suppressed": suppressed,
             "shared_hosting_indicators": len(shared_hosts)}
