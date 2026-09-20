@@ -1037,9 +1037,15 @@ def test_tracked_observables_status_in_network_precedence():
         _seed_actor_ip(con, "203.0.113.7")
         _obs(con, "203.0.113.7", TODAY, source="honeylabs", hl_events=5,
              hl_last_seen=NOW - timedelta(days=3))  # would be "active" alone
+        # Real clock, not NOW. NOW is today at MIDNIGHT, so "NOW - 2 hours"
+        # is yesterday at 22:00 - and the in-network rule compares against
+        # the actual current time with a one-day window. The test therefore
+        # passed all day and began failing after 22:00 UTC, which is a
+        # property of when it runs rather than of what it tests.
         store.upsert_zeek_match(
             con, day=TODAY, indicator_value="203.0.113.7", direction="inbound",
-            hit_count=3, actor="APT-X", last_ts=NOW - timedelta(hours=2))
+            hit_count=3, actor="APT-X",
+            last_ts=datetime.now() - timedelta(hours=2))
     result = store.tracked_observables()
     assert _status_for(result["observables"], "203.0.113.7") == "in-network"
 

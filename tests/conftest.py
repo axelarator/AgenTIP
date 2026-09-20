@@ -21,6 +21,7 @@ import pytest
 
 from cti.errors import VMProxyError
 from cti.probe import vm_proxy
+from cti.sources import passive
 
 _REAL_CONNECT = socket.socket.connect
 
@@ -28,7 +29,7 @@ _REAL_CONNECT = socket.socket.connect
 # a forgotten stub turns into a real, metered API call (and, for Webamon,
 # spends daily budget).
 _API_KEY_ENVS = ("WEBAMON_API_KEY", "HONEYLABS_API_KEY", "THREATFOX_API_KEY",
-                 "VT_API_KEY")
+                 "VT_API_KEY", "CTI_VALIDIN_API_KEY")
 
 
 @pytest.fixture(autouse=True)
@@ -65,6 +66,20 @@ def no_network(monkeypatch, request):
                 "probe VM access blocked in tests - stub the vm_proxy.* "
                 "function this path calls (see tests/conftest.py)")
         monkeypatch.setattr(vm_proxy, "_ssh_json_rpc", _blocked)
+
+    # The keyless sources need an explicit off-switch. Every other direct
+    # HTTP source is disabled for free by _API_KEY_ENVS being deleted above
+    # - no key, no call. InternetDB and mnemonic ask for no key, so nothing
+    # stopped them, and they reached the socket guard below and raised
+    # AssertionError out of paths that are supposed to degrade quietly.
+    # test_passive drives them deliberately, stubbing http.get_json itself.
+    if request.node.module.__name__.rsplit(".", 1)[-1] != "test_passive":
+        for name in ("internetdb", "pdns"):
+            monkeypatch.setattr(
+                passive, name,
+                lambda *a, **k: {"error": "passive sources disabled in tests - "
+                                          "stub them if the path under test "
+                                          "needs one (see tests/conftest.py)"})
 
     def _blocked_connect(self, address):
         raise AssertionError(

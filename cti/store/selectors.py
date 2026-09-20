@@ -77,12 +77,6 @@ CREATE TABLE IF NOT EXISTS selector_stats (
 # Ordered weakest to strongest so comparisons read naturally.
 CLASS_ORDER = ("contextual", "behavioural", "structural", "identity")
 
-# Selectors whose value is a whole SET, matched only in its entirety. A list
-# handed to record_many is otherwise stored one member at a time, which
-# quietly turns "the same nameserver set" into "shares any one nameserver" -
-# the mass-provider match the set form exists to prevent. Seen for real: a
-# live sweep recorded ns1, ns2 and ns3.dnsowl.com as three separate links.
-SET_VALUED = frozenset({"dns.ns_set", "net.port_set", "http.header_set"})
 
 
 @dataclass(frozen=True)
@@ -385,6 +379,19 @@ def artefact(selector_type: str) -> str:
     is the more expensive mistake of the two.
     """
     return ARTEFACT.get(selector_type, selector_type)
+
+
+# Selectors whose value is a whole SET, matched only in its entirety. A list
+# handed to record_many is otherwise stored one member at a time, which
+# quietly turns "the same nameserver set" into "shares any one nameserver" -
+# the mass-provider match the set form exists to prevent. Seen for real
+# twice: a live sweep recorded ns1, ns2 and ns3.dnsowl.com as three separate
+# links, and net.passive_port_set stored 445, 3389 and 5985 as three.
+#
+# Derived from the names rather than hand-listed, because the hand-listed
+# version is what was wrong both times - a new *_set type has to be
+# remembered, and twice it was not.
+SET_VALUED = frozenset(name for name in TYPES if name.endswith("_set"))
 
 
 def selector_class(selector_type: str) -> str:

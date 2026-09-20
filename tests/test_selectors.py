@@ -860,3 +860,29 @@ def test_genuinely_different_addresses_are_both_kept():
         observed, target=observed["target"], kind="domain")
         if t == "net.resolved_ip")
     assert got == ["193.29.58.192", "193.29.58.193", "198.51.100.7"]
+
+
+def test_every_set_valued_type_is_actually_treated_as_a_set():
+    """The hand-maintained version of this list was wrong twice.
+
+    A list handed to record_many is stored one member at a time unless the
+    type is in SET_VALUED, which turns "the same nameserver set" into
+    "shares any one nameserver". It happened to ns1/2/3.dnsowl.com, and
+    again to net.passive_port_set, which stored 445, 3389 and 5985 as three
+    separate selectors on their first live write.
+    """
+    missing = sorted(t for t in S.TYPES if t.endswith("_set")
+                     and t not in S.SET_VALUED)
+    assert missing == []
+
+
+def test_a_port_set_is_one_selector_not_one_per_port():
+    con = duckdb.connect(":memory:")
+    con.execute(S.SCHEMA)
+    S.record_many(con, indicator_value="1.2.3.4",
+                  found=[("net.passive_port_set", [445, 3389, 5985])],
+                  observed_at="2026-09-20 00:00:00", indicator_type="ipv4",
+                  actor="A", source="internetdb")
+    rows = con.execute("SELECT selector_value FROM selectors").fetchall()
+    con.close()
+    assert rows == [("445,3389,5985",)]

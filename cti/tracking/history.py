@@ -26,7 +26,79 @@ import duckdb
 from .. import store as tracking_store
 from ..errors import ok
 from ..sources import observe as observe_source
+from ..store import cdn as cdn_ranges
 from ..util import now_iso
+
+# How many passive-DNS records to keep on one observation row. A busy name
+# returns hundreds and the tail is repetition; the count and the total are
+# both preserved on the source result, so nothing is silently lost.
+PDNS_RECORD_CAP = 50
+
+def _log_passive(con, *, value: str, indicator_type: str, actor: str | None,
+                 observed_at, enrichment: dict[str, Any]) -> None:
+    """Persist the two passive sources, kept apart from their live cousins.
+
+    Both are somebody else's observation at a time we did not choose, which
+    is exactly why every field here is named for its source. An
+    `internetdb_ports` column cannot be mistaken for the nmap one; a
+    `net.passive_port_set` selector cannot match a `net.port_set`.
+    """
+    idb = enrichment.get("internetdb")
+    if isinstance(idb, dict) and "error" not in idb and idb.get("indexed"):
+        tracking_store.upsert_observation(
+            con, observed_at=observed_at, indicator_value=value,
+            source="internetdb", actor=actor, indicator_type=indicator_type,
+            internetdb_ports=idb.get("ports") or None,
+            internetdb_cpes=idb.get("cpes") or None,
+            internetdb_tags=idb.get("tags") or None,
+            internetdb_vulns=idb.get("vulns") or None,
+            internetdb_hostnames=idb.get("hostnames") or None)
+        found: list[tuple[str, Any]] = []
+        if idb.get("ports"):
+            found.append(("net.passive_port_set", idb["ports"]))
+        for cpe in idb.get("cpes") or []:
+            found.append(("net.cpe", cpe))
+        if found:
+            tracking_store.selectors.record_many(
+                con, indicator_value=value, found=found, observed_at=observed_at,
+                indicator_type=indicator_type, actor=actor, source="internetdb")
+
+    pdns = enrichment.get("pdns")
+    if not (isinstance(pdns, dict) and "error" not in pdns
+            and not pdns.get("skipped")):
+        return
+    records = pdns.get("records") or []
+    if not records:
+        return
+    tracking_store.upsert_observation(
+        con, observed_at=observed_at, indicator_value=value,
+        source="mnemonic_pdns", actor=actor, indicator_type=indicator_type,
+        pdns_records=records[:PDNS_RECORD_CAP])
+
+    # Only the A/AAAA answers of a DOMAIN become selectors. The reverse
+    # direction - every name that ever pointed at an address - is left as
+    # payload: it is unbounded on anything popular, and a name that shared
+    # an address with a hundred others years ago is not evidence of
+    # anything. The forward direction is bounded by how often one operator
+    # moved their own domain.
+    if indicator_type != "domain":
+        return
+    addresses = []
+    for record in records:
+        if record.get("rrtype") not in ("a", "aaaa"):
+            continue
+        answer = record.get("answer")
+        # The same CDN gate the live path applies. Without it every domain
+        # that ever sat behind Cloudflare links to every other one that did.
+        if answer and not cdn_ranges.is_cdn(answer):
+            addresses.append(answer)
+    if addresses:
+        tracking_store.selectors.record_many(
+            con, indicator_value=value,
+            found=[("net.historical_ip", a) for a in sorted(set(addresses))],
+            observed_at=observed_at, indicator_type=indicator_type,
+            actor=actor, source="mnemonic_pdns")
+
 
 def _log_observation(con, value: str, indicator_type: str, actor: str | None,
                      observed: dict[str, Any], observed_at) -> None:
@@ -171,6 +243,9 @@ def _log_cluster_enrichment_history(
                             ip_hostnames=hosts or None)
                         tracking_store.detect(con, "ip_hostnames", indicator_value=value,
                                               actor=actor, observed_at=observed_at, new=hosts)
+                    _log_passive(con, value=value, indicator_type=indicator_type,
+                                 actor=actor, observed_at=observed_at,
+                                 enrichment=enrichment)
                     ptr = enrichment.get("ptr")
                     if isinstance(ptr, dict) and "error" not in ptr:
                         tracking_store.upsert_observation(
@@ -244,6 +319,13 @@ def _log_cluster_enrichment_history(
                     tracking_store.detect(con, "infostealer_hits", indicator_value=value, actor=actor,
                                           observed_at=observed_at,
                                           new={"count": len(hits), "urls": urls})
+
+                # Domains get passive DNS too - where this name pointed
+                # before it pointed where it does now. internetdb is
+                # address-only and simply absent here.
+                _log_passive(con, value=value, indicator_type="domain",
+                             actor=actor, observed_at=observed_at,
+                             enrichment=enrichment)
 
                 subdomains = enrichment.get("subdomains")
                 if isinstance(subdomains, dict) and "error" not in subdomains:

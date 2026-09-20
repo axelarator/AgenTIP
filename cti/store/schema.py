@@ -216,6 +216,11 @@ _JSON_FIELDS: tuple[str, ...] = (
     # From the observe pass: record sets and header maps, each one selector
     # whose value is the whole set rather than one per member.
     "dns_ns", "dns_mx", "dns_txt", "http_headers", "http_tech",
+    # Passive sources. Named for where they came from, never merged with
+    # the live equivalents: internetdb_ports is somebody else's scan at an
+    # unknown time, and pdns_records is history, not current resolution.
+    "internetdb_ports", "internetdb_cpes", "internetdb_tags",
+    "internetdb_vulns", "internetdb_hostnames", "pdns_records",
     # Retired providers. Never written any more, but 154 Shodan rows and
     # 7 VirusTotal rows exist and stay readable.
     "shodan_ports", "shodan_tags",

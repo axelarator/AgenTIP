@@ -30,6 +30,8 @@ from .report import ingest as report_ingest
 from .sources import observe as observe_source
 from .sources import pivot, webamon
 from . import store as tracking_store
+from .sources import passive
+from .store import cdn as cdn_ranges
 from .tracking.analytics import SHARED_HOSTING_ASNS
 from .store.changes import STALE_BASELINE_DAYS as _ATTR_STALE_BASELINE_DAYS
 from .util import repo_root
@@ -974,6 +976,30 @@ def _webamon_infostealers(domain: str) -> dict[str, Any]:
     return _cached_pivot("webamon_is", domain, lambda: webamon.infostealers(domain))
 
 
+def _internetdb(ip: str) -> dict[str, Any]:
+    """Shodan's free keyless view of an address. Passive: no packet reaches
+    the indicator, which is why this runs in the ordinary sweep while nmap
+    and naabu stay on request."""
+    return _cached_pivot("internetdb", ip, lambda: passive.internetdb(ip))
+
+
+def _pdns(value: str, *, asn: int | None = None) -> dict[str, Any]:
+    """Passive resolution history, the one thing no live probe can answer.
+
+    Skipped entirely for an address on shared hosting or a CDN. A Cloudflare
+    address has had tens of thousands of names on it and every one of them
+    would arrive here as history; the answer would be both enormous and
+    meaningless, and the same gate already protects webamon_ip and the
+    co-hosting selectors.
+    """
+    if asn is not None and asn in SHARED_HOSTING_ASNS:
+        return {"skipped": "shared hosting - passive DNS would return the "
+                           "provider's tenants, not this actor's history"}
+    if cdn_ranges.is_cdn(value):
+        return {"skipped": "CDN address - see above"}
+    return _cached_pivot("pdns", value, lambda: passive.pdns(value))
+
+
 def _subdomains_for(domain: str) -> dict[str, Any]:
     """Passive subdomain discovery for the automatic sweep: subfinder unioned
     with Wayback CDX, both run on the probe VM. Flag-only (never auto-filed
@@ -1142,6 +1168,8 @@ def _domain_lifecycle(value: str, ports: list[int] | None = None
         "webamon": _webamon_domain(value),
         "webamon_infostealers": _webamon_infostealers(value),
         "subdomains": _subdomains_for(value),
+        # Where this name pointed before it pointed where it does now.
+        "pdns": _pdns(value),
     }
     threatfox = _threatfox_enrichment(value)
     if threatfox is not None:
@@ -1166,6 +1194,12 @@ def _ip_lifecycle(value: str, ports: list[int] | None = None
         # Reverse-DNS PTR record - a day-over-day attribute diff like ASN
         # (see the "ptr" spec in cti/store/changes.py).
         "ptr": _cached_pivot("ptr", value, lambda: pivot.ptr_lookup(value)),
+        # Ports, CPEs and vulns somebody else already scanned for. Stale by
+        # nature, so recorded as passive throughout and never merged with
+        # nmap's - see sources/passive.py.
+        "internetdb": _internetdb(value),
+        # What has lived here before. dnsx answers the present tense only.
+        "pdns": _pdns(value, asn=detail.get("asn")),
     }
     threatfox = _threatfox_enrichment(value)
     if threatfox is not None:
