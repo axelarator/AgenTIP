@@ -756,7 +756,19 @@ def _run_json(cmd: list, stdin_text: str, timeout: int) -> tuple[list, str | Non
     return out, None
 
 
-def _observe_http(target: str) -> tuple[dict, str | None]:
+def _port_args(known_ports: list) -> list:
+    """`-p` for httpx/tlsx when the caller already knows what is open.
+
+    Not a scan: these ports came from an earlier active scan or a report.
+    Without them the probe assumes 80/443, which found nothing at all on a
+    host whose services were on 4443, 8443 and 8080 - and reported no error,
+    because "nothing listening on 443" is not an error.
+    """
+    ports = [str(p) for p in (known_ports or []) if str(p).isdigit()]
+    return ["-p", ",".join(ports)] if ports else []
+
+
+def _observe_http(target: str, known_ports: list | None = None) -> tuple[dict, str | None]:
     """httpx: body hash, favicon hash, title, server, headers, tech, JARM.
 
     -favicon fetches /favicon.ico, so it is one extra request to a host we
@@ -770,7 +782,7 @@ def _observe_http(target: str) -> tuple[dict, str | None]:
                      "-include-response-header",
                      "-jarm",
                      "-timeout", "15", "-retries", "1",
-                     "-disable-update-check"],
+                     "-disable-update-check"] + _port_args(known_ports),
         stdin_text=target, timeout=OBSERVE_TOOL_TIMEOUT)
     if error:
         return {}, error
@@ -796,7 +808,7 @@ def _observe_http(target: str) -> tuple[dict, str | None]:
     }, None
 
 
-def _observe_tls(target: str) -> tuple[dict, str | None]:
+def _observe_tls(target: str, known_ports: list | None = None) -> tuple[dict, str | None]:
     """tlsx: the certificate fields the live TLS grab never extracted.
 
     `serial` and the SPKI hash are the additions that matter - a serial ties
@@ -812,7 +824,8 @@ def _observe_tls(target: str) -> tuple[dict, str | None]:
                     "-serial", "-hash", "sha256",
                     "-expired", "-self-signed", "-mismatched",
                     "-tls-version", "-cipher",
-                    "-timeout", "10", "-disable-update-check"],
+                    "-timeout", "10", "-disable-update-check"]
+                   + _port_args(known_ports),
         stdin_text=target, timeout=OBSERVE_TOOL_TIMEOUT)
     if error:
         return {}, error
@@ -983,8 +996,9 @@ def action_observe(request: dict) -> dict:
                 result["tools_missing"].append(error.split()[0])
         return data
 
-    result["http"] = stage("http", _observe_http, target)
-    result["tls"] = stage("tls", _observe_tls, target)
+    known_ports = request.get("known_ports") or []
+    result["http"] = stage("http", _observe_http, target, known_ports)
+    result["tls"] = stage("tls", _observe_tls, target, known_ports)
     if kind == "domain":
         result["dns"] = stage("dns", _observe_dns, target)
         result["whois"] = stage("whois", _observe_whois, target)

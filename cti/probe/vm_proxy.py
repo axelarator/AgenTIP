@@ -300,7 +300,8 @@ def fetch_and_analyze(urls: list[str], *, max_files: int = 20,
     return response
 
 
-def observe(target: str, *, kind: str | None = None, ports: bool = False,
+def observe(target: str, *, kind: str | None = None,
+            ports: list[int] | None = None, scan_ports: bool = False,
             top_ports: int = 100) -> dict[str, object]:
     """One observation pass over an indicator, returning shareable facts.
 
@@ -308,11 +309,16 @@ def observe(target: str, *, kind: str | None = None, ports: bool = False,
     each answer one question about a host; this returns the values another
     host could have in common, which is what links get made from.
 
-    `ports` is opt-in and off by default: a port scan is active traffic,
-    while everything else here is the same light-touch contact the ordinary
-    sweep already makes. When it is on, the call gets the long timeout.
+    `ports` are ports already known open, so httpx and tlsx look where the
+    services are instead of assuming 80/443. Supplying them is not a scan.
+
+    `scan_ports` IS a scan and is off by default: discovering new ports is
+    active traffic, while everything else here is the same light-touch
+    contact the ordinary sweep already makes. When it is on, the call gets
+    the long timeout.
     """
     return _ssh_json_rpc(
         {"action": "observe", "target": target, "kind": kind,
-         "ports": bool(ports), "top_ports": top_ports},
-        timeout=LONG_TIMEOUT if ports else SUBFINDER_TIMEOUT)
+         "known_ports": list(ports or []),
+         "ports": bool(scan_ports), "top_ports": top_ports},
+        timeout=LONG_TIMEOUT if scan_ports else SUBFINDER_TIMEOUT)

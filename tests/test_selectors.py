@@ -519,3 +519,21 @@ def test_a_sweep_on_shared_hosting_does_not_manufacture_links(tmp_path, monkeypa
             core._log_observation(con, host, "domain", "A", behind_cdn,
                                   datetime(2026, 9, 20, 6, 0))
         assert S.neighbours(con, "one.example") == []
+
+
+def test_an_observe_result_is_not_mistaken_for_a_failure():
+    """The helper sets error:None on success, and errors.is_failure tests for
+    the PRESENCE of an "error" key rather than its truthiness. The first live
+    sweep therefore computed a full observe pass for 143.246.217.59 and
+    discarded it without a word - no rows, no selectors, no error."""
+    from cti.errors import is_failure, normalize_probe, ok
+
+    raw = {"target": "x", "http": {"body_sha256": "a" * 64}, "error": None}
+    assert is_failure(raw), "this is the trap: error:None reads as failure"
+    assert ok(normalize_probe(raw)), "normalize_probe is what makes it usable"
+
+
+def test_a_real_observe_failure_is_still_a_failure():
+    from cti.errors import normalize_probe, ok
+
+    assert not ok(normalize_probe({"error": "probe VM unreachable"}))

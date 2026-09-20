@@ -909,15 +909,30 @@ def _cached_pivot(source: str, value: str, fetch) -> Any:
     return cache.cached(source, value, fetch)
 
 
-def _observe(value: str, kind: str) -> dict[str, Any]:
+def _observe(value: str, kind: str,
+             ports: list[int] | None = None) -> dict[str, Any]:
     """One observation pass, cached like every other source.
 
-    Port scanning is deliberately not requested: it is active traffic, and
-    the sweep is the light-touch path. active_scan remains the way to ask.
+    `ports` are ports already KNOWN to be open on this host, from an earlier
+    active scan or a report. Passing them is not a scan - it tells httpx and
+    tlsx where to look instead of assuming 80/443. The first live sweep
+    found nothing at all on 143.246.217.59 for exactly this reason: its
+    services are on 4443, 8443 and 8080, and the default probe found no web
+    service and no certificate while reporting no error.
+
+    Discovering NEW ports is still active_scan's job; this only reuses what
+    is already on the record.
     """
     try:
-        return _cached_pivot(f"observe_{kind}", value,
-                             lambda: vm_proxy.observe(value, kind=kind))
+        # normalize_probe strips the `error: None` the helper sets on
+        # success. Without it every result looked failed: errors.is_failure
+        # tests for the PRESENCE of an "error" key, not its truthiness, so
+        # the first live sweep computed a full observe pass and discarded it
+        # silently. This is the same trap normalize_probe was written for -
+        # _live_tls and _live_http already go through it.
+        return _cached_pivot(
+            f"observe_{kind}", value,
+            lambda: normalize_probe(vm_proxy.observe(value, kind=kind, ports=ports)))
     except vm_proxy.VMProxyError as e:
         return {"error": str(e)}
 
@@ -1093,7 +1108,8 @@ def _threatfox_enrichment(value: str) -> dict[str, Any] | None:
     return _cached_pivot("threatfox", value, lambda: pivot.threatfox_lookup(value, api_key))
 
 
-def _domain_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
+def _domain_lifecycle(value: str, ports: list[int] | None = None
+                      ) -> tuple[str, dict[str, Any], dict[str, Any]]:
     rdap = _cached_pivot("rdap", value, lambda: pivot.rdap_lookup(value, "domain"))
     resolved = pivot.resolve_host(value)  # live, not cached — liveness is the point
     status = pivot.classify_domain_lifecycle(rdap, resolved)
@@ -1110,7 +1126,7 @@ def _domain_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
         # fields those two never surfaced - body and favicon digests, the
         # certificate serial and SPKI hash, the nameserver set, the
         # registrar. Those are what the selector index is built from.
-        "observe": _observe(value, "domain"),
+        "observe": _observe(value, "domain", ports),
         "tls": _live_tls(value),
         "http": _live_http(value),
         "webamon": _webamon_domain(value),
@@ -1123,14 +1139,15 @@ def _domain_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     return status, detail, enrichment
 
 
-def _ip_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
+def _ip_lifecycle(value: str, ports: list[int] | None = None
+                  ) -> tuple[str, dict[str, Any], dict[str, Any]]:
     ripe = _cached_pivot("ripestat", value, lambda: pivot.ripestat_lookup(value))
     status = pivot.classify_ip_lifecycle(ripe)
     detail = {"asn": ripe.get("asn") if isinstance(ripe, dict) else None,
              "prefix": ripe.get("prefix") if isinstance(ripe, dict) else None,
              "as_holder": ripe.get("as_holder") if isinstance(ripe, dict) else None}
     enrichment: dict[str, Any] = {
-        "observe": _observe(value, "ip"),
+        "observe": _observe(value, "ip", ports),
         # Domains Webamon has scanned resolving to this IP - the reverse-IP
         # / hosted-domain signal (replaces Shodan hostnames + Hackertarget).
         # Open ports are no longer discovered automatically here: that's
@@ -1146,7 +1163,8 @@ def _ip_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     return status, detail, enrichment
 
 
-def _sweep_lifecycle(domains: list[str], ips: list[str]
+def _sweep_lifecycle(domains: list[str], ips: list[str],
+                      known_ports: dict[str, list[int]] | None = None
                       ) -> dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]:
     """Concurrent, lock-free lifecycle+enrichment sweep for a batch of
     domains/ips - the network phase shared by pivot_cluster (rechecking
@@ -1159,12 +1177,16 @@ def _sweep_lifecycle(domains: list[str], ips: list[str]
     phase already runs unlocked. A single lookup blowing up is recorded
     as an ("unknown", {"error": ...}, {}) tuple rather than sinking the
     whole batch."""
+    # Ports already known open on a host, so the observe pass looks where
+    # the services actually are rather than assuming 80/443.
+    known_ports = known_ports or {}
     jobs = ([("domains", v, _domain_lifecycle) for v in domains]
             + [("ips", v, _ip_lifecycle) for v in ips])
     results: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]] = {}
     if jobs:
         with concurrent.futures.ThreadPoolExecutor(max_workers=_PIVOT_CLUSTER_WORKERS) as ex:
-            futures = {ex.submit(fn, v): (cat, v) for cat, v, fn in jobs}
+            futures = {ex.submit(fn, v, known_ports.get(v)): (cat, v)
+                       for cat, v, fn in jobs}
             for fut in concurrent.futures.as_completed(futures):
                 cat, v = futures[fut]
                 try:
@@ -1546,7 +1568,11 @@ def pivot_cluster(name: str) -> dict[str, Any]:
     ips = [o["value"] for o in data["observables"]["ips"]]
 
     # Network phase: concurrent, no lock held.
-    results = _sweep_lifecycle(domains, ips)
+    known_ports = {o["value"]: o["ports"]
+                   for cat in ("domains", "ips")
+                   for o in data["observables"][cat]
+                   if o.get("ports")}
+    results = _sweep_lifecycle(domains, ips, known_ports)
 
     # Write phase: brief lock, applied onto a fresh read of the cluster.
     now = now_iso()

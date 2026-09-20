@@ -569,3 +569,25 @@ def test_http_fetch_still_honours_method_headers_and_body():
     source = _helper_function("action_http_fetch")
     for feature in ('request.get("method"', 'request.get("data")', 'request.get("headers")'):
         assert feature in source
+
+
+def test_known_ports_are_passed_to_the_web_and_tls_probes():
+    """143.246.217.59 serves on 4443, 8443 and 8080. Probing only 80/443
+    found no web service and no certificate, and reported no error - because
+    "nothing listening on 443" is not an error."""
+    assert helper["_port_args"]([4443, 8443, 8080]) == ["-p", "4443,8443,8080"]
+    assert helper["_port_args"]([]) == []
+    assert helper["_port_args"](None) == []
+
+
+def test_known_ports_are_filtered_to_digits():
+    """They come from stored cluster data, which is not a trusted schema."""
+    assert helper["_port_args"]([443, "bad", None, 8443]) == ["-p", "443,8443"]
+
+
+def test_supplying_known_ports_is_not_a_port_scan():
+    """Reusing ports already on the record is not new active traffic;
+    discovering ports still belongs to active_scan."""
+    source = _helper_function("action_observe")
+    assert 'request.get("known_ports")' in source
+    assert 'if request.get("ports")' in source, "scanning stays behind its own flag"
