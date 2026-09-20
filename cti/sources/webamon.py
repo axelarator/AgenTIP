@@ -261,6 +261,248 @@ def fingerprint_siblings(fp_hash: str, kind: str = "dom", size: int = 25) -> dic
     return {"total_hits": resp.get("total_hits"), "domains": domains}
 
 
+# --------------------------------------------------------------------------- #
+# Reverse lookup: from a selector value to the indicators that share it
+# --------------------------------------------------------------------------- #
+
+# selector type -> (queried field, path within the root domain entry or None)
+#
+# One map instead of a wrapper per field. The alternative - search_by_title,
+# search_by_subject, search_by_san, twenty more - is the duplication this
+# rewrite exists to remove: each would be the same three lines with a
+# different f-string, and the interesting part (which field, and what a match
+# is worth) belongs in a table beside the taxonomy that classes it.
+#
+# The second element is the scope, and getting it wrong is the difference
+# between a lead and noise. A scan document holds every certificate, resource
+# and address the page touched, so `certificate.san_list:"www.example.com"`
+# matches a site that merely loaded an image from a host with that
+# certificate. When the path is set, the value is re-checked inside the
+# `domain[]` entry marked `root` - the scanned host itself. Verified on the
+# live index: that check rejects kiratlimimarlik.com, whose own certificate
+# names only itself, and keeps formthirtythree.com, which really is served
+# under example.com's certificate.
+#
+# None means the field is scan-wide and the distinction does not arise:
+# page_title, the fingerprints and lexical features describe the scan.
+#
+# Absences are deliberate:
+#   tls.cert_sha256   Webamon publishes no leaf-certificate SHA-256. Their
+#                     fingerprint.ssl is their own digest - webamon.fp_ssl.
+#   whois.*           domain.whois.registrar matches zero documents; the
+#                     index carries no registration data, so `whois` on the
+#                     probe VM is the only source for those selectors.
+#   net.port_set      not in the index. That is naabu and nmap.
+#   dns.*             no resolver records; dnsx is the source.
+REVERSE_FIELDS: dict[str, tuple[str, str | None]] = {
+    # --- our own selectors, as Webamon stores the same fact ---------------
+    # domain.resource.sha256 is the raw body digest, verified byte-for-byte:
+    # example.com's body hashes to ff67a9d7... and so does this field. It is
+    # therefore comparable with httpx's -hash sha256, which fingerprint.dom
+    # is not.
+    "http.body_sha256":   ("domain.resource.sha256", "resource.sha256"),
+    # Scan-wide on purpose: the question a staged payload asks is "who else
+    # served this file", and a sub-resource is exactly where it would be.
+    "file.sha256":        ("domain.resource.sha256", None),
+    "tls.subject_cn":     ("certificate.subject_name", "certificate.subject_name"),
+    "tls.san":            ("certificate.san_list", "certificate.san_list"),
+    "tls.issuer":         ("certificate.issuer", "certificate.issuer"),
+    "net.resolved_ip":    ("server.ip", "ip"),
+    "http.server":        ("domain.server", "server"),
+    "net.asn":            ("domain.asn.number", "asn.number"),
+    "http.title":         ("page_title", None),
+    "http.tech":          ("technology.name", None),
+    # --- Webamon's own digests, scan-wide by nature ------------------------
+    "webamon.fp_dom":            ("fingerprint.dom", None),
+    "webamon.fp_dom_structure":  ("fingerprint.dom_structure", None),
+    "webamon.fp_ssl":            ("fingerprint.ssl", None),
+    "webamon.fp_cert_san":       ("fingerprint.cert_san", None),
+    "webamon.fp_cert_config":    ("fingerprint.cert_config", None),
+    "webamon.fp_cert_issuer":    ("fingerprint.cert_issuer", None),
+    "webamon.fp_header_order":   ("fingerprint.header_order", None),
+    "webamon.fp_cookie_names":   ("fingerprint.cookie_names", None),
+    "webamon.fp_domains":        ("fingerprint.domains", None),
+    "webamon.fp_ns_set":         ("fingerprint.ns_set", None),
+    "webamon.fp_mx_set":         ("fingerprint.mx_set", None),
+    "webamon.fp_links":          ("fingerprint.links", None),
+    "webamon.fp_scripts":        ("fingerprint.scripts", None),
+    "webamon.fp_cookies":        ("fingerprint.cookies", None),
+    "webamon.fp_tech":           ("fingerprint.tech", None),
+    "webamon.fp_asn":            ("fingerprint.asn", None),
+    "brand.impersonated":        ("lexical.brand_match", None),
+}
+
+# Fields whose matching is token-based rather than exact. A quoted phrase is
+# not enough on these: the analyzer splits the value and matches the pieces,
+# so total_hits counts documents that do not carry it. The re-check below is
+# what makes a result trustworthy; this set only says whether total_hits is
+# a count or an upper bound. The digest and address fields were confirmed
+# exact against the live index.
+_ANALYZED = frozenset({
+    "certificate.subject_name", "certificate.san_list", "certificate.issuer",
+    "page_title", "domain.server", "technology.name", "lexical.brand_match",
+})
+
+
+def reversible(selector_type: str) -> bool:
+    """Whether Webamon can answer "who else has this?" for this selector."""
+    return selector_type in REVERSE_FIELDS
+
+
+# Lucene's reserved characters. Quoting a phrase is not enough on its own:
+# the API answers HTTP 400 for `certificate.san_list:"*.sharepoint.com"`,
+# because the parser still sees the wildcard inside the quotes. Every
+# wildcard SAN in this repo's own data - and most certificates carry one -
+# failed to price until these were escaped.
+_LUCENE_RESERVED = '+-&|!(){}[]^"~*?:\\/'
+
+
+def _lucene_literal(value: Any) -> str:
+    """A phrase-quoted Lucene term with reserved characters escaped.
+
+    Quoting is not cosmetic: `infostealers` documents what an unquoted value
+    does, where a nonsense domain came back with 572k hits. Escaping is not
+    either - a value must not be able to end the phrase early and add a
+    clause of its own, and a wildcard must be matched rather than expanded.
+    """
+    text = "".join("\\" + c if c in _LUCENE_RESERVED else c for c in str(value))
+    return f'"{text}"'
+
+
+def _field_values(doc: Any, path: str) -> list[str]:
+    """Every leaf value at a dotted path, descending through lists.
+
+    A scan document nests: `domain` is a list, each entry has its own
+    `certificate` (sometimes a list, sometimes one object), each of those a
+    `san_list`. A match can come from any of them, so the whole subtree has
+    to be collected before a value can be confirmed or rejected.
+    """
+    nodes: list[Any] = [doc]
+    for part in path.split("."):
+        nxt: list[Any] = []
+        for node in nodes:
+            for n in (node if isinstance(node, list) else [node]):
+                if isinstance(n, dict) and part in n:
+                    nxt.append(n[part])
+        nodes = nxt
+    out: list[str] = []
+    stack = list(nodes)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, list):
+            stack.extend(node)
+        elif isinstance(node, dict):
+            stack.extend(node.values())
+        elif node is not None and not isinstance(node, bool):
+            out.append(str(node))
+    return out
+
+
+def _root_entry(doc: dict[str, Any]) -> dict[str, Any] | None:
+    """The `domain[]` entry for the host that was scanned.
+
+    `root: True` marks it. Falling back to a name match on resolved_domain
+    covers documents where the flag is absent; returning None when neither
+    identifies an entry is deliberate, because a root-scoped check that
+    cannot find the root must reject rather than pass.
+    """
+    entries = [d for d in (doc.get("domain") or []) if isinstance(d, dict)]
+    for entry in entries:
+        if entry.get("root") is True:
+            return entry
+    resolved = (doc.get("resolved_domain") or "").lower().rstrip(".")
+    for entry in entries:
+        if (entry.get("name") or "").lower().rstrip(".") == resolved and resolved:
+            return entry
+    return None
+
+
+def _carries(doc: dict[str, Any], field: str, root_path: str | None,
+             needle: str) -> bool:
+    if root_path is None:
+        values = _field_values(doc, field)
+    else:
+        root = _root_entry(doc)
+        if root is None:
+            return False
+        values = _field_values(root, root_path)
+    return needle in {v.lower().rstrip(".") for v in values}
+
+
+def reverse_selector(selector_type: str, selector_value: Any, *,
+                     size: int = 25) -> dict[str, Any]:
+    """Indicators Webamon has scanned that carry this selector value.
+
+    Returns {"field", "total_hits", "indicators", "sampled", "rejected",
+    "exact", "capped"} or {"error": ...}.
+
+    Two corrections are applied to what the API returns, and both were needed
+    to make it usable.
+
+    `total_hits` counts SCANS, not indicators. example.com's DOM digest
+    returns 4388 hits and one indicator, because the index has scanned that
+    page 4388 times, so `indicators` is counted from the page instead. A
+    caller seeing capped=True with one indicator is looking at a heavily
+    rescanned single site, not a widely shared value.
+
+    Every result is then re-checked, scoped per REVERSE_FIELDS, and
+    `rejected` counts the ones that did not really carry the value.
+    """
+    mapped = REVERSE_FIELDS.get(selector_type)
+    if not mapped:
+        return {"error": f"{selector_type} has no reverse field on webamon"}
+    field, root_path = mapped
+    value = str(selector_value).strip()
+    if not value:
+        return {"error": "empty selector value"}
+
+    # A root-scoped check needs the whole domain[] array to find the root
+    # entry; a scan-wide one needs only the field it queried.
+    projection = "resolved_domain,date," + ("domain" if root_path else field)
+    resp = _search({"lucene_query": f"{field}:{_lucene_literal(value)}",
+                    "index": "scans", "fields": projection, "size": size})
+    if "error" in resp:
+        return resp
+
+    results = [r for r in (resp.get("results") or []) if isinstance(r, dict)]
+    needle = value.lower().rstrip(".")
+    confirmed = [r for r in results if _carries(r, field, root_path, needle)]
+    indicators = sorted({r.get("resolved_domain") for r in confirmed
+                         if r.get("resolved_domain")})
+    return {"field": field, "total_hits": resp.get("total_hits"),
+            "indicators": indicators, "sampled": len(results),
+            "rejected": len(results) - len(confirmed),
+            "exact": field not in _ANALYZED, "capped": len(results) >= size}
+
+
+def global_count(selector_type: str, selector_value: Any) -> dict[str, Any]:
+    """How common this selector value is across Webamon's whole index.
+
+    This is the `global_count` the rarity table was built for and had no
+    source: crt.sh stopped ingesting, and urlscan needs a key and caps its
+    total at 10,000. Webamon answers for one budget unit on a key that is
+    already configured, and the spread is the whole point - 48.8 million
+    scans share example.com's cookie fingerprint and 2 share its SSL
+    fingerprint. One of those is a pivot and the other is a wasted sweep.
+
+    `size` is 1 because only the count is wanted. `exact` is False on an
+    analyzed field, where the count includes documents that do not carry the
+    value; that is still the safe direction for a rarity gate, since it can
+    overstate how common a value is but never understate it.
+    """
+    mapped = REVERSE_FIELDS.get(selector_type)
+    if not mapped:
+        return {"error": f"{selector_type} has no reverse field on webamon"}
+    field, _ = mapped
+    resp = _search({"lucene_query": f"{field}:{_lucene_literal(selector_value)}",
+                    "index": "scans", "fields": "resolved_domain", "size": 1})
+    if "error" in resp:
+        return resp
+    return {"field": field, "count": resp.get("total_hits"), "source": "webamon",
+            "exact": field not in _ANALYZED}
+
+
+
 def submit_scan(submission_url: str) -> dict[str, Any]:
     """Submit a fresh Webamon scan (their infrastructure, not ours).
     Returns {"report_id": ...} or {"error": ...}."""

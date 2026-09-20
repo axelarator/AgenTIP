@@ -698,3 +698,89 @@ def test_cert_subject_spacing_does_not_decide_the_class():
         got = dict(observe.selectors_from({"tls": {"subject_dn": subject}},
                                           target="x.example", kind="domain"))
         assert "tls.default_subject" in got, subject
+
+
+# --------------------------------------------------------------------------- #
+# Subject: the CN, not the DN a tool happened to format
+# --------------------------------------------------------------------------- #
+
+def test_the_subject_selector_holds_the_common_name_not_the_whole_dn():
+    """Two tools formatted one certificate two ways and the link vanished.
+
+    openssl's grab gave "c = us, st = wa, ..., cn = *.sharepoint.com" and
+    tlsx gave "cn=*.sharepoint.com". Both were stored as tls.subject_cn, so
+    the same certificate occupied two selector values that could never match
+    each other - the exact failure `normalize` exists to prevent. Neither
+    form can be looked up against an index either, which holds the bare name.
+    """
+    observed = dict(_OBSERVED)
+    observed["tls"] = dict(_OBSERVED["tls"], subject_cn=None,
+                           subject_dn="C = US, ST = WA, O = Microsoft Corporation, "
+                                      "CN = *.sharepoint.com")
+    assert _extracted(observed)["tls.subject_cn"] == "*.sharepoint.com"
+
+    # the other tool's formatting of the same certificate, same selector
+    observed["tls"] = dict(_OBSERVED["tls"], subject_cn=None,
+                           subject_dn="cn=*.sharepoint.com, o=microsoft corporation")
+    assert _extracted(observed)["tls.subject_cn"] == "*.sharepoint.com"
+
+
+def test_a_dn_with_an_escaped_comma_is_not_split_on_it():
+    """RFC 4514 escapes a literal comma, and this one is from real data:
+    `o=alibaba (china) technology co.\\, ltd.`."""
+    assert observe._common_name(
+        "cn=cn-beijing.oss.aliyuncs.com, o=alibaba (china) technology co.\\, "
+        "ltd., l=hangzhou, c=cn") == "cn-beijing.oss.aliyuncs.com"
+
+
+def test_a_default_subject_keeps_the_whole_dn():
+    """For a stock certificate the combination of default fields IS the
+    fingerprint, so trimming it to the CN would throw the signal away."""
+    observed = dict(_OBSERVED)
+    dn = "cn=localhost, ou=it, o=myorg, l=default, st=default, c=ru"
+    observed["tls"] = dict(_OBSERVED["tls"], subject_cn="localhost", subject_dn=dn)
+    got = _extracted(observed)
+    assert got["tls.default_subject"] == dn
+    assert "tls.subject_cn" not in got
+
+
+def test_a_subject_with_no_common_name_yields_no_subject_selector():
+    observed = dict(_OBSERVED)
+    observed["tls"] = dict(_OBSERVED["tls"], subject_cn=None, subject_dn="o=nocn, c=us")
+    assert "tls.subject_cn" not in _extracted(observed)
+
+
+# --------------------------------------------------------------------------- #
+# SANs: a provider's certificate is not dozens of links
+# --------------------------------------------------------------------------- #
+
+def test_a_certificate_naming_a_few_hosts_records_each_san():
+    got = [v for t, v in observe.selectors_from(
+        _OBSERVED, target=_OBSERVED["target"], kind="domain") if t == "tls.san"]
+    assert got == ["help.hoster-kg.com"]
+
+
+def test_a_providers_multi_san_certificate_records_a_count_instead():
+    """One Aliyun OSS host contributed 58 SAN selectors and one Azure blob
+    host 53, out of 148 in the whole table. Any two tenants behind either
+    then shared dozens of 'structural' selectors."""
+    observed = dict(_OBSERVED)
+    observed["tls"] = dict(_OBSERVED["tls"],
+                           sans=[f"*.z{i}.blob.storage.azure.net" for i in range(50)])
+    got = dict(observe.selectors_from(observed, target="x.blob.core.windows.net",
+                                      kind="domain"))
+    assert "tls.san" not in got
+    assert got["tls.multi_san_cert"] == "50"
+    assert S.selector_class("tls.multi_san_cert") == "contextual", \
+        "a count of SANs must never be able to promote"
+
+
+def test_the_san_cap_sits_above_the_real_cases():
+    """The source reporting's shared certificate named 8 hosts."""
+    observed = dict(_OBSERVED)
+    observed["tls"] = dict(_OBSERVED["tls"],
+                           sans=[f"host{i}.evil.example" for i in range(8)])
+    got = [v for t, v in observe.selectors_from(
+        observed, target="host0.evil.example", kind="domain") if t == "tls.san"]
+    # 7, not 8: the certificate naming its own host is not a link.
+    assert len(got) == 7 and "host0.evil.example" not in got

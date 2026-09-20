@@ -16,6 +16,10 @@ from ..store import cdn as cdn_ranges
 from ..store import psl
 from ..store.selectors import TYPES
 
+# Above this many SANs a certificate belongs to a hosting provider rather
+# than an operator. See the gate in selectors_from for the measurement.
+MAX_OPERATOR_SANS = 16
+
 # Certificate subjects that identify a default build rather than an operator.
 # A self-signed cert left at its install-time defaults is shared by every
 # deployment of that software, so it links tools, not owners. Recording it
@@ -48,6 +52,36 @@ def _is_default_cert(subject: str | None) -> bool:
         return False
     lowered = " ".join(subject.lower().replace("=", " = ").split())
     return any(marker in lowered for marker in _DEFAULT_CERT_MARKERS)
+
+def _common_name(subject: str) -> str | None:
+    """The CN out of a distinguished name.
+
+    Only needed for sources that hand over a DN and no separate CN - the
+    retired Cert Spotter rows and openssl's `tls_live` grab. tlsx returns
+    subject_cn directly, and that is preferred over parsing.
+
+    RFC 4514 escapes a literal comma as `\\,`, which appears for real in this
+    repo's data: `o=alibaba (china) technology co.\\, ltd.`. Splitting on a
+    bare comma would cut that in half, so the escape is honoured.
+    """
+    parts, current, escaped = [], [], False
+    for ch in subject:
+        if escaped:
+            current.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == ",":
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current))
+    for part in parts:
+        key, _, value = part.partition("=")
+        if key.strip().lower() == "cn" and value.strip():
+            return value.strip()
+    return None
 
 
 def selectors_from(result: dict[str, Any], *, target: str,
@@ -94,14 +128,41 @@ def selectors_from(result: dict[str, Any], *, target: str,
     # an earlier version did to "cn=localhost, ou=it, o=myorg, l=default,
     # st=default, c=ru" - a subject shared by two tracked 7-Eleven
     # impersonation domains.
+    #
+    # A default subject keeps the whole DN, because the combination of stock
+    # fields IS the fingerprint. A real one keeps only the CN: the DN carried
+    # a tool's formatting with it, so the same Microsoft certificate was
+    # stored as both "c = us, st = wa, ..., cn = *.sharepoint.com" and
+    # "cn=*.sharepoint.com" and the two never linked - and neither form can
+    # be looked up against an index, which holds the bare name.
     subject = tls.get("subject_dn") or tls.get("subject_cn")
     if subject:
-        yield ("tls.default_subject" if _is_default_cert(subject)
-               else "tls.subject_cn"), subject
-    for san in tls.get("sans") or []:
-        # A certificate naming its own host links nothing.
-        if san and san.lower().lstrip("*.") != target.lower():
-            yield "tls.san", san
+        if _is_default_cert(subject):
+            yield "tls.default_subject", subject
+        else:
+            cn = tls.get("subject_cn") or _common_name(subject)
+            if cn:
+                yield "tls.subject_cn", cn
+    # A certificate naming a handful of hosts is the operator requesting them
+    # together - the structural link this selector exists for. A certificate
+    # naming dozens is a cloud provider's, and recording every name makes any
+    # two tenants behind it share dozens of "structural" selectors: one
+    # Aliyun OSS host in this repo's data contributed 58 SANs and one Azure
+    # blob host 53, out of 148 in the whole table.
+    #
+    # The cap, not a provider list, because the shape is the tell and no list
+    # could stay current. The source reporting's shared certificate named 8
+    # hosts, so the bar sits comfortably above the real cases.
+    sans = [s for s in (tls.get("sans") or []) if s]
+    if len(sans) <= MAX_OPERATOR_SANS:
+        for san in sans:
+            # A certificate naming its own host links nothing.
+            if san.lower().lstrip("*.") != target.lower():
+                yield "tls.san", san
+    elif sans:
+        # Not silence: the count itself says "provider certificate", which is
+        # worth knowing beside a finding and can never promote one.
+        yield "tls.multi_san_cert", str(len(sans))
 
     if kind == "domain":
         apex = psl.apex_for_selector(target)

@@ -44,8 +44,14 @@ SCALAR_MAP = {
     "http_title": "http.title",
     "ptr_hostname": "net.reverse_dns",
     "asn": "net.asn",
-    "webamon_fingerprint_dom": "http.body_sha256",
-    "webamon_fingerprint_ssl": "tls.spki_sha256",
+    # NOT http.body_sha256 and tls.spki_sha256, which is what these were
+    # mapped to. They are Webamon's own digests over their own extraction:
+    # example.com's body hashes to ff67a9d7... while its fingerprint.dom is
+    # f4726eb4..., verified byte-for-byte. Mapping them onto our hash types
+    # put a value into the identity class that can never match a real body
+    # or key digest, and had its rarity judged against the wrong population.
+    "webamon_fingerprint_dom": "webamon.fp_dom",
+    "webamon_fingerprint_ssl": "webamon.fp_ssl",
     "country_code": "net.country",
 }
 
@@ -113,10 +119,16 @@ def extract(row: dict, *, shared_hosting: bool = False,
         value = row.get(column)
         if value in (None, ""):
             continue
-        # The same rule the live path applies, from the same function.
-        if selector_type == "tls.subject_cn" and \
-                observe_source._is_default_cert(str(value)):
-            selector_type = "tls.default_subject"
+        if selector_type == "tls.subject_cn":
+            # Both rules the live path applies, from the same functions. These
+            # columns hold whatever the tool that wrote them formatted: a full
+            # DN from openssl's grab, and the same certificate's DN spelled
+            # differently by tlsx. Recording either verbatim put one fact into
+            # two selector values that could never match.
+            if observe_source._is_default_cert(str(value)):
+                selector_type = "tls.default_subject"
+            else:
+                value = observe_source._common_name(str(value)) or value
         found.append((selector_type, value))
 
     for column, selector_type in LIST_MAP.items():
@@ -127,11 +139,19 @@ def extract(row: dict, *, shared_hosting: bool = False,
             members = json.loads(raw) if isinstance(raw, str) else raw
         except (json.JSONDecodeError, ValueError):
             continue
-        for member in members or []:
-            if isinstance(member, dict):
-                member = member.get("name") or member.get("value")
-            if member:
-                found.append((selector_type, member))
+        members = [m.get("name") or m.get("value") if isinstance(m, dict) else m
+                   for m in (members or [])]
+        members = [m for m in members if m]
+        # The provider-certificate cap, same threshold as the live path. One
+        # Aliyun OSS host's certificate names 58 hosts and one Azure blob
+        # host's 53; without this the legacy columns reintroduced 1679 SAN
+        # selectors after the live path had been capped to 148.
+        if selector_type == "tls.san" and len(members) > observe_source.MAX_OPERATOR_SANS:
+            if members:
+                found.append(("tls.multi_san_cert", str(len(members))))
+            continue
+        for member in members:
+            found.append((selector_type, member))
 
     for column, selector_type in SET_MAP.items():
         raw = row.get(column)

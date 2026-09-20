@@ -130,6 +130,19 @@ TYPES: dict[str, SelectorType] = {t.name: t for t in (
     _t("file.sha256", "identity",
        "the same file was staged on both hosts",
        "that both hosts are adversary-controlled - it may be a common tool"),
+    _t("webamon.fp_dom", "identity",
+       "Webamon's DOM digest matches - the same rendered page, as their "
+       "scanner normalizes it. Survives the cosmetic edits that change a "
+       "raw body hash",
+       "the same thing as http.body_sha256. It is a different digest over a "
+       "different input: example.com's body hashes to ff67a9d7... while its "
+       "fingerprint.dom is f4726eb4..., so the two never match and must "
+       "never share a selector type"),
+    _t("webamon.fp_ssl", "identity",
+       "Webamon's certificate digest matches. Rare by construction - "
+       "example.com's value returns 2 scans index-wide",
+       "comparability with tls.spki_sha256 or tls.cert_sha256; it is their "
+       "hash over their own extraction, matchable only against itself"),
 
     # --- structural: strong, but coincidence is possible --------------------
     # Configuration and registration facts. Two of these, of different types,
@@ -163,6 +176,29 @@ TYPES: dict[str, SelectorType] = {t.name: t for t in (
        "both names resolve to the same address",
        "co-tenancy on shared hosting, which is not a link - check cdncheck "
        "or the ASN first"),
+    _t("dns.mx_set", "structural",
+       "the same mail-exchanger set - the same mail provider and usually the "
+       "same account. Rarer than an NS set, because most malicious domains "
+       "publish no MX at all",
+       "a link on a mass provider's MX (Google, Microsoft, Zoho)"),
+    _t("webamon.fp_dom_structure", "structural",
+       "the same DOM structure with the text changed - how a cloned kit is "
+       "recognised after the operator edits the branding. This is the "
+       "selector for the source reporting's cloned decoy page",
+       "the same page: every site built from one template shares it, which "
+       "is why it is structural and not identity"),
+    _t("webamon.fp_cert_san", "structural",
+       "the same SAN list, as one digest. Stronger than a single shared SAN: "
+       "it means both certificates name exactly the same set of hosts"),
+    _t("webamon.fp_domains", "structural",
+       "the page loads resources from the same set of domains - the same "
+       "kit's backend and CDN choices"),
+    _t("webamon.fp_ns_set", "structural",
+       "Webamon's digest of the nameserver set",
+       "a link on a mass provider - the same caveat as dns.ns_set, and the "
+       "rarity gate cannot read a digest, so check the plaintext set too"),
+    _t("webamon.fp_mx_set", "structural",
+       "Webamon's digest of the mail-exchanger set"),
 
 
     # --- behavioural: corroborates, never promotes alone --------------------
@@ -206,6 +242,20 @@ TYPES: dict[str, SelectorType] = {t.name: t for t in (
     _t("http.title", "behavioural",
        "the same page title. Weak alone, useful when the title is itself "
        "distinctive and the body hash differs only by a timestamp"),
+    _t("webamon.fp_header_order", "behavioural",
+       "the response headers arrive in the same ORDER, which is a property "
+       "of the server build and proxy chain rather than its configuration - "
+       "the HTTP analogue of JARM"),
+    _t("webamon.fp_cert_config", "behavioural",
+       "the same certificate configuration - key type, extensions, validity "
+       "window shape",
+       "a link: 1.3 million scans share example.com's value"),
+    _t("webamon.fp_cert_issuer", "behavioural",
+       "the same issuer, as a digest",
+       "a link - the plaintext form is tls.issuer, which is contextual for "
+       "the same reason"),
+    _t("webamon.fp_cookie_names", "behavioural",
+       "the same cookie names - usually the same application or panel"),
 
     # --- contextual: colour only, structurally unable to promote ------------
     # These exist so findings can be described, not so leads can be made.
@@ -222,8 +272,35 @@ TYPES: dict[str, SelectorType] = {t.name: t for t in (
     _t("tls.issuer", "contextual",
        "certificates from the same CA",
        "a link: almost everything is Let's Encrypt"),
+    _t("tls.multi_san_cert", "contextual",
+       "both hosts present a certificate naming about as many hosts - which "
+       "says they are behind hosting of a similar shape",
+       "a link. It is recorded in place of the SAN list when a certificate "
+       "names more than MAX_OPERATOR_SANS hosts, so that a provider's "
+       "certificate cannot manufacture dozens of structural selectors"),
     _t("http.tech", "contextual",
        "the same detected technology"),
+    _t("webamon.fp_tech", "contextual",
+       "the same detected technology set",
+       "a link: 22 million scans share example.com's value"),
+    _t("webamon.fp_asn", "contextual",
+       "the same set of ASNs served the page's resources",
+       "a link: 6.8 million scans share example.com's value"),
+    _t("webamon.fp_links", "contextual",
+       "the same outbound link set",
+       "a link: 2.9 million scans share example.com's value"),
+    _t("webamon.fp_scripts", "contextual",
+       "the page loads the same set of scripts",
+       "a link: 17.8 million scans share example.com's value"),
+    _t("webamon.fp_cookies", "contextual",
+       "the page sets the same cookies, values included",
+       "a link: 48.8 million scans share example.com's value"),
+    _t("brand.impersonated", "contextual",
+       "both names are lexically close to the same brand - which is a "
+       "statement about the lure, not the operator",
+       "a link, ever. Every phishing kit targeting one brand shares it; "
+       "1962 scans match 'microsoft'. It is here to be displayed beside a "
+       "finding, and would have labelled update-sentinelone.com on sight"),
     _t("net.country", "contextual", "hosted in the same country"),
 )}
 
@@ -377,14 +454,24 @@ def for_indicator(con: duckdb.DuckDBPyConnection,
                 "ORDER BY selector_type", [indicator_value])
 
 
-def _usable(selector_type: str, selector_value: Any) -> bool:
-    """Class AND value. A type can be structural while a particular value of
-    it names a mass provider and links nothing - `dns.ns_set` on Cloudflare's
-    nameservers is the case this exists for."""
-    from .rarity import value_is_provider_scale
+def _usable(con: duckdb.DuckDBPyConnection, selector_type: str,
+            selector_value: Any) -> bool:
+    """Class AND value.
 
-    return can_promote(selector_type) and not value_is_provider_scale(
-        selector_type, selector_value)
+    A type can be structural while a particular value of it names a mass
+    provider and links nothing - `dns.ns_set` on Cloudflare's nameservers is
+    the case this exists for. The second check is the priced one: a value
+    with more index-wide hits than PROVIDER_SCALE_GLOBAL_COUNT describes the
+    internet, and no vendored list could have named it in advance, because
+    nobody knows which DOM digest is on 17 million sites until they ask.
+    """
+    from .rarity import globally_common, value_is_provider_scale
+
+    if not can_promote(selector_type):
+        return False
+    if value_is_provider_scale(selector_type, selector_value):
+        return False
+    return not globally_common(con, selector_type, selector_value)
 
 
 def shared(con: duckdb.DuckDBPyConnection, *, min_indicators: int = 2,
@@ -408,7 +495,7 @@ def shared(con: duckdb.DuckDBPyConnection, *, min_indicators: int = 2,
         ORDER BY 3 DESC, 1""", [min_indicators])
     if promotable_only:
         result = [r for r in result
-                  if _usable(r["selector_type"], r["selector_value"])]
+                  if _usable(con, r["selector_type"], r["selector_value"])]
     for r in result:
         r["selector_class"] = selector_class(r["selector_type"])
     return result
@@ -443,7 +530,7 @@ def neighbours(con: duckdb.DuckDBPyConnection, indicator_value: str, *,
         if promotable_only:
             # Filter on the type AND the value it matched on, so a link that
             # exists only through a mass provider is not offered.
-            usable = {t for t, v in pairs if _usable(t, v)}
+            usable = {t for t, v in pairs if _usable(con, t, v)}
             types = [t for t in types if t in usable]
             if not types:
                 continue
