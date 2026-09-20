@@ -1,6 +1,6 @@
 """Runs on the cti host itself - drains the pending-fingerprints queue
 and drives a remote probe plus an OpenSearch lookup to fill it in. See
-the threat-cluster-tracking skill's "Automating the handoff" section.
+docs/probe-vm.md, "Automating the handoff to a fingerprinting vantage point".
 
 One remote hop and one HTTPS query per target, not two SSH hops - and,
 as of this change, every target in a queued batch is dispatched

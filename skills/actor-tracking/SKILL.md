@@ -11,10 +11,10 @@ RDAP) data, optionally cross-referenced against the lab's Zeek logs
 in OpenSearch (on request only - see below), and stored as per-day
 observation rows in DuckDB at
 `data/tracking/tracking.duckdb`. This is the temporal complement to
-the cluster JSON store (`skills/threat-cluster-tracking/`): clusters
+the cluster JSON store (`skills/cluster-bookkeeping/`): clusters
 stay canonical for TTP/diamond/profile data, this layer answers "what
 changed, and when". A cluster observable's own asn/ports/cert/tags
-fields (see `skills/threat-cluster-tracking/`) are a live point-in-time
+fields (see `skills/cluster-bookkeeping/`) are a live point-in-time
 snapshot for analyst display; the history of when those values changed
 lives only here, in DuckDB.
 
@@ -43,7 +43,36 @@ directly (there is no `daily_tracking.py` flag for this).
 
 ## Tables
 
+- `selectors` - the cross-indicator index: one row per (selector_type,
+  selector_value, indicator). This is the only table that answers **"who
+  else has this?"**; every other one answers "what changed about this?".
+  Written by the `observe` pass and by `active_scan`'s nmap port set.
+  Query it by value, not by indicator - that is what the index is for:
+
+  ```sql
+  SELECT selector_type, selector_value,
+         count(DISTINCT indicator_value) AS indicators,
+         string_agg(DISTINCT actor, ', ') AS actors
+  FROM selectors
+  GROUP BY 1, 2 HAVING indicators > 1
+  ORDER BY indicators DESC;
+  ```
+
+  A shared value is **not** a link on its own. What each type proves,
+  and the rule that promotes a candidate, are in the
+  `infrastructure-pivoting` skill - do not infer a relationship from a
+  row here without it.
+- `selector_stats` - one row per selector value. `local_count` is how
+  many of our indicators hold it (a free GROUP BY); `global_count` is
+  how many scans share it index-wide, from Webamon, filled only for
+  values that already link something. Above 10,000 the value describes
+  the internet rather than an operator and cannot promote a link. A NULL
+  `global_count` means "not priced", never "rare".
 - `observations` - one row per (day, indicator, source). Live sources:
+  `observe_http`, `observe_tls`, `observe_dns` (the CLI pass - the
+  current source for certificates, page and favicon digests, DNS
+  records and registration), `observe_silent` (probed, nothing
+  answered - how a C2 going dark becomes visible),
   `report:<file>`, `honeylabs`, `rdap`, `threatfox`, `tls_live`,
   `http_live`, `dns_resolve`, `ptr`, `webamon`, `webamon_infostealers`,
   `subdomains` (subfinder + Wayback, unioned), `nmap`, or

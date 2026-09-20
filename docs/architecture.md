@@ -58,7 +58,7 @@ python -c "from cti_tools import core; print(core.list_clusters())"
 **Claude Code** — native MCP support. `.mcp.json` at the repo root
 (written by `setup.sh`) already points at
 `mcp-server/.venv/bin/python -m cti_tools.server` with `cwd` set to
-`mcp-server`. Drop `skills/threat-cluster-tracking/` into
+`mcp-server`. Drop `skills/cluster-bookkeeping/` into
 `.claude/skills/`.
 
 **GitHub Copilot (VS Code)** — MCP support lives in VS Code's own MCP
@@ -71,7 +71,7 @@ current path, it's moved a couple of times.
 `pi-mcp-adapter` package (https://pi.dev/packages/pi-mcp-adapter),
 which gives it a native MCP client (the `mcp`/`mcpScript` tools). Wire
 it the same way as above via `.pi/mcp.json` (already written by
-`setup.sh`). `.pi/skills/threat-cluster-tracking/` is already
+`setup.sh`). `.pi/skills/cluster-bookkeeping/` is already
 populated.
 
 ### Why `.mcp.json` uses absolute paths, not `${workspaceFolder}`
@@ -273,7 +273,7 @@ directly). Same dedup/provenance semantics as `ingest_report`: a value
 already tracked just gets `source` appended to its provenance list.
 Categories also include `emails`, `cves`, `wallets`, and the JA4+/JARM
 fingerprint categories (`ja4`, `ja4s`, `ja4h`, `ja4l`, `ja4x`, `ja4t`,
-`ja4ts`, `ja4ssh`, `jarm`) — see the threat-cluster-tracking skill for
+`ja4ts`, `ja4ssh`, `jarm`) — see the cluster-bookkeeping skill for
 why those nine are never auto-extracted and have to be filed by hand.
 
 ## Infrastructure pivoting

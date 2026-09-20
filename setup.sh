@@ -78,19 +78,26 @@ touch "$ROOT"/data/tracking/.gitkeep
 
 # Claude Code reads Agent Skills from .claude/skills/ - mirror the
 # canonical copy there the same way .pi/skills/ already mirrors it for
-# Pi, so a fresh clone doesn't silently run without the skill (in
-# particular, its "pivoting vs. probing" section - the one place the
-# distinction between a passive lookup and an active JARM/JA4/nmap/
-# dirsearch probe via the lab probe VM is actually written down). Plain
-# copy, not a symlink -
-# same convention as .pi/skills/, and avoids relying on every harness
-# following symlinks the same way.
-# Both skills, not just one: actor-tracking was never mirrored here, so
-# Claude Code loaded the cluster-tracking rules and never the time-series
-# ones - the DuckDB layer's vocabulary, budgets and query discipline were
-# reachable only through tool descriptions. The mirrors are generated and
-# gitignored now; skills/ is the only copy under version control, because
-# three committed copies drift.
+# Pi, so a fresh clone doesn't silently run without the skills. Plain
+# copy, not a symlink - same convention as .pi/skills/, and avoids
+# relying on every harness following symlinks the same way.
+#
+# Every skills/*/, not a hand-listed set: actor-tracking was never
+# mirrored here, so Claude Code loaded the cluster-tracking rules and
+# never the time-series ones - the DuckDB layer's vocabulary, budgets and
+# query discipline were reachable only through tool descriptions. The
+# mirrors are generated and gitignored; skills/ is the only copy under
+# version control, because three committed copies drift.
+#
+# The mirrors are rebuilt from scratch rather than copied over. Copying
+# into an existing directory only ever ADDS, so a skill that was renamed
+# or split left its old copy behind and every harness kept loading it -
+# which is exactly what happened when threat-cluster-tracking became
+# cluster-bookkeeping and infrastructure-pivoting.
+for target in "$ROOT/.claude/skills" "$ROOT/.pi/skills"; do
+    rm -rf "$target"
+    mkdir -p "$target"
+done
 for skill in "$ROOT"/skills/*/; do
     name=$(basename "$skill")
     for target in "$ROOT/.claude/skills" "$ROOT/.pi/skills"; do
@@ -106,7 +113,7 @@ echo
 echo "Sanity check:"
 python -c "from cti import core; print(core.list_clusters())"
 echo
-echo "Next: point GitHub Copilot at skills/threat-cluster-tracking/ (wherever"
+echo "Next: point GitHub Copilot at skills/cluster-bookkeeping/ (wherever"
 echo "its own Agent Skills loader reads from) and at .mcp.json."
 echo "See docs/architecture.md."
 echo
