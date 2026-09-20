@@ -46,7 +46,14 @@ declare -A GO_TOOLS=(
 
 ALL_TOOLS="${!APT_TOOLS[*]} ${!GO_TOOLS[*]}"
 
-log() { printf '%s [%s] %s\n' "$(date -Is)" "${SSH_CLIENT%% *}" "$*" >>"$LOG"; }
+# Set from SSH_CLIENT before elevating and carried across the re-exec, which
+# strips the environment. Defaulted so `set -u` cannot turn a missing audit
+# field into a fatal error - losing the address is bad, refusing to run
+# because of it is worse.
+CLIENT="${SSH_CLIENT:-local}"
+CLIENT="${CLIENT%% *}"
+
+log() { printf '%s [%s] %s\n' "$(date -Is)" "${CLIENT:-unknown}" "$*" >>"$LOG"; }
 
 usage() {
   cat <<EOF
@@ -64,8 +71,28 @@ sandbox changes.
 EOF
 }
 
-require_root() {
-  [[ $EUID -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
+# The forced command runs as the probe user, but apt-get, go install and
+# setcap need root. Rather than putting the key in root's authorized_keys -
+# which needs PermitRootLogin forced-commands-only, and becomes a root shell
+# key if that setting ever drifts - the script re-execs itself through a
+# single NOPASSWD sudo rule scoped to this one path:
+#
+#   detonate ALL=(root) NOPASSWD: /usr/local/sbin/cti-provision
+#
+# The re-exec happens AFTER the request has been parsed and validated, and
+# passes the validated tokens as separate arguments. The unvalidated string
+# from the client is never handed to sudo.
+elevate() {
+  [[ $EUID -eq 0 ]] && return 0
+  command -v sudo >/dev/null 2>&1 || {
+    echo "not root and sudo is unavailable - install the sudoers rule:" >&2
+    echo "  $(id -un) ALL=(root) NOPASSWD: /usr/local/sbin/cti-provision" >&2
+    exit 1
+  }
+  # --from carries the client address across sudo's environment stripping.
+  # It cannot be forged from outside: the request is validated against the
+  # closed verb set first, so "--from" as a verb is rejected before this.
+  exec sudo -n /usr/local/sbin/cti-provision --from "$CLIENT" "$@"
 }
 
 tool_version() {
@@ -170,26 +197,48 @@ do_install() {
 }
 
 main() {
-  require_root
-  touch "$LOG" && chmod 0640 "$LOG"
+  # After the re-exec the first two arguments are the carried client address.
+  if [[ ${1:-} == --from ]]; then
+    CLIENT="${2:-unknown}"
+    shift 2
+  fi
 
-  # Under a forced command the client's request arrives here, not in "$@".
-  # Split it ourselves rather than eval-ing it.
+  # Under a forced command the client's request arrives in the environment,
+  # not in "$@". After the sudo re-exec the environment is gone and it
+  # arrives in "$@" instead, so both are accepted.
   local request="${SSH_ORIGINAL_COMMAND:-${*:-status}}"
   read -r -a argv <<<"$request"
   local verb="${argv[0]:-status}"
   local arg="${argv[1]:-}"
 
-  log "request: ${request:-<empty>}"
+  # Validate BEFORE elevating. Whatever reaches sudo has already been checked
+  # against the closed verb set and the tool allowlist, and is passed as
+  # separate arguments rather than a string.
+  case "$verb" in
+    status|help|-h|--help) ;;
+    install)
+      [[ -n $arg ]] || { echo "install needs a tool name or 'all'" >&2; exit 2; }
+      if [[ $arg != all && -z ${APT_TOOLS[$arg]:-} && -z ${GO_TOOLS[$arg]:-} ]]; then
+        echo "not in the allowlist: $arg" >&2
+        echo "allowed: $ALL_TOOLS" >&2
+        exit 2
+      fi ;;
+    update)
+      [[ -n ${GO_TOOLS[$arg]:-} ]] || {
+        echo "update only applies to Go tools: ${!GO_TOOLS[*]}" >&2; exit 2; } ;;
+    *) echo "unknown verb: $verb" >&2; usage >&2; exit 2 ;;
+  esac
+
+  elevate "$verb" ${arg:+"$arg"}
+
+  touch "$LOG" && chmod 0640 "$LOG"
+  log "request: ${request:-<empty>} (uid $EUID)"
 
   case "$verb" in
     status)  do_status ;;
-    install) [[ -n $arg ]] || { echo "install needs a tool name or 'all'" >&2; exit 2; }
-             do_install "$arg" ;;
-    update)  [[ -n ${GO_TOOLS[$arg]:-} ]] || { echo "update only applies to Go tools: ${!GO_TOOLS[*]}" >&2; exit 2; }
-             install_go "$arg" ;;
+    install) do_install "$arg" ;;
+    update)  install_go "$arg" ;;
     help|-h|--help) usage ;;
-    *)       echo "unknown verb: $verb" >&2; usage >&2; exit 2 ;;
   esac
 }
 

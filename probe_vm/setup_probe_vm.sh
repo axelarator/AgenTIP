@@ -83,6 +83,21 @@ echo "== cti-provision (the bounded provisioning command)"
 if [[ -f "$PROVISION_SRC" ]]; then
   install -m 0755 -o root -g root "$PROVISION_SRC" /usr/local/sbin/cti-provision
   echo "   installed /usr/local/sbin/cti-provision"
+  # One NOPASSWD rule, scoped to this one path. The forced command runs as
+  # $PROBE_USER; apt-get, go install and setcap need root, and the script
+  # re-execs itself through this rule after validating the request. Scoped
+  # here rather than putting the key in root's authorized_keys, which would
+  # need PermitRootLogin forced-commands-only and become a root shell key if
+  # that setting ever drifted.
+  printf '%s ALL=(root) NOPASSWD: /usr/local/sbin/cti-provision\n' "$PROBE_USER" \
+    > /etc/sudoers.d/cti-provision
+  chmod 0440 /etc/sudoers.d/cti-provision
+  if visudo -cf /etc/sudoers.d/cti-provision >/dev/null 2>&1; then
+    echo "   sudoers rule installed and validated"
+  else
+    rm -f /etc/sudoers.d/cti-provision
+    echo "   ERROR: sudoers rule failed validation, removed" >&2
+  fi
   # The key is pinned further down, AFTER the probe key's write - that one
   # truncates the file on purpose (sshd matches the first line for a key, so
   # a stale unrestricted entry would void the forced command), and appending

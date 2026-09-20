@@ -435,3 +435,49 @@ def test_both_keys_are_pinned_to_different_forced_commands():
     script = (REPO / "probe_vm" / "setup_probe_vm.sh").read_text()
     assert 'command="python3 /opt/cti/probe_helper.py"' in script
     assert 'command="/usr/local/sbin/cti-provision"' in script
+
+
+def test_provisioning_validates_before_it_elevates():
+    """Whatever reaches sudo must already have been checked. The first
+    version required root but had no way to GET root, so it could never do
+    its job; the fix must not become a path for an unvalidated string to
+    reach a privileged re-exec."""
+    script = _provision_script()
+    validate = script.index("# Validate BEFORE elevating")
+    elevate = script.index('elevate "$verb"')
+    assert validate < elevate
+
+
+def test_the_privileged_re_exec_passes_separate_arguments():
+    """`sudo ... $request` would hand the client's raw string to a root
+    process. The validated tokens go as distinct argv entries instead."""
+    script = _provision_script()
+    assert 'exec sudo -n /usr/local/sbin/cti-provision --from "$CLIENT" "$@"' in script
+    # the raw request string must never be what sudo receives
+    assert "sudo -n /usr/local/sbin/cti-provision $request" not in script
+    assert 'sudo -n /usr/local/sbin/cti-provision "$request"' not in script
+
+
+def test_the_sudoers_rule_is_scoped_to_the_one_path():
+    """A broader rule would give the probe user root for anything."""
+    bootstrap = (REPO / "probe_vm" / "setup_probe_vm.sh").read_text()
+    assert "NOPASSWD: /usr/local/sbin/cti-provision" in bootstrap
+    assert "NOPASSWD: ALL" not in bootstrap
+    assert "visudo -cf" in bootstrap, "an invalid sudoers file can lock out sudo entirely"
+
+
+def test_the_audit_field_cannot_make_the_script_fail():
+    """sudo strips the environment, so SSH_CLIENT is unset after the re-exec.
+    Under `set -u` that was a fatal unbound-variable error: the script
+    refused to run because it could not name the caller. Losing the address
+    is bad; refusing to run over it is worse."""
+    script = _provision_script()
+    assert 'SSH_CLIENT%% *' not in script, "unguarded SSH_CLIENT under set -u"
+    assert '${SSH_CLIENT:-' in script
+    assert '${CLIENT:-unknown}' in script
+
+
+def test_the_client_address_survives_the_privileged_re_exec():
+    script = _provision_script()
+    assert 'exec sudo -n /usr/local/sbin/cti-provision --from "$CLIENT" "$@"' in script
+    assert '[[ ${1:-} == --from ]]' in script, "the carried address must be stripped again"
