@@ -481,3 +481,60 @@ def test_the_client_address_survives_the_privileged_re_exec():
     script = _provision_script()
     assert 'exec sudo -n /usr/local/sbin/cti-provision --from "$CLIENT" "$@"' in script
     assert '[[ ${1:-} == --from ]]' in script, "the carried address must be stripped again"
+
+
+def test_go_is_taken_from_upstream_not_the_distro():
+    """Debian bookworm ships go1.19.8. httpx declares go 1.26.0 and tlsx
+    1.25.0, so every `go install` failed with the packaged toolchain and the
+    only diagnosis available was 'go install did not complete'."""
+    script = _provision_script()
+    assert "apt-get install -y -q golang-go" not in script, "the distro Go is too old"
+    assert "go.dev/dl/" in script and "GO_SHA256" in script, "pin and verify the download"
+    assert "sha256sum" in script
+
+
+def test_the_go_download_is_checksum_verified_before_use():
+    script = _provision_script()
+    mismatch = script.index("checksum mismatch")
+    extract = script.index("tar -C /usr/local -xzf")
+    assert mismatch < extract, "the archive must be verified before it is extracted"
+
+
+def test_go_install_failures_keep_their_error():
+    """Six tools failed at once with one unhelpful line because the output
+    was sent to /dev/null."""
+    script = _provision_script()
+    assert 'timeout 900 "$GO_BIN" install "$module" 2>&1' in script
+    # The failure branch must report what go actually said, not a fixed
+    # string. (Checking the string is absent entirely matched the comment
+    # explaining the old behaviour, which proved nothing.)
+    failure = [l for l in script.splitlines()
+               if "$tool: FAILED" in l and "go" not in l.split("FAILED")[0].lower()]
+    assert any('$err' in l for l in script.splitlines()
+               if "$tool: FAILED -" in l), "the go failure must include go's own output"
+
+
+def test_the_probe_user_path_check_does_not_use_a_builtin_through_runuser():
+    """`runuser -u X -- command -v tool` looks for a BINARY named 'command'
+    and always fails, so every tool was reported NOT ON PATH - including
+    nmap, which was installed and working."""
+    script = _provision_script()
+    assert 'runuser -u "$PROBE_USER" -- command -v' not in script
+    assert 'runuser -u "$PROBE_USER" -- sh -c' in script
+
+
+def test_whois_is_never_asked_for_its_version():
+    """whois treats an unknown flag as a query string, so `whois -version`
+    sent a live lookup to RIPE's database on every status call."""
+    script = _provision_script()
+    assert "SAFE_VERSION_PROBE" in script
+    safe = script[script.index("SAFE_VERSION_PROBE="):].split("\n")[0]
+    assert "whois" not in safe, "whois must not be version-probed"
+    assert "nmap" in safe and "httpx" in safe
+
+
+def test_package_names_map_to_the_binaries_they_provide():
+    """dnsutils provides dig; checking for a binary called 'dnsutils' found
+    nothing and reported a working install as missing."""
+    script = _provision_script()
+    assert "[dnsutils]=" in script and '"dig"' in script

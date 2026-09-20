@@ -28,6 +28,16 @@ LOG=/var/log/cti-provision.log
 GOBIN=/usr/local/bin
 PROBE_USER="${CTI_PROBE_USER:-detonate}"
 
+# Go, from upstream rather than the distro. Debian bookworm ships 1.19.8 and
+# the tools below need far newer - httpx declares go 1.26.0, tlsx 1.25.0 - so
+# every `go install` failed with the packaged toolchain. Pinned version and
+# checksum: updating Go means deploying a new copy of this script, which is
+# the same review step as adding a tool.
+GO_VERSION="go1.27.1"
+GO_SHA256="63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445"
+GO_ROOT=/usr/local/go
+GO_BIN="$GO_ROOT/bin/go"
+
 # name -> how to install it. Nothing here is parameterised by the caller.
 declare -A APT_TOOLS=(
   [whois]="whois"
@@ -43,6 +53,15 @@ declare -A GO_TOOLS=(
   [cdncheck]="github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest"
   [asnmap]="github.com/projectdiscovery/asnmap/cmd/asnmap@latest"
 )
+
+# Package name and binary name differ for some apt tools; checking for the
+# package name found nothing and reported a working install as "missing".
+declare -A BINARY=( [dnsutils]="dig" )
+
+# Tools it is safe to ask for a version. `whois -version` is NOT: whois
+# treats an unknown flag as a query string, so the first version of this
+# sent a live lookup for "-version" to RIPE's database on every status call.
+SAFE_VERSION_PROBE=" nmap openssl dig naabu dnsx cdncheck httpx tlsx asnmap "
 
 ALL_TOOLS="${!APT_TOOLS[*]} ${!GO_TOOLS[*]}"
 
@@ -96,21 +115,64 @@ elevate() {
 }
 
 tool_version() {
-  local tool=$1 path
-  path=$(command -v "$tool" 2>/dev/null) || { echo "missing"; return; }
-  # Every one of these supports -version or --version; keep it to one line
-  # and never let a hanging tool wedge the connection.
+  local tool=$1 binary=${BINARY[$1]:-$1} path
+  path=$(command -v "$binary" 2>/dev/null) || { echo "missing"; return; }
+  if [[ " $SAFE_VERSION_PROBE " != *" $binary "* ]]; then
+    printf 'present (%s)' "$path"     # no version probe: see SAFE_VERSION_PROBE
+    return
+  fi
   local v
-  v=$(timeout 10 "$path" -version 2>&1 | head -1) \
-    || v=$(timeout 10 "$path" --version 2>&1 | head -1) \
-    || v="present"
+  v=$(timeout 10 "$path" -version 2>&1 | head -1) || v=""
+  [[ -n $v ]] || v=$(timeout 10 "$path" --version 2>&1 | head -1) || v=""
   printf '%s (%s)' "${v:-present}" "$path"
+}
+
+# `runuser -u X -- command -v tool` cannot work: command is a shell builtin,
+# so runuser looks for a binary named "command" and fails. Every tool was
+# reported NOT ON PATH, including ones that were plainly installed.
+probe_user_has() {
+  local binary=${BINARY[$1]:-$1}
+  runuser -u "$PROBE_USER" -- sh -c "command -v $(printf '%q' "$binary")" >/dev/null 2>&1
+}
+
+ensure_go() {
+  # An adequate Go already present (distro or a previous run of this).
+  if [[ -x $GO_BIN ]]; then return 0; fi
+  if command -v go >/dev/null 2>&1; then
+    local have
+    have=$(go version | awk '{print $3}')
+    # 1.19 < 1.25, and sort -V gets that right where string compare does not.
+    if [[ $(printf '%s\n%s\n' "go1.25.0" "$have" | sort -V | head -1) == "go1.25.0" ]]; then
+      GO_BIN=$(command -v go)
+      return 0
+    fi
+    echo "  distro go is $have, too old for these modules - fetching $GO_VERSION" >&2
+  fi
+
+  local tarball="/tmp/${GO_VERSION}.linux-amd64.tar.gz"
+  log "downloading $GO_VERSION"
+  if ! timeout 600 curl -fsSL -o "$tarball" \
+        "https://go.dev/dl/${GO_VERSION}.linux-amd64.tar.gz"; then
+    echo "  go: FAILED - could not download $GO_VERSION" >&2
+    return 1
+  fi
+  local got
+  got=$(sha256sum "$tarball" | awk '{print $1}')
+  if [[ $got != "$GO_SHA256" ]]; then
+    rm -f "$tarball"
+    echo "  go: FAILED - checksum mismatch (expected $GO_SHA256, got $got)" >&2
+    return 1
+  fi
+  rm -rf "$GO_ROOT"
+  tar -C /usr/local -xzf "$tarball" && rm -f "$tarball"
+  [[ -x $GO_BIN ]] || { echo "  go: FAILED - $GO_BIN missing after extract" >&2; return 1; }
+  echo "  go: installed $GO_VERSION -> $GO_BIN"
 }
 
 do_status() {
   echo "probe VM provisioning status"
   echo "  host:  $(hostname)"
-  echo "  go:    $(command -v go >/dev/null && go version || echo 'not installed')"
+  echo "  go:    $([[ -x $GO_BIN ]] && "$GO_BIN" version || (command -v go >/dev/null && go version) || echo 'not installed')"
   echo
   for tool in $ALL_TOOLS; do
     printf '  %-10s %s\n' "$tool" "$(tool_version "$tool")"
@@ -135,15 +197,15 @@ install_apt() {
 
 install_go() {
   local tool=$1 module=${GO_TOOLS[$1]}
-  if ! command -v go >/dev/null 2>&1; then
-    log "go missing, installing golang-go for $tool"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q golang-go >/dev/null 2>&1 \
-      || { echo "  $tool: FAILED - go is not installed and golang-go would not install" >&2; return 1; }
-  fi
+  ensure_go || { echo "  $tool: FAILED - no usable Go toolchain" >&2; return 1; }
   log "go install $module"
-  # GOFLAGS/GOPATH kept out of the caller's control; GOBIN fixed above.
-  if GOBIN="$GOBIN" GOPATH=/root/go GOCACHE=/root/.cache/go-build \
-     timeout 600 go install -v "$module" >/dev/null 2>&1; then
+  # Failures were swallowed by >/dev/null, so "go install did not complete"
+  # was the only diagnosis available for six tools at once. Keep the tail.
+  local err
+  err=$(GOBIN="$GOBIN" GOPATH=/root/go GOCACHE=/root/.cache/go-build \
+        GOTOOLCHAIN=auto PATH="$GO_ROOT/bin:$PATH" \
+        timeout 900 "$GO_BIN" install "$module" 2>&1) && true
+  if [[ -x "$GOBIN/$tool" ]]; then
     echo "  $tool: installed -> $GOBIN/$tool"
     # naabu wants raw sockets for SYN scans; without the capability it falls
     # back to connect() scans, which work and are just slower and louder.
@@ -153,7 +215,7 @@ install_go() {
         || echo "    note: no cap_net_raw, naabu will use connect() scans"
     fi
   else
-    echo "  $tool: FAILED - go install did not complete" >&2
+    echo "  $tool: FAILED - $(echo "$err" | tail -2 | tr '\n' ' ')" >&2
     return 1
   fi
 }
@@ -186,7 +248,7 @@ do_install() {
   echo
   echo "the probe user sees:"
   for tool in $targets; do
-    if runuser -u "$PROBE_USER" -- command -v "$tool" >/dev/null 2>&1; then
+    if probe_user_has "$tool"; then
       printf '  %-10s ok\n' "$tool"
     else
       printf '  %-10s NOT ON PATH for %s\n' "$tool" "$PROBE_USER"
