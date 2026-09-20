@@ -673,8 +673,14 @@ def test_a_cdn_edge_addresss_page_hash_is_not_a_link():
 
 def test_a_domain_behind_a_cdn_still_has_a_meaningful_page_hash():
     """The bytes are the operator's content, not the CDN's error page - only
-    the IP case is suppressed."""
-    behind = {"http": {"body_sha256": "c" * 64},
+    the IP case is suppressed.
+
+    The 200 is load-bearing and was missing here: without a status there is
+    no evidence a page was served, and the hash is recorded as an error
+    page instead. That is the conservative direction on purpose - "the same
+    page is being served" is a claim, and it needs the status to support it.
+    """
+    behind = {"http": {"body_sha256": "c" * 64, "status": 200},
               "cdn": {"is_cdn": True}, "errors": {}}
     got = dict(observe.selectors_from(behind, target="shop.example", kind="domain"))
     assert got.get("http.body_sha256") == "c" * 64
@@ -784,3 +790,49 @@ def test_the_san_cap_sits_above_the_real_cases():
         observed, target="host0.evil.example", kind="domain") if t == "tls.san"]
     # 7, not 8: the certificate naming its own host is not a link.
     assert len(got) == 7 and "host0.evil.example" not in got
+
+
+# --------------------------------------------------------------------------- #
+# A body hash means "the same page", only if a page was served
+# --------------------------------------------------------------------------- #
+
+def _with_status(status):
+    observed = dict(_OBSERVED)
+    observed["http"] = dict(_OBSERVED["http"], status=status)
+    return _extracted(observed)
+
+
+@pytest.mark.parametrize("status", [200, 204, 301, 302])
+def test_a_served_page_gives_a_body_hash(status):
+    got = _with_status(status)
+    assert got["http.body_sha256"] == "b" * 64
+    assert "http.favicon_mmh3" in got
+
+
+@pytest.mark.parametrize("status", [403, 404, 500, 521, None])
+def test_an_error_response_gives_a_demoted_hash_instead(status):
+    """Cloudflare's 521 "Web Server Is Down" page promoted three STAC4749
+    domains under three DIFFERENT registrations. The bytes were the CDN's,
+    not the operator's - and this selector's own `never` field already said
+    "a shared CDN error page" proves nothing. Nothing enforced it.
+
+    Its hash is on 103 scans index-wide, far under any rarity threshold, so
+    the global count could never have caught this either.
+    """
+    got = _with_status(status)
+    assert "http.body_sha256" not in got
+    assert got["http.error_page_sha256"] == "b" * 64
+    assert S.selector_class("http.error_page_sha256") == "behavioural", \
+        "an error page must not be able to promote a link"
+
+
+def test_an_error_page_hash_is_kept_rather_than_discarded():
+    """Two tracked hosts serving the same error page IS a weak signal about
+    shared hosting - the same treatment tls.default_subject gets."""
+    assert "http.error_page_sha256" in _with_status(521)
+
+
+def test_a_favicon_from_an_error_page_is_not_recorded():
+    """There is no favicon on an origin-down page; whatever was fetched
+    belongs to the CDN."""
+    assert "http.favicon_mmh3" not in _with_status(521)

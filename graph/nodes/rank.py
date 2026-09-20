@@ -49,6 +49,12 @@ ITEMS_PER_FAMILY = {
     "cert_tls": 3,
     "hosting": 4,
     "opendir": 8,
+    # Links are already filtered by the corroboration rule, so the ones
+    # that reach here have passed a bar no other family's items have to
+    # clear. Six because a real campaign surfaces as a handful of linked
+    # pairs at once - the source reporting's certificate was on 8 hosts -
+    # and showing two of them would describe a cluster as a coincidence.
+    "infrastructure": 6,
 }
 DEFAULT_ITEM_BUDGET = 3
 
@@ -59,6 +65,9 @@ CONFIDENCE_WEIGHT = {"high": 3.0, "medium": 2.0, "low": 1.0}
 # change means someone rebuilt TLS; a new subdomain means someone
 # registered a name, which happens constantly.
 CHANGE_WEIGHT = {
+    # A corroborated link outranks every change type: a change says one
+    # host moved, a link says two hosts are the same operation.
+    "selector_link": 4.0,
     "cert_issuer_changed": 3.0,
     "cert_new": 2.5,
     "webamon_fingerprint_changed": 3.0,
@@ -94,6 +103,14 @@ def _looks_like_shared_hosting(item: Item, asn_by_indicator: dict[str, int]) -> 
     same as one on dedicated infrastructure, which is exactly the
     distinction the analyst rules ask for.
     """
+    if item.family == "infrastructure":
+        # The selector layer already applied a stricter, purpose-built gate:
+        # co-hosting selectors are never recorded on a CDN or big-cloud
+        # address, and a body hash is suppressed for an IP behind a CDN. A
+        # link that survived that is a link, and re-suppressing it here on
+        # the ASN alone would drop exactly the promoted pairs this family
+        # exists to surface.
+        return False
     asn = asn_by_indicator.get(item.indicator)
     if asn is not None and asn in SHARED_HOSTING_ASNS:
         return True
@@ -215,6 +232,45 @@ def _items_from_open_directories(digest: dict[str, Any]) -> list[Item]:
     return out
 
 
+def _items_from_infrastructure_links(digest: dict[str, Any]) -> list[Item]:
+    """Candidate links, already judged by the corroboration rule.
+
+    These are not attribute changes and do not belong in the same shape as
+    one, but they go through the same Item so the fan-out, the budget and
+    the suppression all work unchanged.
+
+    Only promoted candidates become items. A held-back candidate is a link
+    the rule declined to make, and its reason is already in the digest for
+    a human to read; handing three hundred of them to a model would be the
+    exact mistake the ranker exists to prevent. The count is carried on
+    every item so the specialist knows what it is not being shown.
+    """
+    links = (digest.get("infrastructure_links") or {})
+    promoted = links.get("promoted") or []
+    held = links.get("held_back_total") or 0
+    out = []
+    for row in promoted:
+        out.append(Item(
+            family="infrastructure", attribute="selector_link",
+            actor=row.get("actor"),
+            indicator=row.get("seed") or "",
+            change_type="selector_link",
+            # The rule is deterministic and was applied before this point:
+            # an identity selector, or two independent structural ones. That
+            # is a high-confidence claim by construction.
+            confidence="high",
+            detected_at=str(digest.get("day") or "") or None,
+            old_value={"held_back": held},
+            new_value={"linked_to": row.get("linked_to"),
+                       "reason": row.get("reason"),
+                       "identity": row.get("identity"),
+                       "structural": row.get("structural"),
+                       "corroborating": row.get("corroborating")},
+            source_section="infrastructure_links",
+        ))
+    return out
+
+
 def score(item: Item, asn_by_indicator: dict[str, int]) -> Item:
     base = CHANGE_WEIGHT.get(item.change_type, 1.0)
     item.score = base * CONFIDENCE_WEIGHT.get(item.confidence, 1.0)
@@ -237,7 +293,8 @@ def rank(state: CTIState) -> dict:
     digest = state.get("digest_json") or {}
     items = (_items_from_attribute_changes(digest)
              + _items_from_asn_pivots(digest)
-             + _items_from_open_directories(digest))
+             + _items_from_open_directories(digest)
+             + _items_from_infrastructure_links(digest))
     asn_by_indicator = _asn_index(digest, [i.indicator for i in items])
     items = [score(item, asn_by_indicator) for item in items]
 

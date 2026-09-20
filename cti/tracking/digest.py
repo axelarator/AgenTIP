@@ -100,6 +100,10 @@ def _has_signals(sections: dict[str, Any]) -> bool:
         or sections.get("cross_actor_asn_overlap")
         or sections.get("temporal_clusters")
         or sections.get("open_directories")
+        # A corroborated link is an event in its own right. Without this a
+        # day whose only finding was "these two hosts are one operation"
+        # rendered as "no activity" and never woke Stage B.
+        or (sections.get("infrastructure_links") or {}).get("promoted")
     )
 
 
@@ -174,6 +178,29 @@ def write(day: date, sections: dict[str, Any]) -> Path:
         lines += _table(real_changes,
                         ["ip", "actor", "change_type", "old_asn", "new_asn",
                          "new_netname", "confidence"])
+        lines.append("")
+
+    links = sections.get("infrastructure_links") or {}
+    promoted = links.get("promoted") or []
+    if promoted:
+        lines += ["## Corroborated infrastructure links", ""]
+        # Two hosts, why, and nothing else. The evidence is in the JSON;
+        # what a reader needs here is which pairs the rule was willing to
+        # make and on what, because that is the claim being asserted.
+        for link in promoted:
+            lines.append(f"- **{link.get('seed')}** <-> **{link.get('linked_to')}**"
+                         + (f" ({link['actor']})" if link.get("actor") else ""))
+            lines.append(f"  - {link.get('reason')}")
+        held = links.get("held_back_total") or 0
+        if held:
+            # The held-back count is the filter reporting for duty. Without
+            # it "2 links today" reads as a thin day rather than a strict
+            # rule, and nobody can tell which.
+            reasons = links.get("held_back_reasons") or {}
+            top = next(iter(reasons), None)
+            lines.append("")
+            lines.append(f"_{held} further candidate(s) held back"
+                         + (f"; most common reason: {top}_" if top else "_"))
         lines.append("")
 
     attr_changes = sections.get("attribute_changes") or []

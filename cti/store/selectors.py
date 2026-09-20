@@ -239,6 +239,14 @@ TYPES: dict[str, SelectorType] = {t.name: t for t in (
        "a link on shared hosting, where every pair of addresses shares "
        "thousands of tenants. Backfilling it without that gate produced 5320 "
        "selectors from this repo's own data, nearly all Cloudflare tenants"),
+    _t("http.error_page_sha256", "behavioural",
+       "both hosts serve the same error page. Weak, but not nothing: the "
+       "same origin-down page from the same CDN is a statement about shared "
+       "hosting, and an unusual custom error page can be a real tell",
+       "a link, and especially not a shared deployment. Cloudflare's 521 "
+       "'Web Server Is Down' page promoted three domains under three "
+       "different registrations before this type existed, because a body "
+       "hash was recorded whatever the status code said"),
     _t("http.title", "behavioural",
        "the same page title. Weak alone, useful when the title is itself "
        "distinctive and the body hash differs only by a timestamp"),

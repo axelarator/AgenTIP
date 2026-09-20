@@ -24,6 +24,7 @@ def build_collect():
     g.add_node("sweep", collect.sweep)
     g.add_node("enrich_and_write", collect.enrich_and_write)
     g.add_node("run_analytics", collect.run_analytics)
+    g.add_node("corroborate", collect.corroborate)
     g.add_node("write_digest", collect.write_digest)
 
     g.add_edge(START, "ingest_inbox")
@@ -33,7 +34,11 @@ def build_collect():
                             ["sweep", "enrich_and_write"])
     g.add_edge("sweep", "enrich_and_write")
     g.add_edge("enrich_and_write", "run_analytics")
-    g.add_edge("run_analytics", "write_digest")
+    # Corroboration reads the selectors the sweep just recorded and must
+    # therefore run after it - but before the digest, because its output IS
+    # a digest section and the analyze subgraph reads the digest.
+    g.add_edge("run_analytics", "corroborate")
+    g.add_edge("corroborate", "write_digest")
     g.add_edge("write_digest", END)
     return g.compile()
 

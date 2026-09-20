@@ -39,6 +39,47 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = os.environ.get("CTI_GRAPH_MODEL", "claude-sonnet-5")
 
 
+def selector_taxonomy() -> str:
+    """The selector taxonomy, rendered from the code that enforces it.
+
+    The prompt must not carry its own copy. `selectors.py` decides what a
+    shared value proves and `expand.py` applies that decision; a prompt
+    that restated it in prose would drift the first time a type was
+    reclassed, and the model would then be arguing with the rule that
+    already ran. whois.registrar was reclassed structural -> behavioural
+    during this work, which is exactly the edit a hand-written table would
+    have missed.
+
+    Only the classes that can promote are listed in full. Behavioural and
+    contextual types are named but not explained, because the one thing the
+    specialist needs to know about them is that they cannot make a link.
+    """
+    from cti.store.selectors import CLASS_ORDER, TYPES
+
+    by_class: dict[str, list] = {c: [] for c in CLASS_ORDER}
+    for spec in TYPES.values():
+        by_class[spec.cls].append(spec)
+
+    lines: list[str] = []
+    for cls in ("identity", "structural"):
+        lines.append(f"### {cls} - {'promotes alone' if cls == 'identity' else 'two independent ones promote'}")
+        lines.append("")
+        for spec in sorted(by_class[cls], key=lambda s: s.name):
+            lines.append(f"- **`{spec.name}`** - {spec.means}.")
+            if spec.never:
+                lines.append(f"  Never: {spec.never}.")
+        lines.append("")
+    for cls in ("behavioural", "contextual"):
+        names = ", ".join(f"`{s.name}`" for s in sorted(by_class[cls], key=lambda s: s.name))
+        note = ("corroborate a link, never make one" if cls == "behavioural"
+                else "describe a finding; structurally unable to promote one")
+        lines.append(f"### {cls} - {note}")
+        lines.append("")
+        lines.append(names)
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def load_prompt(name: str, *, with_common: bool = True) -> str:
     """A specialist's prompt is its own file plus the shared rules.
 
@@ -51,6 +92,9 @@ def load_prompt(name: str, *, with_common: bool = True) -> str:
     judgements also depended on.
     """
     body = (PROMPTS / f"{name}.md").read_text()
+    # A prompt may ask for a table the code owns rather than restating it.
+    if "{{SELECTOR_TAXONOMY}}" in body:
+        body = body.replace("{{SELECTOR_TAXONOMY}}", selector_taxonomy())
     if not with_common:
         return body
     return (PROMPTS / "_common.md").read_text() + "\n\n---\n\n" + body

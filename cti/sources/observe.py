@@ -107,9 +107,28 @@ def selectors_from(result: dict[str, Any], *, target: str,
     # each other that way. A DOMAIN behind a CDN is different: the bytes are
     # the operator's, so only the IP case is suppressed.
     probing_cdn_edge = kind == "ip" and (on_shared_infra or cdn_failed)
+    # A body hash only means "the same page is being served" when a page was
+    # actually served. On an error response the bytes are the CDN's or the
+    # server's, not the operator's, and hashing them links every host whose
+    # origin happens to be down. This selector's own `never` field said so -
+    # "anything at all when the body is an empty response, a default nginx
+    # or Apache welcome page, or a shared CDN error page" - and nothing
+    # enforced it, so three STAC4749 domains under three different
+    # registrations were promoted on Cloudflare's 521 "Web Server Is Down"
+    # page. Its hash is on 103 scans index-wide, well under any rarity
+    # threshold, so pricing could never have caught it either.
+    #
+    # The hash is still recorded, demoted: two tracked hosts serving the
+    # same error page IS a weak signal about shared hosting, and it is the
+    # same treatment tls.default_subject already gets rather than discarding
+    # a fact because it cannot carry weight.
+    status = http.get("status")
+    served_a_page = isinstance(status, int) and 200 <= status < 400
     if http.get("body_sha256") and not probing_cdn_edge:
-        yield "http.body_sha256", http["body_sha256"]
-    if http.get("favicon_mmh3") not in (None, "", 0) and not probing_cdn_edge:
+        yield (("http.body_sha256" if served_a_page else "http.error_page_sha256"),
+               http["body_sha256"])
+    if (http.get("favicon_mmh3") not in (None, "", 0) and not probing_cdn_edge
+            and served_a_page):
         yield "http.favicon_mmh3", http["favicon_mmh3"]
     if tls.get("cert_sha256"):
         yield "tls.cert_sha256", tls["cert_sha256"]

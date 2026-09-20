@@ -11,9 +11,10 @@ import operator
 from dataclasses import asdict, dataclass, field
 from typing import Annotated, Any, Literal, TypedDict
 
-# The four specialist families. Each owns a disjoint set of the digest's
-# attribute vocabulary, so a row is routed to exactly one of them.
-Family = Literal["infra_change", "cert_tls", "hosting", "opendir"]
+# The specialist families. The first four own a disjoint set of the digest's
+# attribute vocabulary, so a change row is routed to exactly one of them.
+Family = Literal["infra_change", "cert_tls", "hosting", "opendir",
+                 "infrastructure"]
 
 FAMILY_ATTRIBUTES: dict[Family, tuple[str, ...]] = {
     "infra_change": ("asn", "ports", "ptr", "resolved_ip"),
@@ -21,6 +22,12 @@ FAMILY_ATTRIBUTES: dict[Family, tuple[str, ...]] = {
     "hosting": ("ip_hostnames", "subdomains", "webamon_fingerprint",
                 "infostealer_hits"),
     "opendir": ("opendir_files",),
+    # The fifth specialist reads links between indicators rather than
+    # changes to one. Every other family answers "what changed here?"; this
+    # one answers "who else has this?", which is a different question and
+    # needs a different reader. Its attribute is not a digest column - it
+    # is a candidate link produced by the corroboration rule.
+    "infrastructure": ("selector_link",),
 }
 
 ATTRIBUTE_FAMILY: dict[str, Family] = {

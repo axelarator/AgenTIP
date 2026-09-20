@@ -267,6 +267,100 @@ def run_analytics(state: dict) -> dict:
     return {"sections": sections}
 
 
+# How many candidate links the digest carries. Not a limit on what the
+# selector index knows - `expand.candidates_for` will happily return three
+# hundred - but on what is worth putting in front of anyone. The held-back
+# ones are counted, not listed: "42 more, none with a second selector" is
+# the useful summary, and the full set is one query away.
+MAX_DIGEST_LINKS = 25
+
+# Global counts cost a Webamon call each. Priced newest-and-widest first,
+# and only for values that already link something, so a quiet day spends
+# nothing at all.
+GLOBAL_COUNT_BUDGET = 25
+
+
+def _indicators_touched(con, day) -> list[str]:
+    """Indicators whose selectors were seen today.
+
+    The whole index is not rechecked daily. A link between two hosts that
+    neither changed is the same link it was yesterday and was reported
+    then; what is new today is what today's sweep saw.
+    """
+    rows = con.execute(
+        "SELECT DISTINCT indicator_value FROM selectors WHERE last_seen >= ?",
+        [str(day)]).fetchall()
+    return [r[0] for r in rows]
+
+
+def corroborate(state: dict) -> dict:
+    """Turn today's selectors into candidate links, and price them.
+
+    Three steps, cheapest first, which is the same order `expand` uses:
+
+    1. refresh the local stats - one GROUP BY, free;
+    2. price the values that link something, against Webamon, bounded;
+    3. apply the corroboration rule to every indicator touched today.
+
+    Nothing here contacts an indicator. The selectors were collected by the
+    sweep that already ran; this is arithmetic over what it found, plus a
+    bounded number of index lookups. A failure is recorded and the day
+    continues - the digest is worth more than this section.
+    """
+    sections = dict(state.get("sections") or {})
+
+    def _run():
+        from cti.sources import webamon
+        from cti.store import expand, rarity
+
+        with store.connect() as con:
+            stats = rarity.refresh(con)
+            priced = rarity.fill_global_counts(
+                con, webamon.global_count, limit=GLOBAL_COUNT_BUDGET,
+                can_price=webamon.reversible)
+
+            promoted, held = [], []
+            seen_pairs: set[tuple[str, str]] = set()
+            for indicator in _indicators_touched(con, _day(state)):
+                for candidate in expand.candidates_for(con, indicator):
+                    # A link is symmetric, and both ends are touched on the
+                    # same day, so without this every promotion appears
+                    # twice with the two indicators swapped.
+                    pair = tuple(sorted((indicator, candidate.indicator)))
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    # Explicit keys, not {"indicator": ..., **to_dict()}:
+                    # Candidate.to_dict() has its own "indicator" and
+                    # silently overwrote the seed, so every link pointed at
+                    # itself and the other end was lost.
+                    evidence = candidate.to_dict()
+                    row = {"seed": indicator,
+                           "linked_to": evidence.pop("indicator"), **evidence}
+                    (promoted if candidate.promoted else held).append(row)
+
+        promoted.sort(key=lambda r: (-len(r["identity"]), -len(r["structural"])))
+        return {
+            "stats": stats, "priced": priced,
+            "promoted": promoted[:MAX_DIGEST_LINKS],
+            "promoted_total": len(promoted),
+            "held_back_total": len(held),
+            # A held-back candidate is not a non-event: it is a link the
+            # rule declined to make, and the reason is the interesting part.
+            "held_back_reasons": _reason_counts(held),
+        }
+
+    sections["infrastructure_links"] = _phase(sections, "corroborate", _run) or {}
+    return {"sections": sections}
+
+
+def _reason_counts(held: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in held:
+        counts[row["reason"]] = counts.get(row["reason"], 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
 def write_digest(state: dict) -> dict:
     """The digest file, plus its contents loaded into state so the
     analyze subgraph can read it without touching the disk again."""
