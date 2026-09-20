@@ -537,3 +537,96 @@ def test_a_real_observe_failure_is_still_a_failure():
     from cti.errors import normalize_probe, ok
 
     assert not ok(normalize_probe({"error": "probe VM unreachable"}))
+
+
+def test_the_observation_writer_is_called_only_where_a_connection_exists():
+    """The insertion matched two places: the history writer, which holds a
+    DuckDB connection, and pivot_cluster's cluster-JSON snapshot loop, which
+    holds the data lock and has no connection at all. The second raised
+    NameError on the first live sweep after the fix - so the sweep now failed
+    loudly rather than silently, which is how it was found."""
+    import ast
+    import inspect
+
+    from cti import core
+
+    tree = ast.parse(inspect.getsource(core))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        calls = [n for n in ast.walk(node)
+                 if isinstance(n, ast.Call)
+                 and getattr(n.func, "id", None) == "_log_observation"]
+        if not calls:
+            continue
+        # the connection must be bound in this function, as a parameter or by
+        # a `with ... as con`
+        names = {a.arg for a in node.args.args}
+        names |= {n.id for n in ast.walk(node)
+                  if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        names |= {n.optional_vars.id for n in ast.walk(node)
+                  if isinstance(n, ast.withitem) and isinstance(
+                      getattr(n, "optional_vars", None), ast.Name)}
+        assert "con" in names, f"{node.name} calls _log_observation with no connection"
+
+
+# --------------------------------------------------------------------------- #
+# Silence is a finding, not an absence
+# --------------------------------------------------------------------------- #
+
+def test_a_host_that_answers_nothing_is_recorded_as_silent(tmp_path, monkeypatch):
+    """sliver-c2's C2 went dark between 2026-09-12 and 2026-09-20 and nothing
+    in the store said so. An observe pass that probes and gets no answer
+    looked exactly like one that never ran: empty dicts, no errors, no rows."""
+    from cti import core
+    from cti.store import connect
+
+    monkeypatch.setenv("CTI_DUCKDB_PATH", str(tmp_path / "t.duckdb"))
+    silent = {"http": {}, "tls": {}, "dns": {}, "whois": {},
+              "cdn": {"is_cdn": False},
+              "responded": {"http": False, "tls": False}, "errors": {}}
+
+    with connect(read_only=False) as con:
+        core._log_observation(con, "143.246.217.59", "ipv4", "sliver-c2",
+                              silent, datetime(2026, 9, 20, 2, 0))
+        sources = {r[0] for r in con.execute(
+            "SELECT source FROM observations WHERE indicator_value = '143.246.217.59'"
+        ).fetchall()}
+        assert "observe_silent" in sources
+
+
+def test_a_host_that_answers_is_not_recorded_as_silent(tmp_path, monkeypatch):
+    from cti import core
+    from cti.store import connect
+
+    monkeypatch.setenv("CTI_DUCKDB_PATH", str(tmp_path / "t.duckdb"))
+    alive = {"http": {"status": 200, "body_sha256": "a" * 64}, "tls": {},
+             "dns": {}, "whois": {}, "cdn": {},
+             "responded": {"http": True, "tls": False}, "errors": {}}
+
+    with connect(read_only=False) as con:
+        core._log_observation(con, "alive.example", "domain", "A", alive,
+                              datetime(2026, 9, 20, 2, 0))
+        sources = {r[0] for r in con.execute(
+            "SELECT source FROM observations WHERE indicator_value = 'alive.example'"
+        ).fetchall()}
+        assert "observe_silent" not in sources and "observe_http" in sources
+
+
+def test_a_pass_where_the_tools_failed_is_not_called_silent(tmp_path, monkeypatch):
+    """A broken probe VM is not a dead C2, and conflating them would file a
+    tooling outage as an intelligence finding."""
+    from cti import core
+    from cti.store import connect
+
+    monkeypatch.setenv("CTI_DUCKDB_PATH", str(tmp_path / "t.duckdb"))
+    broken = {"http": {}, "tls": {}, "dns": {}, "whois": {}, "cdn": {},
+              "responded": {}, "errors": {"http": "httpx not installed"}}
+
+    with connect(read_only=False) as con:
+        core._log_observation(con, "unknown.example", "domain", "A", broken,
+                              datetime(2026, 9, 20, 2, 0))
+        sources = {r[0] for r in con.execute(
+            "SELECT source FROM observations WHERE indicator_value = 'unknown.example'"
+        ).fetchall()}
+        assert "observe_silent" not in sources

@@ -1356,6 +1356,18 @@ def _log_observation(con, value: str, indicator_type: str, actor: str | None,
             whois_created=whois.get("created"),
             cdn_provider=cdn_info.get("provider"))
 
+    # A host that was probed and answered nothing is a recordable fact, not
+    # an absence of data. Without this row the timeline cannot show when a
+    # C2's services disappeared - sliver-c2's went dark between 2026-09-12
+    # and 2026-09-20 and nothing in the store said so.
+    responded = observed.get("responded") or {}
+    if responded and not any(responded.values()):
+        tracking_store.upsert_observation(
+            con, observed_at=observed_at, indicator_value=value,
+            source="observe_silent", actor=actor, indicator_type=indicator_type,
+            metadata={"probed": sorted(responded), "responded": False,
+                      "ports": observed.get("known_ports") or []})
+
     kind = "ip" if indicator_type.startswith("ipv") else "domain"
     tracking_store.selectors.record_many(
         con, indicator_value=value,
@@ -1616,11 +1628,6 @@ def pivot_cluster(name: str) -> dict[str, Any]:
                 webamon = enrichment.get("webamon")
                 if isinstance(webamon, dict) and "error" not in webamon and webamon.get("latest"):
                     row["webamon_risk"] = webamon["latest"].get("risk_score")
-                observed = enrichment.get("observe")
-                if ok(observed):
-                    _log_observation(con, value, indicator_type, actor,
-                                     observed, observed_at)
-
                 threatfox = enrichment.get("threatfox")
                 if isinstance(threatfox, dict) and "error" not in threatfox:
                     row["threatfox_matches"] = len(threatfox.get("matches") or [])

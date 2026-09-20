@@ -984,9 +984,13 @@ def action_observe(request: dict) -> dict:
         return {"error": "no target given"}
     kind = request.get("kind") or ("ip" if _looks_like_ip(target) else "domain")
 
+    # `responded` separates "we asked and nothing answered" from "we never
+    # asked". Both look like an empty dict otherwise, and the first is a real
+    # observation - it is how a C2 going dark is visible at all.
     result: dict = {"target": target, "kind": kind, "http": {}, "tls": {},
                     "dns": {}, "whois": {}, "ports": [], "cdn": {},
-                    "errors": {}, "tools_missing": [], "error": None}
+                    "responded": {}, "errors": {}, "tools_missing": [],
+                    "error": None}
 
     def stage(name, fn, *args):
         data, error = fn(*args)
@@ -994,6 +998,10 @@ def action_observe(request: dict) -> dict:
             result["errors"][name] = error
             if "not installed" in error:
                 result["tools_missing"].append(error.split()[0])
+        else:
+            # No error means the tool ran. Whether anything answered is a
+            # separate fact, and the one that matters for liveness.
+            result["responded"][name] = bool(data)
         return data
 
     known_ports = request.get("known_ports") or []
