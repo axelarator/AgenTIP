@@ -1902,6 +1902,16 @@ def active_scan(target: str, cluster: str | None = None,
                 tracking_store.detect(con, "ports", indicator_value=target,
                                       actor=cluster, observed_at=observed_at,
                                       new=nmap_ports)
+                # The port SET as a selector, not just a per-host diff. This
+                # is the only path that discovers ports: the observe pass
+                # takes known ports as input and never scans, so without
+                # this line `net.port_set` only ever appeared in backfills
+                # and the report's high-port pivot (RDP on 64350/65111,
+                # which no top-100 scan reaches) had no live source at all.
+                tracking_store.selectors.record(
+                    con, selector_type="net.port_set", selector_value=nmap_ports,
+                    indicator_value=target, indicator_type=indicator_type,
+                    actor=cluster, source="nmap", observed_at=observed_at)
             for listing in opendirs:
                 url = listing.get("url")
                 files = listing.get("files") or []

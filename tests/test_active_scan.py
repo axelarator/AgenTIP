@@ -123,3 +123,27 @@ def test_active_scan_rejects_unknown_tool(monkeypatch):
 def test_active_scan_skips_ipv6():
     r = core.active_scan("2a10:1fc0:6::de96:9634")
     assert "skipped" in r
+
+
+def test_active_scan_records_the_port_set_as_a_selector(monkeypatch):
+    """nmap is the ONLY path that discovers ports.
+
+    The observe pass takes known ports as input and never scans, so without
+    this write `net.port_set` only ever appeared in offline backfills - and
+    the source reporting's high-port pivot (RDP on 64350, 65111, ports no
+    top-100 scan reaches) had no live source at all.
+    """
+    _stub_nmap(monkeypatch, [443, 64350, 65111])
+    monkeypatch.setattr(core.vm_proxy, "dirsearch", lambda url, **kw: {
+        "hits": [], "opendirs": [], "baseline_404": {}, "error": None})
+    core.active_scan("203.0.113.7", tools=["nmap"], cluster="TestActor")
+
+    with tracking_store.connect(read_only=True) as con:
+        row = con.execute(
+            "SELECT selector_value, actor, source FROM selectors "
+            "WHERE selector_type = 'net.port_set' "
+            "AND indicator_value = '203.0.113.7'").fetchone()
+    # One selector whose value is the whole set, sorted numerically - not
+    # three selectors, or two hosts would "share" a port set by both having
+    # 443 open.
+    assert row == ("443,64350,65111", "TestActor", "nmap")

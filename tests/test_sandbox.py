@@ -294,10 +294,17 @@ def test_observe_infers_the_kind_from_the_target():
 
 def test_observe_does_not_scan_ports_unless_asked():
     """A port scan is active traffic; everything else in the pass is the same
-    light-touch contact the ordinary sweep already makes."""
+    light-touch contact the ordinary sweep already makes.
+
+    `None`, not []: an empty list claims a negative result nobody looked for.
+    This test asserted [] and so encoded the bug it should have caught -
+    192.252.186.62 reported `ports: []` for a whole sweep while an nmap run
+    from the same VM found 53, 443 and 3389 open.
+    """
     result = helper["action_observe"]({"target": "example.com"})
-    assert result["ports"] == []
+    assert result["ports"] is None
     assert "ports" not in result["errors"], "naabu must not even be attempted"
+    assert "ports" not in result["responded"]
 
 
 def test_observe_skips_registration_lookups_for_an_ip():
@@ -591,3 +598,36 @@ def test_supplying_known_ports_is_not_a_port_scan():
     source = _helper_function("action_observe")
     assert 'request.get("known_ports")' in source
     assert 'if request.get("ports")' in source, "scanning stays behind its own flag"
+
+
+# --------------------------------------------------------------------------- #
+# observe: "not scanned" is not "nothing open"
+# --------------------------------------------------------------------------- #
+
+def _observe_with_stubs(request, *, ports_found=None):
+    """action_observe with every tool stubbed out, so only its own
+    bookkeeping is under test."""
+    ns = _helper()
+    ns["_observe_http"] = lambda t, kp=None: ({}, None)
+    ns["_observe_tls"] = lambda t, kp=None: ({}, None)
+    ns["_observe_dns"] = lambda t: ({}, None)
+    ns["_observe_whois"] = lambda t: ({}, None)
+    ns["_observe_cdn"] = lambda t: ({"is_cdn": False}, None)
+    ns["_observe_ports"] = lambda t, n: (list(ports_found or []), None)
+    return ns["action_observe"](request)
+
+
+def test_observe_reports_an_empty_list_when_it_scanned_and_found_nothing():
+    result = _observe_with_stubs(
+        {"target": "example.com", "kind": "domain", "ports": True},
+        ports_found=[])
+    assert result["ports"] == []
+    assert result["responded"]["ports"] is False
+
+
+def test_observe_returns_discovered_ports_when_asked():
+    result = _observe_with_stubs(
+        {"target": "example.com", "kind": "domain", "ports": True},
+        ports_found=[443, 3389])
+    assert result["ports"] == [443, 3389]
+    assert result["responded"]["ports"] is True

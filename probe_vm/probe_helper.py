@@ -987,8 +987,13 @@ def action_observe(request: dict) -> dict:
     # `responded` separates "we asked and nothing answered" from "we never
     # asked". Both look like an empty dict otherwise, and the first is a real
     # observation - it is how a C2 going dark is visible at all.
+    # `ports` starts as None, not []. Port discovery is opt-in, and an empty
+    # list is indistinguishable from "scanned and found nothing closed" - a
+    # host that resets every connection and a host nobody scanned looked
+    # identical. 192.252.186.62 reported `ports: []` while an nmap run on the
+    # same VM found 53, 443 and 3389 open, because naabu had never run.
     result: dict = {"target": target, "kind": kind, "http": {}, "tls": {},
-                    "dns": {}, "whois": {}, "ports": [], "cdn": {},
+                    "dns": {}, "whois": {}, "ports": None, "cdn": {},
                     "responded": {}, "errors": {}, "tools_missing": [],
                     "error": None}
 
@@ -1012,8 +1017,10 @@ def action_observe(request: dict) -> dict:
         result["whois"] = stage("whois", _observe_whois, target)
     result["cdn"] = stage("cdn", _observe_cdn, target)
     if request.get("ports"):
+        # An error leaves this [] rather than None, which is right: we did
+        # scan, and errors["ports"] says the scan failed.
         result["ports"] = stage("ports", _observe_ports, target,
-                                int(request.get("top_ports") or 100)) or []
+                                int(request.get("top_ports") or 100))
 
     if result["tools_missing"] and not any(
             result[k] for k in ("http", "tls", "dns", "whois")):

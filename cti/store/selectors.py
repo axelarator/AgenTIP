@@ -326,9 +326,14 @@ def normalize(selector_type: str, value: Any) -> str | None:
     if isinstance(value, (list, tuple, set)):
         # A set-valued selector (ports, nameservers) is one selector whose
         # value is the sorted set, so two hosts match only on the whole set.
-        parts = sorted(str(v).strip().lower() for v in value if str(v).strip())
+        parts = [str(v).strip().lower() for v in value if str(v).strip()]
         if not parts:
             return None
+        # Numeric members sort numerically. A lexical sort turned the ports
+        # 53, 443, 3389 into "3389,443,53", which still matches itself but
+        # is unreadable in a digest and sorts differently from every other
+        # tool's port list.
+        parts.sort(key=lambda p: (0, int(p), "") if p.isdigit() else (1, 0, p))
         return ",".join(parts)
 
     text = str(value).strip()
