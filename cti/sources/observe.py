@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
+from ..store import cdn as cdn_ranges
 from ..store import psl
 from ..store.selectors import TYPES
 
@@ -51,6 +52,7 @@ def selectors_from(result: dict[str, Any], *, target: str,
     dns = result.get("dns") or {}
     whois = result.get("whois") or {}
     cdn = result.get("cdn") or {}
+    cdn_failed = "cdn" in (result.get("errors") or {})
     on_shared_infra = bool(cdn.get("is_cdn"))
 
     # --- identity ---------------------------------------------------------
@@ -92,12 +94,25 @@ def selectors_from(result: dict[str, Any], *, target: str,
         if whois.get("registrar"):
             yield "whois.registrar", whois["registrar"]
 
-    # Resolution and co-tenancy only mean something on dedicated hosting.
+    # Resolution only means something on dedicated hosting.
+    #
+    # The gate has to fail CLOSED. The first version read cdncheck's verdict
+    # and nothing else, so when cdncheck errored - which it did, on a bad
+    # flag - is_cdn came back False and four Cloudflare addresses were
+    # recorded as structural links for example.com. A broken detector
+    # silently re-enabled exactly the noise the gate exists to stop.
+    #
+    # So: cdncheck's verdict on the target, plus the vendored CIDR list on
+    # each address, and when cdncheck failed the local list is the only
+    # thing standing between us and that noise.
     if not on_shared_infra:
-        for address in (dns.get("a") or []) + (dns.get("aaaa") or []):
-            yield "net.resolved_ip", address
+        addresses = list(dns.get("a") or []) + list(dns.get("aaaa") or [])
         if tls.get("resolved_ip"):
-            yield "net.resolved_ip", tls["resolved_ip"]
+            addresses.append(tls["resolved_ip"])
+        for address in addresses:
+            if cdn_ranges.is_cdn(address):
+                continue
+            yield "net.resolved_ip", address
 
     # --- behavioural ------------------------------------------------------
     if http.get("jarm"):

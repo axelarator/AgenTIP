@@ -787,10 +787,14 @@ def _observe_tls(target: str) -> tuple[dict, str | None]:
     rotation entirely because the operator kept the keypair.
     """
     records, error = _run_json(
-        TLSX_CMD + ["-json", "-silent", "-no-color",
-                    "-san", "-cn", "-so", "-serial", "-hash", "sha256",
+        TLSX_CMD + ["-json", "-silent", "-nc",
+                    # -san/-cn/-so are display probes that tlsx refuses to
+                    # combine with others ("san or cn flag cannot be used
+                    # with other probes"). -json returns the whole
+                    # certificate regardless, so they were never needed.
+                    "-serial", "-hash", "sha256",
                     "-expired", "-self-signed", "-mismatched",
-                    "-tls-version", "-cipher", "-ja3s",
+                    "-tls-version", "-cipher",
                     "-timeout", "10", "-disable-update-check"],
         stdin_text=target, timeout=OBSERVE_TOOL_TIMEOUT)
     if error:
@@ -922,7 +926,8 @@ def _observe_cdn(target: str) -> tuple[dict, str | None]:
     CDN hides real clusters.
     """
     records, error = _run_json(
-        CDNCHECK_CMD + ["-json", "-silent", "-no-color", "-resp"],
+        CDNCHECK_CMD + ["-jsonl", "-silent", "-nc", "-resp",
+                        "-disable-update-check"],
         stdin_text=target, timeout=OBSERVE_TOOL_TIMEOUT)
     if error:
         return {}, error

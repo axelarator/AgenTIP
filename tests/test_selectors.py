@@ -370,3 +370,50 @@ def test_contextual_facts_are_still_recorded_just_powerless():
 def test_summarize_reports_missing_tools_rather_than_pretending():
     text = observe.summarize({"http": {}, "tls": {}, "tools_missing": ["httpx"]})
     assert "missing" in text and "httpx" in text
+
+
+# --------------------------------------------------------------------------- #
+# The CDN gate must fail closed
+# --------------------------------------------------------------------------- #
+
+def test_a_broken_cdn_check_does_not_re_enable_the_noise():
+    """Found on the first real observe pass. cdncheck exited 2 on a bad flag,
+    is_cdn came back False, and four Cloudflare addresses were recorded as
+    structural links for example.com - a broken detector silently undoing the
+    gate it was there to enforce."""
+    broken = {
+        "dns": {"a": ["104.20.23.154", "172.66.147.243"],
+                "aaaa": ["2606:4700:10::6814:179a"]},
+        "cdn": {}, "errors": {"cdn": "cdncheck exited 2"},
+    }
+    recorded = [v for t, v in observe.selectors_from(
+        broken, target="example.com", kind="domain") if t == "net.resolved_ip"]
+    assert recorded == []
+
+
+def test_a_dedicated_address_is_still_recorded_when_the_check_works():
+    """The reverse error would hide real clusters."""
+    fine = {"dns": {"a": ["193.29.58.192"]}, "cdn": {"is_cdn": False}, "errors": {}}
+    recorded = [v for t, v in observe.selectors_from(
+        fine, target="x.example", kind="domain") if t == "net.resolved_ip"]
+    assert recorded == ["193.29.58.192"]
+
+
+def test_a_cdn_address_is_dropped_even_when_cdncheck_says_the_target_is_not():
+    """cdncheck reports on the TARGET; the resolved addresses can differ.
+    Both have to be checked."""
+    mixed = {"dns": {"a": ["104.20.23.154", "193.29.58.192"]},
+             "cdn": {"is_cdn": False}, "errors": {}}
+    recorded = [v for t, v in observe.selectors_from(
+        mixed, target="x.example", kind="domain") if t == "net.resolved_ip"]
+    assert recorded == ["193.29.58.192"]
+
+
+def test_the_tls_handshake_address_goes_through_the_same_gate():
+    """It is a second, independent path to net.resolved_ip and was not gated
+    at all in the first version."""
+    cdn_tls = {"dns": {}, "tls": {"resolved_ip": "172.66.147.243"},
+               "cdn": {"is_cdn": False}, "errors": {}}
+    recorded = [v for t, v in observe.selectors_from(
+        cdn_tls, target="x.example", kind="domain") if t == "net.resolved_ip"]
+    assert recorded == []
