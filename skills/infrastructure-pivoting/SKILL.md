@@ -16,9 +16,22 @@ hold in common, and it is what turns a list of IOCs into a campaign.
 
 A candidate link is **promoted** when either:
 
-- **one identity selector** matches, or
-- **two independent structural selectors** match — independent meaning
-  *different types*. Two SANs off one certificate are one fact, not two.
+- **one identity fact** matches, or
+- **two independent structural facts** match.
+
+A *fact* is one thing you looked at, not one column it filled. Two SANs
+off one certificate are one fact; so are that certificate's hash, serial,
+subject and public key. Independence is counted per **artefact** —
+`certificate`, `page`, `address`, or the selector's own type when it
+belongs to no group — because a certificate contains its serial and an
+address determines its PTR, so sharing the one guarantees sharing the
+other.
+
+This is not a refinement of the SAN rule, it *is* the SAN rule. It was
+written down for SANs and applied only there, so a link carrying
+`tls.cert_sha256`, `tls.spki_sha256` and `tls.serial` read as three
+independent facts when it is one certificate seen once — and adding the
+SPKI digest inflated every certificate link by one more.
 
 Behavioural and contextual selectors are recorded beside a finding. They
 never promote one, whatever their number. That is not a style

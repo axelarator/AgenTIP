@@ -81,7 +81,9 @@ def test_one_structural_selector_is_held_back_with_its_reason():
     assert out["promoted_total"] == 0
     assert out["held_back_total"] == 1
     reason = next(iter(out["held_back_reasons"]))
-    assert "net.resolved_ip" in reason and "second" in reason
+    # "address", not "net.resolved_ip": independence is per artefact, and
+    # the resolved IP determines the PTR, ASN, prefix and country too.
+    assert "address" in reason and "second independent" in reason
 
 
 def test_two_independent_structural_selectors_promote():
@@ -269,3 +271,74 @@ def test_the_digest_says_how_many_were_held_back(tmp_path):
 def test_no_links_renders_no_section(tmp_path):
     sections = {"infrastructure_links": {"promoted": [], "held_back_total": 9}}
     assert "Corroborated infrastructure" not in _digest_file(tmp_path, sections)
+
+
+# --------------------------------------------------------------------------- #
+# Independence is per artefact, not per column
+# --------------------------------------------------------------------------- #
+
+def test_three_fields_of_one_certificate_are_not_three_facts():
+    """The hole this closes.
+
+    tls.serial, tls.subject_cn and tls.san are three structural TYPES and
+    one certificate. Counted by type they cleared the two-independent bar
+    on a single observation; counted by artefact they are one fact and the
+    candidate is held back until something else corroborates it.
+    """
+    _seed([("a.example", "tls.serial", "0A:1B", "Actor"),
+           ("b.example", "tls.serial", "0A:1B", "Actor"),
+           ("a.example", "tls.subject_cn", "shared.example", "Actor"),
+           ("b.example", "tls.subject_cn", "shared.example", "Actor"),
+           ("a.example", "tls.san", "other.example", "Actor"),
+           ("b.example", "tls.san", "other.example", "Actor")])
+    out = _run()
+    assert out["promoted_total"] == 0
+    reason = next(iter(out["held_back_reasons"]))
+    assert "one structural fact only (certificate" in reason
+
+
+def test_a_certificate_plus_a_registration_are_two_facts():
+    """Two genuinely separate observations still promote."""
+    _seed([("a.example", "tls.serial", "0A:1B", "Actor"),
+           ("b.example", "tls.serial", "0A:1B", "Actor"),
+           ("a.example", "dns.apex", "shared.example", "Actor"),
+           ("b.example", "dns.apex", "shared.example", "Actor")])
+    out = _run()
+    assert out["promoted_total"] == 1
+    assert "2 independent structural facts" in out["promoted"][0]["reason"]
+    assert "certificate" in out["promoted"][0]["reason"]
+    assert "dns.apex" in out["promoted"][0]["reason"]
+
+
+def test_an_address_determines_its_own_derived_selectors():
+    """Sharing the resolved IP guarantees sharing the PTR, ASN, prefix and
+    country, so those cannot corroborate each other."""
+    _seed([("a.example", "net.resolved_ip", "203.0.113.9", "Actor"),
+           ("b.example", "net.resolved_ip", "203.0.113.9", "Actor"),
+           ("a.example", "net.reverse_dns", "host.dedicated.example", "Actor"),
+           ("b.example", "net.reverse_dns", "host.dedicated.example", "Actor")])
+    out = _run()
+    assert out["promoted_total"] == 0
+    assert "one structural fact only (address" in next(iter(out["held_back_reasons"]))
+
+
+def test_a_certificate_counted_as_identity_is_not_counted_again():
+    """tls.cert_sha256 is identity and tls.serial is structural, but they
+    are one certificate. Counting it on both sides would let a single
+    observation satisfy both halves of the rule."""
+    _seed([("a.example", "tls.cert_sha256", "c" * 64, "Actor"),
+           ("b.example", "tls.cert_sha256", "c" * 64, "Actor"),
+           ("a.example", "tls.serial", "0A:1B", "Actor"),
+           ("b.example", "tls.serial", "0A:1B", "Actor")])
+    link = _run()["promoted"][0]
+    assert link["reason"].startswith("1 identity fact(s) (certificate)")
+
+
+def test_an_ungrouped_selector_is_its_own_artefact():
+    """The safe default: grouping two genuinely separate facts would weaken
+    a real link, which is the more expensive mistake."""
+    from cti.store.selectors import TYPES, artefact
+    assert artefact("dns.apex") == "dns.apex"
+    assert artefact("whois.registrant_email") == "whois.registrant_email"
+    # every type resolves to something, known or itself
+    assert all(artefact(t) for t in TYPES)

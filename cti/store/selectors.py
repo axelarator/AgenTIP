@@ -319,6 +319,58 @@ TYPES: dict[str, SelectorType] = {t.name: t for t in (
 )}
 
 
+# Which observation a selector was read off. Independence is per ARTEFACT,
+# not per type: two selectors describing one thing you looked at once are
+# one fact however many columns they fill.
+#
+# The rule was already written down for SANs - "two SANs off one
+# certificate are one fact, not two" - and applied only to the literal
+# case. Everything else on that certificate still counted separately, so a
+# link carrying tls.cert_sha256, tls.spki_sha256 and tls.serial read as
+# three independent facts when it is one certificate seen once. Adding the
+# SPKI digest made it worse, because it inflated every certificate link by
+# one more.
+#
+# Only strict containment is grouped. A certificate CONTAINS its serial,
+# subject, SANs, issuer and public key, so sharing the certificate
+# guarantees sharing all of them. An address DETERMINES its PTR, ASN,
+# prefix and country the same way. Registration and DNS are left
+# ungrouped: an operator can change registrar without changing nameservers
+# and vice versa, so those really are separate facts.
+_ARTEFACTS: dict[str, tuple[str, ...]] = {
+    "certificate": (
+        "tls.cert_sha256", "tls.spki_sha256", "tls.serial", "tls.subject_cn",
+        "tls.san", "tls.issuer", "tls.default_subject", "tls.multi_san_cert",
+        "webamon.fp_ssl", "webamon.fp_cert_san", "webamon.fp_cert_config",
+        "webamon.fp_cert_issuer",
+    ),
+    "page": (
+        "http.body_sha256", "http.error_page_sha256", "http.title",
+        "webamon.fp_dom", "webamon.fp_dom_structure",
+    ),
+    "address": (
+        "net.resolved_ip", "net.reverse_dns", "net.asn", "net.prefix",
+        "net.country",
+    ),
+}
+
+ARTEFACT: dict[str, str] = {
+    selector_type: artefact
+    for artefact, selector_types in _ARTEFACTS.items()
+    for selector_type in selector_types
+}
+
+
+def artefact(selector_type: str) -> str:
+    """What was observed to produce this selector.
+
+    A type with no group is its own artefact - the safe default, because
+    grouping two genuinely separate facts would weaken a real link, which
+    is the more expensive mistake of the two.
+    """
+    return ARTEFACT.get(selector_type, selector_type)
+
+
 def selector_class(selector_type: str) -> str:
     """The class of a type. Unknown types are contextual: a new selector has
     to be classed deliberately before it can carry weight."""

@@ -4,9 +4,15 @@ one indicator; you read a *link* between two, and nothing else.
 Each item is a candidate link that already passed the corroboration rule in
 code, before you saw it. The rule is:
 
-- **one identity selector**, or
-- **two independent structural selectors** - independent meaning different
-  *types*. Two SANs off one certificate are one fact, not two.
+- **one identity fact**, or
+- **two independent structural facts**.
+
+A fact is one thing observed, not one column it filled. Two SANs off one
+certificate are one fact; so are that certificate's hash, serial, subject
+and public key, which is why `new_value.reason` names artefacts
+(`certificate`, `page`, `address`) and then lists the selectors behind
+them. Do not re-count those selectors as separate evidence - the reason
+line has already done the arithmetic.
 
 Behavioural and contextual selectors are listed under `corroborating` on
 every item. They describe a link. They never make one, whatever their

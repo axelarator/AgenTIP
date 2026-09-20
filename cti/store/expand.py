@@ -28,7 +28,8 @@ from typing import Any
 import duckdb
 
 from .rarity import assess
-from .selectors import CLASS_ORDER, normalize, selector_class, sharing
+from .selectors import (CLASS_ORDER, artefact, normalize, selector_class,
+                        sharing)
 
 
 @dataclass
@@ -97,19 +98,33 @@ def candidates_for(con: duckdb.DuckDBPyConnection, indicator: str
 
     out = []
     for other, slot in evidence.items():
-        independent = {t for t, _ in slot["structural"]}
-        if slot["identity"]:
+        # Independence is per artefact, not per type. Two selectors read off
+        # one certificate are one fact whether they are two SANs or a hash
+        # and a serial - the rule this module already stated for SANs,
+        # applied everywhere it holds.
+        identity_facts = {artefact(t) for t, _ in slot["identity"]}
+        structural_facts = {artefact(t) for t, _ in slot["structural"]}
+        # A certificate seen as identity is the same certificate seen as
+        # structural, so it must not be counted again on the other side.
+        structural_facts -= identity_facts
+
+        if identity_facts:
             promoted, reason = True, (
-                f"{len(slot['identity'])} identity selector(s): "
+                f"{len(identity_facts)} identity fact(s) "
+                f"({', '.join(sorted(identity_facts))}): "
                 f"{', '.join(sorted({t for t, _ in slot['identity']}))}")
-        elif len(independent) >= 2:
+        elif len(structural_facts) >= 2:
             promoted, reason = True, (
-                f"{len(independent)} independent structural selectors: "
-                f"{', '.join(sorted(independent))}")
-        elif independent:
+                f"{len(structural_facts)} independent structural facts: "
+                f"{', '.join(sorted(structural_facts))}")
+        elif structural_facts:
+            only = structural_facts.pop()
+            types = sorted({t for t, _ in slot["structural"]
+                            if artefact(t) == only})
             promoted, reason = False, (
-                f"only one structural selector ({independent.pop()}); "
-                "needs a second of a different type, or one identity selector")
+                f"one structural fact only ({only}"
+                + (f", via {', '.join(types)}" if len(types) > 1 else "")
+                + "); needs a second independent one, or one identity fact")
         else:
             promoted, reason = False, (
                 "corroborating selectors only - nothing that can promote")

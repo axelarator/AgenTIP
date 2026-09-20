@@ -126,11 +126,17 @@ def test_the_corroboration_rule_in_the_skill_matches_the_code():
 
     from cti.store import expand
     source = inspect.getsource(expand)
-    # independence is by TYPE, which is the part most likely to be softened
-    assert 'independent = {t for t, _ in slot["structural"]}' in source
-    text = PIVOTING.read_text()
-    assert "different types" in text or "*different types*" in text
-    assert "two sans off one certificate are one fact" in text.lower()
+    # Independence is per ARTEFACT - the part most likely to be softened,
+    # and the part that was wrong: counting by type made one certificate
+    # read as three independent facts.
+    assert 'artefact(t) for t, _ in slot["structural"]' in source
+    assert 'structural_facts -= identity_facts' in source, \
+        "a certificate counted as identity must not be counted again"
+    # Whitespace-normalized: prose wraps, and a content assertion should
+    # not break because a sentence crossed a line.
+    text = " ".join(PIVOTING.read_text().lower().split())
+    assert "artefact" in text
+    assert "two sans off one certificate are one fact" in text
 
 
 # --------------------------------------------------------------------------- #
