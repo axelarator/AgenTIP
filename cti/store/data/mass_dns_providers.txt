@@ -1,0 +1,40 @@
+# Nameserver suffixes belonging to providers with a mass customer base.
+#
+# Two domains on Cloudflare's nameservers share a provider, not an account -
+# the same distinction cdn_ranges.txt draws for addresses. A custom set
+# (ns1.someactor.com) is a real registration link; these are not.
+#
+# Derived from the values seen in this repo's own data plus the largest
+# public providers. Kept as data so adding one is not a code change.
+# dnsowl.com is NameSilo's free DNS, which is how it turned up here.
+ns.cloudflare.com
+dnsowl.com
+domaincontrol.com
+awsdns-00.com
+awsdns-01.com
+awsdns-02.com
+awsdns-03.com
+awsdns.com
+azure-dns.com
+azure-dns.net
+azure-dns.org
+azure-dns.info
+googledomains.com
+google.com
+registrar-servers.com
+namecheaphosting.com
+dnsmadeeasy.com
+nsone.net
+ultradns.com
+akam.net
+akamaidns.com
+digitalocean.com
+linode.com
+vultr.com
+hostinger.com
+namebrightdns.com
+dns-parking.com
+parkingcrew.net
+sedoparking.com
+bodis.com
+above.com

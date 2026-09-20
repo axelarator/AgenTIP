@@ -156,10 +156,7 @@ TYPES: dict[str, SelectorType] = {t.name: t for t in (
        "the same zone contact address"),
     _t("whois.registrant_email", "structural",
        "the same registrant contact registered both domains"),
-    _t("whois.registrar", "structural",
-       "both registered through the same registrar",
-       "much on its own: registrars have millions of customers. Useful only "
-       "as the second selector beside a stronger one"),
+
     _t("net.reverse_dns", "structural",
        "the same PTR hostname - often the same physical or virtual host"),
     _t("net.resolved_ip", "structural",
@@ -177,6 +174,13 @@ TYPES: dict[str, SelectorType] = {t.name: t for t in (
        "operator identity: JARM identifies software, not owners"),
     _t("tls.ja4s", "behavioural",
        "the server side of the handshake matches"),
+    _t("whois.registrar", "behavioural",
+       "both registered through the same registrar - worth noting beside a "
+       "stronger link, since a bulk-registering operator tends to stay with "
+       "one registrar",
+       "a link on its own: registrars have millions of customers. This was "
+       "classed structural while its own description said otherwise, and "
+       "NameSilo duly appeared as a six-indicator 'link' in a live sweep"),
     _t("tls.default_subject", "behavioural",
        "the same stock certificate subject - a self-signed cert left at its "
        "install-time defaults. Identifies the software build, the way JARM "
@@ -368,6 +372,16 @@ def for_indicator(con: duckdb.DuckDBPyConnection,
                 "ORDER BY selector_type", [indicator_value])
 
 
+def _usable(selector_type: str, selector_value: Any) -> bool:
+    """Class AND value. A type can be structural while a particular value of
+    it names a mass provider and links nothing - `dns.ns_set` on Cloudflare's
+    nameservers is the case this exists for."""
+    from .rarity import value_is_provider_scale
+
+    return can_promote(selector_type) and not value_is_provider_scale(
+        selector_type, selector_value)
+
+
 def shared(con: duckdb.DuckDBPyConnection, *, min_indicators: int = 2,
            promotable_only: bool = True) -> list[dict[str, Any]]:
     """Selector values held by more than one indicator - the link candidates.
@@ -388,7 +402,8 @@ def shared(con: duckdb.DuckDBPyConnection, *, min_indicators: int = 2,
         HAVING count(DISTINCT indicator_value) >= ?
         ORDER BY 3 DESC, 1""", [min_indicators])
     if promotable_only:
-        result = [r for r in result if can_promote(r["selector_type"])]
+        result = [r for r in result
+                  if _usable(r["selector_type"], r["selector_value"])]
     for r in result:
         r["selector_class"] = selector_class(r["selector_type"])
     return result
@@ -409,6 +424,7 @@ def neighbours(con: duckdb.DuckDBPyConnection, indicator_value: str, *,
         SELECT s.indicator_value, s.actor,
                count(DISTINCT s.selector_type) AS via_types,
                string_agg(DISTINCT s.selector_type, ', ') AS via,
+               string_agg(DISTINCT s.selector_type || '=' || s.selector_value, '|') AS pairs,
                max(s.last_seen) AS last_seen
         FROM selectors s JOIN mine m
           ON s.selector_type = m.selector_type AND s.selector_value = m.selector_value
@@ -417,9 +433,13 @@ def neighbours(con: duckdb.DuckDBPyConnection, indicator_value: str, *,
         ORDER BY 3 DESC""", [indicator_value, indicator_value])
     out = []
     for r in result:
+        pairs = [p.split("=", 1) for p in (r.pop("pairs", "") or "").split("|") if "=" in p]
         types = [t.strip() for t in (r["via"] or "").split(",") if t.strip()]
         if promotable_only:
-            types = [t for t in types if can_promote(t)]
+            # Filter on the type AND the value it matched on, so a link that
+            # exists only through a mass provider is not offered.
+            usable = {t for t, v in pairs if _usable(t, v)}
+            types = [t for t in types if t in usable]
             if not types:
                 continue
         r["via"] = types
