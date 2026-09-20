@@ -56,6 +56,13 @@ PROVIDERS: dict[str, Provider] = {
     "rdap": Provider("CTI_RDAP_CAP", 150),
     "validin": Provider("CTI_VALIDIN_DAILY_BUDGET", 10, 0.0,
                         "CTI_VALIDIN_MONTHLY_BUDGET", 50),
+    # Neither of these publishes a rate limit or asks for a key. The caps
+    # are courtesy, not compliance: a runaway sweep should stop before
+    # someone else's free service notices, and a source we pay nothing for
+    # is the one we have least right to hammer. The pacing matters more
+    # than the daily number.
+    "internetdb": Provider("CTI_INTERNETDB_BUDGET", 2000, 0.2),
+    "mnemonic": Provider("CTI_MNEMONIC_BUDGET", 1000, 0.5),
 }
 
 

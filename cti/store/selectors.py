@@ -238,6 +238,19 @@ TYPES: dict[str, SelectorType] = {t.name: t for t in (
     _t("http.header_set", "behavioural",
        "the same unusual response-header combination - typically the same "
        "server build or reverse proxy config"),
+    _t("net.passive_port_set", "behavioural",
+       "a third-party scan index saw the same open-port pattern on both. "
+       "Useful because nobody had to send a packet for it",
+       "the ports that are open NOW. The observation is someone else's, at "
+       "an unknown time, so it can corroborate a link and must never be "
+       "confused with net.port_set, which nmap confirmed"),
+    _t("net.historical_ip", "behavioural",
+       "both names resolved to the same address at some point in passive "
+       "DNS history - which is how infrastructure reuse survives a rotation "
+       "that current resolution no longer shows",
+       "co-residence. Two domains on one address four years apart share "
+       "nothing; only overlapping first/last-seen windows make it a lead, "
+       "which is why this is not net.resolved_ip"),
     _t("net.cohosted_domain", "behavioural",
        "a third-party index sees both names on one address. Corroborates a "
        "link established some other way; on its own it is a statement about "
@@ -315,6 +328,9 @@ TYPES: dict[str, SelectorType] = {t.name: t for t in (
        "a link, ever. Every phishing kit targeting one brand shares it; "
        "1962 scans match 'microsoft'. It is here to be displayed beside a "
        "finding, and would have labelled update-sentinelone.com on sight"),
+    _t("net.cpe", "contextual",
+       "a scan index fingerprinted the same product and version on both",
+       "a link: a CPE names software, and popular software is everywhere"),
     _t("net.country", "contextual", "hosted in the same country"),
 )}
 

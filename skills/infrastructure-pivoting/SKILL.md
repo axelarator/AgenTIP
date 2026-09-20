@@ -127,6 +127,10 @@ How the service behaves. Distinctive in combination, individually shared by ever
 - **`http.title`** — the same page title. Weak alone, useful when the title is itself distinctive and the body hash differs only by a timestamp.
 - **`net.cohosted_domain`** — a third-party index sees both names on one address. Corroborates a link established some other way; on its own it is a statement about the hosting, not the operator.
   - *Never:* a link on shared hosting, where every pair of addresses shares thousands of tenants. Backfilling it without that gate produced 5320 selectors from this repo's own data, nearly all Cloudflare tenants.
+- **`net.historical_ip`** — both names resolved to the same address at some point in passive DNS history - which is how infrastructure reuse survives a rotation that current resolution no longer shows.
+  - *Never:* co-residence. Two domains on one address four years apart share nothing; only overlapping first/last-seen windows make it a lead, which is why this is not net.resolved_ip.
+- **`net.passive_port_set`** — a third-party scan index saw the same open-port pattern on both. Useful because nobody had to send a packet for it.
+  - *Never:* the ports that are open NOW. The observation is someone else's, at an unknown time, so it can corroborate a link and must never be confused with net.port_set, which nmap confirmed.
 - **`net.port_set`** — the same open-port pattern. Unusual high ports are the interesting case - the source reporting keyed on RDP-over-TLS at 64350, 64330, 65535 and 65111.
   - *Never:* a link on a common set such as 22/80/443.
 - **`tls.default_subject`** — the same stock certificate subject - a self-signed cert left at its install-time defaults. Identifies the software build, the way JARM does, and is genuinely useful: two tracked hosts carrying the same one are running the same tool.
@@ -155,6 +159,8 @@ Structurally unable to promote a candidate, no matter how many indicators share 
 - **`net.asn`** — hosted in the same autonomous system.
   - *Never:* a link. Millions of hosts share an ASN; this is background.
 - **`net.country`** — hosted in the same country.
+- **`net.cpe`** — a scan index fingerprinted the same product and version on both.
+  - *Never:* a link: a CPE names software, and popular software is everywhere.
 - **`net.prefix`** — the same announced prefix - tighter than an ASN, still shared infrastructure.
 - **`tls.issuer`** — certificates from the same CA.
   - *Never:* a link: almost everything is Let's Encrypt.
