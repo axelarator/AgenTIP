@@ -123,9 +123,16 @@ echo "Daily actor-tracking loop (skills/actor-tracking/): add to crontab -e:"
 # environment. An earlier version of these lines left it off; the first
 # scheduled run then went to a default probe address that is not this lab's
 # VM, collected nothing, and overwrote cluster statuses with "unknown".
-echo "  15 6 * * * . \$HOME/.bashrc && cd $ROOT && .venv/bin/python -m graph collect >> data/tracking/logs/stage_a.log 2>&1"
-echo "  45 6 * * * . \$HOME/.bashrc && cd $ROOT && .venv/bin/python -m graph analyze >> data/tracking/logs/stage_b.log 2>&1"
-echo "  (both default to today; one line for both: ... -m graph daily)"
+#
+# ONE line, not two. Collect and analyze were separate jobs half an hour
+# apart, which is a guess about how long collect takes: on 2026-09-20 it
+# took 21 minutes with an EMPTY enrich worklist, and it has since grown a
+# corroborate stage. When it overruns, analyze exits with "no digest for
+# <today>" and the day's analysis is simply lost. `daily` starts analyze
+# when collect finishes.
+echo "  15 6 * * * . \$HOME/.bashrc && cd $ROOT && .venv/bin/python -m graph daily >> data/tracking/logs/daily.log 2>&1"
+echo "  (defaults to today. The stages can still be run separately by hand:"
+echo "   -m graph collect, then -m graph analyze.)"
 echo "  Verify cron's view of the environment before trusting it:"
 echo "    env -i HOME=\$HOME SHELL=/bin/bash PATH=/usr/bin:/bin bash -c '. \$HOME/.bashrc; echo \$CTI_PROBE_HOST'"
 echo "Secrets (env, e.g. in ~/.bashrc - never committed): WEBAMON_API_KEY,"

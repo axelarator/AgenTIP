@@ -1769,3 +1769,105 @@ def test_excluding_something_that_was_not_extracted_is_harmless(tmp_path, seen_b
     data = core.ingest_report(str(report), cluster_name="FamousSparrow",
                               exclude=["not-in-the-report.example", "", "   "])
     assert data["excluded"] == []
+
+
+# --------------------------------------------------------------------------- #
+# Add-time enrichment must reach the tracking store, not just the cluster JSON
+# --------------------------------------------------------------------------- #
+
+def _observation_rows(indicator: str) -> list[tuple]:
+    """[] when the store does not exist yet - which is the state before the
+    first write, and exactly what these tests need to assert against."""
+    import duckdb
+
+    from cti import store as tracking_store
+    try:
+        with tracking_store.connect(read_only=True) as con:
+            return con.execute(
+                "SELECT source FROM observations WHERE indicator_value = ? "
+                "ORDER BY source", [indicator]).fetchall()
+    except duckdb.IOException:
+        return []
+
+
+def _selector_rows(indicator: str) -> list[str]:
+    from cti import store as tracking_store
+    with tracking_store.connect(read_only=True) as con:
+        return sorted(r[0] for r in con.execute(
+            "SELECT selector_type FROM selectors WHERE indicator_value = ?",
+            [indicator]).fetchall())
+
+
+def _stub_observe(monkeypatch, host="new.example"):
+    """A realistic observe result for the add-time sweep."""
+    monkeypatch.setattr(core, "_observe", lambda value, kind, ports=None: {
+        "target": value, "kind": kind,
+        "http": {"status": 200, "body_sha256": "b" * 64, "server": "nginx/1.18.0"},
+        "tls": {"cert_sha256": "c" * 64, "serial": "0A:1B",
+                "subject_cn": host, "issuer": "CN = Test CA"},
+        "dns": {"a": ["203.0.113.9"]}, "whois": {}, "cdn": {"is_cdn": False},
+        "ports": None, "responded": {"http": True, "tls": True},
+        "errors": {}, "tools_missing": []})
+    monkeypatch.setattr(core, "_live_tls", lambda host: {"error": "stubbed"})
+    monkeypatch.setattr(core, "_live_http", lambda host: {"error": "stubbed"})
+    monkeypatch.setattr(core, "_webamon_domain", lambda d: {"error": "stubbed"})
+    monkeypatch.setattr(core, "_webamon_infostealers", lambda d: {"error": "stubbed"})
+    monkeypatch.setattr(core, "_subdomains_for", lambda d: {"error": "stubbed"})
+    monkeypatch.setattr(core, "_threatfox_enrichment", lambda v: None)
+    monkeypatch.setattr(core.pivot, "classify_domain_lifecycle",
+                        lambda *a, **k: ("active", {}))
+
+
+def test_adding_a_domain_writes_its_first_observation_row(monkeypatch):
+    """The gap this closes.
+
+    pivot_cluster has always logged its sweep to the tracking store; no
+    other path did. A freshly added domain produced zero observation rows,
+    so it had no baseline - its first real change had nothing to diff
+    against - and no selectors, so it could not be linked to anything until
+    a later daily sweep happened to touch it.
+    """
+    core.create_cluster("Add Time History")
+    _stub_observe(monkeypatch)
+
+    assert _observation_rows("new.example") == []
+    core.add_observable("Add Time History", "domains", "new.example", "report: r.pdf")
+
+    sources = {r[0] for r in _observation_rows("new.example")}
+    assert "observe_http" in sources and "observe_tls" in sources
+
+
+def test_adding_a_domain_makes_it_linkable_immediately(monkeypatch):
+    """Selectors are written by the same call, so the new domain can be
+    linked to anything already tracked without waiting for a sweep."""
+    core.create_cluster("Add Time Selectors")
+    _stub_observe(monkeypatch)
+    core.add_observable("Add Time Selectors", "domains", "new.example", "report: r.pdf")
+
+    types = _selector_rows("new.example")
+    assert "tls.cert_sha256" in types, types
+    assert "http.body_sha256" in types, types
+
+
+def test_a_tracking_store_failure_does_not_lose_the_cluster_write(monkeypatch):
+    """The cluster JSON write already landed; a separate store's outage must
+    not undo it or raise. The note is reported instead."""
+    core.create_cluster("Add Time Degraded")
+    _stub_observe(monkeypatch)
+    monkeypatch.setattr(core, "_log_cluster_enrichment_history",
+                        lambda *a, **k: "tracking DB busy")
+
+    result = core.add_observable("Add Time Degraded", "domains", "new.example", "r")
+    assert result["history_note"] == "tracking DB busy"
+    assert any(o["value"] == "new.example"
+               for o in core.load_cluster("Add Time Degraded")["observables"]["domains"])
+
+
+def test_an_empty_enrichment_writes_nothing(monkeypatch):
+    """Re-adding a tracked value skips the sweep entirely, so there is no
+    result to record and no reason to open the store."""
+    opened = []
+    monkeypatch.setattr(core, "_log_cluster_enrichment_history",
+                        lambda *a, **k: opened.append(1))
+    assert core._record_enrichment("Any", {}) is None
+    assert opened == []

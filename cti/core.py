@@ -836,7 +836,14 @@ def add_observable(name: str, category: str, value: str, source: str,
         enrichment = _sweep_lifecycle(
             domains=[value] if category == "domains" else [],
             ips=[value] if category == "ips" else [])
-    return _add_observable_locked(name, category, value, source, enrichment, metadata)
+    result = _add_observable_locked(name, category, value, source, enrichment,
+                                    metadata)
+    # The enrichment above is a full sweep result; without this it reached
+    # the cluster JSON as a snapshot and the tracking store not at all.
+    note = _record_enrichment(name, enrichment)
+    if note:
+        result = {**result, "history_note": note}
+    return result
 
 
 @_synchronized
@@ -1376,6 +1383,33 @@ def _log_observation(con, value: str, indicator_type: str, actor: str | None,
         source="observe")
 
 
+def _record_enrichment(actor: str, enrichment: dict, *, when: str | None = None
+                       ) -> str | None:
+    """Persist an add-time enrichment result to the tracking store.
+
+    pivot_cluster has always done this at the end of a sweep. Nothing else
+    did, so every other path that pays for a full _sweep_lifecycle - adding
+    an observable, ingesting a report, expanding a pivot - computed live
+    TLS, HTTP, DNS, Webamon and ThreatFox data, wrote a snapshot into the
+    cluster JSON, and dropped the rest on the floor.
+
+    What that cost is not abstract. A freshly ingested domain produced zero
+    observation rows, so it had no baseline, so its first real change was
+    invisible - the diff had nothing to compare against - and no selectors,
+    so it could not be linked to anything until the next daily sweep
+    happened to touch it. The most interesting moment in an indicator's
+    life is the one we were throwing away.
+
+    Called OUTSIDE the cluster-JSON lock and after its write, the same way
+    pivot_cluster does it: a different store with its own locking, and a
+    hiccup there must not undo a cluster write that already landed.
+    """
+    if not enrichment:
+        return None
+    observed_at = datetime.fromisoformat(when or now_iso()).replace(tzinfo=None)
+    return _log_cluster_enrichment_history(actor, observed_at, enrichment)
+
+
 def _log_cluster_enrichment_history(
         actor: str, observed_at: datetime,
         results: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]) -> str | None:
@@ -1761,7 +1795,12 @@ def pivot_and_expand(value: str, cluster_name: str,
                           [v for cat, vs, _ in candidates if cat == "ips" for v in vs])
     enrichment = _sweep_lifecycle(new_domains, new_ips)  # unlocked - see docstring
 
-    return _pivot_and_expand_merge(value, kind, cluster_name, now, candidates, review, enrichment)
+    result = _pivot_and_expand_merge(value, kind, cluster_name, now, candidates,
+                                     review, enrichment)
+    note = _record_enrichment(result.get("name") or cluster_name, enrichment, when=now)
+    if note:
+        result["history_note"] = note
+    return result
 
 
 @_synchronized
@@ -2057,6 +2096,17 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                 if source not in entry["sources"]:
                     entry["sources"].append(source)
                 entry["last_seen"] = now
+                # Refresh the snapshot if this call actually fetched one.
+                # It used to be dropped, on the reasoning that refreshing a
+                # tracked value is pivot_cluster's job - but the caller has
+                # already paid for the lookup by the time it gets here, and
+                # discarding it left a stale asn/cert/tags snapshot beside
+                # a fresh result that was thrown away. Only ever an
+                # overwrite with NEWER data; first_seen is not touched.
+                found = enrichment.get((category, value))
+                if found:
+                    _, detail, enr = found
+                    _apply_enrichment_snapshot(entry, category, detail, enr)
             else:
                 entry = {"value": value, "sources": [source],
                           "first_seen": now, "last_seen": now}
@@ -2261,6 +2311,13 @@ def ingest_report(source: str, cluster_name: str | None = None,
     enrichment = _sweep_lifecycle(new_domains, new_ips)  # unlocked
     result = _ingest_report_phase2(cluster_name, source, extracted, enrichment, create_if_missing)
     result["excluded"] = excluded   # the returned dict only; it is not re-saved
+    # After phase 2's write, outside its lock. A report is the moment a
+    # domain becomes tracked, and until now that moment produced no
+    # observation row at all - so the indicator had no baseline to diff
+    # against and no selectors to link on until a later sweep found it.
+    note = _record_enrichment(result.get("name") or cluster_name, enrichment)
+    if note:
+        result["history_note"] = note
     return result
 
 

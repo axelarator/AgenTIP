@@ -374,10 +374,20 @@ def test_the_printed_cron_lines_source_bashrc():
     """The printed lines were the root cause: they dropped the prefix the old
     crontab had, and cron ran with an empty environment."""
     lines = [l for l in (REPO / "setup.sh").read_text().splitlines()
-             if 'echo "  ' in l and ("graph collect" in l or "graph analyze" in l)
-             and "* * *" in l]
-    assert len(lines) == 2
+             if 'echo "  ' in l and "* * *" in l]
+    assert lines, "no cron line is printed at all"
     assert all("$HOME/.bashrc" in l for l in lines), lines
+
+
+def test_the_printed_cron_runs_the_stages_as_one_job():
+    """Two jobs half an hour apart is a guess about how long collect takes.
+    It took 21 minutes on 2026-09-20 with an empty enrich worklist, and has
+    since grown a corroborate stage; when it overruns, analyze exits with
+    "no digest for <today>" and the day's analysis is lost."""
+    lines = [l for l in (REPO / "setup.sh").read_text().splitlines()
+             if 'echo "  ' in l and "* * *" in l]
+    assert len(lines) == 1, "collect and analyze must not be separate jobs"
+    assert "graph daily" in lines[0]
 
 
 def test_no_test_can_write_pipeline_traces_into_the_live_data_dir():
