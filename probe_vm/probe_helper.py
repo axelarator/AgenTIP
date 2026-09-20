@@ -34,6 +34,8 @@ and prints a JSON status instead of reading stdin.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import html
 import ipaddress
@@ -808,6 +810,46 @@ def _observe_http(target: str, known_ports: list | None = None) -> tuple[dict, s
     }, None
 
 
+def _spki_sha256(pem: str | None) -> str | None:
+    """SHA-256 over the certificate's SubjectPublicKeyInfo, from its PEM.
+
+    This is the value that survives certificate rotation: reissuing a
+    certificate mints a new serial and a new leaf hash, but an operator who
+    keeps the keypair keeps this. It is the same digest as an HPKP/SPKI pin,
+    so it is comparable with anyone else's.
+
+    tlsx does not produce it. `fingerprint_hash` carries md5, sha1 and
+    sha256 of the CERTIFICATE and nothing else, so the field this code used
+    to read had never existed and tls.spki_sha256 - an identity-class
+    selector - had been permanently empty.
+
+    `openssl x509 -pubkey` emits a PEM whose base64 body IS the DER-encoded
+    SubjectPublicKeyInfo, so one openssl call and the standard library are
+    enough; piping into `openssl pkey -outform DER` would be a second
+    process to reach the same bytes. Verified equal to
+    `openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER |
+    openssl dgst -sha256` on a generated certificate.
+    """
+    if not pem or "BEGIN CERTIFICATE" not in pem:
+        return None
+    if not _tool_present(OPENSSL_CMD):
+        return None
+    try:
+        proc = subprocess.run(OPENSSL_CMD + ["x509", "-pubkey", "-noout"],
+                              input=pem, capture_output=True, text=True,
+                              timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    body = "".join(line for line in proc.stdout.splitlines()
+                   if line and not line.startswith("-----"))
+    if not body:
+        return None
+    try:
+        return hashlib.sha256(base64.b64decode(body, validate=True)).hexdigest()
+    except (ValueError, binascii.Error):
+        return None
+
+
 def _observe_tls(target: str, known_ports: list | None = None) -> tuple[dict, str | None]:
     """tlsx: the certificate fields the live TLS grab never extracted.
 
@@ -815,18 +857,30 @@ def _observe_tls(target: str, known_ports: list | None = None) -> tuple[dict, st
     a reissue to its original, and an SPKI hash survives certificate
     rotation entirely because the operator kept the keypair.
     """
-    records, error = _run_json(
-        TLSX_CMD + ["-json", "-silent", "-nc",
-                    # -san/-cn/-so are display probes that tlsx refuses to
-                    # combine with others ("san or cn flag cannot be used
-                    # with other probes"). -json returns the whole
-                    # certificate regardless, so they were never needed.
-                    "-serial", "-hash", "sha256",
-                    "-expired", "-self-signed", "-mismatched",
-                    "-tls-version", "-cipher",
-                    "-timeout", "10", "-disable-update-check"]
-                   + _port_args(known_ports),
-        stdin_text=target, timeout=OBSERVE_TOOL_TIMEOUT)
+    base = TLSX_CMD + ["-json", "-silent", "-nc",
+                       # -san/-cn/-so are display probes that tlsx refuses to
+                       # combine with others ("san or cn flag cannot be used
+                       # with other probes"). -json returns the whole
+                       # certificate regardless, so they were never needed.
+                       "-serial", "-hash", "sha256",
+                       "-expired", "-self-signed", "-mismatched",
+                       "-tls-version", "-cipher",
+                       "-timeout", "10", "-disable-update-check"] \
+        + _port_args(known_ports)
+
+    # -cert asks for the PEM, which is the only way to reach an SPKI hash:
+    # tlsx has no SPKI output of its own. It reads as an output flag rather
+    # than one of the display probes that conflict, but that could not be
+    # tested before deploying, and getting it wrong would lose the WHOLE
+    # certificate rather than one field. So the flag is retried without, and
+    # the worst case is the value we never had anyway.
+    records, error = _run_json(base + ["-cert"], stdin_text=target,
+                               timeout=OBSERVE_TOOL_TIMEOUT)
+    degraded = None
+    if error:
+        degraded = f"tlsx rejected -cert, retried without it ({error[:80]})"
+        records, error = _run_json(base, stdin_text=target,
+                                   timeout=OBSERVE_TOOL_TIMEOUT)
     if error:
         return {}, error
     if not records:
@@ -840,7 +894,7 @@ def _observe_tls(target: str, known_ports: list | None = None) -> tuple[dict, st
         "sans": r.get("subject_an") or [],
         "serial": r.get("serial"),
         "cert_sha256": fingerprint.get("sha256"),
-        "spki_sha256": fingerprint.get("spki_sha256"),
+        "spki_sha256": _spki_sha256(r.get("certificate")),
         "not_before": r.get("not_before"),
         "not_after": r.get("not_after"),
         "self_signed": r.get("self_signed"),
@@ -850,6 +904,7 @@ def _observe_tls(target: str, known_ports: list | None = None) -> tuple[dict, st
         "cipher": r.get("cipher"),
         "ja3s": r.get("ja3s_hash"),
         "resolved_ip": r.get("ip"),
+        "degraded": degraded,
     }, None
 
 

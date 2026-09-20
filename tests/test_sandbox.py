@@ -631,3 +631,124 @@ def test_observe_returns_discovered_ports_when_asked():
         ports_found=[443, 3389])
     assert result["ports"] == [443, 3389]
     assert result["responded"]["ports"] is True
+
+
+# --------------------------------------------------------------------------- #
+# SPKI: the digest that survives certificate rotation
+# --------------------------------------------------------------------------- #
+
+def _self_signed_pem(tmp_path):
+    """A real certificate, so the digest is checked against openssl's own
+    answer rather than a fixture somebody typed."""
+    import subprocess
+    cert = tmp_path / "c.pem"
+    key = tmp_path / "k.pem"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
+                    "-keyout", str(key), "-out", str(cert), "-days", "1",
+                    "-nodes", "-subj", "/CN=spki-test"],
+                   capture_output=True, check=True)
+    return cert.read_text()
+
+
+def test_the_spki_digest_matches_opensslts_own_answer(tmp_path):
+    """The canonical SPKI pin is
+    `x509 -pubkey -noout | pkey -pubin -outform DER | dgst -sha256`.
+    The helper reaches the same bytes with one process instead of three,
+    because the base64 body of `x509 -pubkey` IS the DER SubjectPublicKeyInfo.
+    """
+    import subprocess
+    pem = _self_signed_pem(tmp_path)
+    canonical = subprocess.run(
+        "openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER "
+        "| openssl dgst -sha256", shell=True, input=pem, capture_output=True,
+        text=True).stdout.split()[-1]
+    assert helper["_spki_sha256"](pem) == canonical
+
+
+def test_a_reissued_certificate_keeps_its_spki_digest(tmp_path):
+    """The whole point. A reissue mints a new serial and a new leaf hash;
+    an operator who keeps the keypair keeps this, which is why the selector
+    is identity-class."""
+    import subprocess
+    key = tmp_path / "k.pem"
+    subprocess.run(["openssl", "genrsa", "-out", str(key), "2048"],
+                   capture_output=True, check=True)
+    pems = []
+    for n in (1, 2):
+        cert = tmp_path / f"c{n}.pem"
+        subprocess.run(["openssl", "req", "-x509", "-key", str(key),
+                        "-out", str(cert), "-days", str(n), "-subj",
+                        f"/CN=reissue-{n}"], capture_output=True, check=True)
+        pems.append(cert.read_text())
+    assert pems[0] != pems[1], "two different certificates"
+    spki = helper["_spki_sha256"]
+    assert spki(pems[0]) == spki(pems[1]) is not None
+
+
+def test_garbage_in_gives_none_not_an_exception():
+    """This runs inside an observe pass; raising would lose every other
+    field collected alongside it."""
+    for junk in (None, "", "not a certificate",
+                 "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----"):
+        assert helper["_spki_sha256"](junk) is None
+
+
+def test_tlsx_is_asked_for_the_certificate_it_needs():
+    """The SPKI is computed from the PEM, which tlsx only emits with -cert."""
+    body = _helper_function("_observe_tls")
+    assert '"-cert"' in body
+
+
+def test_the_helper_does_not_read_an_spki_field_from_tlsx():
+    """tlsx's fingerprint_hash carries md5, sha1 and sha256 of the
+    CERTIFICATE and nothing else. Reading a spki_sha256 key from it left an
+    identity-class selector permanently empty - zero rows, ever."""
+    body = _helper_function("_observe_tls")
+    assert 'fingerprint.get("spki_sha256")' not in body
+
+
+def test_a_rejected_cert_flag_costs_the_spki_not_the_certificate():
+    """-cert could not be tested before deploying. If tlsx rejects it the
+    fallback must still return the certificate: losing one field we never
+    had is acceptable, losing the whole TLS grab is not."""
+    ns = _helper()
+    calls: list = []
+
+    def fake_run_json(cmd, stdin_text, timeout):
+        calls.append(cmd)
+        if "-cert" in cmd:
+            return [], "tlsx exited 1: flag cannot be used with other probes"
+        return [{"subject_cn": "example.com", "serial": "0A:1B",
+                 "fingerprint_hash": {"sha256": "c" * 64}}], None
+
+    ns["_run_json"] = fake_run_json
+    result, error = ns["_observe_tls"]("example.com")
+    assert error is None
+    assert result["cert_sha256"] == "c" * 64, "the certificate survived"
+    assert result["spki_sha256"] is None
+    assert "retried without it" in result["degraded"]
+    assert len(calls) == 2 and "-cert" not in calls[1]
+
+
+def test_a_working_cert_flag_is_not_retried():
+    ns = _helper()
+    calls: list = []
+
+    def fake_run_json(cmd, stdin_text, timeout):
+        calls.append(cmd)
+        return [{"serial": "0A", "certificate": "not a pem",
+                 "fingerprint_hash": {"sha256": "c" * 64}}], None
+
+    ns["_run_json"] = fake_run_json
+    result, error = ns["_observe_tls"]("example.com")
+    assert len(calls) == 1 and error is None
+    assert result["degraded"] is None
+
+
+def test_a_real_tls_failure_is_still_an_error():
+    """The retry must not swallow a genuine failure - an unreachable host
+    fails both attempts and has to be reported as an error, not silence."""
+    ns = _helper()
+    ns["_run_json"] = lambda cmd, stdin_text, timeout: ([], "tlsx timed out")
+    result, error = ns["_observe_tls"]("example.com")
+    assert result == {} and error == "tlsx timed out"
