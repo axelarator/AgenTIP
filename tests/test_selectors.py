@@ -417,3 +417,105 @@ def test_the_tls_handshake_address_goes_through_the_same_gate():
     recorded = [v for t, v in observe.selectors_from(
         cdn_tls, target="x.example", kind="domain") if t == "net.resolved_ip"]
     assert recorded == []
+
+
+# --------------------------------------------------------------------------- #
+# The capture path: a sweep must WRITE selectors, not just compute them
+# --------------------------------------------------------------------------- #
+
+def test_a_sweep_writes_both_the_observation_and_the_selectors(tmp_path, monkeypatch):
+    """The whole point of step 3. Before this, an observe pass existed only
+    as a return value: the fields were computed on the probe VM and dropped
+    at the write boundary, and nothing was ever indexed across indicators."""
+    from cti import core
+    from cti.store import connect
+
+    monkeypatch.setenv("CTI_DUCKDB_PATH", str(tmp_path / "t.duckdb"))
+
+    observed = {
+        "target": "c2.example", "kind": "domain",
+        "http": {"status": 200, "title": "Panel", "server": "nginx",
+                 "body_sha256": "b" * 64, "favicon_mmh3": -12345,
+                 "content_type": "text/html", "tech": ["nginx"],
+                 "headers": {"x-powered-by": "PHP"}},
+        "tls": {"cert_sha256": "c" * 64, "issuer": "CN = Test CA",
+                "subject_cn": "c2.example", "subject_dn": "CN = c2.example",
+                "sans": ["c2.example", "backup.example"], "serial": "0A:1B",
+                "spki_sha256": "d" * 64, "self_signed": True,
+                "tls_version": "tls13"},
+        "dns": {"a": ["193.29.58.192"], "ns": ["ns1.host.example", "ns2.host.example"],
+                "mx": [], "txt": []},
+        "whois": {"registrar": "Example Registrar",
+                  "registrant_email": "op@mail.example", "created": "2026-01-02"},
+        "cdn": {"is_cdn": False}, "ports": [], "errors": {}, "tools_missing": [],
+    }
+
+    with connect(read_only=False) as con:
+        core._log_observation(con, "c2.example", "domain", "TestActor",
+                              observed, datetime(2026, 9, 20, 6, 0))
+
+        stored = {r[0]: r[1] for r in con.execute(
+            "SELECT source, payload FROM observations WHERE indicator_value = 'c2.example'"
+        ).fetchall()}
+        assert set(stored) == {"observe_http", "observe_tls", "observe_dns"}
+
+        # the fields that used to be discarded
+        wide = con.execute(
+            "SELECT body_sha256, favicon_mmh3, tls_serial, tls_spki_sha256, "
+            "whois_registrar, content_type FROM observations_wide "
+            "WHERE body_sha256 IS NOT NULL OR tls_serial IS NOT NULL "
+            "OR whois_registrar IS NOT NULL").fetchall()
+        recorded = {v for row in wide for v in row if v}
+        assert "b" * 64 in recorded, "body hash still discarded"
+        assert "0A:1B" in recorded and "d" * 64 in recorded
+        assert "Example Registrar" in recorded
+
+        found = {r["selector_type"] for r in S.for_indicator(con, "c2.example")}
+        assert {"http.body_sha256", "tls.cert_sha256", "tls.spki_sha256",
+                "tls.serial", "dns.ns_set", "whois.registrant_email",
+                "net.resolved_ip"} <= found
+
+
+def test_two_hosts_serving_the_same_page_become_neighbours(tmp_path, monkeypatch):
+    """The SilkParasite pivot, end to end: a decoy page byte-identical across
+    hosts, linking them after every other attribute differs."""
+    from cti import core
+    from cti.store import connect
+
+    monkeypatch.setenv("CTI_DUCKDB_PATH", str(tmp_path / "t.duckdb"))
+    shared_page = "a" * 64
+
+    def pass_for(host, ip, cert):
+        return {"http": {"status": 200, "body_sha256": shared_page, "server": "nginx"},
+                "tls": {"cert_sha256": cert, "issuer": "CN = Different CA"},
+                "dns": {"a": [ip]}, "whois": {}, "cdn": {"is_cdn": False}, "errors": {}}
+
+    with connect(read_only=False) as con:
+        core._log_observation(con, "first.example", "domain", "A",
+                              pass_for("first.example", "193.29.58.192", "c1"),
+                              datetime(2026, 9, 20, 6, 0))
+        core._log_observation(con, "second.example", "domain", "B",
+                              pass_for("second.example", "46.30.191.230", "c2"),
+                              datetime(2026, 9, 20, 6, 0))
+
+        [neighbour] = S.neighbours(con, "first.example")
+        assert neighbour["indicator_value"] == "second.example"
+        assert neighbour["via"] == ["http.body_sha256"]
+        assert neighbour["strongest"] == "identity"
+        assert neighbour["actor"] == "B", "a cross-actor link is the interesting case"
+
+
+def test_a_sweep_on_shared_hosting_does_not_manufacture_links(tmp_path, monkeypatch):
+    from cti import core
+    from cti.store import connect
+
+    monkeypatch.setenv("CTI_DUCKDB_PATH", str(tmp_path / "t.duckdb"))
+    behind_cdn = {"http": {"status": 200, "server": "cloudflare"},
+                  "tls": {"issuer": "CN = Cloudflare"},
+                  "dns": {"a": ["104.20.23.154"]}, "whois": {},
+                  "cdn": {"is_cdn": True, "provider": "cloudflare"}, "errors": {}}
+    with connect(read_only=False) as con:
+        for host in ("one.example", "two.example"):
+            core._log_observation(con, host, "domain", "A", behind_cdn,
+                                  datetime(2026, 9, 20, 6, 0))
+        assert S.neighbours(con, "one.example") == []

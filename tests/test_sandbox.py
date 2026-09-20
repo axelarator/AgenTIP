@@ -323,6 +323,20 @@ def test_the_bootstrap_installs_what_observe_needs():
 # The provisioning path - a second key, deliberately weaker than a shell
 # --------------------------------------------------------------------------- #
 
+def _helper_function(name: str) -> str:
+    """One function's source, read from the file.
+
+    inspect.getsource cannot be used: the helper is loaded with exec() by
+    design - it is the VM-side payload, stdlib-only and not importable as
+    part of the package - so its functions have no source file association.
+    """
+    text = (REPO / "probe_vm" / "probe_helper.py").read_text()
+    start = text.index(f"def {name}(")
+    rest = text[start + 1:]
+    end = rest.index("\ndef ") if "\ndef " in rest else len(rest)
+    return text[start:start + 1 + end]
+
+
 def _provision_script() -> str:
     return (REPO / "probe_vm" / "cti-provision").read_text()
 
@@ -538,3 +552,20 @@ def test_package_names_map_to_the_binaries_they_provide():
     nothing and reported a working install as missing."""
     script = _provision_script()
     assert "[dnsutils]=" in script and '"dig"' in script
+
+
+def test_http_fetch_returns_the_fields_its_caller_reads():
+    """cti/sources/http.py:_fetch_probe reads headers and final_url off this
+    response. They were never sent, so every via="probe" request came back
+    with headers={} and final_url=None - silently, always."""
+    source = _helper_function("action_http_fetch")
+    assert '"headers"' in source and '"final_url"' in source
+    # all three exit paths, including both error branches
+    assert source.count('"headers"') >= 3, "an error path still omits headers"
+
+
+def test_http_fetch_still_honours_method_headers_and_body():
+    """ThreatFox's query API is a POST; losing that would break it."""
+    source = _helper_function("action_http_fetch")
+    for feature in ('request.get("method"', 'request.get("data")', 'request.get("headers")'):
+        assert feature in source

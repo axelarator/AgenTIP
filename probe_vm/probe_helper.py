@@ -173,6 +173,19 @@ def action_jarm_probe(request: dict) -> dict:
 # http_fetch (ported)
 # --------------------------------------------------------------------------- #
 def action_http_fetch(request: dict) -> dict:
+    """Fetch a URL from the VM, as the caller asked (method, headers, body).
+
+    Returns headers and final_url alongside status/body. cti/sources/http.py
+    has always read both off this response, and they were never sent - so
+    every via="probe" request came back with headers={} and final_url=None.
+    Not an error, just silently empty, which is worse: any logic keying on a
+    response header or a redirect target through the probe path was dead and
+    said nothing.
+
+    Kept as its own urlopen rather than routed through _fetch, because _fetch
+    takes no method, headers or body - it is the GET-only path used by
+    http_probe and the open-directory crawl.
+    """
     url = request["url"]
     method = request.get("method", "GET")
     headers = request.get("headers") or {}
@@ -184,17 +197,21 @@ def action_http_fetch(request: dict) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=context) as resp:
             return {"status": resp.status,
-                    "body": resp.read().decode("utf-8", errors="replace"), "error": None}
+                    "body": resp.read().decode("utf-8", errors="replace"),
+                    "headers": {k.lower(): v for k, v in resp.headers.items()},
+                    "final_url": resp.geturl(),
+                    "error": None}
     except urllib.error.HTTPError as e:
-        return {"status": e.code, "body": e.read().decode("utf-8", errors="replace"),
+        return {"status": e.code,
+                "body": e.read().decode("utf-8", errors="replace"),
+                "headers": {k.lower(): v for k, v in (e.headers or {}).items()},
+                "final_url": url,
                 "error": None}
     except (urllib.error.URLError, TimeoutError, OSError) as e:
-        return {"status": None, "body": None, "error": f"failed to reach {url}: {e}"}
+        return {"status": None, "body": None, "headers": {}, "final_url": url,
+                "error": f"failed to reach {url}: {e}"}
 
 
-# --------------------------------------------------------------------------- #
-# resolve_dns / resolve_ptr (ported) + dns_lookup (new)
-# --------------------------------------------------------------------------- #
 def action_resolve_dns(request: dict) -> dict:
     try:
         infos = socket.getaddrinfo(request["host"], None)

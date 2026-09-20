@@ -191,6 +191,21 @@ _SCALAR_FIELDS: tuple[tuple[str, str], ...] = (
     ("webamon_fingerprint_dom", "TEXT"), ("webamon_fingerprint_ssl", "TEXT"),
     ("webamon_last_scan", "TEXT"),
     ("infostealer_count", "INTEGER"),
+    # Fields the probe VM has been computing and the write path discarding.
+    # body_sha256 is the pivot the SilkParasite reporting turned on: a decoy
+    # page byte-identical across 13 hosts, which survives the domain, the IP
+    # and the provider all changing.
+    ("body_sha256", "TEXT"),
+    ("favicon_mmh3", "TEXT"),
+    ("content_type", "TEXT"),
+    ("tls_serial", "TEXT"),
+    ("tls_spki_sha256", "TEXT"),
+    ("tls_self_signed", "BOOLEAN"),
+    ("tls_version", "TEXT"),
+    ("whois_registrar", "TEXT"),
+    ("whois_registrant_email", "TEXT"),
+    ("whois_created", "TEXT"),
+    ("cdn_provider", "TEXT"),
 )
 
 _JSON_FIELDS: tuple[str, ...] = (
@@ -198,6 +213,9 @@ _JSON_FIELDS: tuple[str, ...] = (
     "cert_sibling_hostnames", "discovered_hostnames", "vt_file_hashes",
     "resolved_ip", "tls_sans", "nmap_ports", "ip_hostnames", "subdomains",
     "infostealer_urls",
+    # From the observe pass: record sets and header maps, each one selector
+    # whose value is the whole set rather than one per member.
+    "dns_ns", "dns_mx", "dns_txt", "http_headers", "http_tech",
     # Retired providers. Never written any more, but 154 Shodan rows and
     # 7 VirusTotal rows exist and stay readable.
     "shodan_ports", "shodan_tags",

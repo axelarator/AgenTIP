@@ -27,6 +27,7 @@ from .util import (asn_int, atomic_write_text, new_values, now_iso,
 from . import attack, stix
 from .probe import vm_proxy
 from .report import ingest as report_ingest
+from .sources import observe as observe_source
 from .sources import pivot, webamon
 from . import store as tracking_store
 from .tracking.analytics import SHARED_HOSTING_ASNS
@@ -908,6 +909,19 @@ def _cached_pivot(source: str, value: str, fetch) -> Any:
     return cache.cached(source, value, fetch)
 
 
+def _observe(value: str, kind: str) -> dict[str, Any]:
+    """One observation pass, cached like every other source.
+
+    Port scanning is deliberately not requested: it is active traffic, and
+    the sweep is the light-touch path. active_scan remains the way to ask.
+    """
+    try:
+        return _cached_pivot(f"observe_{kind}", value,
+                             lambda: vm_proxy.observe(value, kind=kind))
+    except vm_proxy.VMProxyError as e:
+        return {"error": str(e)}
+
+
 def _live_tls(host: str) -> dict[str, Any]:
     try:
         return _cached_pivot("tls_live", host, lambda: normalize_probe(vm_proxy.tls_grab(host)))
@@ -1091,6 +1105,12 @@ def _domain_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
     # (subfinder + Wayback, flag-only). All day-over-day attribute diffs -
     # see _log_cluster_enrichment_history.
     enrichment: dict[str, Any] = {
+        # One CLI pass on the probe VM. It supersedes the separate tls_grab
+        # and http_probe calls for everything they returned AND carries the
+        # fields those two never surfaced - body and favicon digests, the
+        # certificate serial and SPKI hash, the nameserver set, the
+        # registrar. Those are what the selector index is built from.
+        "observe": _observe(value, "domain"),
         "tls": _live_tls(value),
         "http": _live_http(value),
         "webamon": _webamon_domain(value),
@@ -1110,6 +1130,7 @@ def _ip_lifecycle(value: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
              "prefix": ripe.get("prefix") if isinstance(ripe, dict) else None,
              "as_holder": ripe.get("as_holder") if isinstance(ripe, dict) else None}
     enrichment: dict[str, Any] = {
+        "observe": _observe(value, "ip"),
         # Domains Webamon has scanned resolving to this IP - the reverse-IP
         # / hosted-domain signal (replaces Shodan hostnames + Hackertarget).
         # Open ports are no longer discovered automatically here: that's
@@ -1260,6 +1281,67 @@ def _apply_enrichment_snapshot(entry: dict[str, Any], category: str,
 # driven by one function - see that module for what each spec preserves.
 
 
+def _log_observation(con, value: str, indicator_type: str, actor: str | None,
+                     observed: dict[str, Any], observed_at) -> None:
+    """Persist one observe pass, then record the selectors it implies.
+
+    Two writes, deliberately. The observation row is the time series - what
+    this host looked like today, diffable against yesterday. The selectors
+    are the index - what it has in common with anything else we track. The
+    old pipeline only ever did the first, which is why "who else has this
+    certificate?" had no answer.
+    """
+    http = observed.get("http") or {}
+    tls = observed.get("tls") or {}
+    dns = observed.get("dns") or {}
+    whois = observed.get("whois") or {}
+    cdn_info = observed.get("cdn") or {}
+
+    if http:
+        tracking_store.upsert_observation(
+            con, observed_at=observed_at, indicator_value=value,
+            source="observe_http", actor=actor, indicator_type=indicator_type,
+            body_sha256=http.get("body_sha256"),
+            favicon_mmh3=(str(http["favicon_mmh3"])
+                          if http.get("favicon_mmh3") not in (None, "", 0) else None),
+            content_type=http.get("content_type"),
+            http_status=http.get("status"), http_title=http.get("title"),
+            http_server=http.get("server"), http_final_url=http.get("final_url"),
+            http_headers=http.get("headers") or None,
+            http_tech=http.get("tech") or None)
+
+    if tls:
+        tracking_store.upsert_observation(
+            con, observed_at=observed_at, indicator_value=value,
+            source="observe_tls", actor=actor, indicator_type=indicator_type,
+            tls_sha256=tls.get("cert_sha256"), tls_issuer=tls.get("issuer"),
+            tls_subject=tls.get("subject_dn") or tls.get("subject_cn"),
+            tls_sans=tls.get("sans") or None,
+            tls_serial=tls.get("serial"),
+            tls_spki_sha256=tls.get("spki_sha256"),
+            tls_self_signed=tls.get("self_signed"),
+            tls_version=tls.get("tls_version"),
+            tls_not_before=tls.get("not_before"), tls_not_after=tls.get("not_after"))
+
+    if dns or whois or cdn_info:
+        tracking_store.upsert_observation(
+            con, observed_at=observed_at, indicator_value=value,
+            source="observe_dns", actor=actor, indicator_type=indicator_type,
+            dns_ns=dns.get("ns") or None, dns_mx=dns.get("mx") or None,
+            dns_txt=dns.get("txt") or None,
+            whois_registrar=whois.get("registrar"),
+            whois_registrant_email=whois.get("registrant_email"),
+            whois_created=whois.get("created"),
+            cdn_provider=cdn_info.get("provider"))
+
+    kind = "ip" if indicator_type.startswith("ipv") else "domain"
+    tracking_store.selectors.record_many(
+        con, indicator_value=value,
+        found=observe_source.selectors_from(observed, target=value, kind=kind),
+        observed_at=observed_at, indicator_type=indicator_type, actor=actor,
+        source="observe")
+
+
 def _log_cluster_enrichment_history(
         actor: str, observed_at: datetime,
         results: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]) -> str | None:
@@ -1279,6 +1361,11 @@ def _log_cluster_enrichment_history(
                     indicator_type = "domain"
                 else:
                     indicator_type = "ipv6" if ":" in value else "ipv4"
+
+                observed = enrichment.get("observe")
+                if ok(observed):
+                    _log_observation(con, value, indicator_type, actor,
+                                     observed, observed_at)
 
                 threatfox = enrichment.get("threatfox")
                 if isinstance(threatfox, dict) and "error" not in threatfox:
@@ -1503,6 +1590,11 @@ def pivot_cluster(name: str) -> dict[str, Any]:
                 webamon = enrichment.get("webamon")
                 if isinstance(webamon, dict) and "error" not in webamon and webamon.get("latest"):
                     row["webamon_risk"] = webamon["latest"].get("risk_score")
+                observed = enrichment.get("observe")
+                if ok(observed):
+                    _log_observation(con, value, indicator_type, actor,
+                                     observed, observed_at)
+
                 threatfox = enrichment.get("threatfox")
                 if isinstance(threatfox, dict) and "error" not in threatfox:
                     row["threatfox_matches"] = len(threatfox.get("matches") or [])
