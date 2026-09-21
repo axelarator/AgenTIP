@@ -21,7 +21,6 @@ default for back-compat with the original single-purpose helper):
   resolve_dns  {host}                            -> {status, addrs}|{status:nxdomain}|{status:error,error}
   resolve_ptr  {ip}                              -> {status, hostname}|{status:no_ptr}|{status:error,error}
   dns_lookup   {host, types:[A,AAAA,MX,NS,TXT]}  -> {records:{TYPE:[...]}, error}
-  tls_grab     {host, port}                      -> {cert:{sha256,issuer,subject,sans,not_before,not_after,protocol}, resolved_ip, error}
   http_probe   {url, insecure}                   -> {status, final_url, title, server, content_type, body_sha256, autoindex, error}
   subfinder    {domain}                          -> {subdomains:[...], error}
   wayback_cdx  {domain}                          -> {urls:[...], subdomains:[...], error}
@@ -71,7 +70,6 @@ USER_AGENT = "Mozilla/5.0 (cti-agent probe)"
 HTTP_TIMEOUT = 20
 TCP_PRECHECK_TIMEOUT = 3
 JARM_SUBPROCESS_TIMEOUT = 20
-TLS_TIMEOUT = 15
 HTTP_PROBE_MAX_BYTES = 512_000        # bounded body read for http_probe
 WAYBACK_TIMEOUT = 30
 NMAP_TIMEOUT = 600
@@ -250,65 +248,6 @@ def action_dns_lookup(request: dict) -> dict:
     except Exception as e:
         return {"records": records, "error": str(e)}
     return {"records": records, "error": None}
-
-
-# --------------------------------------------------------------------------- #
-# tls_grab (new) - live current certificate
-# --------------------------------------------------------------------------- #
-def _parse_openssl_cert(der: bytes) -> dict:
-    """Fields from a DER cert via `openssl x509`. Python's ssl can't parse
-    an unverified peer cert (getpeercert() returns {} under CERT_NONE), and
-    we deliberately want the cert even when it's self-signed/expired
-    (adversary infra), so shell to openssl for the human-readable fields."""
-    out: dict[str, object] = {"issuer": None, "subject": None, "sans": [],
-                              "not_before": None, "not_after": None}
-    try:
-        proc = subprocess.run(
-            [*OPENSSL_CMD, "x509", "-inform", "DER", "-noout",
-             "-issuer", "-subject", "-startdate", "-enddate", "-ext", "subjectAltName"],
-            input=der, capture_output=True, timeout=15)
-        text = proc.stdout.decode("utf-8", errors="replace")
-    except Exception:
-        return out
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("issuer="):
-            out["issuer"] = line[len("issuer="):].strip()
-        elif line.startswith("subject="):
-            out["subject"] = line[len("subject="):].strip()
-        elif line.startswith("notBefore="):
-            out["not_before"] = line[len("notBefore="):].strip()
-        elif line.startswith("notAfter="):
-            out["not_after"] = line[len("notAfter="):].strip()
-        elif "DNS:" in line:
-            out["sans"] = sorted({m for m in re.findall(r"DNS:([^,\s]+)", line)})
-    return out
-
-
-def action_tls_grab(request: dict) -> dict:
-    host = request["host"]
-    port = int(request.get("port") or 443)
-    try:
-        resolved_ip = resolve_target_ip(host)
-    except Exception as e:
-        return {"cert": None, "resolved_ip": None, "error": f"DNS resolution failed: {e}"}
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    server_hostname = None if is_ip_literal(host) else host
-    try:
-        with socket.create_connection((resolved_ip, port), timeout=TLS_TIMEOUT) as sock:
-            with ctx.wrap_socket(sock, server_hostname=server_hostname) as tls:
-                der = tls.getpeercert(binary_form=True)
-                protocol = tls.version()
-    except Exception as e:
-        return {"cert": None, "resolved_ip": resolved_ip, "error": f"TLS grab failed: {e}"}
-    if not der:
-        return {"cert": None, "resolved_ip": resolved_ip, "error": "no peer certificate"}
-    cert = _parse_openssl_cert(der)
-    cert["sha256"] = hashlib.sha256(der).hexdigest()
-    cert["protocol"] = protocol
-    return {"cert": cert, "resolved_ip": resolved_ip, "error": None}
 
 
 # --------------------------------------------------------------------------- #
@@ -1138,7 +1077,6 @@ _ACTIONS = {
     "resolve_dns": action_resolve_dns,
     "resolve_ptr": action_resolve_ptr,
     "dns_lookup": action_dns_lookup,
-    "tls_grab": action_tls_grab,
     "http_probe": action_http_probe,
     "subfinder": action_subfinder,
     "wayback_cdx": action_wayback_cdx,

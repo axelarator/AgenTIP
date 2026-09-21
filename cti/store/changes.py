@@ -32,6 +32,7 @@ from typing import Any, Callable
 import duckdb
 
 from ..util import is_stale
+from .selectors import canonical_dn
 
 # A baseline this old is re-checked for the first time in months; a
 # change against it shouldn't read as a confident "changed since
@@ -102,7 +103,10 @@ class AttributeSpec:
     """One tracked attribute.
 
     attribute        value written to attribute_changes.attribute
-    source           observations.source holding this attribute's rows
+    source           observations.source holding this attribute's rows - or
+                     a tuple of them, newest-format first. A spec that
+                     changes tool keeps the old source in the tuple so its
+                     baseline stays continuous across the switch
     columns          observations_wide columns making up the baseline
     guard            column that must be non-NULL for a row to count as a
                      usable baseline, or None when NULL is itself a
@@ -121,7 +125,7 @@ class AttributeSpec:
     fixed_confidence bypass the prior/staleness calculation
     """
     attribute: str
-    source: str
+    source: str | tuple[str, ...]
     columns: tuple[str, ...]
     bare: bool
     classify: Callable[[Any, Any], str | None]
@@ -146,7 +150,13 @@ def _classify_cert(old: dict, new: dict) -> str | None:
     """A same-issuer, same-SANs renewal is routine and deliberately not
     recorded - the sha256 rotation it produces is tracked separately by
     the cert_hash spec, on its own timeline."""
-    if new["issuer"] and old["issuer"] and new["issuer"] != old["issuer"]:
+    # Compared as canonical DNs. The baseline may be an openssl row ("C = US,
+    # O = Let's Encrypt, CN = YE1") and the new value tlsx's ("CN=YE1, O=Let's
+    # Encrypt, C=US"): the same issuer, spelled two ways. Compared as strings
+    # the first observation after the switch would report a certificate
+    # issuer change for every domain that has one.
+    if (new["issuer"] and old["issuer"]
+            and canonical_dn(new["issuer"]) != canonical_dn(old["issuer"])):
         return "cert_issuer_changed"
     if set(new["sans"] or []) != set(old["sans"] or []):
         return "cert_sans_changed"
@@ -169,6 +179,16 @@ def _classify_subdomains(old: list, new: list) -> str | None:
 
 def _added(new: list, old: list, key: str) -> dict:
     return {key: new, "added": sorted(set(new or []) - set(old or []))}
+
+
+# The certificate now comes from the observe pass (tlsx) and the separate
+# openssl grab that used to write `tls_live` is gone. Both stay in the tuple:
+# 310 tls_live rows are the baseline for 22 domains, and dropping them would
+# turn every one of those domains' next observation into a "first_seen".
+# Verified before the switch: on all 73 same-day pairs the two sources agree
+# exactly on sha256 and on the SAN set, and every domain that has tls_live
+# history already has observe_tls history.
+CERT_SOURCES = ("observe_tls", "tls_live")
 
 
 SPECS: dict[str, AttributeSpec] = {
@@ -205,7 +225,7 @@ SPECS: dict[str, AttributeSpec] = {
              "SQL NULL, so the guard excludes only never-written rows.",
     ),
     "cert": AttributeSpec(
-        attribute="cert", bare=False, source="tls_live", guard="tls_sha256",
+        attribute="cert", bare=False, source=CERT_SOURCES, guard="tls_sha256",
         columns=("tls_issuer", "tls_sans"),
         json_columns=frozenset({"tls_sans"}),
         classify=_classify_cert,
@@ -215,7 +235,7 @@ SPECS: dict[str, AttributeSpec] = {
         first_seen_empty=lambda new: new["issuer"] is None and not new["sans"],
     ),
     "cert_hash": AttributeSpec(
-        attribute="cert_hash", bare=False, source="tls_live", guard="tls_sha256",
+        attribute="cert_hash", bare=False, source=CERT_SOURCES, guard="tls_sha256",
         columns=("tls_sha256",),
         classify=lambda old, new: None if old["sha256"] == new["sha256"] else "cert_new",
         normalize_new=lambda c: ({"sha256": c["sha256"]} if c.get("sha256") else SKIP),
@@ -287,7 +307,7 @@ SPECS: dict[str, AttributeSpec] = {
 # --------------------------------------------------------------------------- #
 
 _BASELINE_SQL = ("SELECT observed_at, {cols} FROM observations_wide "
-                 "WHERE indicator_value = ? AND source = ? {guard} "
+                 "WHERE indicator_value = ? AND source IN ({marks}) {guard} "
                  "AND observed_at < ? ORDER BY observed_at DESC LIMIT 1")
 
 # observations_wide column -> the key the specs and old code use.
@@ -305,8 +325,10 @@ def baseline(con: duckdb.DuckDBPyConnection, spec: AttributeSpec,
     """The most recent prior observation of this attribute, strictly
     before `before`. Replaces all twelve `latest_*_for` functions."""
     guard = f"AND {spec.guard} IS NOT NULL" if spec.guard else ""
-    sql = _BASELINE_SQL.format(cols=", ".join(spec.columns), guard=guard)
-    row = con.execute(sql, [indicator_value, spec.source, before]).fetchone()
+    sources = (spec.source,) if isinstance(spec.source, str) else tuple(spec.source)
+    sql = _BASELINE_SQL.format(cols=", ".join(spec.columns), guard=guard,
+                               marks=", ".join("?" for _ in sources))
+    row = con.execute(sql, [indicator_value, *sources, before]).fetchone()
     if row is None:
         return None
     out: dict[str, Any] = {"observed_at": row[0]}

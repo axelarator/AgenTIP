@@ -40,9 +40,6 @@ response shapes per action). Actions:
 - "resolve_dns" / "resolve_ptr": DNS / reverse-DNS from the VM - what
   pivot.resolve_host / pivot.ptr_lookup run through.
 - "dns_lookup": multi-record-type DNS (A/AAAA/MX/NS/TXT) from the VM.
-- "tls_grab": one live TLS handshake, returning the peer certificate
-  (sha256/issuer/subject/SANs/validity) - the live replacement for
-  Cert Spotter's CT-log cert lookup, current as of the moment checked.
 - "http_probe": one HTTP(S) GET, returning status/title/server/final
   URL plus any autoindex (open-directory) listing detected at that URL.
 - "subfinder": passive subdomain enumeration for a domain.
@@ -107,7 +104,7 @@ LONG_TIMEOUT = int(os.environ.get("CTI_PROBE_LONG_TIMEOUT", "900"))
 # instance of the forced remote command; this isn't a persistent server on
 # the far end), but the expensive setup happens once per ControlPersist
 # window. This matters most for the plain single-round-trip pivots
-# (RDAP/RIPEstat/resolve_dns/http_fetch/tls_grab), where per-call SSH setup
+# (RDAP/RIPEstat/resolve_dns/http_fetch), where per-call SSH setup
 # would otherwise dominate wall time.
 SSH_CONTROL_PATH = os.path.expanduser(
     os.environ.get("CTI_PROBE_CONTROL_PATH", "~/.ssh/cti-vm-proxy-control.sock"))
@@ -223,14 +220,6 @@ def dns_lookup(host: str, types: list[str] | None = None) -> dict[str, object]:
     {"records": {"A": [...], "AAAA": [...], ...}, "error": str|None}."""
     return _ssh_json_rpc({"action": "dns_lookup", "host": host,
                           "types": types or ["A", "AAAA", "MX", "NS", "TXT"]})
-
-
-def tls_grab(host: str, port: int = 443) -> dict[str, object]:
-    """One live TLS handshake from the VM, returning the peer certificate:
-    {"cert": {"sha256","issuer","subject","sans":[...],"not_before",
-    "not_after","protocol"}, "resolved_ip": str, "error": str|None}.
-    The current-cert replacement for Cert Spotter's CT-log lookup."""
-    return _ssh_json_rpc({"action": "tls_grab", "host": host, "port": port})
 
 
 def http_probe(url: str, insecure: bool = False) -> dict[str, object]:

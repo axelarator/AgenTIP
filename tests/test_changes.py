@@ -34,6 +34,13 @@ def changes(con):
         "FROM attribute_changes ORDER BY id").fetchall()]
 
 
+def _seed_source(spec):
+    """The source to write a baseline row under. A spec that changed tool
+    keeps the old source in a tuple for continuity (see CERT_SOURCES); the
+    first entry is the one being written today."""
+    return spec.source if isinstance(spec.source, str) else spec.source[0]
+
+
 def seed(con, source, value, observed_at=DAY1, **fields):
     upsert_observation(con, observed_at=observed_at, indicator_value=value,
                        source=source, actor="A", **fields)
@@ -72,7 +79,7 @@ def test_no_baseline_emits_first_seen(con, attribute):
 @pytest.mark.parametrize("attribute", sorted(CASES))
 def test_unchanged_records_nothing(con, attribute):
     fields, same, _ = CASES[attribute]
-    seed(con, SPECS[attribute].source, "t", **fields)
+    seed(con, _seed_source(SPECS[attribute]), "t", **fields)
     assert detect(con, attribute, indicator_value="t", actor="A",
                   observed_at=DAY2, new=same) is None
     assert changes(con) == []
@@ -81,7 +88,7 @@ def test_unchanged_records_nothing(con, attribute):
 @pytest.mark.parametrize("attribute", sorted(CASES))
 def test_changed_records_a_row(con, attribute):
     fields, _, different = CASES[attribute]
-    seed(con, SPECS[attribute].source, "t", **fields)
+    seed(con, _seed_source(SPECS[attribute]), "t", **fields)
     change_type = detect(con, attribute, indicator_value="t", actor="A",
                          observed_at=DAY2, new=different)
     assert change_type not in (None, "first_seen")
@@ -255,8 +262,65 @@ def test_every_spec_has_a_confidence_prior_for_every_change_type(con):
         c = duckdb.connect(":memory:")
         init_schema(c)
         upsert_observation(c, observed_at=DAY1, indicator_value="t",
-                           source=spec.source, actor="A", **fields)
+                           source=_seed_source(spec), actor="A", **fields)
         detect(c, name, indicator_value="t", actor="A", observed_at=DAY2, new=different)
         ct = c.execute("SELECT change_type FROM attribute_changes").fetchone()
         assert ct and ct[0] in CONFIDENCE_BASE, f"{name}: {ct}"
         c.close()
+
+
+# --------------------------------------------------------------------------- #
+# The certificate moved from tls_live to observe_tls
+# --------------------------------------------------------------------------- #
+
+def test_a_legacy_tls_live_row_is_still_a_usable_baseline(con):
+    """310 tls_live rows are the baseline for 22 domains. If the specs read
+    only observe_tls, the next observation of every one of them would be
+    recorded as a first_seen and a real rotation at the switch would be
+    invisible."""
+    seed(con, "tls_live", "x.com", tls_sha256="h1", tls_issuer="LE", tls_sans=["x.com"])
+    assert detect(con, "cert_hash", indicator_value="x.com", actor="A",
+                  observed_at=DAY2, new={"sha256": "h2"}) == "cert_new"
+
+
+def test_the_new_source_is_a_usable_baseline_too(con):
+    seed(con, "observe_tls", "x.com", tls_sha256="h1", tls_issuer="LE", tls_sans=["x.com"])
+    assert detect(con, "cert_hash", indicator_value="x.com", actor="A",
+                  observed_at=DAY2, new={"sha256": "h2"}) == "cert_new"
+
+
+def test_the_newest_row_wins_across_both_sources(con):
+    """Baseline is the most recent prior row, whichever tool wrote it."""
+    seed(con, "tls_live", "x.com", observed_at=DAY1, tls_sha256="old")
+    seed(con, "observe_tls", "x.com", observed_at=DAY1 + timedelta(hours=12),
+         tls_sha256="newer")
+    assert detect(con, "cert_hash", indicator_value="x.com", actor="A",
+                  observed_at=DAY2, new={"sha256": "newer"}) is None
+
+
+def test_the_same_issuer_spelled_by_two_tools_is_not_a_change(con):
+    """openssl writes "C = US, O = Let's Encrypt, CN = YE1" and tlsx writes
+    "CN=YE1, O=Let's Encrypt, C=US". Compared as strings, the first
+    observation after the switch would report a certificate issuer change
+    for every domain that has one."""
+    seed(con, "tls_live", "x.com", tls_sha256="h1",
+         tls_issuer="C = US, O = Let's Encrypt, CN = YE1", tls_sans=["x.com"])
+    assert detect(con, "cert", indicator_value="x.com", actor="A", observed_at=DAY2,
+                  new={"issuer": "CN=YE1, O=Let's Encrypt, C=US",
+                       "sans": ["x.com"], "sha256": "h1"}) is None
+
+
+def test_a_genuinely_different_issuer_is_still_reported_across_the_switch(con):
+    seed(con, "tls_live", "x.com", tls_sha256="h1",
+         tls_issuer="C = US, O = Let's Encrypt, CN = YE1", tls_sans=["x.com"])
+    assert detect(con, "cert", indicator_value="x.com", actor="A", observed_at=DAY2,
+                  new={"issuer": "CN=DigiCert, O=DigiCert Inc, C=US",
+                       "sans": ["x.com"], "sha256": "h2"}) == "cert_issuer_changed"
+
+
+def test_no_spec_writes_to_tls_live_any_more():
+    """The source is retired. It may appear in a spec's tuple only as history
+    to read from, never as the source being written."""
+    from cti.store.changes import CERT_SOURCES
+    assert CERT_SOURCES[0] == "observe_tls"
+    assert "tls_live" in CERT_SOURCES[1:]

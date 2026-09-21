@@ -348,8 +348,10 @@ Plus:
   cache; 401/403/429 and an exhausted budget come back as
   `{"error": ...}`, never raised.
 - **Live checks from the probe VM** (`vm_proxy` → `probe_helper.py`):
-  `tls_grab` (the current certificate — sha256/issuer/subject/SANs/
-  validity — replacing Cert Spotter's CT lookup), `http_probe` (status/
+  `observe` (one CLI pass: the current certificate from tlsx — sha256/
+  issuer/subject/SANs/validity plus serial, SPKI hash and revocation —
+  page and favicon digests, DNS and registration; this replaced both Cert
+  Spotter's CT lookup and the separate openssl `tls_grab`), `http_probe` (status/
   final URL/title/server, plus any autoindex listing), `dns_lookup`
   (A/AAAA/MX/NS/TXT), PTR, and passive subdomain discovery via
   `subfinder` and the Wayback Machine's CDX API.

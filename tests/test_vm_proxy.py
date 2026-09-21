@@ -154,7 +154,7 @@ def test_nmap_and_dirsearch_pass_long_timeout(monkeypatch):
                     ("dirsearch", vm_proxy.LONG_TIMEOUT)]
 
 
-def test_tls_grab_and_http_probe_and_dns_lookup_actions(monkeypatch):
+def test_http_probe_and_dns_lookup_and_passive_actions(monkeypatch):
     seen = []
 
     def fake_rpc(request, timeout=None):
@@ -162,12 +162,11 @@ def test_tls_grab_and_http_probe_and_dns_lookup_actions(monkeypatch):
         return {"error": None}
 
     monkeypatch.setattr(vm_proxy, "_ssh_json_rpc", fake_rpc)
-    vm_proxy.tls_grab("example.com")
     vm_proxy.http_probe("https://example.com/")
     vm_proxy.dns_lookup("example.com")
     vm_proxy.subfinder("example.com")
     vm_proxy.wayback_cdx("example.com")
-    assert seen == ["tls_grab", "http_probe", "dns_lookup", "subfinder", "wayback_cdx"]
+    assert seen == ["http_probe", "dns_lookup", "subfinder", "wayback_cdx"]
 
 
 def test_probe_host_reads_environment(monkeypatch):
@@ -306,3 +305,10 @@ def test_subfinders_budget_covers_the_helpers_own_limit():
     body = helper[helper.index("def action_subfinder"):helper.index("def action_wayback_cdx")]
     helper_limit = int(re.search(r"timeout=(\d+)", body).group(1))
     assert vm_proxy.SUBFINDER_TIMEOUT > helper_limit
+
+
+def test_the_openssl_tls_grab_is_gone():
+    """The certificate is read off the observe pass (tlsx), which returns a
+    superset of what the separate openssl handshake did. Keeping the wrapper
+    would invite the second connection back."""
+    assert not hasattr(vm_proxy, "tls_grab")

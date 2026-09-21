@@ -800,3 +800,11 @@ def test_a_flagged_certificate_still_reports_true():
                         "expired": True, "self_signed": True})
     assert result["revoked"] is True
     assert result["expired"] is True and result["self_signed"] is True
+
+
+def test_the_helper_no_longer_offers_the_openssl_tls_grab():
+    """The certificate comes from tlsx inside the observe pass. Leaving the
+    action on the VM would leave a second handshake one call away."""
+    assert "action_tls_grab" not in helper
+    assert "tls_grab" not in helper["_ACTIONS"]
+    assert "TLS_TIMEOUT" not in helper, "an orphaned constant is dead config"

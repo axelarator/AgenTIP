@@ -266,7 +266,7 @@ call does it with one fewer moving part.
   repo — standalone, standard library plus `certifi`, shelling out to
   `dig`/`openssl`/`nmap`/`subfinder`/`dirsearch`/Salesforce `jarm` for
   the actions that need them; it also serves the pivot sources' and the
-  enrichment sweep's `http_fetch`/`resolve_dns`/`tls_grab`/`http_probe`/
+  enrichment sweep's `http_fetch`/`resolve_dns`/`http_probe`/
   etc. — see its module docstring). For a `jarm_probe` job (one
   target/port pair — see below) it:
   resolves the target to an IP once (Zeek's logs only ever key on the

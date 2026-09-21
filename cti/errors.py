@@ -63,7 +63,7 @@ def ok(result: Any) -> bool:
 
 
 def normalize_probe(result: Any) -> dict[str, Any]:
-    """Normalize a vm_proxy live-grab response (tls_grab/http_probe/
+    """Normalize a vm_proxy live-grab response (http_probe/
     dns_lookup), which always carries an `error` key - None on success -
     into the {...} | {"error": ...} shape every consumer gates on. Drops
     the `error: None` key on success so a good result isn't misread as a

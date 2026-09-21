@@ -73,16 +73,21 @@ directly (there is no `daily_tracking.py` flag for this).
   current source for certificates, page and favicon digests, DNS
   records and registration), `observe_silent` (probed, nothing
   answered - how a C2 going dark becomes visible),
-  `report:<file>`, `honeylabs`, `rdap`, `threatfox`, `tls_live`,
+  `report:<file>`, `honeylabs`, `rdap`, `threatfox`,
   `http_live`, `dns_resolve`, `ptr`, `webamon`, `webamon_infostealers`,
   `subdomains` (subfinder + Wayback, unioned), `nmap`, or
   `cluster:<slug>`. Open-directory listings are not an observation
   source - they live in `opendir_files` (below).
   HoneyLabs fields: hl_events, hl_events_7d, hl_first_seen,
   hl_last_seen, hl_ports (JSON int array), hl_tags, hl_threat_level.
-  Registry fields: asn, netname, country_code. Live TLS
-  (source=`tls_live`): tls_sha256, tls_issuer, tls_subject, tls_sans
-  (JSON array), tls_not_before, tls_not_after. Live HTTP
+  Registry fields: asn, netname, country_code. TLS
+  (source=`observe_tls`): tls_sha256, tls_issuer, tls_subject, tls_sans
+  (JSON array), tls_serial, tls_spki_sha256, tls_not_before,
+  tls_not_after. There is no separate openssl grab any more: `tls_live`
+  rows (310, for 22 domains) are retired history, still read as the
+  baseline for cert change detection, and never written. tlsx and openssl
+  spelled a distinguished name differently, so compare issuers through
+  `selectors.canonical_dn`, never as raw strings. Live HTTP
   (source=`http_live`): http_status, http_title, http_server,
   http_final_url. Webamon: webamon_report_id, webamon_risk_score,
   webamon_fingerprint_dom, webamon_fingerprint_ssl, webamon_last_scan,

@@ -55,8 +55,6 @@ def default_lifecycle_stubs(monkeypatch):
     monkeypatch.setattr(pivot, "resolve_host", lambda host: [])
     monkeypatch.setattr(pivot, "ripestat_lookup", lambda ip: {"asn": []})
     monkeypatch.setattr(pivot, "ptr_lookup", lambda ip: {"hostname": None})
-    monkeypatch.setattr(core.vm_proxy, "tls_grab",
-                        lambda host, port=443: {"cert": None, "resolved_ip": None, "error": None})
     monkeypatch.setattr(core.vm_proxy, "http_probe",
                         lambda url, insecure=False: {"status": None, "final_url": url, "title": None,
                                                      "server": None, "content_type": None,
@@ -332,7 +330,7 @@ def test_netname_change(fake_net):
 # store.detect() diffs against the prior observations row for the same
 # (indicator, source) - see the per-attribute specs in
 # cti/store/changes.py - so these helpers mirror the real call order
-# _log_cluster_enrichment_history uses: write the dated nmap/tls_live
+# _log_cluster_enrichment_history uses: write the dated nmap/observe_tls
 # observation first, then diff/record.
 #
 # These exercise the same driver as tests/test_changes.py, from the
@@ -349,7 +347,7 @@ def _sweep_ports(con, ip, actor, day, ports):
 
 def _sweep_cert(con, domain, actor, day, issuer, sans):
     store.upsert_observation(con, observed_at=day, indicator_value=domain,
-                             source="tls_live", actor=actor, tls_issuer=issuer,
+                             source="observe_tls", actor=actor, tls_issuer=issuer,
                              tls_sha256=f"sha-{issuer}-{','.join(sorted(sans))}",
                              tls_sans=sans or None)
     store.detect(con, "cert", indicator_value=domain, actor=actor,

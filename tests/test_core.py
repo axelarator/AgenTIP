@@ -12,6 +12,35 @@ import pytest
 from cti import core
 
 
+def stub_cert(monkeypatch, grab):
+    """Feed a certificate to the sweep through the observe pass.
+
+    The certificate used to come from a separate openssl handshake
+    (`vm_proxy.tls_grab`, source `tls_live`); it is now read off the observe
+    pass, which is where tlsx already fetches it. `grab` keeps the old
+    description of a certificate - `{"cert": {...}, "resolved_ip": ...}` -
+    so each test still says what certificate it is about, and this turns it
+    into the observe result the sweep actually consumes.
+    """
+    def observe(value, *, kind=None, ports=None, scan_ports=False, top_ports=100):
+        described = grab(value) or {}
+        cert = described.get("cert")
+        tls = {}
+        if cert:
+            tls = {"cert_sha256": cert.get("sha256"), "issuer": cert.get("issuer"),
+                   "subject_dn": cert.get("subject"), "sans": cert.get("sans") or [],
+                   "not_before": cert.get("not_before"),
+                   "not_after": cert.get("not_after"),
+                   "tls_version": cert.get("protocol"),
+                   "resolved_ip": described.get("resolved_ip")}
+        return {"target": value, "kind": kind, "http": {}, "tls": tls, "dns": {},
+                "whois": {}, "cdn": {}, "ports": None,
+                "responded": {"tls": bool(tls)}, "errors": {},
+                "tools_missing": [], "error": None}
+
+    monkeypatch.setattr(core.vm_proxy, "observe", observe)
+
+
 @pytest.fixture(autouse=True)
 def isolated_data_dir(tmp_path, monkeypatch):
     """Never touch the real data/clusters/ directory from tests."""
@@ -46,8 +75,7 @@ def default_lifecycle_stubs(monkeypatch):
     # Live enrichment now flows through webamon.* (host-direct) and
     # vm_proxy.* (probe VM) rather than the retired scan-platform pivots -
     # stub both boundaries to empty, no-network defaults.
-    monkeypatch.setattr(core.vm_proxy, "tls_grab",
-                        lambda host, port=443: {"cert": None, "resolved_ip": None, "error": None})
+    stub_cert(monkeypatch, lambda host, port=443: {"cert": None, "resolved_ip": None, "error": None})
     monkeypatch.setattr(core.vm_proxy, "http_probe",
                         lambda url, insecure=False: {"status": None, "final_url": url, "title": None,
                                                      "server": None, "content_type": None,
@@ -640,8 +668,7 @@ def stub_pivot_net(monkeypatch):
     monkeypatch.setattr(core.pivot, "rdap_lookup", lambda value, kind: {"handle": "H"})
     monkeypatch.setattr(core.pivot, "ripestat_lookup", lambda ip: {"asn": [999]})
     monkeypatch.setattr(core.pivot, "ptr_lookup", lambda ip: {"hostname": None})
-    monkeypatch.setattr(core.vm_proxy, "tls_grab",
-                        lambda host, port=443: {"cert": None, "resolved_ip": None, "error": None})
+    stub_cert(monkeypatch, lambda host, port=443: {"cert": None, "resolved_ip": None, "error": None})
     monkeypatch.setattr(core.vm_proxy, "http_probe",
                         lambda url, insecure=False: {"status": None, "final_url": url, "title": None,
                                                      "server": None, "content_type": None,
@@ -732,8 +759,7 @@ def test_pivot_observable_domain_webamon_and_tls(stub_pivot_net):
     stub_pivot_net.setattr(core.webamon, "search_domain",
                            lambda domain, size=5: {"total_hits": 2, "results": [],
                                                     "latest": {"report_id": "rid", "risk_score": 55}})
-    stub_pivot_net.setattr(core.vm_proxy, "tls_grab",
-                           lambda host, port=443: {"cert": {"sha256": "abc", "issuer": "R3"},
+    stub_cert(stub_pivot_net, lambda host, port=443: {"cert": {"sha256": "abc", "issuer": "R3"},
                                                    "resolved_ip": "1.2.3.4", "error": None})
     result = core.pivot_observable("example.com")
     assert result["webamon"]["latest"]["report_id"] == "rid"
@@ -919,7 +945,7 @@ def test_enrichment_snapshot_suppresses_cohosted_domains_for_shared_hosting_ip(m
 
 def test_add_observable_new_domain_captures_cert_snapshot(monkeypatch):
     core.create_cluster("Live Enrich Domain")
-    monkeypatch.setattr(core.vm_proxy, "tls_grab", lambda host, port=443: {
+    stub_cert(monkeypatch, lambda host, port=443: {
         "cert": {"sha256": "deadbeef", "issuer": "Let's Encrypt", "subject": "evil.example",
                  "sans": ["evil.example", "mail.evil.example"],
                  "not_before": "2026-01-01", "not_after": "2026-04-01", "protocol": "TLSv1.3"},
@@ -930,7 +956,7 @@ def test_add_observable_new_domain_captures_cert_snapshot(monkeypatch):
     assert domain["cert"]["issuer"] == "Let's Encrypt"
     assert domain["cert"]["sha256"] == "deadbeef"
     assert domain["cert"]["sans"] == ["evil.example", "mail.evil.example"]
-    assert domain["cert"]["source"] == "tls_live"
+    assert domain["cert"]["source"] == "observe_tls"
     # The cert sha256 is auto-filed onto the cluster's hashes bucket.
     assert any(h["value"] == "cert-sha256:deadbeef" for h in data["observables"]["hashes"])
 
@@ -1007,7 +1033,7 @@ def test_pivot_and_expand_new_sibling_captures_enrichment_snapshot(monkeypatch):
     # otherwise cache the autouse fixture's empty default first.
     monkeypatch.setattr(core.vm_proxy, "subfinder",
                         lambda domain: {"subdomains": ["mail.evil.example"], "error": None})
-    monkeypatch.setattr(core.vm_proxy, "tls_grab", lambda host, port=443: {
+    stub_cert(monkeypatch, lambda host, port=443: {
         "cert": {"sha256": "sib1", "issuer": "ZeroSSL", "subject": host, "sans": [host],
                  "not_before": None, "not_after": None, "protocol": "TLSv1.3"},
         "resolved_ip": "1.2.3.4", "error": None})
@@ -1026,7 +1052,7 @@ def test_pivot_cluster_persists_cert_snapshot_onto_observable(stub_cluster_sweep
     # test_pivot_cluster_logs_tls_history above: add_observable's own
     # enrichment sweep would otherwise cache the fixture's empty defaults
     # under these values before pivot_cluster gets to run.
-    stub_cluster_sweep_net.setattr(core.vm_proxy, "tls_grab", lambda host, port=443: {
+    stub_cert(stub_cluster_sweep_net, lambda host, port=443: {
         "cert": {"sha256": "cafe", "issuer": "Let's Encrypt", "subject": host, "sans": [host],
                  "not_before": None, "not_after": None, "protocol": "TLSv1.3"},
         "resolved_ip": "1.2.3.4", "error": None})
@@ -1426,8 +1452,7 @@ def stub_cluster_sweep_net(monkeypatch):
     monkeypatch.setattr(core.pivot, "ripestat_lookup",
                         lambda ip: {"prefix": "185.10.0.0/16", "asn": [64500]})
     monkeypatch.setattr(core.pivot, "ptr_lookup", lambda ip: {"hostname": None})
-    monkeypatch.setattr(core.vm_proxy, "tls_grab",
-                        lambda host, port=443: {"cert": None, "resolved_ip": None, "error": None})
+    stub_cert(monkeypatch, lambda host, port=443: {"cert": None, "resolved_ip": None, "error": None})
     monkeypatch.setattr(core.vm_proxy, "http_probe",
                         lambda url, insecure=False: {"status": None, "final_url": url, "title": None,
                                                      "server": None, "content_type": None,
@@ -1466,7 +1491,7 @@ def test_pivot_cluster_logs_tls_history(stub_cluster_sweep_net):
     # call now also runs a live lifecycle sweep for the new domain (see
     # _sweep_lifecycle) and caches its tls result (_cached_pivot) -
     # overriding the stub afterward would just be shadowed by the cache.
-    stub_cluster_sweep_net.setattr(core.vm_proxy, "tls_grab", lambda host, port=443: {
+    stub_cert(stub_cluster_sweep_net, lambda host, port=443: {
         "cert": {"sha256": "beef", "issuer": "R3", "subject": host, "sans": [host],
                  "not_before": "2026-01-01", "not_after": "2026-04-01", "protocol": "TLSv1.3"},
         "resolved_ip": "1.2.3.4", "error": None})
@@ -1481,7 +1506,7 @@ def test_pivot_cluster_logs_tls_history(stub_cluster_sweep_net):
     with tracking_store.connect(read_only=True) as con:
         row = con.execute(
             """SELECT tls_sha256, tls_issuer FROM observations_wide
-               WHERE indicator_value = ? AND source = 'tls_live'""",
+               WHERE indicator_value = ? AND source = 'observe_tls'""",
             ["evil-tls.example"]).fetchone()
     assert row == ("beef", "R3")
 
@@ -1808,7 +1833,6 @@ def _stub_observe(monkeypatch, host="new.example"):
         "dns": {"a": ["203.0.113.9"]}, "whois": {}, "cdn": {"is_cdn": False},
         "ports": None, "responded": {"http": True, "tls": True},
         "errors": {}, "tools_missing": []})
-    monkeypatch.setattr(core, "_live_tls", lambda host: {"error": "stubbed"})
     monkeypatch.setattr(core, "_live_http", lambda host: {"error": "stubbed"})
     monkeypatch.setattr(core, "_webamon_domain", lambda d: {"error": "stubbed"})
     monkeypatch.setattr(core, "_webamon_infostealers", lambda d: {"error": "stubbed"})
@@ -1949,3 +1973,107 @@ def test_the_date_regex_was_copied_not_rewritten():
     from cti import clusters_render
     assert clusters_render._date_only("2026-09") == "2026-09-01"
     assert clusters_render._date_only("2026-09-20T06:00:00+00:00") == "2026-09-20"
+
+
+# --------------------------------------------------------------------------- #
+# tls_live is gone: the certificate is read off the observe pass
+# --------------------------------------------------------------------------- #
+
+def _observed(**tls):
+    return {"target": "x.example", "kind": "domain", "http": {}, "dns": {},
+            "whois": {}, "cdn": {}, "ports": None, "responded": {},
+            "errors": {}, "tools_missing": [], "tls": tls}
+
+
+def test_the_tls_key_keeps_the_shape_its_three_consumers_read():
+    """The cluster snapshot, the change detector and the sweep row all read
+    {"cert": {sha256, issuer, subject, sans, not_before, not_after,
+    protocol}}. Preserving it is what let the swap touch none of them."""
+    got = core._tls_from_observe(_observed(
+        cert_sha256="c" * 64, issuer="CN=R3, O=LE, C=US",
+        subject_dn="CN=x.example", subject_cn="x.example",
+        sans=["x.example"], not_before="2026-01-01T00:00:00Z",
+        not_after="2026-04-01T00:00:00Z", tls_version="tls13",
+        resolved_ip="203.0.113.9"))
+    assert got["cert"] == {
+        "sha256": "c" * 64, "issuer": "CN=R3, O=LE, C=US",
+        "subject": "CN=x.example", "sans": ["x.example"],
+        "not_before": "2026-01-01T00:00:00Z", "not_after": "2026-04-01T00:00:00Z",
+        "protocol": "tls13"}
+    assert got["resolved_ip"] == "203.0.113.9"
+
+
+def test_the_subject_is_the_full_dn_not_just_the_common_name():
+    """A stock certificate is identified by its organisation and unit, which
+    the CN alone drops."""
+    got = core._tls_from_observe(_observed(
+        cert_sha256="c" * 64, subject_dn="CN=localhost, OU=IT, O=MyOrg",
+        subject_cn="localhost"))
+    assert got["cert"]["subject"] == "CN=localhost, OU=IT, O=MyOrg"
+
+
+def test_a_host_with_no_certificate_is_an_error_not_an_empty_cert():
+    """Consumers gate on `"error" not in tls and tls.get("cert")`."""
+    got = core._tls_from_observe(_observed())
+    assert "error" in got and "cert" not in got
+
+
+def test_a_tlsx_failure_is_reported_rather_than_replaced_by_another_tool():
+    """The resilience lost by dropping the openssl fallback, taken
+    deliberately: a failure shows up as an error for that host that day, not
+    as a differently-behaved tool quietly answering instead."""
+    observed = _observed()
+    observed["errors"] = {"tls": "tlsx exited 1: dial tcp: i/o timeout"}
+    assert core._tls_from_observe(observed) == {
+        "error": "tlsx exited 1: dial tcp: i/o timeout"}
+
+
+def test_an_observe_pass_that_itself_failed_passes_the_error_through():
+    assert core._tls_from_observe({"error": "probe VM unreachable"}) == {
+        "error": "probe VM unreachable"}
+    assert "error" in core._tls_from_observe(None)
+
+
+def test_a_sweep_writes_no_tls_live_row_and_makes_no_second_handshake(monkeypatch):
+    """Two TLS connections to each adversary host to learn one thing twice,
+    on every sweep. The certificate is recorded once, as observe_tls."""
+    from cti import store as tracking_store
+
+    core.create_cluster("One Handshake")
+    calls = []
+    stub_cert(monkeypatch, lambda host: calls.append(host) or {
+        "cert": {"sha256": "a" * 64, "issuer": "CN=R3, O=LE, C=US",
+                 "subject": "CN=" + host, "sans": [host]}})
+    core.add_observable("One Handshake", "domains", "evil.example", "report: r.pdf")
+
+    assert calls == ["evil.example"], "one observe call, not one per source"
+    with tracking_store.connect(read_only=True) as con:
+        sources = {r[0] for r in con.execute(
+            "SELECT source FROM observations WHERE indicator_value = 'evil.example'"
+        ).fetchall()}
+    assert "observe_tls" in sources
+    assert "tls_live" not in sources
+
+
+def test_a_certificate_rotation_is_still_detected_from_observe_tls(monkeypatch):
+    """The change detector used to baseline from tls_live. Moving the source
+    without moving the baseline would have silenced cert_new entirely."""
+    from datetime import datetime
+
+    from cti import store as tracking_store
+
+    with tracking_store.connect(read_only=False) as con:
+        # yesterday's certificate, written the way the observe pass writes it
+        tracking_store.upsert_observation(
+            con, observed_at=datetime(2026, 9, 20), indicator_value="rot.example",
+            source="observe_tls", actor="A", indicator_type="domain",
+            tls_sha256="1" * 64, tls_issuer="CN=R3, O=LE, C=US", tls_sans=["rot.example"])
+        change = tracking_store.detect(
+            con, "cert_hash", indicator_value="rot.example", actor="A",
+            observed_at=datetime(2026, 9, 21), new={"sha256": "2" * 64})
+    assert change == "cert_new"
+
+
+def test_no_openssl_grab_remains_on_the_host_side():
+    assert not hasattr(core, "_live_tls")
+    assert not hasattr(core.vm_proxy, "tls_grab")

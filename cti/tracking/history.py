@@ -257,15 +257,16 @@ def _log_cluster_enrichment_history(
                     continue
 
                 # --- domains ---
+                # The certificate observation itself is already on disk: this
+                # `tls` key is read off the observe pass, whose observe_tls row
+                # _log_observation wrote above. There used to be a second
+                # `tls_live` row here from a separate openssl handshake, which
+                # recorded the same certificate a second time. Only the change
+                # detection remains, and it baselines against observe_tls (and
+                # the legacy tls_live rows) - see changes.CERT_SOURCES.
                 tls = enrichment.get("tls")
                 if isinstance(tls, dict) and "error" not in tls and tls.get("cert"):
                     cert = tls["cert"]
-                    tracking_store.upsert_observation(
-                        con, observed_at=observed_at, indicator_value=value,
-                        source="tls_live", actor=actor, indicator_type="domain",
-                        tls_sha256=cert.get("sha256"), tls_issuer=cert.get("issuer"),
-                        tls_subject=cert.get("subject"), tls_sans=cert.get("sans") or None,
-                        tls_not_before=cert.get("not_before"), tls_not_after=cert.get("not_after"))
                     tracking_store.detect(con, "cert", indicator_value=value, actor=actor,
                                           observed_at=observed_at, new=cert)
                     tracking_store.detect(con, "cert_hash", indicator_value=value, actor=actor,

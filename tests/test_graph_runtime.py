@@ -428,7 +428,7 @@ def test_a_slow_optional_lookup_does_not_cost_a_domain_its_status(monkeypatch):
                         lambda v, kind: {"handle": "H", "events": [], "nameservers": ["ns1.example"],
                                          "status": ["active"]})
     monkeypatch.setattr(core.pivot, "resolve_host", lambda h: ["93.184.216.34"])
-    for fn in ("tls_grab", "http_probe", "wayback_cdx"):
+    for fn in ("http_probe", "wayback_cdx"):
         monkeypatch.setattr(core.vm_proxy, fn, lambda *a, **k: {"error": None})
     monkeypatch.setattr(core.webamon, "search_domain", lambda d: {"error": "skipped"})
     monkeypatch.setattr(core.webamon, "infostealers", lambda d: {"error": "skipped"})
