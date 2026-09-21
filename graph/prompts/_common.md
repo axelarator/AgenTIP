@@ -46,6 +46,17 @@ empty array is a valid and often correct answer.
 ]
 ```
 
+Write every hash, fingerprint and digest **in full**, in `headline` and
+`detail` alike. Never elide the middle with `...`, and never give a prefix
+alone. The reader's next step is to paste the value somewhere else; a
+shortened one cannot be pasted. If a value is too long to sit in a
+headline, name the indicator there and put the full value in `detail`.
+
+`indicators` must list every value the finding is about, in full, including
+**both** sides of a change - the old value and the new one. The portal
+renders these as copyable chips, so this array is what makes a finding
+usable even when the prose around it is terse.
+
 Set `correlation_type` to null when a finding is worth saying but not
 worth storing as a durable correlation. Only use `new_infrastructure`
 for something the digest itself marks as first-seen-in-window.
