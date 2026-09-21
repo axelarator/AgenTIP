@@ -1126,3 +1126,94 @@ def test_observable_history_keeps_its_exact_empty_shape():
     assert store.observable_history("203.0.113.250") == {
         "ip": "203.0.113.250", "status": "never-enriched",
         "observations": [], "asn_changes": [], "zeek_matches": []}
+
+
+# --------------------------------------------------------------------------- #
+# Domain status - the ladder that did not exist
+# --------------------------------------------------------------------------- #
+
+def _seed_domain(con, value, *, resolved, day=None, source="dns_resolve"):
+    """Mirrors _seed_actor_ip: the actor row is what puts the indicator in
+    tracked_observables' scope."""
+    _obs(con, value, day or TODAY, source=source, actor="APT-X",
+         indicator_type="domain", resolved_ip=resolved)
+    store.upsert_actor(con, "APT-X", NOW - timedelta(days=1))
+
+
+def test_a_domain_that_resolves_is_not_never_enriched():
+    """The bug. _tracking_status' ladder below Zeek is HoneyLabs, then an
+    ASN change, then whether a HoneyLabs row exists - all IP-only paths, so
+    every domain fell off the end. 58 domains carrying dozens of
+    observations each reported as untouched."""
+    with store.connect() as con:
+        _seed_domain(con, "evil.example", resolved=["203.0.113.9"])
+    assert store.observable_history("evil.example")["status"] == "resolving"
+
+
+def test_a_domain_resolving_to_nothing_is_unresolved_not_quiet():
+    """The signal there was no way to see before: the domain went dark.
+    An empty list is an answer; None means nobody asked."""
+    with store.connect() as con:
+        _seed_domain(con, "dead.example", resolved=[])
+    assert store.observable_history("dead.example")["status"] == "unresolved"
+
+
+def test_a_stale_resolution_does_not_still_count_as_resolving():
+    with store.connect() as con:
+        _seed_domain(con, "old.example", resolved=["203.0.113.9"],
+                     day=TODAY - timedelta(days=30))
+    assert store.observable_history("old.example")["status"] == "quiet"
+
+
+def test_a_recent_address_change_makes_a_domain_moved():
+    with store.connect() as con:
+        _seed_domain(con, "moved.example", resolved=["203.0.113.9"],
+                     day=TODAY - timedelta(days=30))
+        store.record_attribute_change(
+            con, detected_at=NOW - timedelta(days=2),
+            indicator_value="moved.example", actor="APT-X",
+            attribute="resolved_ip", change_type="resolved_ip_changed",
+            confidence="medium", old_value=None, new_value={"ip": "x"})
+    assert store.observable_history("moved.example")["status"] == "moved"
+
+
+def test_a_first_seen_row_does_not_make_a_domain_moved():
+    """Same rule the IP ladder applies: a baseline is not a pivot."""
+    with store.connect() as con:
+        _seed_domain(con, "fresh.example", resolved=["203.0.113.9"],
+                     day=TODAY - timedelta(days=30))
+        store.record_attribute_change(
+            con, detected_at=NOW - timedelta(days=2),
+            indicator_value="fresh.example", actor="APT-X",
+            attribute="resolved_ip", change_type="first_seen",
+            confidence="medium", old_value=None, new_value={"ip": "x"})
+    assert store.observable_history("fresh.example")["status"] == "quiet"
+
+
+def test_an_unobserved_domain_is_still_never_enriched():
+    with store.connect():
+        pass
+    assert store.observable_history("unknown.example")["status"] == "never-enriched"
+
+
+def test_list_and_detail_agree_for_domains_too():
+    """tests/test_tracking.py already pinned this for IPs. The two ladders
+    are fed from different places - one SQL, one Python over rows in hand -
+    so they can drift apart silently."""
+    with store.connect() as con:
+        _seed_domain(con, "a.example", resolved=["203.0.113.9"])
+        _seed_domain(con, "b.example", resolved=[])
+    listed = {o["indicator_value"]: o["status"]
+              for o in store.tracked_observables()["observables"]}
+    for value in ("a.example", "b.example"):
+        assert listed[value] == store.observable_history(value)["status"], value
+
+
+def test_the_ip_ladder_is_untouched():
+    """Six existing tests depend on these labels; the domain work must not
+    reach them."""
+    with store.connect() as con:
+        _seed_actor_ip(con, "203.0.113.7")
+        _obs(con, "203.0.113.7", TODAY, source="honeylabs", hl_events=5,
+             hl_last_seen=NOW - timedelta(days=3))
+    assert store.observable_history("203.0.113.7")["status"] == "active"

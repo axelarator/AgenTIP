@@ -160,6 +160,11 @@ def actor_summary(actor: str) -> dict[str, Any]:
     }
 
 
+# How recently a domain must have been resolved for its answer to count as
+# current. Matches the HoneyLabs freshness window the IP ladder uses, so the
+# two kinds age out at the same rate.
+DOMAIN_FRESH_DAYS = 7
+
 _TRACKED_OBSERVABLES_SQL = """
 WITH tracked_ips AS (
     SELECT DISTINCT o.indicator_value
@@ -241,8 +246,42 @@ latest_threatfox AS (
                                       ORDER BY observed_at DESC) AS rn
         FROM observations_wide WHERE source = 'threatfox'
     ) WHERE rn = 1
+),
+-- The domain half of the status ladder. Nothing below here existed, which
+-- is why every domain reported never-enriched.
+indicator_kind AS (
+    SELECT indicator_value, indicator_type FROM (
+        SELECT indicator_value, indicator_type,
+               row_number() OVER (PARTITION BY indicator_value
+                                  ORDER BY observed_at DESC) AS rn
+        FROM observations_wide WHERE indicator_type IS NOT NULL
+    ) WHERE rn = 1
+),
+last_observed AS (
+    SELECT indicator_value, max(observed_at) AS last_observed_at
+    FROM observations_wide GROUP BY indicator_value
+),
+latest_resolve AS (
+    -- An empty list is an answer (the name resolves to nothing); NULL means
+    -- nobody asked. The status ladder depends on telling those apart.
+    SELECT indicator_value, observed_at AS resolve_observed_at, resolved_ip
+    FROM (
+        SELECT *, row_number() OVER (PARTITION BY indicator_value
+                                      ORDER BY observed_at DESC) AS rn
+        FROM observations_wide
+        WHERE source IN ('dns_resolve', 'observe_dns') AND resolved_ip IS NOT NULL
+    ) WHERE rn = 1
+),
+latest_domain_change AS (
+    SELECT indicator_value, max(detected_at) AS domain_change_at
+    FROM attribute_changes
+    WHERE attribute IN ('resolved_ip', 'cert', 'cert_hash')
+      AND change_type <> 'first_seen'
+    GROUP BY indicator_value
 )
-SELECT t.indicator_value, la.actor,
+SELECT t.indicator_value, la.actor, k.indicator_type,
+       lo.last_observed_at, r.resolve_observed_at, r.resolved_ip,
+       dc.domain_change_at,
        h.hl_observed_at, h.hl_events, h.hl_last_seen, h.hl_ports, h.hl_tags,
        h.hl_threat_level, na.asn, na.netname, na.country_code,
        c.asn_change_at, c.old_asn, c.new_asn, c.old_netname, c.new_netname,
@@ -258,6 +297,10 @@ LEFT JOIN latest_asn_change c ON c.indicator_value = t.indicator_value
 LEFT JOIN latest_zeek z ON z.indicator_value = t.indicator_value
 LEFT JOIN latest_nmap s ON s.indicator_value = t.indicator_value
 LEFT JOIN latest_threatfox tf ON tf.indicator_value = t.indicator_value
+LEFT JOIN indicator_kind k ON k.indicator_value = t.indicator_value
+LEFT JOIN last_observed lo ON lo.indicator_value = t.indicator_value
+LEFT JOIN latest_resolve r ON r.indicator_value = t.indicator_value
+LEFT JOIN latest_domain_change dc ON dc.indicator_value = t.indicator_value
 ORDER BY t.indicator_value
 """
 
@@ -293,6 +336,67 @@ def _tracking_status(now: datetime, row: dict[str, Any]) -> str:
     return "never-enriched"
 
 
+def _domain_status(now: datetime, row: dict[str, Any]) -> str:
+    """Derived status for a domain, in precedence order.
+
+    `_tracking_status` cannot answer this. Its whole ladder below Zeek is
+    HoneyLabs, then an ASN change, then whether a HoneyLabs row exists -
+    and all three are IP-only paths. Every domain fell off the end to
+    `never-enriched`, which is how 58 domains carrying dozens of
+    observations each came to be reported as untouched.
+
+    The ladder here uses what a domain actually has:
+
+      in-network  Zeek saw it. Type-agnostic, stays first.
+      resolving   its newest resolution answered with an address
+      unresolved  its newest resolution answered with nothing. This is
+                  the domain going dark - the signal there was no way to
+                  see before, and the reason `quiet` is not good enough
+      moved       its address or certificate changed recently
+      quiet       observed recently, nothing changed
+      never-enriched   genuinely no observations
+    """
+    zeek_recent = False
+    if row.get("zeek_last_ts") is not None:
+        zeek_recent = (now - row["zeek_last_ts"]) <= timedelta(days=1)
+    elif row.get("zeek_day") is not None:
+        zeek_recent = (now.date() - row["zeek_day"]) <= timedelta(days=1)
+    if zeek_recent:
+        return "in-network"
+
+    resolved_at = row.get("resolve_observed_at")
+    fresh = resolved_at is not None and (now - resolved_at) <= timedelta(days=DOMAIN_FRESH_DAYS)
+    if fresh:
+        # An empty list is an answer, not a gap: dns_resolve writes [] when
+        # the name resolves to nothing. None means we never asked.
+        addresses = row.get("resolved_ip")
+        if addresses:
+            return "resolving"
+        if addresses is not None:
+            return "unresolved"
+
+    changed_at = row.get("domain_change_at")
+    if changed_at is not None and (now - changed_at) <= timedelta(days=30):
+        return "moved"
+    if row.get("last_observed_at") is not None:
+        return "quiet"
+    return "never-enriched"
+
+
+def indicator_status(now: datetime, indicator_type: str | None,
+                     row: dict[str, Any]) -> str:
+    """Status for an indicator of either kind.
+
+    The two ladders stay separate rather than merging into one because
+    they are answering different questions with different evidence, and
+    folding them produced the bug: a domain evaluated against HoneyLabs
+    freshness can only ever come back `never-enriched`.
+    """
+    if (indicator_type or "").startswith("domain"):
+        return _domain_status(now, row)
+    return _tracking_status(now, row)
+
+
 def tracked_observables() -> dict[str, Any]:
     """Dashboard-facing snapshot: every indicator in scope for tracking
     (mirrors enrich.build_worklist's own definition - any observation
@@ -314,9 +418,15 @@ def tracked_observables() -> dict[str, Any]:
         # Status first, while timestamps are still real datetime/date
         # objects fresh off the connection - _cell() below turns them
         # into ISO strings for JSON, which _tracking_status can't diff.
-        r["status"] = _tracking_status(now, r)
+        # resolved_ip arrives from observations_wide as a JSON *string*;
+        # the domain ladder needs the list, and it has to be decoded before
+        # the status call rather than in the loop below.
+        if r.get("resolved_ip") is not None:
+            r["resolved_ip"] = json.loads(r["resolved_ip"])
+        r["status"] = indicator_status(now, r.get("indicator_type"), r)
         for k in ("hl_observed_at", "hl_last_seen", "asn_change_at", "zeek_day", "zeek_last_ts",
-                 "nmap_observed_at", "threatfox_observed_at"):
+                 "nmap_observed_at", "threatfox_observed_at",
+                 "last_observed_at", "resolve_observed_at", "domain_change_at"):
             r[k] = _cell(r[k])
         for k in ("hl_ports", "hl_tags", "nmap_ports", "threatfox_matches"):
             r[k] = json.loads(r[k]) if r[k] is not None else []
@@ -352,10 +462,28 @@ def observable_history(ip: str) -> dict[str, Any]:
                 """SELECT day, direction, hit_count, ports, first_ts, last_ts
                    FROM zeek_matches WHERE indicator_value = ?
                    ORDER BY day ASC""", [ip])
+            changed = con.execute(
+                """SELECT max(detected_at) FROM attribute_changes
+                   WHERE indicator_value = ?
+                     AND attribute IN ('resolved_ip', 'cert', 'cert_hash')
+                     AND change_type <> 'first_seen'""", [ip]).fetchone()
+            domain_change_at = changed[0] if changed else None
     except TrackingBusy:
         return {"error": "tracking DB busy (daily job likely running); retry shortly"}
     except duckdb.IOException as e:
         return {"error": f"tracking DB unavailable: {e}"}
+
+    # The whole reason this function looked empty. The SELECT above named
+    # nineteen columns, every one of them from the IP enrichment path, and
+    # never touched `payload` - where the observe pass, InternetDB, mnemonic,
+    # the certificates, the body hashes and the DNS records all live. A domain
+    # came back as ~170 rows with nothing in them but a date, a source and an
+    # actor.
+    #
+    # Decoded here rather than in the stringify loop below because the domain
+    # status ladder reads resolved_ip out of it.
+    for o in observations:
+        o["payload"] = json.loads(o["payload"]) if o["payload"] is not None else {}
 
     now = datetime.now()
     # Status first, from raw datetime/date objects, before the loops
@@ -367,13 +495,29 @@ def observable_history(ip: str) -> dict[str, Any]:
     # actual pivot, and shouldn't make "moved" fire on a fresh IP.
     latest_change = next((c for c in reversed(asn_changes) if c["change_type"] != "first_seen"), None)
     latest_zeek = zeek_matches[-1] if zeek_matches else None
-    status = _tracking_status(now, {
+
+    # The domain half, read off the rows already in hand rather than by
+    # querying again. tests/test_tracking.py pins that this detail status
+    # equals the one tracked_observables() computes, so the two must be fed
+    # the same facts from the same ladder.
+    indicator_type = next((o["indicator_type"] for o in reversed(observations)
+                           if o.get("indicator_type")), None)
+    latest_resolve = next(
+        (o for o in reversed(observations)
+         if o["source"] in ("dns_resolve", "observe_dns")
+         and (o.get("payload") or {}).get("resolved_ip") is not None), None)
+    status = indicator_status(now, indicator_type, {
         "hl_observed_at": latest_hl["observed_at"] if latest_hl else None,
         "hl_events": latest_hl["hl_events"] if latest_hl else None,
         "hl_last_seen": latest_hl["hl_last_seen"] if latest_hl else None,
         "asn_change_at": latest_change["detected_at"] if latest_change else None,
         "zeek_day": latest_zeek["day"] if latest_zeek else None,
         "zeek_last_ts": latest_zeek["last_ts"] if latest_zeek else None,
+        "last_observed_at": observations[-1]["observed_at"] if observations else None,
+        "resolve_observed_at": latest_resolve["observed_at"] if latest_resolve else None,
+        "resolved_ip": ((latest_resolve.get("payload") or {}).get("resolved_ip")
+                        if latest_resolve else None),
+        "domain_change_at": domain_change_at,
     })
 
     for o in observations:
@@ -382,13 +526,6 @@ def observable_history(ip: str) -> dict[str, Any]:
         for k in ("hl_ports", "hl_tags", "nmap_ports", "threatfox_matches"):
             o[k] = json.loads(o[k]) if o[k] is not None else []
         o["metadata"] = json.loads(o["metadata"]) if o["metadata"] is not None else {}
-        # The whole reason this function looked empty. The SELECT above names
-        # nineteen columns, every one of them from the IP enrichment path, and
-        # never touched `payload` - where the observe pass, InternetDB,
-        # mnemonic, the certificates, the body hashes and the DNS records all
-        # live. A domain came back as ~170 rows with nothing in them but a
-        # date, a source and an actor.
-        o["payload"] = json.loads(o["payload"]) if o["payload"] is not None else {}
     for c in asn_changes:
         c["detected_at"] = _cell(c["detected_at"])
     for z in zeek_matches:
