@@ -36,7 +36,12 @@
 </div>
 
 <style>
-  .shell { max-width: 1180px; margin: 0 auto; padding: 0 1.25rem 3rem; }
+  /* Use the monitor. This is a data-dense internal tool on a wide screen,
+     not prose - a 1180px column left most of the display empty while
+     timelines and selector tables scrolled sideways inside it. The cap is
+     generous rather than absent so text lines do not become unreadable on
+     an ultrawide. */
+  .shell { max-width: min(2100px, 96vw); margin: 0 auto; padding: 0 1.5rem 3rem; }
   .topbar {
     display: flex; align-items: center; gap: 1.5rem;
     padding: 1rem 0; margin-bottom: 1.25rem;

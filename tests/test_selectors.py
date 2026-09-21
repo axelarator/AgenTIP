@@ -886,3 +886,55 @@ def test_a_port_set_is_one_selector_not_one_per_port():
     rows = con.execute("SELECT selector_value FROM selectors").fetchall()
     con.close()
     assert rows == [("445,3389,5985",)]
+
+
+# --------------------------------------------------------------------------- #
+# Distinguished names: one certificate, two tools, one selector
+# --------------------------------------------------------------------------- #
+
+def test_the_same_issuer_from_two_tools_is_one_selector():
+    """tlsx emits RFC 4514 - most specific first, no spaces around '=' -
+    and openssl's default prints the reverse with spaces. The identical
+    issuer arrived as two selector values with five indicators under each,
+    where there should have been one group of five.
+    """
+    tlsx = S.normalize("tls.issuer", "CN=YE1, O=Let's Encrypt, C=US")
+    openssl = S.normalize("tls.issuer", "C = US, O = Let's Encrypt, CN = YE1")
+    assert tlsx == openssl == "CN=YE1, O=Let's Encrypt, C=US"
+
+
+def test_a_stock_subject_from_two_tools_is_one_selector():
+    """tls.default_subject is behavioural - it corroborates a link. Split
+    across two spellings it under-corroborates, silently."""
+    a = S.normalize("tls.default_subject",
+                    "CN=localhost, OU=IT, O=MyOrg, L=Default, ST=Default, C=RU")
+    b = S.normalize("tls.default_subject",
+                    "C = RU, ST = Default, L = Default, O = MyOrg, OU = IT, CN = localhost")
+    assert a == b
+
+
+def test_an_escaped_comma_survives_canonicalization():
+    """RFC 4514 escapes a literal comma, and this repo has one for real:
+    `O=alibaba (china) technology co.\\, ltd.`. Splitting on a bare comma
+    would cut that attribute in half."""
+    out = S.normalize("tls.issuer",
+                      r"C = CN, O = alibaba (china) technology co.\, ltd., CN = a")
+    assert r"alibaba (china) technology co.\, ltd." in out
+
+
+def test_a_value_that_is_not_a_dn_is_left_alone():
+    """A title or a header can contain '=' without being a DN, and
+    mangling it would invent a selector nobody recorded."""
+    assert S.normalize("http.title", "a=b something") == "a=b something"
+    assert S.canonical_dn("no equals here at all") == "no equals here at all"
+
+
+def test_canonicalization_is_stable():
+    once = S.canonical_dn("C = US, O = Let's Encrypt, CN = YE1")
+    assert S.canonical_dn(once) == once
+
+
+def test_the_common_name_leads_the_canonical_form():
+    """It is the attribute a reader looks for, and it is what tlsx and
+    every CT log put first."""
+    assert S.canonical_dn("C=US, O=Example, CN=leaf.example").startswith("CN=")

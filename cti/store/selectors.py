@@ -478,6 +478,67 @@ _EMPTY_BODY_SHA256 = {
 _JUNK = {"", "-", "none", "null", "unknown", "n/a", "localhost"}
 
 
+# Attribute order for a canonical DN. Two tools describe the same
+# certificate in two orders - tlsx emits RFC 4514 (most specific first,
+# no spaces) and openssl's default prints the reverse with spaces around
+# each '=' - so the identical issuer arrived as two selector values:
+#
+#   CN=YE1, O=Let's Encrypt, C=US
+#   C = US, O = Let's Encrypt, CN = YE1
+#
+# Five indicators under each, where there should have been one group of
+# five. tls.issuer is contextual so nothing was promoted on it, but
+# tls.default_subject is behavioural and corroborates, and it was split
+# the same way. Ordering by this table makes both inputs land on one form.
+_DN_ORDER = ("CN", "OU", "O", "L", "ST", "C", "STREET", "DC", "UID",
+             "EMAILADDRESS", "SERIALNUMBER")
+
+
+def _split_dn(text: str) -> list[tuple[str, str]]:
+    """(attribute, value) pairs from a DN string.
+
+    RFC 4514 escapes a literal comma as '\\,' and this repo has one for
+    real - `O=alibaba (china) technology co.\\, ltd.` - so splitting on a
+    bare comma would cut that attribute in half.
+    """
+    parts, current, escaped = [], [], False
+    for ch in text:
+        if escaped:
+            current.append(ch)
+            escaped = False
+        elif ch == "\\":
+            current.append(ch)
+            escaped = True
+        elif ch == ",":
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current))
+
+    pairs = []
+    for part in parts:
+        key, sep, value = part.partition("=")
+        if not sep:
+            return []                      # not a DN at all
+        pairs.append((key.strip().upper(), value.strip()))
+    return pairs
+
+
+def canonical_dn(text: str) -> str:
+    """One form for a distinguished name, whichever tool produced it.
+
+    Returns the input unchanged when it does not parse as a DN, so a value
+    that merely contains an '=' is never mangled.
+    """
+    pairs = _split_dn(text)
+    if not pairs or not all(k for k, _ in pairs):
+        return text
+    rank = {name: i for i, name in enumerate(_DN_ORDER)}
+    pairs.sort(key=lambda kv: (rank.get(kv[0], len(_DN_ORDER)), kv[0]))
+    return ", ".join(f"{k}={v}" for k, v in pairs)
+
+
 def normalize(selector_type: str, value: Any) -> str | None:
     """Canonical string form, or None if the value carries no signal.
 
@@ -512,6 +573,9 @@ def normalize(selector_type: str, value: Any) -> str | None:
         text = text.lower().rstrip(".")
     if selector_type in ("whois.registrant_email", "dns.soa_email"):
         text = text.lower()
+    # A distinguished name, whichever tool spelled it. See canonical_dn.
+    if selector_type in ("tls.issuer", "tls.default_subject", "tls.subject_dn"):
+        text = canonical_dn(text)
 
     if selector_type == "http.body_sha256" and text in _EMPTY_BODY_SHA256:
         return None

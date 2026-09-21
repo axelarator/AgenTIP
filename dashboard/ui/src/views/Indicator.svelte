@@ -288,8 +288,8 @@
   .obs, .sel, .link { border: 1px solid var(--border, #d0d0d8); border-radius: 8px;
                       padding: .75rem .9rem; margin-bottom: .6rem; }
   .obs__head { display: flex; justify-content: space-between; font-size: .85rem; }
-  .obs__body { display: grid; grid-template-columns: minmax(9rem, auto) 1fr;
-               gap: .25rem .9rem; margin: .6rem 0 0; font-size: .82rem; }
+  .obs__body { display: grid; grid-template-columns: minmax(10rem, max-content) 1fr;
+               gap: .3rem 1.2rem; margin: .6rem 0 0; font-size: .82rem; }
   .obs__body dt { color: var(--muted, #6b6b76); }
   .obs__body dd { margin: 0; overflow-wrap: anywhere; }
   .sel__top, .link__top { display: flex; gap: .7rem; align-items: baseline; flex-wrap: wrap; }
