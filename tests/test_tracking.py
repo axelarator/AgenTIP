@@ -1095,3 +1095,34 @@ def test_observable_history_orders_by_time_and_includes_asn_changes():
     empty = store.observable_history("203.0.113.250")
     assert empty == {"ip": "203.0.113.250", "status": "never-enriched",
                      "observations": [], "asn_changes": [], "zeek_matches": []}
+
+
+def test_observable_history_returns_the_payload_not_just_the_ip_columns():
+    """The reason the portal looked empty.
+
+    The SELECT named nineteen columns, every one from the IP enrichment
+    path, and never touched `payload` - where the observe pass, InternetDB,
+    mnemonic, the certificates, the body hashes and the DNS records all
+    live. A domain came back as ~170 rows carrying nothing but a date, a
+    source and an actor.
+    """
+    with store.connect() as con:
+        _seed_actor_ip(con, "evil.example")
+        _obs(con, "evil.example", TODAY, source="observe_tls",
+             tls_sha256="c" * 64, tls_spki_sha256="d" * 64, tls_serial="0A:1B")
+    result = store.observable_history("evil.example")
+    payload = result["observations"][-1]["payload"]
+    assert payload["tls_sha256"] == "c" * 64
+    assert payload["tls_spki_sha256"] == "d" * 64
+    assert result["observations"][-1]["indicator_type"] is not None
+
+
+def test_observable_history_keeps_its_exact_empty_shape():
+    """Pinned deliberately. dashboard/server.py hands this dict straight to
+    the client and app.js reads profile.ip; a new top-level key here is a
+    contract change. Richer answers belong in indicator_profile."""
+    with store.connect():
+        pass          # a read-only open needs the schema to exist first
+    assert store.observable_history("203.0.113.250") == {
+        "ip": "203.0.113.250", "status": "never-enriched",
+        "observations": [], "asn_changes": [], "zeek_matches": []}

@@ -336,6 +336,7 @@ def observable_history(ip: str) -> dict[str, Any]:
         with connect_retry(read_only=True) as con:
             observations = _rows(con,
                 """SELECT observed_at, source, source_url, actor, campaign,
+                          indicator_type, payload,
                           hl_events, hl_events_7d, hl_first_seen, hl_last_seen,
                           hl_ports, hl_tags, hl_threat_level,
                           nmap_ports, threatfox_matches,
@@ -381,6 +382,13 @@ def observable_history(ip: str) -> dict[str, Any]:
         for k in ("hl_ports", "hl_tags", "nmap_ports", "threatfox_matches"):
             o[k] = json.loads(o[k]) if o[k] is not None else []
         o["metadata"] = json.loads(o["metadata"]) if o["metadata"] is not None else {}
+        # The whole reason this function looked empty. The SELECT above names
+        # nineteen columns, every one of them from the IP enrichment path, and
+        # never touched `payload` - where the observe pass, InternetDB,
+        # mnemonic, the certificates, the body hashes and the DNS records all
+        # live. A domain came back as ~170 rows with nothing in them but a
+        # date, a source and an actor.
+        o["payload"] = json.loads(o["payload"]) if o["payload"] is not None else {}
     for c in asn_changes:
         c["detected_at"] = _cell(c["detected_at"])
     for z in zeek_matches:
