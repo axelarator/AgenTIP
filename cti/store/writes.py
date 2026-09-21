@@ -105,6 +105,43 @@ def upsert_actor(con: duckdb.DuckDBPyConnection, name: str, seen_at, *,
          _json(merged_ports), cluster_slug, name])
 
 
+def record_findings(con: duckdb.DuckDBPyConnection, *, day, findings: list[dict],
+                    ) -> int:
+    """Persist a day's findings. Returns how many rows were new.
+
+    Every finding, not only the ones carrying a correlation_type. On
+    2026-09-21 that distinction was 1 of 5 - the other four existed nowhere
+    but a debug trace, and the leads worth clicking are usually among the
+    ones not worth filing as durable correlations.
+
+    Idempotent on (day, family, headline) so re-running a day's analysis
+    updates rather than duplicates.
+    """
+    written = 0
+    for f in findings:
+        headline = (f.get("headline") or "").strip()
+        if not headline:
+            continue
+        existed = con.execute(
+            "SELECT 1 FROM findings WHERE day = ? AND family = ? AND headline = ?",
+            [day, f.get("family"), headline]).fetchone()
+        con.execute(
+            """INSERT INTO findings (day, family, actor, headline, detail,
+                   indicators, correlation_type, confidence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (day, family, headline) DO UPDATE SET
+                   actor = excluded.actor,
+                   detail = excluded.detail,
+                   indicators = excluded.indicators,
+                   correlation_type = excluded.correlation_type,
+                   confidence = excluded.confidence""",
+            [day, f.get("family"), f.get("actor"), headline, f.get("detail"),
+             json.dumps(f.get("indicators") or []), f.get("correlation_type"),
+             f.get("confidence")])
+        written += not existed
+    return written
+
+
 def insert_correlation(con: duckdb.DuckDBPyConnection, *, actor: str,
                        correlation_type: str, indicators: list[str],
                        narrative: str, confidence: str = "medium",

@@ -146,7 +146,30 @@ def persist(state: CTIState) -> dict:
 
     saved = []
     errors = []
-    for finding in state.get("findings") or []:
+
+    # Every finding, before the correlation filter below. The two are not
+    # the same set and the difference is the point: on 2026-09-21, 1 of 5
+    # findings carried a correlation_type, and the other four - a cert
+    # rotation, a workers.dev link, a PTR loss - existed nowhere but the
+    # run trace afterwards. The leads worth clicking are usually among the
+    # ones not worth filing.
+    findings = state.get("findings") or []
+    if findings:
+        try:
+            from datetime import date as _date
+
+            from cti.store import connect, record_findings
+            day = state.get("day")
+            with connect(read_only=False) as con:
+                record_findings(con,
+                                day=_date.fromisoformat(day) if isinstance(day, str) else day,
+                                findings=[f.to_dict() for f in findings])
+        except Exception as e:                  # noqa: BLE001
+            # Best-effort, like the enrichment history write: a store
+            # hiccup must not cost the day's analysis.
+            errors.append(f"persist findings: {type(e).__name__}: {e}")
+
+    for finding in findings:
         if not finding.correlation_type or finding.correlation_type == "zeek_hit":
             continue
         if not finding.actor or not finding.indicators:

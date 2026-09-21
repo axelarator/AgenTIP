@@ -487,6 +487,49 @@ def _selector_detail(con, indicator: str) -> list[dict[str, Any]]:
     return out
 
 
+def finding_days() -> dict[str, Any]:
+    """Days that have findings, newest first."""
+    try:
+        with connect_retry(read_only=True) as con:
+            found = _rows(con,
+                """SELECT day, count(*) AS findings,
+                          count(*) FILTER (WHERE correlation_type IS NOT NULL) AS saved
+                   FROM findings GROUP BY day ORDER BY day DESC""")
+    except TrackingBusy:
+        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
+    except duckdb.IOException as e:
+        return {"error": f"tracking DB unavailable: {e}"}
+    for row in found:
+        row["day"] = _cell(row["day"])
+    return {"days": found, "count": len(found)}
+
+
+def findings_for(day: str) -> dict[str, Any]:
+    """One day's findings, with every indicator at full length.
+
+    This is what makes the portal correct on a day the model abbreviates in
+    prose: `indicators` has always carried complete values, and rendering
+    them as chips does not depend on the narrative saying so.
+    """
+    try:
+        with connect_retry(read_only=True) as con:
+            found = _rows(con,
+                """SELECT id, day, family, actor, headline, detail, indicators,
+                          correlation_type, confidence, created_at
+                   FROM findings WHERE day = ?
+                   ORDER BY correlation_type IS NULL, family, headline""", [day])
+    except TrackingBusy:
+        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
+    except duckdb.IOException as e:
+        return {"error": f"tracking DB unavailable: {e}"}
+    for row in found:
+        row["day"] = _cell(row["day"])
+        row["created_at"] = _cell(row["created_at"])
+        row["indicators"] = json.loads(row["indicators"]) if row["indicators"] else []
+        row["saved"] = row["correlation_type"] is not None
+    return {"day": day, "findings": found, "count": len(found)}
+
+
 def indicator_index() -> dict[str, Any]:
     """One row per indicator that has ever been observed.
 

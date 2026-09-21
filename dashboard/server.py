@@ -174,6 +174,23 @@ async def selector_detail(request):
     return JSONResponse(result)
 
 
+async def findings_index(request):
+    result = tracking_store.finding_days()
+    if "error" in result:
+        return JSONResponse(result, status_code=503)
+    return JSONResponse(result)
+
+
+async def findings_detail(request):
+    day = request.path_params["date"]
+    if not _NARRATIVE_DATE_RE.match(day):
+        return JSONResponse({"error": "invalid date"}, status_code=400)
+    result = tracking_store.findings_for(day)
+    if "error" in result:
+        return JSONResponse(result, status_code=503)
+    return JSONResponse(result)
+
+
 async def tracking_narratives(request):
     ndir = tracking_digest.narrative_dir()
     if not ndir.is_dir():
@@ -264,6 +281,8 @@ routes = [
     Route("/api/indicators", indicator_index),
     Route("/api/indicators/{value:path}", indicator_detail),
     Route("/api/selectors", selector_detail),          # ?type=&value=
+    Route("/api/findings", findings_index),
+    Route("/api/findings/{date}", findings_detail),
     Route("/api/tracking/observables", tracking_observables),
     Route("/api/tracking/observables/{ip}", tracking_observable_detail),
     Route("/api/tracking/narratives", tracking_narratives),

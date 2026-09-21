@@ -1386,3 +1386,77 @@ def test_selector_detail_normalizes_the_value_it_was_given():
     d = store.selector_detail("tls.cert_sha256", ("C" * 64))
     assert d["selector_value"] == "c" * 64
     assert len(d["indicators"]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# findings
+# --------------------------------------------------------------------------- #
+
+_FINDING = {"family": "cert_tls", "actor": "STAC4749",
+            "headline": "New certificate on webconf.shop-api.workers.dev",
+            "detail": "the cert changed",
+            "indicators": ["webconf.shop-api.workers.dev",
+                           "cert-sha256:" + "8" * 64],
+            "correlation_type": None, "confidence": "medium"}
+
+
+def test_every_finding_is_persisted_not_only_the_saved_ones():
+    """The distinction is the point. On 2026-09-21, 1 of 5 findings carried
+    a correlation_type; the other four existed nowhere but a debug trace.
+    The leads worth clicking are usually among the ones not worth filing."""
+    with store.connect() as con:
+        store.record_findings(con, day=TODAY, findings=[
+            _FINDING,
+            {**_FINDING, "headline": "saved one", "correlation_type": "shared_fingerprint"},
+        ])
+    day = store.findings_for(TODAY.isoformat())
+    assert day["count"] == 2
+    assert sum(f["saved"] for f in day["findings"]) == 1
+
+
+def test_findings_keep_indicator_values_at_full_length():
+    """What makes the portal correct on a day the model abbreviates in
+    prose. The narrative wrote `8ed8767a…`; this is the same finding."""
+    with store.connect() as con:
+        store.record_findings(con, day=TODAY, findings=[_FINDING])
+    found = store.findings_for(TODAY.isoformat())["findings"][0]
+    assert "cert-sha256:" + "8" * 64 in found["indicators"]
+    assert "…" not in json.dumps(found["indicators"])
+
+
+def test_recording_a_day_twice_updates_rather_than_duplicates():
+    with store.connect() as con:
+        assert store.record_findings(con, day=TODAY, findings=[_FINDING]) == 1
+        assert store.record_findings(
+            con, day=TODAY,
+            findings=[{**_FINDING, "detail": "revised"}]) == 0
+    found = store.findings_for(TODAY.isoformat())
+    assert found["count"] == 1
+    assert found["findings"][0]["detail"] == "revised"
+
+
+def test_a_finding_with_no_headline_is_skipped():
+    with store.connect() as con:
+        assert store.record_findings(
+            con, day=TODAY, findings=[{**_FINDING, "headline": "  "}]) == 0
+    assert store.findings_for(TODAY.isoformat())["count"] == 0
+
+
+def test_saved_findings_sort_before_noted_ones():
+    with store.connect() as con:
+        store.record_findings(con, day=TODAY, findings=[
+            _FINDING,
+            {**_FINDING, "headline": "aaa saved", "correlation_type": "shared_fingerprint"},
+        ])
+    families = [f["saved"] for f in store.findings_for(TODAY.isoformat())["findings"]]
+    assert families == [True, False]
+
+
+def test_finding_days_counts_saved_separately():
+    with store.connect() as con:
+        store.record_findings(con, day=TODAY, findings=[
+            _FINDING,
+            {**_FINDING, "headline": "saved", "correlation_type": "temporal_cluster"},
+        ])
+    day = store.finding_days()["days"][0]
+    assert day["findings"] == 2 and day["saved"] == 1

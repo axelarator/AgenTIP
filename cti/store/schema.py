@@ -96,6 +96,31 @@ CREATE TABLE IF NOT EXISTS correlations (
     created_by  TEXT
 );
 
+-- Every finding the specialists produce, not only the ones worth saving as
+-- a durable correlation. On 2026-09-21 that was 1 of 5: the other four -
+-- a cert rotation, a workers.dev link, a PTR loss - existed nowhere but
+-- the run trace, which is a debug artifact that caps lists at 40 elements
+-- and strings at 2000 chars. The interesting leads are usually among the
+-- ones not worth persisting as correlations, so they get a home here.
+--
+-- correlation_type NULL means "worth saying, not worth storing" - the
+-- documented way a specialist declines to file one, not a missing value.
+CREATE SEQUENCE IF NOT EXISTS findings_seq;
+CREATE TABLE IF NOT EXISTS findings (
+    id          BIGINT PRIMARY KEY DEFAULT nextval('findings_seq'),
+    day         DATE NOT NULL,
+    family      TEXT NOT NULL,
+    actor       TEXT,
+    headline    TEXT NOT NULL,
+    detail      TEXT,
+    indicators  JSON,
+    correlation_type TEXT,
+    confidence  TEXT,
+    created_at  TIMESTAMP NOT NULL DEFAULT now(),
+    UNIQUE (day, family, headline)
+);
+CREATE INDEX IF NOT EXISTS findings_day ON findings (day);
+
 CREATE TABLE IF NOT EXISTS zeek_matches (
     day        DATE NOT NULL,
     indicator_value TEXT NOT NULL,
