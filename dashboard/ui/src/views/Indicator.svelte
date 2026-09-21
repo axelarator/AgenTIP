@@ -5,17 +5,26 @@
   import Busy from "../components/Busy.svelte";
   import CopyValue from "../components/CopyValue.svelte";
   import IndicatorChip from "../components/IndicatorChip.svelte";
+  import Select from "../components/Select.svelte";
+  import SelectorMeaning from "../components/SelectorMeaning.svelte";
+  import HeldBack from "../components/HeldBack.svelte";
 
   let { value } = $props();
   let loading = $state(true);
   let p = $state(null);
   let tab = $state("current");
   let sourceFilter = $state("all");
+  // 172 observations over 27 days is a lot of scrolling to reach last week.
+  let windowDays = $state(7);
+  let jumpDate = $state("");
 
   $effect(() => {
     loading = true;
     p = null;
     tab = "current";
+    sourceFilter = "all";
+    windowDays = 7;
+    jumpDate = "";
     api(indicatorUrl(value))
       .then((d) => (p = d))
       .finally(() => (loading = false));
@@ -29,11 +38,41 @@
   );
   const promoted = $derived((p?.links ?? []).filter((l) => l.promoted));
   const held = $derived((p?.links ?? []).filter((l) => !l.promoted));
+  const days = $derived(
+    !p?.observations ? [] :
+      [...new Set(p.observations.map((o) => String(o.observed_at).slice(0, 10)))]
+        .sort().reverse(),
+  );
+
+  // A specific day wins over the rolling window: picking one is an explicit
+  // request for that day, not a wider net.
+  const cutoff = $derived(
+    jumpDate ? null
+    : windowDays === 0 ? null
+    : new Date(Date.now() - windowDays * 86400000).toISOString().slice(0, 10),
+  );
+
   const timeline = $derived(
     !p?.observations ? [] :
-      [...p.observations].reverse()
-        .filter((o) => sourceFilter === "all" || o.source === sourceFilter),
+      [...p.observations].reverse().filter((o) => {
+        if (sourceFilter !== "all" && o.source !== sourceFilter) return false;
+        const day = String(o.observed_at).slice(0, 10);
+        if (jumpDate) return day === jumpDate;
+        return !cutoff || day >= cutoff;
+      }),
   );
+
+  const hiddenCount = $derived(
+    (p?.observations?.length ?? 0) - timeline.length,
+  );
+
+  // type -> class, so a held-back link can say why each shared selector
+  // cannot carry it. Both ends of a shared selector carry it, so the
+  // indicator's own bag is a complete source for this.
+  const selectorClasses = $derived(
+    Object.fromEntries((p?.selectors ?? []).map((s) => [s.selector_type, s.selector_class])),
+  );
+
 
   const TABS = $derived([
     ["current", `Current (${Object.keys(p?.current ?? {}).length})`],
@@ -103,12 +142,30 @@
 
   {:else if tab === "timeline"}
     <div class="controls">
-      <select bind:value={sourceFilter}>
-        <option value="all">all sources</option>
-        {#each p.sources as s}<option value={s}>{s}</option>{/each}
-      </select>
-      <span class="muted">{timeline.length} rows</span>
+      <Select
+        label="source"
+        bind:value={sourceFilter}
+        options={[{ value: "all", label: "all sources" },
+                  ...p.sources.map((s) => ({ value: s, label: s }))]} />
+      <Select
+        label="window"
+        bind:value={windowDays}
+        options={[{ value: 7, label: "last 7 days" },
+                  { value: 14, label: "last 14 days" },
+                  { value: 30, label: "last 30 days" },
+                  { value: 0, label: "everything" }]} />
+      <Select
+        label="day"
+        bind:value={jumpDate}
+        options={[{ value: "", label: "any day" },
+                  ...days.map((d) => ({ value: d, label: d }))]} />
+      <span class="muted">
+        {timeline.length} row{timeline.length === 1 ? "" : "s"}{#if hiddenCount > 0}, {hiddenCount} outside the window{/if}
+      </span>
     </div>
+    {#if !timeline.length}
+      <p class="muted">Nothing in this window. Widen it or pick another day.</p>
+    {/if}
     {#each timeline as o}
       <article class="obs">
         <div class="obs__head">
@@ -143,14 +200,16 @@
             </a>
             <CopyValue value={s.selector_value} />
           </div>
-          <p class="sel__means">{s.means}</p>
-          {#if s.never}<p class="sel__never"><em>Never:</em> {s.never}</p>{/if}
+          <SelectorMeaning
+            meaning={s.means}
+            never={s.never}
+            carriers={s.carriers ?? []} />
           <p class="muted">
-            held by {s.local_count ?? "?"} of our indicators
+            recorded {dayOf(s.first_seen)} → {dayOf(s.last_seen)}
             {#if s.global_count !== null && s.global_count !== undefined}
-              · {s.global_count.toLocaleString()} index-wide
+              · {s.global_count.toLocaleString()} on the index
             {/if}
-            {#if !s.can_promote}· <strong>cannot promote</strong>{#if s.why_not}: {s.why_not}{/if}{/if}
+            {#if !s.can_promote}· <strong>cannot promote a link</strong>{#if s.why_not}: {s.why_not}{/if}{/if}
           </p>
         </article>
       {/each}
@@ -178,14 +237,11 @@
         The corroboration rule declined these. That is the filter working, not a gap.
       </p>
       {#each held.slice(0, 25) as l}
-        <article class="link">
-          <div class="link__top">
-            <IndicatorChip value={l.indicator} />
-            {#if l.actor}<span class="muted">{l.actor}</span>{/if}
-          </div>
-          <p class="link__reason">{l.reason}</p>
-        </article>
+        <HeldBack link={l} classes={selectorClasses} />
       {/each}
+      {#if held.length > 25}
+        <p class="muted">{held.length - 25} more not shown.</p>
+      {/if}
     {/if}
     {#if !p.links.length}<p class="muted">Nothing shares a selector with this indicator.</p>{/if}
 

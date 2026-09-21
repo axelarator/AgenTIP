@@ -5,8 +5,14 @@
 
   // `value` may be a bare indicator, or a prefixed hash the pipeline files
   // onto a cluster ("cert-sha256:<64 hex>"). The prefix is how the store
-  // distinguishes a certificate hash from a file hash, so it is kept in the
-  // displayed and copied text and only stripped to decide where to link.
+  // distinguishes a certificate hash from a file hash, so it stays in the
+  // displayed and copied text and is only stripped to build the link.
+  //
+  // A hash links to the selector page BY VALUE, with no type. Inferring the
+  // type from the shape was wrong for two of the three hashes in one
+  // JadeProx finding - a certificate digest and an SPKI digest are both 64
+  // hex characters, and both went to a body-hash page that found nothing,
+  // so real links looked like dead ends.
   let { value, selectorType = null } = $props();
 
   const bare = $derived(String(value).replace(/^(?:cert-)?sha\d*:/i, ""));
@@ -14,8 +20,7 @@
     selectorType
       ? href.selector(selectorType, bare)
       : looksLikeHash(value)
-        ? href.selector(String(value).startsWith("cert-sha256:")
-            ? "tls.cert_sha256" : "http.body_sha256", bare)
+        ? href.selector(bare)
         : href.indicator(bare),
   );
 </script>

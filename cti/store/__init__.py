@@ -20,7 +20,7 @@ from .observations import upsert_observation
 from .query import (finding_days, findings_for,
                     QUERY_MAX_BYTES, QUERY_MAX_ROWS, actor_summary,
                     indicator_index, indicator_profile, observable_history,
-                    selector_detail, run_readonly_query,
+                    selector_detail, selector_types_for, run_readonly_query,
                     save_correlation,
                     tracked_observables)
 from . import selectors
@@ -37,7 +37,7 @@ __all__ = [
     "confidence", "connect", "connect_retry", "db_path", "detect",
     "init_schema", "insert_correlation", "latest_asn_for",
     "finding_days", "findings_for", "indicator_index", "indicator_profile", "observable_history",
-    "selector_detail", "record_findings", "record_active_scan",
+    "selector_detail", "selector_types_for", "record_findings", "record_active_scan",
     "record_asn_change",
     "selectors",
     "record_attribute_change", "run_readonly_query", "save_correlation",

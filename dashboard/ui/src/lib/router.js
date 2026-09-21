@@ -33,8 +33,13 @@ export function parseHash(raw) {
         : { name: "indicators" };
     case "findings":
       return rest[0] ? { name: "findings", date: rest[0] } : { name: "findings" };
+    // One segment is a bare value and the type gets resolved server-side;
+    // two is an explicit type and value. Chips use the one-segment form
+    // because they know the value and not what kind of selector it is.
     case "selector":
-      return { name: "selector", type: rest[0], value: rest.slice(1).join("/") };
+      return rest.length > 1
+        ? { name: "selector", type: rest[0], value: rest.slice(1).join("/") }
+        : { name: "selector", type: null, value: rest[0] };
     case "narratives":
       return rest[0]
         ? { name: "narrative", date: rest[0] }
@@ -56,7 +61,9 @@ export const route = readable(parseHash(location.hash), (set) => {
 
 export const href = {
   indicator: (v) => `#/indicator/${encodeURIComponent(v)}`,
-  selector: (t, v) => `#/selector/${encodeURIComponent(t)}/${encodeURIComponent(v)}`,
+  selector: (t, v) => v === undefined
+    ? `#/selector/${encodeURIComponent(t)}`
+    : `#/selector/${encodeURIComponent(t)}/${encodeURIComponent(v)}`,
   cluster: (slug, tab) => `#/cluster/${encodeURIComponent(slug)}${tab ? "/" + tab : ""}`,
   findings: (d) => `#/findings/${encodeURIComponent(d)}`,
   narrative: (d) => `#/narratives/${encodeURIComponent(d)}`,

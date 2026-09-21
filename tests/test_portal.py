@@ -137,3 +137,47 @@ def test_the_copy_helper_works_without_a_secure_context():
     here, not an edge case."""
     copy = (SRC / "lib" / "copy.js").read_text()
     assert "isSecureContext" in copy and "execCommand" in copy
+
+
+# --------------------------------------------------------------------------- #
+# What the feedback round changed
+# --------------------------------------------------------------------------- #
+
+def test_a_hash_chip_links_by_value_and_never_guesses_a_type():
+    """A certificate digest and an SPKI digest are both 64 hex characters.
+    Guessing sent two of the three hashes in one finding to a body-hash
+    page that found nothing."""
+    chip = (SRC / "components" / "IndicatorChip.svelte").read_text()
+    assert "tls.cert_sha256" not in chip and "http.body_sha256" not in chip
+    assert "href.selector(bare)" in chip
+
+
+def test_the_timeline_can_be_narrowed_without_scrolling():
+    """172 observations over 27 days is a lot of scrolling to reach last
+    week."""
+    view = (SRC / "views" / "Indicator.svelte").read_text()
+    assert "windowDays" in view and "jumpDate" in view
+
+
+def test_dropdowns_use_the_themed_component_not_a_bare_select():
+    """A native select reads as browser chrome dropped into the page."""
+    for name in ("Indicator.svelte", "Indicators.svelte"):
+        view = (SRC / "views" / name).read_text()
+        assert "<select" not in view, f"{name} still has a bare select"
+
+
+def test_selector_prose_is_framed_by_whether_it_is_actually_shared():
+    """The taxonomy's `means` is written for the shared case. Shown beside
+    one host's attribute unlabelled, it reads as a non-sequitur."""
+    c = (SRC / "components" / "SelectorMeaning.svelte").read_text()
+    assert "If shared, it would mean" in c
+    assert "Nothing else recorded carries this value" in c
+
+
+def test_a_held_back_link_names_its_selectors_and_why_they_cannot_promote():
+    """"corroborating selectors only - nothing that can promote" is
+    accurate and answers nothing."""
+    c = (SRC / "components" / "HeldBack.svelte").read_text()
+    assert "These two share" in c
+    assert "behavioural" in c and "contextual" in c
+    assert "one identity selector, or two structural selectors" in c

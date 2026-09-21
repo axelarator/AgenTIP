@@ -473,6 +473,13 @@ def _selector_detail(con, indicator: str) -> list[dict[str, Any]]:
         selector_type = row["selector_type"]
         spec = S.TYPES.get(selector_type)
         verdict = rarity.assess(con, selector_type, row["selector_value"])
+        # Who else carries it. The taxonomy's prose is written for the
+        # shared case - "the same leaf certificate is installed on both
+        # hosts" - and beside a single host's attribute that invites the
+        # obvious question, which two? Naming them answers it.
+        carriers = [c["indicator_value"]
+                    for c in S.sharing(con, selector_type, row["selector_value"])
+                    if c["indicator_value"] != indicator]
         out.append({
             **{k: _cell(v) for k, v in row.items()},
             "selector_class": S.selector_class(selector_type),
@@ -483,6 +490,7 @@ def _selector_detail(con, indicator: str) -> list[dict[str, Any]]:
             "global_count": verdict["global_count"],
             "can_promote": verdict["can_promote"],
             "why_not": verdict["why_not"],
+            "carriers": carriers,
         })
     return out
 
@@ -584,14 +592,58 @@ def indicator_index() -> dict[str, Any]:
     return {"indicators": found, "count": len(found)}
 
 
-def selector_detail(selector_type: str, selector_value: Any) -> dict[str, Any]:
+def selector_types_for(value: Any) -> dict[str, Any]:
+    """Which selector types carry this value.
+
+    The portal links a hash chip here without knowing what kind of hash it
+    is, and it must not guess. The first version of the chip inferred the
+    type from the value's shape - 64 hex characters, so probably a body
+    hash - which was right for one of the three hashes in a JadeProx
+    finding and silently wrong for the other two: a certificate digest and
+    an SPKI digest both went to a body-hash page that found nothing, making
+    real links look like dead ends.
+    """
+    try:
+        with connect_retry(read_only=True) as con:
+            found = _rows(con,
+                """SELECT selector_type,
+                          count(DISTINCT indicator_value) AS indicators,
+                          min(first_seen) AS first_seen,
+                          max(last_seen)  AS last_seen
+                   FROM selectors WHERE selector_value = ?
+                   GROUP BY selector_type
+                   ORDER BY indicators DESC, selector_type""", [str(value)])
+    except TrackingBusy:
+        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
+    except duckdb.IOException as e:
+        return {"error": f"tracking DB unavailable: {e}"}
+    for row in found:
+        row["first_seen"] = _cell(row["first_seen"])
+        row["last_seen"] = _cell(row["last_seen"])
+    return {"value": str(value), "types": found}
+
+
+def selector_detail(selector_type: str | None, selector_value: Any) -> dict[str, Any]:
     """Who else carries this selector value, and what that is worth.
 
-    The page a hash chip links to. Every verdict comes from the module that
-    owns it - `rarity.assess` for the gates, `selectors.TYPES` for what the
-    type means - so this never re-decides anything.
+    `selector_type` may be None, in which case it is resolved from the
+    value - see selector_types_for. Every verdict comes from the module
+    that owns it, so this never re-decides anything.
     """
     from . import rarity, selectors as S
+
+    if not selector_type:
+        resolved = selector_types_for(selector_value)
+        if "error" in resolved:
+            return resolved
+        if not resolved["types"]:
+            return {"selector_type": None, "selector_value": str(selector_value),
+                    "indicators": [], "other_types": [],
+                    "not_a_selector": True}
+        selector_type = resolved["types"][0]["selector_type"]
+        other_types = [t["selector_type"] for t in resolved["types"][1:]]
+    else:
+        other_types = []
 
     spec = S.TYPES.get(selector_type)
     try:
@@ -617,6 +669,10 @@ def selector_detail(selector_type: str, selector_value: Any) -> dict[str, Any]:
         "can_promote": verdict["can_promote"],
         "why_not": verdict["why_not"],
         "apex_spread": apexes,
+        # A value can be more than one kind of thing - the same string could
+        # be a cert digest on one host and something else elsewhere. Naming
+        # the others lets the page offer them rather than pick silently.
+        "other_types": other_types,
         "indicators": [{k: _cell(v) for k, v in c.items()} for c in carriers],
     }
 

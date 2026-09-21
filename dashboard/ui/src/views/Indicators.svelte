@@ -3,6 +3,7 @@
   import { href } from "../lib/router.js";
   import { dayOf } from "../lib/format.js";
   import Busy from "../components/Busy.svelte";
+  import Select from "../components/Select.svelte";
 
   let loading = $state(true);
   let data = $state(null);
@@ -35,11 +36,12 @@
 {:else}
   <div class="controls">
     <input placeholder="Filter by value or actor…" bind:value={filter} />
-    <select bind:value={kind}>
-      <option value="all">all types</option>
-      <option value="domain">domains</option>
-      <option value="ip">addresses</option>
-    </select>
+    <Select
+      label="type"
+      bind:value={kind}
+      options={[{ value: "all", label: "all types" },
+                { value: "domain", label: "domains" },
+                { value: "ip", label: "addresses" }]} />
     <span class="muted">{rows.length} of {data.count}</span>
   </div>
 

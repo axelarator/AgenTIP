@@ -1460,3 +1460,71 @@ def test_finding_days_counts_saved_separately():
         ])
     day = store.finding_days()["days"][0]
     assert day["findings"] == 2 and day["saved"] == 1
+
+
+def test_a_selector_value_resolves_its_own_type():
+    """The portal links a hash chip by value and must not guess the type.
+
+    Inferring it from the shape was wrong for two of the three hashes in
+    one JadeProx finding: a certificate digest and an SPKI digest are both
+    64 hex characters, so both went to a body-hash page that found nothing
+    and two real links looked like dead ends.
+    """
+    with store.connect() as con:
+        _seed_domain(con, "a.example", resolved=["203.0.113.9"])
+        store.selectors.record(
+            con, indicator_value="a.example", selector_type="tls.spki_sha256",
+            selector_value="d" * 64, observed_at=NOW, indicator_type="domain",
+            actor="APT-X", source="observe")
+    d = store.selector_detail(None, "d" * 64)
+    assert d["selector_type"] == "tls.spki_sha256"
+    assert [i["indicator_value"] for i in d["indicators"]] == ["a.example"]
+
+
+def test_a_value_carried_under_several_types_names_the_others():
+    with store.connect() as con:
+        _seed_domain(con, "a.example", resolved=["203.0.113.9"])
+        for t in ("tls.cert_sha256", "http.body_sha256"):
+            store.selectors.record(
+                con, indicator_value="a.example", selector_type=t,
+                selector_value="e" * 64, observed_at=NOW,
+                indicator_type="domain", actor="APT-X", source="observe")
+    d = store.selector_detail(None, "e" * 64)
+    assert d["other_types"], "the page must be able to offer the alternatives"
+
+
+def test_an_unknown_value_says_so_rather_than_erroring():
+    """Reachable now that chips link by value: a hash filed from a report
+    may never have been observed as a selector."""
+    with store.connect():
+        pass
+    d = store.selector_detail(None, "f" * 64)
+    assert d.get("not_a_selector") is True
+    assert d["indicators"] == []
+
+
+def test_profile_selectors_name_who_else_carries_them():
+    """The taxonomy's prose is written for the shared case - "the same leaf
+    certificate is installed on both hosts" - and beside one host's
+    attribute that invites the obvious question, which two."""
+    with store.connect() as con:
+        for host in ("a.example", "b.example"):
+            _seed_domain(con, host, resolved=["203.0.113.9"])
+            store.selectors.record(
+                con, indicator_value=host, selector_type="tls.cert_sha256",
+                selector_value="c" * 64, observed_at=NOW,
+                indicator_type="domain", actor="APT-X", source="observe")
+    sel = next(s for s in store.indicator_profile("a.example")["selectors"]
+               if s["selector_type"] == "tls.cert_sha256")
+    assert sel["carriers"] == ["b.example"], "excludes the indicator itself"
+
+
+def test_a_lone_selector_reports_no_carriers():
+    with store.connect() as con:
+        _seed_domain(con, "a.example", resolved=["203.0.113.9"])
+        store.selectors.record(
+            con, indicator_value="a.example", selector_type="tls.cert_sha256",
+            selector_value="c" * 64, observed_at=NOW, indicator_type="domain",
+            actor="APT-X", source="observe")
+    sel = store.indicator_profile("a.example")["selectors"][0]
+    assert sel["carriers"] == []

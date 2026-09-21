@@ -166,9 +166,12 @@ async def selector_detail(request):
     """
     selector_type = request.query_params.get("type")
     value = request.query_params.get("value")
-    if not selector_type or not value:
-        return JSONResponse({"error": "type and value are required"},
-                            status_code=400)
+    if not value:
+        return JSONResponse({"error": "value is required"}, status_code=400)
+    # `type` is optional. A hash chip links here knowing only the value, and
+    # the page resolves what kind of selector it is rather than guessing
+    # from its shape - which was wrong for two of the three hashes in a
+    # single JadeProx finding.
     result = tracking_store.selector_detail(selector_type, value)
     if "error" in result:
         return JSONResponse(result, status_code=503)

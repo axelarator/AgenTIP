@@ -2,9 +2,8 @@
 //
 // 503 is not an error here, it is a state. The daily job holds DuckDB's
 // write lock for minutes at a time and every read endpoint answers 503
-// while it does; the old app handled this by catching per-call and
-// substituting an empty list, which is why the sidebar survived a sweep.
-// Surfacing it as `busy` lets a view say so instead of blanking.
+// while it does; surfacing it as `busy` lets a view say so instead of
+// blanking or showing a red failure for something that is working.
 export async function api(path) {
   const res = await fetch(path, { headers: { accept: "application/json" } });
   if (res.status === 503) {
@@ -21,5 +20,11 @@ export async function api(path) {
 }
 
 export const indicatorUrl = (v) => `/api/indicators/${encodeURIComponent(v)}`;
+
+// `type` is optional and usually absent. A hash chip knows the value and
+// not what kind of selector it is; the server resolves that. Guessing from
+// the value's shape sent a certificate digest and an SPKI digest to a
+// body-hash page that found nothing.
 export const selectorUrl = (t, v) =>
-  `/api/selectors?type=${encodeURIComponent(t)}&value=${encodeURIComponent(v)}`;
+  `/api/selectors?value=${encodeURIComponent(v)}` +
+  (t ? `&type=${encodeURIComponent(t)}` : "");
