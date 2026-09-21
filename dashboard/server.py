@@ -27,6 +27,7 @@ from graph import trace as graph_trace
 from cti import store as tracking_store
 
 STATIC_DIR = Path(__file__).parent / "static"
+NEXT_DIR = Path(__file__).parent / "static-next"
 _NARRATIVE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -289,6 +290,13 @@ routes = [
     Route("/api/tracking/narratives/{date}", tracking_narrative_detail),
     Route("/api/runs", runs),
     Route("/api/runs/{date}", run_detail),
+    # The rewrite, served alongside the current UI rather than over it.
+    # Vite builds into static-next with emptyOutDir, so pointing it at
+    # STATIC_DIR would mean one stray `npm run build` silently replaces the
+    # working dashboard. This mount goes away at cutover, when the build
+    # output moves to STATIC_DIR.
+    *([Mount("/next", app=StaticFiles(directory=str(NEXT_DIR), html=True),
+             name="next")] if NEXT_DIR.is_dir() else []),
     Mount("/", app=StaticFiles(directory=str(STATIC_DIR), html=True), name="static"),
 ]
 

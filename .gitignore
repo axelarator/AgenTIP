@@ -38,3 +38,9 @@ data/tracking/*
 
 # LangGraph run traces (one JSONL per run) - runtime state, not intel.
 data/runs/
+
+# Frontend build tooling. The built bundle in dashboard/static/ IS committed
+# (the lab VM serves it directly and nothing on that path has node), but the
+# dependency tree that produces it is not.
+dashboard/ui/node_modules/
+dashboard/ui/.vite/
