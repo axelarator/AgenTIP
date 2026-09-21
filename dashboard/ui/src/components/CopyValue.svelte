@@ -31,7 +31,7 @@
 <style>
   .copyvalue { display: inline-flex; align-items: baseline; gap: .4rem; max-width: 100%; }
   .copyvalue__text {
-    font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-family: var(--font-mono);
     font-size: .82rem;
     user-select: all;
     word-break: break-all;
@@ -43,10 +43,10 @@
     letter-spacing: .04em;
     padding: .1rem .35rem;
     border-radius: 4px;
-    border: 1px solid var(--border, #d0d0d8);
+    border: 1px solid var(--border);
     background: transparent;
-    color: var(--muted, #6b6b76);
+    color: var(--ink-3);
     cursor: pointer;
   }
-  .copyvalue__btn:hover { color: var(--ink, #16161a); border-color: var(--muted, #6b6b76); }
+  .copyvalue__btn:hover { color: var(--ink); border-color: var(--ink-3); }
 </style>

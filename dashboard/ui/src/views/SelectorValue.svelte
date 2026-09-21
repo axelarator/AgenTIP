@@ -94,16 +94,14 @@
 <style>
   .shead h1 { font-size: 1rem; margin: 0 0 .4rem; }
   .shead__kind { margin: 0 0 .3rem; font-size: .74rem; text-transform: uppercase;
-                 letter-spacing: .06em; color: var(--muted, #6b6b76);
-                 font-family: var(--font-mono, monospace); }
-  .empty { border: 1px dashed var(--border, #d0d0d8); border-radius: 8px; padding: 1.25rem; }
-  .verdict { border: 1px solid var(--border, #d0d0d8); border-radius: 8px;
+                 letter-spacing: .06em; color: var(--ink-3);
+                 font-family: var(--font-mono); }
+  .empty { border: 1px dashed var(--border); border-radius: 8px; padding: 1.25rem; }
+  .verdict { border: 1px solid var(--border); border-radius: 8px;
              padding: .9rem 1rem; margin: 1.2rem 0; }
-  .verdict__means { margin: 0 0 .4rem; font-size: .92rem; }
-  .verdict__never { margin: 0 0 .5rem; font-size: .85rem; color: var(--muted, #6b6b76); }
-  .can { color: rgb(30,130,70); font-size: .88rem; margin: .5rem 0 0; }
-  .cannot { color: var(--muted, #6b6b76); font-size: .88rem; margin: .5rem 0 0; }
+  .can { color: var(--track-active-ink); font-size: .88rem; margin: .5rem 0 0; }
+  .cannot { color: var(--ink-3); font-size: .88rem; margin: .5rem 0 0; }
   .cls { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em;
-         color: var(--muted, #6b6b76); margin: 1.4rem 0 .6rem; }
-  .muted { color: var(--muted, #6b6b76); font-size: .85rem; }
+         color: var(--ink-3); margin: 1.4rem 0 .6rem; }
+  .muted { color: var(--ink-3); font-size: .85rem; }
 </style>

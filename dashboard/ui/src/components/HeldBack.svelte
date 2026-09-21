@@ -51,17 +51,17 @@
 </article>
 
 <style>
-  .held { border: 1px solid var(--border, #d0d0d8); border-radius: 8px;
+  .held { border: 1px solid var(--border); border-radius: 8px;
           padding: .75rem .9rem; margin-bottom: .6rem; }
   .held__top { display: flex; gap: .7rem; align-items: baseline; flex-wrap: wrap; }
   .held__verdict { margin: .45rem 0 .5rem; font-size: .86rem; }
-  .held__lead { margin: 0 0 .3rem; font-size: .82rem; color: var(--muted, #6b6b76); }
+  .held__lead { margin: 0 0 .3rem; font-size: .82rem; color: var(--ink-3); }
   .held__list { list-style: none; margin: 0 0 .5rem; padding: 0; }
   .held__list li { display: flex; flex-wrap: wrap; gap: .5rem;
                    align-items: baseline; padding: .2rem 0; font-size: .8rem; }
-  .held__type { font-family: var(--font-mono, monospace); }
-  .held__why { color: var(--muted, #6b6b76); }
-  .held__rule { margin: 0; font-size: .78rem; color: var(--muted, #6b6b76);
+  .held__type { font-family: var(--font-mono); }
+  .held__why { color: var(--ink-3); }
+  .held__rule { margin: 0; font-size: .78rem; color: var(--ink-3);
                 font-style: italic; }
-  .muted { color: var(--muted, #6b6b76); font-size: .85rem; }
+  .muted { color: var(--ink-3); font-size: .85rem; }
 </style>

@@ -8,6 +8,7 @@
   import Select from "../components/Select.svelte";
   import SelectorMeaning from "../components/SelectorMeaning.svelte";
   import HeldBack from "../components/HeldBack.svelte";
+  import StatusChip from "../components/StatusChip.svelte";
 
   let { value } = $props();
   let loading = $state(true);
@@ -97,7 +98,7 @@
   <header class="ihead">
     <h1><CopyValue value={p.indicator} /></h1>
     <div class="ihead__meta">
-      <span class="pill pill--{p.status}">{p.status}</span>
+      <StatusChip status={p.status} />
       <span>{p.indicator_type ?? "unknown type"}</span>
       {#each p.actors as a}
         <a href={href.cluster(a.toLowerCase().replace(/\s+/g, "-"))}>{a}</a>
@@ -107,11 +108,11 @@
     </div>
   </header>
 
-  <nav class="tabs">
+  <div class="tabs">
     {#each TABS as [key, label]}
-      <button class:is-active={tab === key} onclick={() => (tab = key)}>{label}</button>
+      <button class="tab" class:is-active={tab === key} onclick={() => (tab = key)}>{label}</button>
     {/each}
-  </nav>
+  </div>
 
   {#if tab === "current"}
     {#if !Object.keys(p.current).length}
@@ -272,34 +273,22 @@
 <style>
   .ihead h1 { margin: 0 0 .5rem; font-size: 1.15rem; }
   .ihead__meta { display: flex; flex-wrap: wrap; gap: .9rem; font-size: .85rem;
-                 color: var(--muted, #6b6b76); margin-bottom: 1.25rem; }
-  .pill { padding: .1rem .5rem; border-radius: 999px; font-size: .75rem;
-          background: var(--chip-bg, rgba(127,127,140,.12)); }
-  .pill--resolving { background: rgba(45,160,90,.16); }
-  .pill--unresolved { background: rgba(200,80,60,.16); }
-  .pill--in-network { background: rgba(200,140,40,.18); }
-  .tabs { display: flex; gap: .4rem; margin-bottom: 1.25rem; flex-wrap: wrap; }
-  .tabs button { border: 1px solid var(--border, #d0d0d8); background: transparent;
-                 padding: .3rem .7rem; border-radius: 6px; cursor: pointer;
-                 color: var(--muted, #6b6b76); font-size: .85rem; }
-  .tabs button.is-active { color: var(--ink, #16161a); border-color: var(--muted, #6b6b76); }
+                 color: var(--ink-3); margin-bottom: 1.25rem; }
   .cls { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em;
-         color: var(--muted, #6b6b76); margin: 1.4rem 0 .6rem; }
-  .obs, .sel, .link { border: 1px solid var(--border, #d0d0d8); border-radius: 8px;
+         color: var(--ink-3); margin: 1.4rem 0 .6rem; }
+  .obs, .sel, .link { border: 1px solid var(--border); border-radius: 8px;
                       padding: .75rem .9rem; margin-bottom: .6rem; }
   .obs__head { display: flex; justify-content: space-between; font-size: .85rem; }
   .obs__body { display: grid; grid-template-columns: minmax(10rem, max-content) 1fr;
                gap: .3rem 1.2rem; margin: .6rem 0 0; font-size: .82rem; }
-  .obs__body dt { color: var(--muted, #6b6b76); }
+  .obs__body dt { color: var(--ink-3); }
   .obs__body dd { margin: 0; overflow-wrap: anywhere; }
   .sel__top, .link__top { display: flex; gap: .7rem; align-items: baseline; flex-wrap: wrap; }
-  .sel__type { font-family: var(--font-mono, monospace); font-size: .82rem; }
-  .sel__means { margin: .45rem 0 .2rem; font-size: .86rem; }
-  .sel__never { margin: 0 0 .3rem; font-size: .82rem; color: var(--muted, #6b6b76); }
-  .link--promoted { border-color: rgba(45,160,90,.5); }
+  .sel__type { font-family: var(--font-mono); font-size: .82rem; }
+  .link--promoted { border-color: var(--track-active-ink); }
   .link__reason { margin: .4rem 0; font-size: .86rem; }
   .link__ev { display: flex; gap: .6rem; font-size: .8rem; margin-top: .2rem; flex-wrap: wrap; }
   .controls { display: flex; gap: .75rem; align-items: center; margin-bottom: 1rem; }
-  .muted { color: var(--muted, #6b6b76); font-size: .85rem; }
+  .muted { color: var(--ink-3); font-size: .85rem; }
   .wrap { overflow-wrap: anywhere; }
 </style>

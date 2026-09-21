@@ -181,3 +181,208 @@ def test_a_held_back_link_names_its_selectors_and_why_they_cannot_promote():
     assert "These two share" in c
     assert "behavioural" in c and "contextual" in c
     assert "one identity selector, or two structural selectors" in c
+
+
+# --------------------------------------------------------------------------- #
+# The port: theme, statuses, and the pure-JS modules
+# --------------------------------------------------------------------------- #
+
+import shutil
+import subprocess
+
+
+def _theme_tokens() -> set[str]:
+    css = (SRC / "app.css").read_text()
+    return set(re.findall(r"(--[a-z0-9-]+)\s*:", css))
+
+
+def test_every_css_variable_a_component_uses_exists_in_the_theme():
+    """The first cut of the portal used --muted, --panel and --chip-bg.
+    None of them exist, so each fell back to a hard-coded light-mode colour
+    and ignored dark mode entirely - 27 uses, invisible to the build, the
+    linter and every other test."""
+    tokens = _theme_tokens()
+    unknown = {}
+    for path in _sources():
+        if path.suffix != ".svelte":
+            continue
+        for name in re.findall(r"var\((--[a-z0-9-]+)", path.read_text()):
+            # a chip's colour pair is built at runtime from a stem
+            if name not in tokens:
+                unknown.setdefault(name, []).append(path.name)
+    assert unknown == {}
+
+
+def test_no_component_hard_codes_a_colour():
+    """A literal colour does not follow the theme. Tokens only."""
+    offenders = []
+    for path in _sources():
+        if path.suffix != ".svelte":
+            continue
+        for m in re.finditer(r"rgba?\(\s*\d|#[0-9a-fA-F]{3,8}\b", path.read_text()):
+            offenders.append(f"{path.name}: {m.group(0)}")
+    assert offenders == []
+
+
+def test_every_status_the_backend_can_produce_has_a_label_and_a_colour():
+    """indicator_status can return IP-ladder and domain-ladder values. One
+    without an entry silently renders as a default grey "never enriched",
+    which is exactly the lie the domain ladder was written to stop."""
+    query = (REPO / "cti" / "store" / "query.py").read_text()
+    produced = set()
+    for fn in ("_tracking_status", "_domain_status"):
+        body = query[query.index(f"def {fn}"):]
+        body = body[:body.index("\ndef ")]
+        produced |= set(re.findall(r'return "([a-z-]+)"', body))
+    assert produced, "found no statuses - the parse broke"
+    labels = (SRC / "lib" / "labels.js").read_text()
+    status_block = labels[labels.index("export const STATUS = {"):labels.index("export const STATUS_ORDER")]
+    defined = set(re.findall(r'^\s*"?([a-z-]+)"?:', status_block, re.M))
+    assert produced <= defined, sorted(produced - defined)
+
+
+def test_every_view_is_routed_and_every_route_has_a_view():
+    app = (SRC / "App.svelte").read_text()
+    router = (SRC / "lib" / "router.js").read_text()
+    files = {p.stem for p in (SRC / "views").glob("*.svelte")}
+    imported = set(re.findall(r'views/(\w+)\.svelte', app))
+    assert files == imported, f"orphaned or missing: {files ^ imported}"
+    names = set(re.findall(r'name: "([a-z]+)"', router))
+    routed = set(re.findall(r'\$route\.name === "([a-z]+)"', app)) | {"overview"}
+    assert names <= routed, f"router names with no view: {names - routed}"
+
+
+def _node(script: str):
+    node = shutil.which("node")
+    if not node or not (UI / "node_modules").is_dir():
+        pytest.skip("node or dashboard/ui/node_modules not available")
+    # router.js reads `location` when it is imported; node has none.
+    script = 'globalThis.location = { hash: "" };\n' + script
+    out = subprocess.run([node, "--input-type=module", "-e", script],
+                         capture_output=True, text=True, cwd=UI, timeout=30)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+def test_the_router_parses_the_old_and_new_shapes():
+    got = _node("""
+      const { parseHash: p } = await import("./src/lib/router.js");
+      console.log(JSON.stringify([
+        p("#/"), p("#/cluster/jadeprox"), p("#/cluster/jadeprox/observables"),
+        p("#/techniques"), p("#/techniques/T1071"), p("#/tracking"),
+        p("#/tracking/1.2.3.4"), p("#/indicator/evil.example"),
+        p("#/selector/abc"), p("#/selector/http.server/nginx%2F1.29.3"),
+        p("#/search/a%2Fb"), p("#/nonsense")]));
+    """)
+    assert got[0]["name"] == "overview"
+    assert got[1] == {"name": "cluster", "slug": "jadeprox", "tab": "diamond"}
+    assert got[2]["tab"] == "observables"
+    assert got[3]["name"] == "techniques" and got[4] == {"name": "technique", "id": "T1071"}
+    # the old tracking bookmarks land on the better page
+    assert got[5]["name"] == "indicators"
+    assert got[6] == {"name": "indicator", "value": "1.2.3.4"}
+    # one segment = value only, two = explicit type
+    assert got[8] == {"name": "selector", "type": None, "value": "abc"}
+    assert got[9]["type"] == "http.server" and got[9]["value"] == "nginx/1.29.3", \
+        "an encoded slash must survive the split"
+    assert got[10]["query"] == "a/b"
+    assert got[11]["name"] == "overview"
+
+
+def test_selector_type_names_are_never_mistaken_for_indicators():
+    """The narrative writes `tls.cert_sha256` and `workers.dev` in backticks
+    alike. One is a selector type and must not become a link to an indicator
+    page that does not exist."""
+    got = _node("""
+      import { looksLikeIndicator as f, looksLikeHash as h } from "./src/lib/format.js";
+      const t = ["tls.cert_sha256", "http.body_sha256", "net.resolved_ip",
+                 "workers.dev", "evil.example", "203.0.113.9", "a.b",
+                 "cert-sha256:" + "a".repeat(64), "a".repeat(64), "not a value"];
+      console.log(JSON.stringify(t.map((v) => [f(v), h(v)])));
+    """)
+    assert got[0:3] == [[False, False]] * 3
+    assert got[3] == [True, False] and got[4] == [True, False]
+    assert got[5] == [True, False]
+    assert got[7][1] is True and got[8][1] is True
+    assert got[9] == [False, False]
+
+
+def test_report_sources_group_repeat_ingests_of_one_report():
+    got = _node("""
+      import { groupReportSources as g } from "./src/lib/reports.js";
+      const r = (ing, n) => ({ source: "https://x/report", ingested: ing,
+        observables_found: { domains: n }, ttps_found: ["T1"] });
+      const out = g([r("2026-09-02", 0), r("2026-09-01", 5),
+                     { source: "other", ingested: "2026-09-03", observables_found: {} }]);
+      console.log(JSON.stringify(out.map((x) => [x.source, x.attempts.length,
+        x.observableCounts.domains, x.lastIngested])));
+    """)
+    assert got[0] == ["https://x/report", 2, 5, "2026-09-02"]
+    assert got[1][1] == 1
+
+
+def test_dates_are_shown_as_written_not_shifted_by_the_browser_zone():
+    """The API's timestamps are naive. Running them through new Date()
+    reinterprets them in the local zone and moves every time by the offset."""
+    got = _node("""
+      import { formatDate as d, formatDateOnly as o } from "./src/lib/format.js";
+      console.log(JSON.stringify([d("2026-09-21T06:32:15"), d("2026-09-21 06:32:15"),
+        d(null), o("2025-09"), o("2022-12-01T00:00:00Z"), o(null), o("free text")]));
+    """)
+    assert got == ["2026-09-21 06:32", "2026-09-21 06:32", "—",
+                   "2025-09-01", "2022-12-01", None, "free text"]
+
+
+def test_code_inside_bold_is_parsed_not_shown_with_its_backticks():
+    """The model writes **Cert rotation on `host`** routinely. The first
+    tokenizer matched the whole bold span as one plain token, so the
+    backticks rendered literally. Found by driving the built app, not by any
+    build step or type check."""
+    got = _node("""
+      const { inline } = await import("./src/lib/markdown.js");
+      console.log(JSON.stringify(inline(
+        "**Cert rotation on `webconf.shop-api.workers.dev`** (medium): done")));
+    """)
+    assert [(t["t"], t["v"]) for t in got] == [
+        ("text", "Cert rotation on "), ("indicator", "webconf.shop-api.workers.dev"),
+        ("text", " (medium): done")]
+    assert got[0]["strong"] is True and "strong" not in got[2]
+    assert "`" not in "".join(t["v"] for t in got)
+
+
+def test_a_full_hash_in_backticks_becomes_a_chip_and_an_abbreviated_one_does_not():
+    """The narrative prompt now asks for full hashes. An abbreviated one
+    (`0ca9769a…`) is not a hash and must not link anywhere."""
+    got = _node("""
+      const { inline } = await import("./src/lib/markdown.js");
+      const h = "8ed8767a759e2ecdc712f05c483a77a2546a80b2432cad8e6246afb9dd519fa2";
+      console.log(JSON.stringify([
+        inline("`" + h + "`")[0], inline("`cert-sha256:" + h + "`")[0],
+        inline("`0ca9769a…`")[0], inline("`tls.cert_sha256`")[0],
+        inline("`203.0.113.9`")[0], inline("`workers.dev`")[0]]));
+    """)
+    assert [t["t"] for t in got] == ["hash", "hash", "code", "code", "indicator", "indicator"]
+    assert len(got[0]["v"]) == 64, "the value is carried whole"
+
+
+def test_blocks_lists_and_headings_parse():
+    got = _node("""
+      const { parse } = await import("./src/lib/markdown.js");
+      console.log(JSON.stringify(parse(
+        "## Title\\n\\ntext **b**\\n- one\\n- two\\n1. first\\n2. second\\n\\n"))
+        .replace(/\\s+/g, " "));
+    """)
+    assert [b["type"] for b in got] == ["heading", "p", "list", "list"]
+    assert got[2]["ordered"] is False and len(got[2]["items"]) == 2
+    assert got[3]["ordered"] is True and len(got[3]["items"]) == 2
+
+
+def test_markup_in_narrative_text_stays_text():
+    """The narrative is over adversary-influenced content. Tags in it are
+    just characters to a tokenizer that never builds HTML."""
+    got = _node("""
+      const { inline } = await import("./src/lib/markdown.js");
+      console.log(JSON.stringify(inline("<img src=x onerror=alert(1)> **<b>x</b>**")));
+    """)
+    assert all(t["t"] in ("text", "code", "indicator", "hash") for t in got)
+    assert "<img src=x onerror=alert(1)>" in "".join(t["v"] for t in got)

@@ -43,12 +43,12 @@
   .meaning__state { margin: 0 0 .5rem; font-size: .88rem; }
   .meaning__state code { font-size: .8rem; overflow-wrap: anywhere; }
   .meaning__if, .meaning__never { margin: 0 0 .35rem; font-size: .86rem; }
-  .meaning__never { color: var(--muted, #6b6b76); }
+  .meaning__never { color: var(--ink-3); }
   .meaning__tag {
     display: inline-block;
     font-size: .68rem; text-transform: uppercase; letter-spacing: .05em;
-    color: var(--muted, #6b6b76);
+    color: var(--ink-3);
     margin-right: .4rem;
   }
-  .meaning__tag--warn { color: rgb(170,90,60); }
+  .meaning__tag--warn { color: var(--pri-high-ink); }
 </style>

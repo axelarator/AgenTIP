@@ -84,11 +84,11 @@
            flex-wrap: wrap; gap: 1rem; }
   .fhead__links { display: flex; gap: 1rem; font-size: .85rem; }
   .days { list-style: none; padding: 0; }
-  .days li { padding: .5rem 0; border-bottom: 1px solid var(--border, #d0d0d8);
+  .days li { padding: .5rem 0; border-bottom: 1px solid var(--border);
              display: flex; gap: 1rem; align-items: baseline; }
-  .finding { border: 1px solid var(--border, #d0d0d8); border-radius: 8px;
+  .finding { border: 1px solid var(--border); border-radius: 8px;
              padding: .9rem 1rem; margin-bottom: .8rem; }
-  .finding--saved { border-color: rgba(45,160,90,.5); }
+  .finding--saved { border-color: var(--track-active-ink); }
   .finding__top { display: flex; gap: .5rem; align-items: center;
                   flex-wrap: wrap; margin-bottom: .4rem; }
   .finding h2 { font-size: .98rem; margin: .1rem 0 .4rem; }
@@ -96,8 +96,8 @@
   .finding__inds { display: flex; flex-wrap: wrap; gap: .4rem; }
   .tag { font-size: .7rem; text-transform: uppercase; letter-spacing: .04em;
          padding: .12rem .45rem; border-radius: 4px;
-         background: var(--chip-bg, rgba(127,127,140,.12)); }
-  .tag--saved { background: rgba(45,160,90,.18); }
-  .tag--high { background: rgba(200,80,60,.16); }
-  .muted { color: var(--muted, #6b6b76); font-size: .85rem; }
+         background: var(--surface-2); }
+  .tag--saved { background: var(--track-active-bg); }
+  .tag--high { background: var(--pri-high-bg); }
+  .muted { color: var(--ink-3); font-size: .85rem; }
 </style>

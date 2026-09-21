@@ -38,7 +38,7 @@
     max-width: 100%;
     padding: .12rem .4rem;
     border-radius: 5px;
-    background: var(--chip-bg, rgba(127,127,140,.10));
+    background: var(--surface-2);
   }
   .ichip__link { text-decoration: none; flex: none; opacity: .75; }
   .ichip__link:hover { opacity: 1; }
