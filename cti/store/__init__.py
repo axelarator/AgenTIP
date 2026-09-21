@@ -18,7 +18,9 @@ from .changes import (SPECS, asn_confidence, baseline, confidence, detect,
 from .connection import connect, connect_retry, db_path
 from .observations import upsert_observation
 from .query import (QUERY_MAX_BYTES, QUERY_MAX_ROWS, actor_summary,
-                    observable_history, run_readonly_query, save_correlation,
+                    indicator_index, indicator_profile, observable_history,
+                    selector_detail, run_readonly_query,
+                    save_correlation,
                     tracked_observables)
 from . import selectors
 from .schema import init_schema
@@ -32,7 +34,9 @@ __all__ = [
     "TrackingBusy", "actor_summary", "asn_confidence", "baseline",
     "confidence", "connect", "connect_retry", "db_path", "detect",
     "init_schema", "insert_correlation", "latest_asn_for",
-    "observable_history", "record_active_scan", "record_asn_change",
+    "indicator_index", "indicator_profile", "observable_history",
+    "selector_detail", "record_active_scan",
+    "record_asn_change",
     "selectors",
     "record_attribute_change", "run_readonly_query", "save_correlation",
     "tracked_observables", "upsert_actor", "upsert_observation",

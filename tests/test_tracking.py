@@ -1217,3 +1217,172 @@ def test_the_ip_ladder_is_untouched():
         _obs(con, "203.0.113.7", TODAY, source="honeylabs", hl_events=5,
              hl_last_seen=NOW - timedelta(days=3))
     assert store.observable_history("203.0.113.7")["status"] == "active"
+
+
+# --------------------------------------------------------------------------- #
+# indicator_profile
+# --------------------------------------------------------------------------- #
+
+def test_indicator_profile_folds_current_values_with_provenance():
+    with store.connect() as con:
+        _seed_domain(con, "evil.example", resolved=["203.0.113.9"],
+                     day=TODAY - timedelta(days=2))
+        _obs(con, "evil.example", TODAY - timedelta(days=2),
+             source="observe_tls", indicator_type="domain", tls_sha256="a" * 64)
+        _obs(con, "evil.example", TODAY, source="observe_tls",
+             indicator_type="domain", tls_sha256="b" * 64)
+    current = store.indicator_profile("evil.example")["current"]
+    assert current["tls_sha256"]["value"] == "b" * 64, "newest wins"
+    assert current["tls_sha256"]["source"] == "observe_tls"
+    # An older field is not lost just because a newer row omitted it.
+    assert current["resolved_ip"]["value"] == ["203.0.113.9"]
+
+
+def test_current_is_built_from_the_schema_not_a_hardcoded_list():
+    """The bug this whole change exists to fix, turned into a guard.
+
+    observable_history named nineteen columns by hand, and every payload
+    field added afterwards - the observe pass, InternetDB, mnemonic - was
+    invisible. A list written out in _fold_current would rot the same way,
+    so it iterates the schema's own key sets instead.
+    """
+    import inspect
+
+    from cti.store import query, schema
+    source = inspect.getsource(query._fold_current)
+    assert "OBS_SCALAR_KEYS" in source and "OBS_JSON_KEYS" in source
+    # A key added to the schema must need no edit here.
+    assert "internetdb_ports" in schema.OBS_JSON_KEYS
+    assert "internetdb_ports" not in source
+
+
+def test_indicator_profile_carries_selector_meaning_and_rarity():
+    """The taxonomy's means/never prose is written for a human and has
+    never had anywhere to be shown."""
+    with store.connect() as con:
+        _seed_domain(con, "a.example", resolved=["203.0.113.9"])
+        store.selectors.record(
+            con, indicator_value="a.example", selector_type="tls.cert_sha256",
+            selector_value="c" * 64, observed_at=NOW, indicator_type="domain",
+            actor="APT-X", source="observe")
+        # What the daily corroborate node does. Without it local_count is
+        # None - "not priced", which assess() deliberately distinguishes
+        # from "rare" - so the profile would under-report rather than lie.
+        from cti.store import rarity
+        rarity.refresh(con)
+    sel = store.indicator_profile("a.example")["selectors"][0]
+    assert sel["selector_class"] == "identity"
+    assert sel["means"] and sel["never"], "prose must reach the caller"
+    assert sel["local_count"] == 1
+    assert "can_promote" in sel and "why_not" in sel
+
+
+def test_indicator_profile_reports_links_without_recomputing_them():
+    """expand.candidates_for already applies the corroboration rule and the
+    rarity gates. This function renders its verdict; it must not
+    second-guess it."""
+    with store.connect() as con:
+        for host in ("a.example", "b.example"):
+            _seed_domain(con, host, resolved=["203.0.113.9"])
+            store.selectors.record(
+                con, indicator_value=host, selector_type="tls.cert_sha256",
+                selector_value="c" * 64, observed_at=NOW,
+                indicator_type="domain", actor="APT-X", source="observe")
+    links = store.indicator_profile("a.example")["links"]
+    assert [l["indicator"] for l in links] == ["b.example"]
+    assert links[0]["promoted"] is True
+    assert "identity fact" in links[0]["reason"]
+
+
+def test_indicator_profile_finds_correlations_naming_the_indicator():
+    """correlations.indicators is a JSON array, so this is a containment
+    test rather than a join. Nothing in the repo did this before."""
+    with store.connect() as con:
+        _seed_domain(con, "a.example", resolved=["203.0.113.9"])
+        store.insert_correlation(
+            con, actor="APT-X", correlation_type="shared_fingerprint",
+            indicators=["a.example", "b.example"], confidence="high",
+            narrative="n")
+    found = store.indicator_profile("a.example")["correlations"]
+    assert len(found) == 1 and "a.example" in found[0]["indicators"]
+
+
+def test_indicator_profile_status_matches_the_other_two_readers():
+    with store.connect() as con:
+        _seed_domain(con, "dead.example", resolved=[])
+    assert store.indicator_profile("dead.example")["status"] == "unresolved"
+    assert store.observable_history("dead.example")["status"] == "unresolved"
+
+
+def test_indicator_profile_on_an_unknown_value_is_empty_not_an_error():
+    with store.connect():
+        pass
+    p = store.indicator_profile("nothing.example")
+    assert "error" not in p
+    assert p["observation_count"] == 0 and p["status"] == "never-enriched"
+    assert p["current"] == {} and p["selectors"] == [] and p["links"] == []
+
+
+def test_indicator_index_is_wider_than_the_tracked_scope():
+    """tracked_observables only returns indicators whose actor carries
+    tracked = TRUE. An indicator can hold a hundred observations and a full
+    selector bag while that flag is off, and it must still be findable."""
+    with store.connect() as con:
+        _obs(con, "untracked.example", TODAY, source="observe_dns",
+             indicator_type="domain", actor="Nobody")
+    index = store.indicator_index()
+    assert "untracked.example" in {i["indicator_value"] for i in index["indicators"]}
+    listed = {o["indicator_value"] for o in store.tracked_observables()["observables"]}
+    assert "untracked.example" not in listed
+
+
+def test_indicator_index_counts_observations_sources_and_selectors():
+    with store.connect() as con:
+        _seed_domain(con, "a.example", resolved=["203.0.113.9"])
+        _obs(con, "a.example", TODAY, source="observe_tls",
+             indicator_type="domain", tls_sha256="c" * 64)
+        store.selectors.record(
+            con, indicator_value="a.example", selector_type="tls.cert_sha256",
+            selector_value="c" * 64, observed_at=NOW, indicator_type="domain",
+            actor="APT-X", source="observe")
+    row = next(i for i in store.indicator_index()["indicators"]
+               if i["indicator_value"] == "a.example")
+    assert row["observations"] == 2 and row["sources"] == 2
+    assert row["selectors"] == 1 and row["indicator_type"] == "domain"
+
+
+def test_indicator_index_does_not_compute_a_third_status():
+    """Two ladders already exist and a test pins that they agree. A third,
+    derived from this aggregate, could disagree with both - which is the
+    bug this change set exists to fix."""
+    with store.connect() as con:
+        _seed_domain(con, "a.example", resolved=["203.0.113.9"])
+    assert "status" not in store.indicator_index()["indicators"][0]
+
+
+def test_selector_detail_answers_who_else_has_this():
+    with store.connect() as con:
+        for host in ("a.example", "b.example"):
+            _seed_domain(con, host, resolved=["203.0.113.9"])
+            store.selectors.record(
+                con, indicator_value=host, selector_type="tls.cert_sha256",
+                selector_value="c" * 64, observed_at=NOW,
+                indicator_type="domain", actor="APT-X", source="observe")
+    d = store.selector_detail("tls.cert_sha256", "c" * 64)
+    assert {i["indicator_value"] for i in d["indicators"]} == {"a.example", "b.example"}
+    assert d["selector_class"] == "identity"
+    assert d["means"], "what a shared value proves must reach the page"
+
+
+def test_selector_detail_normalizes_the_value_it_was_given():
+    """A hash written upper-case by one tool and lower by another is one
+    selector; the page must find it either way."""
+    with store.connect() as con:
+        _seed_domain(con, "a.example", resolved=["203.0.113.9"])
+        store.selectors.record(
+            con, indicator_value="a.example", selector_type="tls.cert_sha256",
+            selector_value="c" * 64, observed_at=NOW, indicator_type="domain",
+            actor="APT-X", source="observe")
+    d = store.selector_detail("tls.cert_sha256", ("C" * 64))
+    assert d["selector_value"] == "c" * 64
+    assert len(d["indicators"]) == 1

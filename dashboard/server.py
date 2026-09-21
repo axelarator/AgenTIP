@@ -134,6 +134,46 @@ async def tracking_observable_detail(request):
     return JSONResponse(result)
 
 
+async def indicator_index(request):
+    """Every indicator with observations, for the index page.
+
+    tracked_observables() is scoped to indicators whose actor is tracked;
+    this is deliberately wider, because an indicator can carry a hundred
+    observations and a full selector bag while its actor's `tracked` flag
+    is off, and it should still be reachable.
+    """
+    result = tracking_store.indicator_index()
+    if "error" in result:
+        return JSONResponse(result, status_code=503)
+    return JSONResponse(result)
+
+
+async def indicator_detail(request):
+    result = tracking_store.indicator_profile(request.path_params["value"])
+    if "error" in result:
+        return JSONResponse(result, status_code=503)
+    return JSONResponse(result)
+
+
+async def selector_detail(request):
+    """Who else carries this selector value.
+
+    Type and value arrive as QUERY params, not path segments. Selector
+    values contain '/' (nginx/1.29.3), ':' (certificate serials) and '='
+    with ',' (issuer DNs), and a percent-encoded slash is not reliably
+    distinguishable from a real one server-side.
+    """
+    selector_type = request.query_params.get("type")
+    value = request.query_params.get("value")
+    if not selector_type or not value:
+        return JSONResponse({"error": "type and value are required"},
+                            status_code=400)
+    result = tracking_store.selector_detail(selector_type, value)
+    if "error" in result:
+        return JSONResponse(result, status_code=503)
+    return JSONResponse(result)
+
+
 async def tracking_narratives(request):
     ndir = tracking_digest.narrative_dir()
     if not ndir.is_dir():
@@ -220,6 +260,10 @@ routes = [
     Route("/api/techniques/{technique_id}", technique_detail),
     Route("/api/observables/search", observable_search),
     Route("/api/pending-fingerprints", pending_fingerprints),
+    # Before the catch-all Mount("/") below - Starlette matches in order.
+    Route("/api/indicators", indicator_index),
+    Route("/api/indicators/{value:path}", indicator_detail),
+    Route("/api/selectors", selector_detail),          # ?type=&value=
     Route("/api/tracking/observables", tracking_observables),
     Route("/api/tracking/observables/{ip}", tracking_observable_detail),
     Route("/api/tracking/narratives", tracking_narratives),

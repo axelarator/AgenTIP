@@ -433,6 +433,307 @@ def tracked_observables() -> dict[str, Any]:
     return {"observables": rows, "count": len(rows)}
 
 
+def _fold_current(observations: list[dict[str, Any]]) -> dict[str, Any]:
+    """Latest non-null value per payload field, with where it came from.
+
+    Iterates the schema's own key sets rather than a hardcoded field list.
+    That is the entire point: `observable_history` named nineteen columns by
+    hand and every payload field added since - the whole observe pass,
+    InternetDB, mnemonic - was invisible until someone noticed. A list
+    written out here would rot the same way the next time a key is added.
+    """
+    from .schema import OBS_JSON_KEYS, OBS_SCALAR_KEYS
+
+    keys = OBS_SCALAR_KEYS | OBS_JSON_KEYS
+    current: dict[str, Any] = {}
+    for o in observations:              # ascending, so later rows win
+        payload = o.get("payload") or {}
+        for key in keys:
+            value = payload.get(key)
+            if value in (None, "", [], {}):
+                continue
+            current[key] = {"value": value, "source": o["source"],
+                            "observed_at": o["observed_at"]}
+    return current
+
+
+def _selector_detail(con, indicator: str) -> list[dict[str, Any]]:
+    """This indicator's selectors, each with what it proves and how rare it is.
+
+    The taxonomy already carries `means` and `never` prose per type, written
+    to be read by a human; the profile page is the first thing that can show
+    it. Rarity comes from `rarity.assess`, never recomputed here - every
+    de-noising decision (CDN ranges, mass-provider list, the global-count
+    threshold) stays in the module that owns it.
+    """
+    from . import rarity, selectors as S
+
+    out = []
+    for row in S.for_indicator(con, indicator):
+        selector_type = row["selector_type"]
+        spec = S.TYPES.get(selector_type)
+        verdict = rarity.assess(con, selector_type, row["selector_value"])
+        out.append({
+            **{k: _cell(v) for k, v in row.items()},
+            "selector_class": S.selector_class(selector_type),
+            "artefact": S.artefact(selector_type),
+            "means": spec.means if spec else None,
+            "never": spec.never if spec else None,
+            "local_count": verdict["local_count"],
+            "global_count": verdict["global_count"],
+            "can_promote": verdict["can_promote"],
+            "why_not": verdict["why_not"],
+        })
+    return out
+
+
+def indicator_index() -> dict[str, Any]:
+    """One row per indicator that has ever been observed.
+
+    Wider than `tracked_observables`, which is scoped to indicators whose
+    actor carries `tracked = TRUE`. An indicator can hold a hundred
+    observations and a full selector bag while that flag is off, and it
+    should still be findable.
+    """
+    try:
+        with connect_retry(read_only=True) as con:
+            found = _rows(con, """
+                WITH obs AS (
+                    SELECT indicator_value,
+                           max(indicator_type) AS indicator_type,
+                           min(observed_at)    AS first_seen,
+                           max(observed_at)    AS last_seen,
+                           count(*)            AS observations,
+                           count(DISTINCT source) AS sources
+                    FROM observations_wide GROUP BY indicator_value
+                ),
+                sel AS (
+                    SELECT indicator_value, count(*) AS selectors
+                    FROM selectors GROUP BY indicator_value
+                ),
+                act AS (
+                    SELECT indicator_value, actor FROM (
+                        SELECT indicator_value, actor,
+                               row_number() OVER (PARTITION BY indicator_value
+                                                  ORDER BY observed_at DESC) AS rn
+                        FROM observations_wide WHERE actor IS NOT NULL
+                    ) WHERE rn = 1
+                )
+                SELECT o.indicator_value, o.indicator_type, a.actor,
+                       o.first_seen, o.last_seen, o.observations, o.sources,
+                       coalesce(s.selectors, 0) AS selectors
+                FROM obs o
+                LEFT JOIN sel s ON s.indicator_value = o.indicator_value
+                LEFT JOIN act a ON a.indicator_value = o.indicator_value
+                ORDER BY o.last_seen DESC, o.indicator_value""")
+    except TrackingBusy:
+        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
+    except duckdb.IOException as e:
+        return {"error": f"tracking DB unavailable: {e}"}
+
+    # Status is not computed here. It needs the per-indicator evidence
+    # tracked_observables and indicator_profile gather, and recomputing it
+    # from this aggregate would be a third ladder that could disagree with
+    # the other two - which is the bug this whole change set exists to fix.
+    for row in found:
+        for k in ("first_seen", "last_seen"):
+            row[k] = _cell(row[k])
+    return {"indicators": found, "count": len(found)}
+
+
+def selector_detail(selector_type: str, selector_value: Any) -> dict[str, Any]:
+    """Who else carries this selector value, and what that is worth.
+
+    The page a hash chip links to. Every verdict comes from the module that
+    owns it - `rarity.assess` for the gates, `selectors.TYPES` for what the
+    type means - so this never re-decides anything.
+    """
+    from . import rarity, selectors as S
+
+    spec = S.TYPES.get(selector_type)
+    try:
+        with connect_retry(read_only=True) as con:
+            verdict = rarity.assess(con, selector_type, selector_value)
+            carriers = S.sharing(con, selector_type, selector_value)
+            apexes = rarity.apexes_for(con, selector_type, selector_value)
+    except TrackingBusy:
+        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
+    except duckdb.IOException as e:
+        return {"error": f"tracking DB unavailable: {e}"}
+
+    return {
+        "selector_type": selector_type,
+        "selector_value": S.normalize(selector_type, selector_value),
+        "selector_class": S.selector_class(selector_type),
+        "artefact": S.artefact(selector_type),
+        "means": spec.means if spec else None,
+        "never": spec.never if spec else None,
+        "local_count": verdict["local_count"],
+        "global_count": verdict["global_count"],
+        "global_source": verdict.get("global_source"),
+        "can_promote": verdict["can_promote"],
+        "why_not": verdict["why_not"],
+        "apex_spread": apexes,
+        "indicators": [{k: _cell(v) for k, v in c.items()} for c in carriers],
+    }
+
+
+def indicator_profile(value: str) -> dict[str, Any]:
+    """Everything known about one indicator, domain or IP.
+
+    A new function rather than a wider `observable_history` because that one
+    has a pinned return shape and a live caller, while this answers a
+    different question: not "what did we see, when" but "what is this, what
+    does it share, and what does that prove".
+
+    Nothing here recomputes a judgement. The links come from
+    `expand.candidates_for`, which already applies the corroboration rule and
+    the rarity gates; this function renders its verdict, it does not
+    second-guess it.
+    """
+    from . import expand
+
+    try:
+        with connect_retry(read_only=True) as con:
+            observations = _rows(con,
+                """SELECT observed_at, source, actor, indicator_type, payload
+                   FROM observations_wide WHERE indicator_value = ?
+                   ORDER BY observed_at ASC""", [value])
+            changes = _rows(con,
+                """SELECT detected_at, attribute, change_type, old_value,
+                          new_value, confidence, actor
+                   FROM attribute_changes WHERE indicator_value = ?
+                   ORDER BY detected_at DESC""", [value])
+            asn_changes = _rows(con,
+                """SELECT detected_at, old_asn, old_netname, new_asn,
+                          new_netname, change_type, confidence
+                   FROM asn_changes WHERE indicator_value = ?
+                   ORDER BY detected_at ASC""", [value])
+            zeek_matches = _rows(con,
+                """SELECT day, direction, hit_count, ports, first_ts, last_ts
+                   FROM zeek_matches WHERE indicator_value = ?
+                   ORDER BY day ASC""", [value])
+            opendirs = _rows(con,
+                """SELECT url, path, is_dir, size, mtime, first_seen, last_seen
+                   FROM opendir_files WHERE indicator_value = ?
+                   ORDER BY last_seen DESC, path""", [value])
+            scans = _rows(con,
+                """SELECT ran_at, tools, summary FROM active_scans
+                   WHERE indicator_value = ? ORDER BY ran_at DESC""", [value])
+            # indicators is a JSON array, so this is a containment test
+            # rather than a join. Verified against the live table.
+            correlations = _rows(con,
+                """SELECT id, created_at, actor, correlation_type, indicators,
+                          confidence, narrative
+                   FROM correlations
+                   WHERE list_contains(CAST(indicators AS VARCHAR[]), ?)
+                   ORDER BY created_at DESC""", [value])
+            changed = con.execute(
+                """SELECT max(detected_at) FROM attribute_changes
+                   WHERE indicator_value = ?
+                     AND attribute IN ('resolved_ip', 'cert', 'cert_hash')
+                     AND change_type <> 'first_seen'""", [value]).fetchone()
+            domain_change_at = changed[0] if changed else None
+
+            selectors_here = _selector_detail(con, value)
+            links = [c.to_dict() for c in expand.candidates_for(con, value)]
+    except TrackingBusy:
+        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
+    except duckdb.IOException as e:
+        return {"error": f"tracking DB unavailable: {e}"}
+
+    for o in observations:
+        o["payload"] = json.loads(o["payload"]) if o["payload"] is not None else {}
+
+    indicator_type = next((o["indicator_type"] for o in reversed(observations)
+                           if o.get("indicator_type")), None)
+
+    now = datetime.now()
+    latest_hl = next((o for o in reversed(observations)
+                      if o["source"] == "honeylabs"), None)
+    latest_change = next((c for c in asn_changes[::-1]
+                          if c["change_type"] != "first_seen"), None)
+    latest_zeek = zeek_matches[-1] if zeek_matches else None
+    latest_resolve = next(
+        (o for o in reversed(observations)
+         if o["source"] in ("dns_resolve", "observe_dns")
+         and (o.get("payload") or {}).get("resolved_ip") is not None), None)
+    status = indicator_status(now, indicator_type, {
+        "hl_observed_at": latest_hl["observed_at"] if latest_hl else None,
+        "hl_events": (latest_hl["payload"].get("hl_events") if latest_hl else None),
+        "hl_last_seen": _parse_ts((latest_hl["payload"].get("hl_last_seen")
+                                   if latest_hl else None)),
+        "asn_change_at": latest_change["detected_at"] if latest_change else None,
+        "zeek_day": latest_zeek["day"] if latest_zeek else None,
+        "zeek_last_ts": latest_zeek["last_ts"] if latest_zeek else None,
+        "last_observed_at": observations[-1]["observed_at"] if observations else None,
+        "resolve_observed_at": latest_resolve["observed_at"] if latest_resolve else None,
+        "resolved_ip": ((latest_resolve.get("payload") or {}).get("resolved_ip")
+                        if latest_resolve else None),
+        "domain_change_at": domain_change_at,
+    })
+
+    current = _fold_current([{**o, "observed_at": _cell(o["observed_at"])}
+                             for o in observations])
+    for o in observations:
+        o["observed_at"] = _cell(o["observed_at"])
+    for c in changes:
+        c["detected_at"] = _cell(c["detected_at"])
+        for k in ("old_value", "new_value"):
+            c[k] = json.loads(c[k]) if c[k] is not None else None
+    for c in asn_changes:
+        c["detected_at"] = _cell(c["detected_at"])
+    for z in zeek_matches:
+        for k in ("day", "first_ts", "last_ts"):
+            z[k] = _cell(z[k])
+        z["ports"] = json.loads(z["ports"]) if z["ports"] is not None else []
+    for d in opendirs:
+        for k in ("first_seen", "last_seen", "mtime"):
+            d[k] = _cell(d[k])
+    for s in scans:
+        s["ran_at"] = _cell(s["ran_at"])
+        for k in ("tools", "summary"):
+            s[k] = json.loads(s[k]) if s[k] is not None else None
+    for c in correlations:
+        c["created_at"] = _cell(c["created_at"])
+        c["indicators"] = json.loads(c["indicators"]) if c["indicators"] else []
+
+    actors = sorted({o["actor"] for o in observations if o.get("actor")})
+    return {
+        "indicator": value,
+        "indicator_type": indicator_type,
+        "status": status,
+        "actors": actors,
+        "first_seen": observations[0]["observed_at"] if observations else None,
+        "last_seen": observations[-1]["observed_at"] if observations else None,
+        "observation_count": len(observations),
+        "sources": sorted({o["source"] for o in observations if o.get("source")}),
+        "current": current,
+        "observations": observations,
+        "changes": changes,
+        "asn_changes": asn_changes,
+        "zeek_matches": zeek_matches,
+        "opendir_files": opendirs,
+        "active_scans": scans,
+        "correlations": correlations,
+        "selectors": selectors_here,
+        "links": links,
+    }
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    """payload timestamps come back as ISO strings; the status ladder diffs
+    them against datetime.now()."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return None
+    return None
+
+
 def observable_history(ip: str) -> dict[str, Any]:
     """Full time series for one indicator - every observation, ASN
     change, and Zeek match on record, oldest first. No row cap (unlike
