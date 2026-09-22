@@ -16,7 +16,7 @@ import pytest
 REPO = pathlib.Path(__file__).resolve().parents[1]
 UI = REPO / "dashboard" / "ui"
 SRC = UI / "src"
-BUILD = REPO / "dashboard" / "static-next"
+BUILD = REPO / "dashboard" / "static"
 
 
 def _sources():
@@ -58,7 +58,7 @@ def test_the_build_output_is_committed():
     A missing build means the portal 404s after a deploy."""
     assert (BUILD / "index.html").is_file()
     assets = list((BUILD / "assets").glob("*.js"))
-    assert assets, "no bundle in dashboard/static-next/assets"
+    assert assets, "no bundle in dashboard/static/assets"
 
 
 def test_the_build_is_not_older_than_its_sources():
@@ -68,17 +68,34 @@ def test_the_build_is_not_older_than_its_sources():
     newest_build = max(p.stat().st_mtime
                        for p in BUILD.rglob("*") if p.is_file())
     assert newest_build >= newest_source, (
-        "dashboard/static-next is older than dashboard/ui/src - "
+        "dashboard/static is older than dashboard/ui/src - "
         "run `npm run build` in dashboard/ui")
 
 
-def test_vite_does_not_build_over_the_live_dashboard():
-    """emptyOutDir deletes what it finds. Pointed at ../static that is the
-    working dashboard, and one stray build during the rewrite would take
-    it out."""
+def test_the_build_lands_where_the_server_serves_it():
+    """The bundle is committed and served straight from dashboard/static -
+    the VM has no node. A build that went anywhere else would leave the
+    live dashboard stale with nothing failing."""
     config = (UI / "vite.config.js").read_text()
-    assert '"../static-next"' in config or "'../static-next'" in config
-    assert '"../static"' not in config and "'../static'" not in config
+    assert '"../static"' in config
+    assert 'base: "/"' in config, "assets must resolve from the site root"
+    server = (REPO / "dashboard" / "server.py").read_text()
+    assert 'Path(__file__).parent / "static"' in server
+
+
+def test_no_staging_mount_or_old_ui_remains():
+    """The rewrite was served at /next until cutover. Left in place it would
+    serve a second, stale copy of the app forever."""
+    server = (REPO / "dashboard" / "server.py").read_text()
+    assert "/next" not in server and "static-next" not in server
+    assert not (REPO / "dashboard" / "static-next").exists()
+    for old in ("app.js", "styles.css"):
+        assert not (BUILD / old).exists(), f"the previous UI's {old} is still here"
+
+
+def test_the_built_page_references_assets_from_the_site_root():
+    html = (BUILD / "index.html").read_text()
+    assert 'src="/assets/' in html and "/next/" not in html
 
 
 def test_the_toolchain_is_pinned_and_clean():

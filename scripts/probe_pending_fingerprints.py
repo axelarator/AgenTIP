@@ -393,7 +393,7 @@ def _dispatch_one(job: dict[str, object]) -> dict[str, object]:
     # Precise UTC timestamp for the point in time this probe actually
     # fired - used downstream (main()) to anchor the JARM observable's
     # Arkime deep link to a tight window around the real probe, instead
-    # of a whole-day guess (see dashboard/static/app.js's arkimeSessionUrl).
+    # of a whole-day guess (see dashboard/ui/src/lib/sources.js's arkimeSessionUrl).
     probe_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         probe_result = probe_win(target, port)
