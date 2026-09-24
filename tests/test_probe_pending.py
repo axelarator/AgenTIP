@@ -110,3 +110,31 @@ def test_an_empty_queue_is_a_quiet_no_op(script, monkeypatch):
     monkeypatch.setattr(vm_proxy, "probe_jarm", lambda *a: called.append(a))
     script.main()
     assert called == []
+
+
+def test_conn_rows_without_a_syn_ack_give_no_ja4l_or_ja4ts(monkeypatch):
+    """A refused or filtered port logs as conn_state S0, history "S". Zeek
+    still computes a ja4l for it, against a SYN-ACK that never came - real
+    values looked like 895110009021362_64 - and those got filed as
+    fingerprints for every unreachable target."""
+    rows = [
+        {"dst_ip": "198.51.100.1", "dst_port": 443, "ts": 10.0, "log_file": "conn.log",
+         "conn_state": "S0", "history": "S", "ja4l": "895110009021362_64", "ja4ts": ""},
+        {"dst_ip": "198.51.100.2", "dst_port": 443, "ts": 10.0, "log_file": "conn.log",
+         "conn_state": "S0", "history": "S", "ja4l": "895110009021362_64", "ja4ts": ""},
+        {"dst_ip": "198.51.100.2", "dst_port": 443, "ts": 11.0, "log_file": "conn.log",
+         "conn_state": "SF", "history": "ShAFf", "ja4l": "58_64",
+         "ja4ts": "64308_2-4-8-1-3_1360_8"},
+    ]
+    # Loaded directly: the `script` fixture stubs out the function under test.
+    spec = importlib.util.spec_from_file_location("probe_pending_fingerprints", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod._client, "sources", lambda query, size: list(rows))
+    out = mod.collect_zeek_fingerprints_batch(
+        [("198.51.100.1", 443), ("198.51.100.2", 443)], baseline_ts=0,
+        attempts=1, interval=0)
+    assert out[("198.51.100.1", 443)]["ja4l"] is None
+    assert out[("198.51.100.1", 443)]["ja4ts"] is None
+    assert out[("198.51.100.2", 443)]["ja4l"] == "58_64"
+    assert out[("198.51.100.2", 443)]["ja4ts"] == "64308_2-4-8-1-3_1360_8"

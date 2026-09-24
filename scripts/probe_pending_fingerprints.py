@@ -309,7 +309,8 @@ def collect_zeek_fingerprints_batch(resolved: list[tuple[str, int]], baseline_ts
     which ClientHello followed, and ja4l is a per-connection latency
     measurement where some variance across attempts is just real network
     jitter, not a JARM-probe artifact to filter out - so those two keep
-    "first non-empty value seen" as before."""
+    "first non-empty value seen", but only from conn.log rows where the
+    server answered the SYN (see the history check below)."""
     ports_by_ip: dict[str, set[int]] = {}
     for ip, port in resolved:
         ports_by_ip.setdefault(ip, set()).add(port)
@@ -358,6 +359,18 @@ def collect_zeek_fingerprints_batch(resolved: list[tuple[str, int]], baseline_ts
                     entry["ja4s"] = hit["ja4s"]
                     entry["ts"] = entry["ts"] or hit.get("ts")
             elif log_file.endswith("conn.log"):
+                # A row whose history has no "h" never got a SYN-ACK back
+                # (refused, filtered, or dead - conn_state S0). Zeek's ja4
+                # plugin still emits a ja4l for it, measured against a
+                # timestamp that never arrived: values like
+                # 895110009021362_64, a "latency" of about 28 years. Those
+                # were filed as fingerprints for every unreachable target,
+                # and since they cluster by probe time rather than by host,
+                # one of them linked Chaos msaRAT to DragonForce. Neither
+                # field means anything without the server's half of the
+                # handshake, so both come only from rows that have it.
+                if "h" not in (hit.get("history") or ""):
+                    continue
                 if hit.get("ja4ts") and not entry["ja4ts"]:
                     entry["ja4ts"] = hit["ja4ts"]
                     entry["ts"] = entry["ts"] or hit.get("ts")
