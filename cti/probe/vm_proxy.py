@@ -72,7 +72,7 @@ import time
 
 # --- probe VM connection (from the environment - see module docstring) ------
 PROBE_USER = os.environ.get("CTI_PROBE_USER", "detonate")
-PROBE_HOST = os.environ.get("CTI_PROBE_HOST", "10.20.30.16")
+PROBE_HOST = os.environ.get("CTI_PROBE_HOST", "10.20.30.74")
 PROBE_SSH_KEY = os.path.expanduser(
     os.environ.get("CTI_PROBE_SSH_KEY", "~/.ssh/id_ed25519_probe"))
 PROBE_KNOWN_HOSTS = os.path.expanduser(

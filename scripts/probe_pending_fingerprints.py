@@ -6,7 +6,7 @@ One remote hop and one HTTPS query per target, not two SSH hops - and,
 as of this change, every target in a queued batch is dispatched
 concurrently rather than one at a time (see below):
 
-  1. probe_helper.py on the lab probe VM (10.20.30.16) - generates
+  1. probe_helper.py on the lab probe VM (10.20.30.74) - generates
      a JARM scan and one ordinary TLS handshake against the target.
   2. An OpenSearch query against the Arkime VM (10.20.0.18:9200) -
      reads back whatever that handshake produced in ssl.log/conn.log,
