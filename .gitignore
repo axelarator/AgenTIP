@@ -44,3 +44,7 @@ data/runs/
 # dependency tree that produces it is not.
 dashboard/ui/node_modules/
 dashboard/ui/.vite/
+
+# Stale nested copy left by the 2026-09-19 migration - holds the same
+# sensitive cluster/tracking data as above, just one level deeper.
+data/data/
