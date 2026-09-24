@@ -396,7 +396,7 @@ def _dispatch_one(job: dict[str, object]) -> dict[str, object]:
     # of a whole-day guess (see dashboard/ui/src/lib/sources.js's arkimeSessionUrl).
     probe_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
-        probe_result = probe_win(target, port)
+        probe_result = vm_proxy.probe_win(target, port)
     except ProbeError as e:
         return {"cluster": cluster, "target": target, "port": port, "probe_time": probe_time,
                 "probe_result": None, "probe_error": str(e)}
@@ -505,6 +505,27 @@ def main() -> None:
         futures = [pool.submit(_dispatch_one, job) for job in jobs]
         for future in concurrent.futures.as_completed(futures):
             dispatched.append(future.result())
+
+    # A batch where EVERY probe failed is a broken script or a dead vantage
+    # point, not a queue full of dead hosts. The queue was popped before any
+    # probing began, so carrying on would silently discard it - which is what
+    # happened on 2026-09-22, when a stale bare `probe_win` call failed all
+    # 112 targets in under a second, exited 0, and left the queue empty.
+    # Put everything back and fail loudly instead. A PARTIAL failure is left
+    # alone: some targets genuinely are dead, and requeueing those forever
+    # would make the queue a treadmill.
+    if dispatched and all(d["probe_error"] for d in dispatched):
+        first = sorted({str(d["probe_error"]) for d in dispatched})[0]
+        restored = 0
+        for entry in queue:
+            try:
+                core.requeue_fingerprint(entry["cluster"], entry["category"], entry["value"])
+                restored += 1
+            except Exception as e:  # noqa: BLE001 - keep restoring the rest
+                print(f"could not requeue {entry['value']!r}: {e}", file=sys.stderr)
+        raise SystemExit(
+            f"aborting: every one of {len(dispatched)} probes failed ({first}); "
+            f"{restored}/{len(queue)} entries put back on the queue")
 
     resolved_by_ip_port: dict[tuple[str, int], list[dict[str, object]]] = {}
     for d in dispatched:
