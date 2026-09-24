@@ -229,7 +229,7 @@ def _lookup_ports(cluster: str, target: str) -> list[int]:
 
 # The probe_win() wrapper that used to sit here existed solely to
 # convert VMProxyError into ProbeError - and _dispatch_one catches both
-# anyway. Callers use vm_proxy.probe_win directly.
+# anyway. Callers use vm_proxy.probe_jarm directly.
 
 # The keep-alive connection, the retry-once-on-stale logic and the
 # newest-indexed-ts query that used to be reimplemented here are now
@@ -396,7 +396,7 @@ def _dispatch_one(job: dict[str, object]) -> dict[str, object]:
     # of a whole-day guess (see dashboard/ui/src/lib/sources.js's arkimeSessionUrl).
     probe_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
-        probe_result = vm_proxy.probe_win(target, port)
+        probe_result = vm_proxy.probe_jarm(target, port)
     except ProbeError as e:
         return {"cluster": cluster, "target": target, "port": port, "probe_time": probe_time,
                 "probe_result": None, "probe_error": str(e)}

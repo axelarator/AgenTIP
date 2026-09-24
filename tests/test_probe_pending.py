@@ -44,7 +44,7 @@ def test_a_probe_goes_through_vm_proxy(script, monkeypatch):
     call; the swallowed exception turned it into "probe failed" for every
     target."""
     calls = []
-    monkeypatch.setattr(vm_proxy, "probe_win",
+    monkeypatch.setattr(vm_proxy, "probe_jarm",
                         lambda target, port: calls.append((target, port)) or
                         {"jarm": "j" * 62, "resolved_ip": "203.0.113.9"})
     out = script._dispatch_one({"cluster": "C", "target": "x.example", "port": 443})
@@ -53,13 +53,13 @@ def test_a_probe_goes_through_vm_proxy(script, monkeypatch):
     assert out["probe_result"]["jarm"] == "j" * 62
 
 
-def test_no_bare_probe_win_call_remains_in_the_script():
+def test_no_bare_probe_call_remains_in_the_script():
     """The specific shape of the original bug, checked by text because it
-    only fails at call time."""
+    only fails at call time. Covers the current name as well as the old one."""
     import re
     src = SCRIPT.read_text()
     bare = [l for l in src.splitlines()
-            if re.search(r"(?<![\w.])probe_win\(", l) and not l.lstrip().startswith("#")]
+            if re.search(r"(?<![\w.])probe_(?:win|jarm)\(", l) and not l.lstrip().startswith("#")]
     assert bare == []
 
 
@@ -75,7 +75,7 @@ def test_a_batch_where_every_probe_fails_puts_the_queue_back(script, monkeypatch
     def boom(target, port):
         raise RuntimeError("the helper is broken")
 
-    monkeypatch.setattr(vm_proxy, "probe_win", boom)
+    monkeypatch.setattr(vm_proxy, "probe_jarm", boom)
     with pytest.raises(SystemExit) as exc:
         script.main()
     assert "every one of 4 probes failed" in str(exc.value)
@@ -98,7 +98,7 @@ def test_a_partial_failure_is_left_alone(script, monkeypatch):
             raise RuntimeError("connection refused")
         return {"jarm": "j" * 62, "resolved_ip": None}
 
-    monkeypatch.setattr(vm_proxy, "probe_win", flaky)
+    monkeypatch.setattr(vm_proxy, "probe_jarm", flaky)
     script.main()                                     # must not exit
     assert requeued == []
     assert len(filed) == 3, "the three that worked were filed"
@@ -107,6 +107,6 @@ def test_a_partial_failure_is_left_alone(script, monkeypatch):
 def test_an_empty_queue_is_a_quiet_no_op(script, monkeypatch):
     monkeypatch.setattr(core, "pop_pending_fingerprints", lambda: [])
     called = []
-    monkeypatch.setattr(vm_proxy, "probe_win", lambda *a: called.append(a))
+    monkeypatch.setattr(vm_proxy, "probe_jarm", lambda *a: called.append(a))
     script.main()
     assert called == []

@@ -213,9 +213,6 @@ def probe_jarm(target: str, port: int) -> dict[str, object]:
     return _ssh_json_rpc({"action": "jarm_probe", "target": target, "port": port})
 
 
-# Back-compat alias: probe_pending_fingerprints.py calls vm_proxy.probe_win.
-probe_win = probe_jarm
-
 
 def http_fetch(url: str, headers: dict[str, str] | None = None, method: str = "GET",
                 data: str | None = None, insecure: bool = False) -> dict[str, object]:
