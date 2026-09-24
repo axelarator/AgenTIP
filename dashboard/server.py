@@ -253,6 +253,10 @@ async def run_detail(request):
             output = record.get("output") or {}
             node = record["node"]
             entry = {"stage": stage, "node": node, "elapsed_s": record["elapsed_s"]}
+            # Traces written before 2026-09-24 have no start offset, and
+            # their elapsed_s is the gap since the previous node finished.
+            if "started_s" in record:
+                entry["started_s"] = record["started_s"]
             if node.split(":")[-1] == "rank":
                 items = output.get("items") or []
                 entry["items_seen"] = len(items)

@@ -11,6 +11,7 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -1181,73 +1182,142 @@ def _threatfox_enrichment(value: str) -> dict[str, Any] | None:
     return _cached_pivot("threatfox", value, lambda: pivot.threatfox_lookup(value, api_key))
 
 
-def _domain_lifecycle(value: str, ports: list[int] | None = None
+def _run_sources(calls: dict[str, Any], timings: dict[str, float] | None
+                 ) -> dict[str, Any]:
+    """Run one indicator's source lookups at once and time each.
+
+    They used to run one after another, so an indicator cost the SUM of its
+    lookups - a single IP on sliver-c2 took over three minutes. None depends
+    on another except through what a call itself waits on, so they run
+    concurrently and an indicator costs roughly its slowest lookup.
+
+    Each provider still sees at most one request per indicator in flight,
+    the same as the serial version: this widens the indicator, not the pool
+    of indicators. Probe-VM calls still queue on vm_proxy's slot limit.
+
+    Waits for every call before raising, then raises the first failure in
+    `calls` order - the same one the serial version would have hit first -
+    so the sweep's per-indicator catch-all sees what it always saw.
+    """
+    def timed(name: str, fn):
+        t0 = time.monotonic()
+        try:
+            return fn()
+        finally:
+            if timings is not None:
+                timings[name] = round(time.monotonic() - t0, 2)
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(calls), thread_name_prefix="cti-source") as ex:
+        futures = {name: ex.submit(timed, name, fn) for name, fn in calls.items()}
+        concurrent.futures.wait(futures.values())
+    return {name: fut.result() for name, fut in futures.items()}
+
+
+def _domain_lifecycle(value: str, ports: list[int] | None = None,
+                      timings: dict[str, float] | None = None
                       ) -> tuple[str, dict[str, Any], dict[str, Any]]:
-    rdap = _cached_pivot("rdap", value, lambda: pivot.rdap_lookup(value, "domain"))
-    resolved = pivot.resolve_host(value)  # live, not cached — liveness is the point
-    status = pivot.classify_domain_lifecycle(rdap, resolved)
-    detail = {"resolved": resolved,
-             "nameservers": rdap.get("nameservers") if isinstance(rdap, dict) else None}
+    """`timings`, if given, is filled with seconds per source lookup."""
     # Live current-cert grab (replaces Cert Spotter's CT history), a live
     # HTTP probe, the domain's latest Webamon scan (ASN/tech/kit
     # fingerprints), its infostealer hits, and passive subdomain discovery
     # (subfinder + Wayback, flag-only). All day-over-day attribute diffs -
     # see _log_cluster_enrichment_history.
-    # One CLI pass on the probe VM. It supersedes the separate tls_grab and
-    # http_probe calls for everything they returned AND carries the fields
-    # those two never surfaced - body and favicon digests, the certificate
-    # serial and SPKI hash, the nameserver set, the registrar. Those are what
-    # the selector index is built from. The certificate for the `tls` key is
-    # read off this result; the openssl grab that used to produce it is gone.
-    observed = _observe(value, "domain", ports)
-    enrichment: dict[str, Any] = {
-        "observe": observed,
-        "tls": _tls_from_observe(observed),
-        "http": _live_http(value),
-        "webamon": _webamon_domain(value),
-        "webamon_infostealers": _webamon_infostealers(value),
-        "subdomains": _subdomains_for(value),
+    # `observe` is one CLI pass on the probe VM. It supersedes the separate
+    # tls_grab and http_probe calls for everything they returned AND carries
+    # the fields those two never surfaced - body and favicon digests, the
+    # certificate serial and SPKI hash, the nameserver set, the registrar.
+    # Those are what the selector index is built from. The certificate for
+    # the `tls` key is read off this result; the openssl grab that used to
+    # produce it is gone.
+    got = _run_sources({
+        "rdap": lambda: _cached_pivot("rdap", value,
+                                      lambda: pivot.rdap_lookup(value, "domain")),
+        "resolve": lambda: pivot.resolve_host(value),  # live, not cached — liveness is the point
+        "observe": lambda: _observe(value, "domain", ports),
+        "http": lambda: _live_http(value),
+        "webamon": lambda: _webamon_domain(value),
+        "webamon_infostealers": lambda: _webamon_infostealers(value),
+        "subdomains": lambda: _subdomains_for(value),
         # Where this name pointed before it pointed where it does now.
-        "pdns": _pdns(value),
+        "pdns": lambda: _pdns(value),
+        "threatfox": lambda: _threatfox_enrichment(value),
+    }, timings)
+    rdap, resolved = got["rdap"], got["resolve"]
+    status = pivot.classify_domain_lifecycle(rdap, resolved)
+    detail = {"resolved": resolved,
+             "nameservers": rdap.get("nameservers") if isinstance(rdap, dict) else None}
+    enrichment: dict[str, Any] = {
+        "observe": got["observe"],
+        "tls": _tls_from_observe(got["observe"]),
+        **{k: got[k] for k in ("http", "webamon", "webamon_infostealers",
+                               "subdomains", "pdns")},
     }
-    threatfox = _threatfox_enrichment(value)
-    if threatfox is not None:
-        enrichment["threatfox"] = threatfox
+    if got["threatfox"] is not None:
+        enrichment["threatfox"] = got["threatfox"]
     return status, detail, enrichment
 
 
-def _ip_lifecycle(value: str, ports: list[int] | None = None
+def _ip_lifecycle(value: str, ports: list[int] | None = None,
+                  timings: dict[str, float] | None = None
                   ) -> tuple[str, dict[str, Any], dict[str, Any]]:
-    ripe = _cached_pivot("ripestat", value, lambda: pivot.ripestat_lookup(value))
-    status = pivot.classify_ip_lifecycle(ripe)
-    detail = {"asn": ripe.get("asn") if isinstance(ripe, dict) else None,
-             "prefix": ripe.get("prefix") if isinstance(ripe, dict) else None,
-             "as_holder": ripe.get("as_holder") if isinstance(ripe, dict) else None}
-    enrichment: dict[str, Any] = {
-        "observe": _observe(value, "ip", ports),
+    """`timings`, if given, is filled with seconds per source lookup."""
+    ripe_done = concurrent.futures.Future()
+
+    def ripestat():
+        try:
+            ripe = _cached_pivot("ripestat", value, lambda: pivot.ripestat_lookup(value))
+        except BaseException as e:
+            ripe_done.set_exception(e)
+            raise
+        ripe_done.set_result(ripe)
+        return ripe
+
+    def pdns():
+        # The one dependency: the shared-hosting gate needs the ASN. A
+        # failed RIPEstat lookup fails the indicator either way, so pdns
+        # just skips the gate rather than raising a second time.
+        try:
+            ripe = ripe_done.result()
+        except Exception:
+            ripe = None
+        asn = ripe.get("asn") if isinstance(ripe, dict) else None
+        return _pdns(value, asn=asn)
+
+    got = _run_sources({
+        "ripestat": ripestat,
+        "observe": lambda: _observe(value, "ip", ports),
         # Domains Webamon has scanned resolving to this IP - the reverse-IP
         # / hosted-domain signal (replaces Shodan hostnames + Hackertarget).
         # Open ports are no longer discovered automatically here: that's
         # nmap, run on demand via active_scan (see the port-change signal).
-        "webamon_ip": _webamon_ip(value),
+        "webamon_ip": lambda: _webamon_ip(value),
         # Reverse-DNS PTR record - a day-over-day attribute diff like ASN
         # (see the "ptr" spec in cti/store/changes.py).
-        "ptr": _cached_pivot("ptr", value, lambda: pivot.ptr_lookup(value)),
+        "ptr": lambda: _cached_pivot("ptr", value, lambda: pivot.ptr_lookup(value)),
         # Ports, CPEs and vulns somebody else already scanned for. Stale by
         # nature, so recorded as passive throughout and never merged with
         # nmap's - see sources/passive.py.
-        "internetdb": _internetdb(value),
+        "internetdb": lambda: _internetdb(value),
         # What has lived here before. dnsx answers the present tense only.
-        "pdns": _pdns(value, asn=detail.get("asn")),
-    }
-    threatfox = _threatfox_enrichment(value)
-    if threatfox is not None:
-        enrichment["threatfox"] = threatfox
+        "pdns": pdns,
+        "threatfox": lambda: _threatfox_enrichment(value),
+    }, timings)
+    ripe = got["ripestat"]
+    status = pivot.classify_ip_lifecycle(ripe)
+    detail = {"asn": ripe.get("asn") if isinstance(ripe, dict) else None,
+             "prefix": ripe.get("prefix") if isinstance(ripe, dict) else None,
+             "as_holder": ripe.get("as_holder") if isinstance(ripe, dict) else None}
+    enrichment: dict[str, Any] = {k: got[k] for k in ("observe", "webamon_ip", "ptr",
+                                                        "internetdb", "pdns")}
+    if got["threatfox"] is not None:
+        enrichment["threatfox"] = got["threatfox"]
     return status, detail, enrichment
 
 
 def _sweep_lifecycle(domains: list[str], ips: list[str],
-                      known_ports: dict[str, list[int]] | None = None
+                      known_ports: dict[str, list[int]] | None = None,
+                      timings: dict[tuple[str, str], dict[str, float]] | None = None
                       ) -> dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]:
     """Concurrent, lock-free lifecycle+enrichment sweep for a batch of
     domains/ips - the network phase shared by pivot_cluster (rechecking
@@ -1259,7 +1329,12 @@ def _sweep_lifecycle(domains: list[str], ips: list[str],
     duration - see pivot_cluster's docstring for why its own network
     phase already runs unlocked. A single lookup blowing up is recorded
     as an ("unknown", {"error": ...}, {}) tuple rather than sinking the
-    whole batch."""
+    whole batch.
+
+    `timings`, if given, is filled with {(cat, value): {source: seconds}}.
+    It is kept out of the returned tuples on purpose: `detail` is written
+    onto the observable, and a cluster file should not change every day
+    because a lookup was slower."""
     # Ports already known open on a host, so the observe pass looks where
     # the services actually are rather than assuming 80/443.
     known_ports = known_ports or {}
@@ -1268,8 +1343,12 @@ def _sweep_lifecycle(domains: list[str], ips: list[str],
     results: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]] = {}
     if jobs:
         with concurrent.futures.ThreadPoolExecutor(max_workers=_PIVOT_CLUSTER_WORKERS) as ex:
-            futures = {ex.submit(fn, v, known_ports.get(v)): (cat, v)
-                       for cat, v, fn in jobs}
+            futures = {}
+            for cat, v, fn in jobs:
+                kwargs = {}
+                if timings is not None:
+                    kwargs["timings"] = timings.setdefault((cat, v), {})
+                futures[ex.submit(fn, v, known_ports.get(v), **kwargs)] = (cat, v)
             for fut in concurrent.futures.as_completed(futures):
                 cat, v = futures[fut]
                 try:
@@ -1445,7 +1524,8 @@ def pivot_cluster(name: str) -> dict[str, Any]:
                    for cat in ("domains", "ips")
                    for o in data["observables"][cat]
                    if o.get("ports")}
-    results = _sweep_lifecycle(domains, ips, known_ports)
+    timings: dict[tuple[str, str], dict[str, float]] = {}
+    results = _sweep_lifecycle(domains, ips, known_ports, timings=timings)
 
     # Write phase: brief lock, applied onto a fresh read of the cluster.
     now = now_iso()
@@ -1480,6 +1560,10 @@ def pivot_cluster(name: str) -> dict[str, Any]:
                         _file_cert_hash(data, o["value"], new_sha256, new_cert.get("issuer"),
                                        new_cert.get("revoked"), now)
                 row = {"value": o["value"], "status": status}
+                # Seconds per source lookup. Rides the summary into the run
+                # trace only - see _sweep_lifecycle for why not `detail`.
+                if timings.get((cat, o["value"])):
+                    row["timings"] = timings[(cat, o["value"])]
                 tls = enrichment.get("tls")
                 if isinstance(tls, dict) and "error" not in tls and tls.get("cert"):
                     row["cert_sha256"] = tls["cert"].get("sha256")

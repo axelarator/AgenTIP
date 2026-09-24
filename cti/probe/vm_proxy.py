@@ -68,6 +68,7 @@ import os
 import shlex
 import subprocess
 import threading
+import time
 
 # --- probe VM connection (from the environment - see module docstring) ------
 PROBE_USER = os.environ.get("CTI_PROBE_USER", "detonate")
@@ -129,11 +130,50 @@ SSH_CONTROL_PERSIST = os.environ.get("CTI_PROBE_CONTROL_PERSIST", "300")
 _MAX_CONCURRENT = int(os.environ.get("CTI_PROBE_MAX_CONCURRENT", "6"))
 _slots = threading.BoundedSemaphore(_MAX_CONCURRENT)
 
+# Where the time goes, per action: how long calls queued for a slot and how
+# long they ran once they had one. Process-wide, like the slots. This is
+# what says whether the ceiling above is what a sweep is waiting on: if
+# waiting dwarfs running, more sweep threads cannot help and only a higher
+# ceiling (after raising MaxSessions on the VM) or fewer calls will.
+_stats_lock = threading.Lock()
+_stats: dict[str, dict[str, float]] = {}
+
+
+def reset_stats() -> None:
+    with _stats_lock:
+        _stats.clear()
+
+
+def stats() -> dict[str, object]:
+    """{"max_concurrent": n, "actions": {action: {calls, wait_s, run_s,
+    timeouts}}, "wait_s": total, "run_s": total}, seconds rounded."""
+    with _stats_lock:
+        actions = {a: {k: round(v, 1) if k.endswith("_s") else int(v) for k, v in row.items()}
+                   for a, row in sorted(_stats.items())}
+    return {"max_concurrent": _MAX_CONCURRENT, "actions": actions,
+            "wait_s": round(sum(r["wait_s"] for r in actions.values()), 1),
+            "run_s": round(sum(r["run_s"] for r in actions.values()), 1)}
+
+
+def _record(action: str, wait: float, run: float, timed_out: bool) -> None:
+    with _stats_lock:
+        row = _stats.setdefault(action, {"calls": 0, "wait_s": 0.0, "run_s": 0.0,
+                                         "timeouts": 0})
+        row["calls"] += 1
+        row["wait_s"] += wait
+        row["run_s"] += run
+        row["timeouts"] += timed_out
+
 
 def _ssh_json_rpc(request: dict[str, object], timeout: int | None = None) -> dict[str, object]:
     limit = timeout if timeout is not None else SSH_TIMEOUT
+    action = str(request.get("action", "?"))
+    queued = time.monotonic()
+    ran = None
+    timed_out = False
     try:
         with _slots:
+            ran = time.monotonic()
             proc = subprocess.run(
                 ["ssh", "-i", PROBE_SSH_KEY,
                  "-o", "BatchMode=yes",
@@ -146,6 +186,7 @@ def _ssh_json_rpc(request: dict[str, object], timeout: int | None = None) -> dic
                 input=json.dumps(request), capture_output=True, text=True,
                 timeout=limit)
     except subprocess.TimeoutExpired as e:
+        timed_out = True
         # subprocess.TimeoutExpired is not a VMProxyError, so it used to escape
         # every handler in core (they all catch VMProxyError) and land in
         # _sweep_lifecycle's catch-all, which turned the WHOLE domain into
@@ -154,6 +195,12 @@ def _ssh_json_rpc(request: dict[str, object], timeout: int | None = None) -> dic
         # This module's contract is that transport failures raise VMProxyError.
         raise VMProxyError(
             f"probe call {request.get('action', '?')!r} timed out after {limit}s") from e
+    finally:
+        done = time.monotonic()
+        if ran is None:                 # never got a slot
+            _record(action, done - queued, 0.0, timed_out)
+        else:
+            _record(action, ran - queued, done - ran, timed_out)
     if proc.returncode != 0 and not proc.stdout:
         raise VMProxyError(f"ssh transport to {PROBE_HOST!r} failed: {proc.stderr.strip()}")
     try:

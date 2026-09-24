@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import operator
 from datetime import date
 from pathlib import Path
+from typing import Annotated
 
 import pytest
 from langgraph.graph import END, START, StateGraph
@@ -158,6 +160,54 @@ async def test_a_subgraph_label_does_not_carry_the_per_run_task_id(runs):
     _, path = await trace.run_traced(parent.compile(), {}, day="2026-09-19", stage="daily")
     for n in trace.summarize(path)["nodes"]:
         assert n["node"].count(":") <= 1 and len(n["node"]) < 40
+
+
+class _Fan(TypedDict, total=False):
+    done: Annotated[list, operator.add]
+
+
+async def test_parallel_nodes_are_timed_by_their_own_duration(runs):
+    """The first tracer timed a node as the gap since the previous event.
+    Nine parallel sweeps then read as a serial chain: each got "the time
+    since the last cluster finished", and famoussparrow showed 1s after
+    running for 13 minutes. Three sleeps of 0.2/0.4/0.6s that start
+    together must record those durations and a shared start."""
+    import time
+    from langgraph.types import Send
+
+    def work(payload):
+        time.sleep(payload["d"])
+        return {"done": [payload["d"]]}
+
+    inner = StateGraph(_Fan)
+    inner.add_node("start", lambda s: {})
+    inner.add_node("sweep", work)
+    inner.add_edge(START, "start")
+    inner.add_conditional_edges(
+        "start", lambda s: [Send("sweep", {"d": d}) for d in (0.2, 0.4, 0.6)], ["sweep"])
+    inner.add_edge("sweep", END)
+    parent = StateGraph(_Fan)
+    parent.add_node("collect", inner.compile())
+    parent.add_edge(START, "collect"); parent.add_edge("collect", END)
+
+    final, path = await trace.run_traced(parent.compile(), {}, day="2026-09-24",
+                                         stage="daily")
+    sweeps = [r for r in trace.read(path) if r.get("node") == "collect:sweep"]
+    assert [round(r["elapsed_s"], 1) for r in sweeps] == [0.2, 0.4, 0.6]
+    starts = [r["started_s"] for r in sweeps]
+    assert max(starts) - min(starts) < 0.1, "they ran together, not in turn"
+    assert sorted(final["done"]) == [0.2, 0.4, 0.6]
+
+
+async def test_a_failed_node_is_recorded_with_its_error(runs):
+    g = StateGraph(_S)
+    g.add_node("boom", lambda s: (_ for _ in ()).throw(RuntimeError("probe VM down")))
+    g.add_edge(START, "boom"); g.add_edge("boom", END)
+    with pytest.raises(RuntimeError):
+        await trace.run_traced(g.compile(), {}, day="2026-09-24", stage="collect")
+    [record] = [r for r in trace.read(trace.run_path("2026-09-24", "collect"))
+                if r.get("event") == "node"]
+    assert record["node"] == "boom" and "probe VM down" in record["error"]
 
 
 def test_a_pre_fix_trace_without_a_stage_is_still_readable(runs):

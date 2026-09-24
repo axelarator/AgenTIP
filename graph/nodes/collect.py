@@ -24,6 +24,7 @@ from typing import Any
 from langgraph.types import Send
 
 from cti import core, store
+from cti.probe import vm_proxy
 from cti.tracking import analytics, digest, enrich, ingest
 
 log = logging.getLogger("graph.collect")
@@ -86,6 +87,9 @@ def _phase(sections: dict, name: str, fn, *args, **kwargs):
 
 def ingest_inbox(state: dict) -> dict:
     sections: dict[str, Any] = {}
+    # The probe-VM slot accounting is process-wide; start it where the
+    # sweep's day starts so the digest reports this run and nothing older.
+    vm_proxy.reset_stats()
 
     def _ingest():
         with store.connect() as con:
@@ -215,6 +219,9 @@ def enrich_and_write(state: dict) -> dict:
     # all-ok - visible only to someone who opened the JSON.
     shares = _unknown_share(results)
     sections["pivot_sweep"]["unknown"] = shares
+    # How long the sweep's probe-VM calls queued for a slot against how long
+    # they ran - see vm_proxy.stats.
+    sections["pivot_sweep"]["probe_vm"] = vm_proxy.stats()
     alarmed = {cat: v for cat, v in shares.items()
                if v["checked"] and v["unknown"] / v["checked"] >= UNKNOWN_ALARM}
     problems = len(errors) + len(history_errors)

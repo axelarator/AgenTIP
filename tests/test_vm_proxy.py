@@ -312,3 +312,43 @@ def test_the_openssl_tls_grab_is_gone():
     superset of what the separate openssl handshake did. Keeping the wrapper
     would invite the second connection back."""
     assert not hasattr(vm_proxy, "tls_grab")
+
+
+def test_stats_split_slot_wait_from_run_time(monkeypatch):
+    """Whether the sweep is waiting on the slot ceiling or on the VM is
+    the question that decides between more threads and a higher ceiling.
+    With one slot and two 0.3s calls, the second queues ~0.3s."""
+    import threading
+    import time
+
+    def fake_run(cmd, input=None, capture_output=None, text=None, timeout=None):
+        time.sleep(0.3)
+        return _FakeCompletedProcess(stdout=json.dumps({"ok": True}))
+
+    monkeypatch.setattr(vm_proxy.subprocess, "run", fake_run)
+    monkeypatch.setattr(vm_proxy, "_slots", threading.BoundedSemaphore(1))
+    vm_proxy.reset_stats()
+    calls = [threading.Thread(target=vm_proxy._ssh_json_rpc, args=({"action": "observe"},))
+             for _ in range(2)]
+    for t in calls:
+        t.start()
+    for t in calls:
+        t.join()
+
+    row = vm_proxy.stats()["actions"]["observe"]
+    assert row["calls"] == 2 and row["timeouts"] == 0
+    assert 0.5 <= row["run_s"] <= 0.8
+    assert 0.2 <= row["wait_s"] <= 0.5
+
+
+def test_stats_count_a_timeout(monkeypatch):
+    import subprocess
+
+    def fake_run(cmd, input=None, capture_output=None, text=None, timeout=None):
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    monkeypatch.setattr(vm_proxy.subprocess, "run", fake_run)
+    vm_proxy.reset_stats()
+    with pytest.raises(vm_proxy.VMProxyError):
+        vm_proxy._ssh_json_rpc({"action": "subfinder"})
+    assert vm_proxy.stats()["actions"]["subfinder"]["timeouts"] == 1

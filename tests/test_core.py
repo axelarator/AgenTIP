@@ -2077,3 +2077,79 @@ def test_a_certificate_rotation_is_still_detected_from_observe_tls(monkeypatch):
 def test_no_openssl_grab_remains_on_the_host_side():
     assert not hasattr(core, "_live_tls")
     assert not hasattr(core.vm_proxy, "tls_grab")
+
+
+# --------------------------------------------------------------------------- #
+# per-indicator source lookups: concurrent, timed, failures unchanged
+# --------------------------------------------------------------------------- #
+
+def test_run_sources_runs_lookups_at_once_and_times_each():
+    """An indicator used to cost the sum of its lookups - one IP on
+    sliver-c2 took over three minutes. Three 0.3s lookups must finish in
+    well under 0.9s, and each must be timed on its own."""
+    import time as _time
+    timings = {}
+    t0 = _time.monotonic()
+    got = core._run_sources({name: (lambda n=name: (_time.sleep(0.3), n)[1])
+                             for name in ("a", "b", "c")}, timings)
+    assert _time.monotonic() - t0 < 0.8
+    assert got == {"a": "a", "b": "b", "c": "c"}
+    assert set(timings) == {"a", "b", "c"}
+    assert all(0.25 <= t < 0.8 for t in timings.values())
+
+
+def test_run_sources_raises_the_first_failure_in_order_after_all_finish():
+    """The serial version raised the first failing lookup in call order,
+    and the sweep's catch-all turns that into the indicator's error. Keep
+    it that way, and don't abandon the slower lookups mid-flight."""
+    import time as _time
+    finished = []
+
+    def slow_ok():
+        _time.sleep(0.2)
+        finished.append("slow_ok")
+
+    def boom(msg):
+        raise RuntimeError(msg)
+
+    with pytest.raises(RuntimeError, match="first"):
+        core._run_sources({"slow_ok": slow_ok,
+                           "first": lambda: boom("first"),
+                           "second": lambda: boom("second")}, None)
+    assert finished == ["slow_ok"]
+
+
+def test_ip_lifecycle_still_gates_pdns_on_the_ripestat_asn(stub_cluster_sweep_net):
+    """The one dependency between an IP's lookups: pdns is skipped for a
+    shared-hosting ASN, which comes from RIPEstat. Running the lookups at
+    once must not lose the gate."""
+    from cti.tracking.analytics import SHARED_HOSTING_ASNS
+    shared = next(iter(SHARED_HOSTING_ASNS))
+    stub_cluster_sweep_net.setattr(core.pivot, "ripestat_lookup",
+                                   lambda ip: {"prefix": "1.2.0.0/16", "asn": shared})
+    stub_cluster_sweep_net.setattr(core.passive, "pdns",
+                                   lambda value: pytest.fail("pdns ran for a shared-hosting ASN"))
+    timings = {}
+    status, detail, enrichment = core._ip_lifecycle("1.2.3.4", timings=timings)
+    assert status == "routed" and detail["asn"] == shared
+    assert "skipped" in enrichment["pdns"]
+    assert {"ripestat", "observe", "pdns"} <= set(timings)
+
+
+def test_pivot_cluster_reports_timings_but_does_not_store_them(stub_cluster_sweep_net):
+    """Timings ride the summary into the run trace. They stay out of the
+    observable's status_detail, or every cluster file would change every
+    day because a lookup was slower."""
+    core.create_cluster("Timed")
+    core.add_observable("Timed", "domains", "timed-c2.example", "r")
+    core.add_observable("Timed", "ips", "185.10.10.11", "r")
+
+    summary = core.pivot_cluster("Timed")
+    assert {"rdap", "resolve", "observe", "subdomains"} <= set(summary["domains"][0]["timings"])
+    assert {"ripestat", "observe", "ptr"} <= set(summary["ips"][0]["timings"])
+
+    data = core.get_cluster("Timed")
+    for cat in ("domains", "ips"):
+        for o in data["observables"][cat]:
+            assert "timings" not in (o.get("status_detail") or {})
+            assert "timings" not in o

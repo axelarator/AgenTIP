@@ -105,9 +105,15 @@ class Trace:
         self._fh.write(json.dumps(record, default=str) + "\n")
         self._fh.flush()   # a crashed run should still leave its trace
 
-    def node(self, name: str, output: Any, elapsed: float) -> None:
-        self._write({"event": "node", "node": name, "elapsed_s": round(elapsed, 3),
-                     "output": _plain(output)})
+    def node(self, name: str, output: Any, elapsed: float,
+             started: float | None = None, error: str | None = None) -> None:
+        record = {"event": "node", "node": name, "elapsed_s": round(elapsed, 3)}
+        if started is not None:
+            record["started_s"] = round(started - self.started, 3)
+        if error:
+            record["error"] = error
+        record["output"] = _plain(output)
+        self._write(record)
 
     def close(self, final_state: Any = None) -> Path:
         self._write({"event": "run_end", "elapsed_s": round(time.time() - self.started, 3),
@@ -130,27 +136,43 @@ async def run_traced(compiled, state: dict, *, day: str, stage: str,
                      path: Path | None = None) -> tuple[dict, Path]:
     """Run a compiled graph, writing a trace and returning the final state.
 
-    `stream_mode="updates"` gives one event per node as it finishes, which
-    is what makes the per-node timing real rather than inferred.
+    Timing comes from `stream_mode="tasks"`, which emits an event when each
+    task starts and another when it finishes, keyed by task id. The first
+    version timed a node as the gap since the previous "updates" event.
+    That is only a duration when nodes run one at a time: the nine
+    parallel sweeps each got "the time since the last cluster finished",
+    so the trace drew a parallel fan-out as a serial chain and put
+    famoussparrow at 1s when it had run for 13 minutes.
+
     `subgraphs=True` makes that include nodes inside a composed subgraph;
     without it a `daily` run records two events, `collect` and `analyze`,
-    and nothing about what happened inside either.
+    and nothing about what happened inside either. "updates" is still
+    consumed, for the final state only.
     """
     trace = Trace(day, stage, path)
     final: dict = dict(state)
-    last = time.time()
+    started: dict[str, float] = {}
     try:
-        async for namespace, chunk in compiled.astream(
-                state, stream_mode="updates", subgraphs=True):
+        async for namespace, mode, chunk in compiled.astream(
+                state, stream_mode=["updates", "tasks"], subgraphs=True):
             now = time.time()
-            for node_name, output in chunk.items():
-                trace.node(_label(namespace, node_name), output, now - last)
-                # Only top-level updates are the graph's own state. A
-                # subgraph's node outputs are a subset of what the subgraph
-                # returns to its parent as one top-level update at the end.
-                if not namespace and isinstance(output, dict):
-                    final.update(output)
-            last = now
+            if mode == "tasks":
+                if "result" not in chunk:           # a task starting
+                    started[chunk["id"]] = now
+                    continue
+                t0 = started.pop(chunk["id"], now)
+                error = chunk.get("error")
+                trace.node(_label(namespace, chunk["name"]), chunk["result"],
+                           now - t0, started=t0,
+                           error=str(error) if error else None)
+                continue
+            # Only top-level updates are the graph's own state. A subgraph's
+            # node outputs are a subset of what the subgraph returns to its
+            # parent as one top-level update at the end.
+            if not namespace:
+                for output in chunk.values():
+                    if isinstance(output, dict):
+                        final.update(output)
     finally:
         trace.close(final)
     return final, trace.path
