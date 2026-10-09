@@ -11,6 +11,8 @@ from typing import Any
 
 import duckdb
 
+from ..store.hosting import shared_asns
+
 RECENT_ACTOR_ACTIVITY = """
 SELECT actor,
        count(DISTINCT indicator_value) AS unique_ips,
@@ -38,7 +40,9 @@ SELECT detected_at, indicator_value, actor, attribute, change_type,
        old_value, new_value, confidence
 FROM attribute_changes
 WHERE detected_at >= current_date - INTERVAL (?) DAY
-  AND change_type <> 'first_seen'
+  -- cert_renewed: same issuer and SANs, new sha256. Kept in the table for
+  -- the timeline, left out of the digest - it is the provider, not news.
+  AND change_type NOT IN ('first_seen', 'cert_renewed')
 ORDER BY detected_at DESC
 """
 
@@ -64,12 +68,12 @@ GROUP BY actor, port
 ORDER BY actor, ip_count DESC, port
 """
 
-# Large multi-tenant clouds where ASN co-occurrence isn't a correlation
+# Multi-tenant providers where ASN co-occurrence isn't a correlation
 # signal - see silver-fox.json/jadeprox.json diamond notes ("generic
-# multi-tenant AWS/Aliyun... not treated as a correlation"). A stable
-# enough judgment call about hosting providers in general (not
-# per-actor data) that a code constant beats a DB table.
-SHARED_HOSTING_ASNS = (16509, 45102, 13335)  # AWS, Alibaba Cloud, Cloudflare
+# multi-tenant AWS/Aliyun... not treated as a correlation"). Was a
+# three-ASN constant; it is now the data file behind cti/store/hosting.py,
+# which also adds the per-address PTR test.
+SHARED_HOSTING_ASNS = shared_asns()
 
 # Genuinely new leads: an unattributed IP, first observed ever inside
 # the window, sitting on an ASN a tracked actor is known for. Daily

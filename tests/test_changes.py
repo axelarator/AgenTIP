@@ -102,14 +102,30 @@ def test_changed_records_a_row(con, attribute):
 
 def test_same_issuer_same_sans_renewal_is_not_a_cert_change(con):
     """A routine renewal mints a new sha256 but keeps issuer and SANs.
-    `cert` must stay silent; `cert_hash` must fire. Recording the renewal
-    as a cert change is what would flood the digest."""
+    `cert` must stay silent; `cert_hash` records it as cert_renewed, which
+    rank scores at zero. Recording the renewal as cert_new is what flooded
+    the digest."""
     seed(con, "tls_live", "x.com", tls_sha256="h1", tls_issuer="LE", tls_sans=["x.com"])
     renewed = {"issuer": "LE", "sans": ["x.com"], "sha256": "h2"}
     assert detect(con, "cert", indicator_value="x.com", actor="A",
                   observed_at=DAY2, new=renewed) is None
     assert detect(con, "cert_hash", indicator_value="x.com", actor="A",
-                  observed_at=DAY2, new=renewed) == "cert_new"
+                  observed_at=DAY2, new=renewed) == "cert_renewed"
+
+
+def test_a_rotation_that_changes_the_sans_is_cert_new(con):
+    seed(con, "observe_tls", "x.com", tls_sha256="h1", tls_issuer="LE", tls_sans=["x.com"])
+    assert detect(con, "cert_hash", indicator_value="x.com", actor="A", observed_at=DAY2,
+                  new={"issuer": "LE", "sans": ["x.com", "y.com"], "sha256": "h2"}
+                  ) == "cert_new"
+
+
+def test_a_renewal_compares_issuers_as_canonical_dns(con):
+    seed(con, "tls_live", "x.com", tls_sha256="h1", tls_issuer="C = US, O = LE, CN = R3",
+         tls_sans=["x.com"])
+    assert detect(con, "cert_hash", indicator_value="x.com", actor="A", observed_at=DAY2,
+                  new={"issuer": "CN=R3, O=LE, C=US", "sans": ["x.com"], "sha256": "h2"}
+                  ) == "cert_renewed"
 
 
 def test_issuer_change_outranks_sans_change(con):

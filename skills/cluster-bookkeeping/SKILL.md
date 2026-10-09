@@ -80,6 +80,59 @@ in a cluster, prune it with `remove_observable(name, category, value)` /
 or without the algo prefix), removing every matching entry. Note why in
 the hunt log when you do, so the removal is auditable rather than silent.
 
+### Lifecycle: indicators age out on their own
+
+Every domain and IP carries a `lifecycle`, kept by the daily sweep. You
+do not prune stale infrastructure by hand any more.
+
+| State | Meaning | Swept | Exported |
+|---|---|---|---|
+| `active` | live evidence within 30 days (`last_live`) | yes | yes |
+| `dormant` | no live evidence for 30+ days; its change rows are dropped from the digest | yes | yes |
+| `retired` | no live evidence for 90+ days, or a superseded certificate hash | no | only with `include_inactive=True` |
+| `candidate` | filed by the weekly expansion sweep, awaiting your decision | yes | only with `include_inactive=True` |
+
+- **Live evidence:** a domain resolves (and is not sinkholed or expired),
+  or an IP answers on HTTP, TLS or a scanned port. A routed prefix on its
+  own does not count.
+- **`last_seen` vs `last_live`:** `last_seen` still means "last re-filed".
+  `last_live` is the one to trust for whether the host is still up.
+- **Reactivation:** a dormant or retired host that answers again goes back
+  to `active` and leads the digest under "Reactivated infrastructure".
+  Re-filing it from a new report reactivates it too.
+- **Exports:** `get_observables`, `export_stix_bundle` and
+  `export_stix_ecosystem` leave out retired entries and candidates unless
+  you pass `include_inactive=True`. Retired indicators then carry
+  `valid_until`.
+- **Thresholds:** override with `CTI_DORMANT_DAYS` / `CTI_RETIRED_DAYS`.
+- **Certificate hashes:** one source per domain, not one per day. When a
+  domain presents a new certificate, the hash it replaced is marked
+  `superseded_by` and retired. A provider's certificate is never filed:
+  more than 16 SANs, a default subject, or served from a CDN edge.
+
+### Candidates: coverage that grows without a search
+
+Once a week (`CTI_EXPAND_WEEKDAY`, default Monday, or force it with
+`python -m graph daily --expand`) the daily run reverse-pivots each
+cluster's rarest promotable selectors through Webamon. A new host is
+swept once, and is filed as a `candidate` only if it passes the
+corroboration rule against that cluster's own indicators: one identity
+fact, or two independent structural facts (see `skills/infrastructure-pivoting/`).
+
+- **In the digest:** candidates appear under "New candidates" with the
+  link that justified them and the seed selector they came from.
+- **Deciding:** call `accept_candidate(name, value, note)` to make it a
+  tracked indicator. Call `reject_candidate(name, value, reason)` to drop
+  it and add it to the cluster's `denylist`; the sweep never files a
+  denied value again.
+- **Auto-reject:** a candidate with no live evidence for 30 days is
+  rejected automatically, with the reason recorded on the deny list.
+- **Not probed yet:** candidates are not queued for fingerprinting and
+  their certificates are not filed until you accept them.
+- **Cost:** up to 8 seeds per cluster and 10 new hosts swept per cluster
+  each week. The reverse lookups are capped at `CTI_WEBAMON_EXPAND_BUDGET`
+  (default 150) per day. Validin is not used, because it is manual-only.
+
 ## JA4+ and JARM fingerprints
 
 Beyond hashes/domains/ips/urls/emails/cves/wallets, a cluster can also

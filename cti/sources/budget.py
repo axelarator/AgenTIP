@@ -52,6 +52,10 @@ class Provider:
 
 PROVIDERS: dict[str, Provider] = {
     "webamon": Provider("CTI_WEBAMON_DAILY_BUDGET", 1000),
+    # The weekly expansion sweep's reverse lookups, counted separately so
+    # one run cannot spend the day's enrichment budget. Each lookup also
+    # spends a `webamon` unit; this is the cap, not a second bill.
+    "webamon_expand": Provider("CTI_WEBAMON_EXPAND_BUDGET", 150),
     "honeylabs": Provider("CTI_HL_BUDGET", 400, 6.0),
     "rdap": Provider("CTI_RDAP_CAP", 150),
     "validin": Provider("CTI_VALIDIN_DAILY_BUDGET", 10, 0.0,

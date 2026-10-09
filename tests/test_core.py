@@ -2153,3 +2153,220 @@ def test_pivot_cluster_reports_timings_but_does_not_store_them(stub_cluster_swee
         for o in data["observables"][cat]:
             assert "timings" not in (o.get("status_detail") or {})
             assert "timings" not in o
+
+
+# --------------------------------------------------------------------------- #
+# Indicator lifecycle
+# --------------------------------------------------------------------------- #
+
+def _entry(**kw):
+    return {"value": "x.example", "sources": ["r"], "first_seen": "2026-08-01T00:00:00+00:00",
+            "last_seen": "2026-08-01T00:00:00+00:00", **kw}
+
+
+def test_lifecycle_ages_active_to_dormant_to_retired():
+    e = _entry(last_live="2026-08-01T00:00:00+00:00")
+    assert core._age_lifecycle(e, "2026-08-20T00:00:00+00:00", live=False) is None
+    assert e["lifecycle"] == "active"
+    assert core._age_lifecycle(e, "2026-08-31T00:00:00+00:00", live=False) == ("active", "dormant")
+    assert core._age_lifecycle(e, "2026-10-30T00:00:00+00:00", live=False) == ("dormant", "retired")
+
+
+def test_live_evidence_reactivates_and_stamps_last_live():
+    e = _entry(lifecycle="retired")
+    assert core._age_lifecycle(e, "2026-11-01T00:00:00+00:00", live=True) == ("retired", "active")
+    assert e["last_live"] == "2026-11-01T00:00:00+00:00"
+
+
+def test_never_live_ages_from_first_seen():
+    e = _entry()
+    assert core._age_lifecycle(e, "2026-09-05T00:00:00+00:00", live=False) == ("active", "dormant")
+
+
+def test_a_candidate_never_ages_into_active_or_dormant():
+    e = _entry(lifecycle="candidate")
+    assert core._age_lifecycle(e, "2026-12-01T00:00:00+00:00", live=False) is None
+    assert core._age_lifecycle(e, "2026-12-02T00:00:00+00:00", live=True) is None
+    assert e["lifecycle"] == "candidate" and e["last_live"]
+
+
+def test_liveness_rules():
+    assert core._is_live("domains", "active", {})
+    assert not core._is_live("domains", "sinkholed", {})
+    # A routed prefix says the network exists, not that the host answers.
+    assert not core._is_live("ips", "routed", {"observe": {"responded": {"cdn": True}}})
+    assert core._is_live("ips", "routed", {"observe": {"responded": {"ports": True}}})
+    assert core._is_live("ips", "routed", {"observe": {"tls": {"cert_sha256": "h"}}})
+
+
+def test_the_sweep_skips_retired_and_ages_the_rest(stub_cluster_sweep_net, monkeypatch):
+    core.create_cluster("Aging")
+    core.add_observable("Aging", "domains", "gone.example", "r")
+    core.add_observable("Aging", "domains", "old.example", "r")
+    data = core.load_cluster("Aging")
+    for o in data["observables"]["domains"]:
+        o["first_seen"] = "2026-01-01T00:00:00+00:00"
+        if o["value"] == "gone.example":
+            o["lifecycle"] = "retired"
+    core.save_cluster(data)
+
+    swept = []
+    real = core._sweep_lifecycle
+    monkeypatch.setattr(core, "_sweep_lifecycle",
+                        lambda d, i, *a, **k: swept.extend(d) or real(d, i, *a, **k))
+    summary = core.pivot_cluster("Aging")
+    assert swept == ["old.example"]
+    assert summary["lifecycle"] == [{"category": "domains", "value": "old.example",
+                                     "from": "active", "to": "retired"}]
+
+
+def test_refiling_from_a_new_report_reactivates_a_retired_host():
+    core.create_cluster("Refile")
+    core.add_observable("Refile", "urls", "https://x.example/a", "r")
+    data = core.load_cluster("Refile")
+    data["observables"]["domains"].append(_entry(value="back.example", lifecycle="retired"))
+    core.save_cluster(data)
+    with core._data_lock():
+        data = core.load_cluster("Refile")
+        extracted = {c: [] for c in core.OBSERVABLE_CATEGORIES}
+        extracted["domains"] = ["back.example"]
+        core._merge_observables(data, extracted, "new report")
+        core.save_cluster(data)
+    entry = core.load_cluster("Refile")["observables"]["domains"][0]
+    assert entry["lifecycle"] == "active"
+
+
+def test_exports_leave_out_retired_and_candidates_unless_asked():
+    core.create_cluster("Export Life")
+    data = core.load_cluster("Export Life")
+    data["observables"]["domains"] += [
+        _entry(value="live.example"),
+        _entry(value="quiet.example", lifecycle="dormant"),
+        _entry(value="gone.example", lifecycle="retired",
+               lifecycle_since="2026-09-01T00:00:00+00:00"),
+        _entry(value="maybe.example", lifecycle="candidate"),
+    ]
+    core.save_cluster(data)
+
+    view = {o["value"] for o in core.get_observables("Export Life")["observables"]["domains"]}
+    assert view == {"live.example", "quiet.example"}
+    names = {o["name"] for o in core.export_stix_bundle("Export Life")["objects"]
+             if o["type"] == "indicator"}
+    assert names == {"live.example", "quiet.example"}
+    full = [o for o in core.export_stix_bundle("Export Life", include_inactive=True)["objects"]
+            if o["type"] == "indicator"]
+    assert {o["name"] for o in full} == {"live.example", "quiet.example", "gone.example",
+                                         "maybe.example"}
+    gone = next(o for o in full if o["name"] == "gone.example")
+    assert gone["valid_until"] == "2026-09-01T00:00:00+00:00"
+
+
+# --------------------------------------------------------------------------- #
+# Certificate hash filing
+# --------------------------------------------------------------------------- #
+
+def _hashes(data):
+    return {h["value"]: h for h in data["observables"]["hashes"]}
+
+
+def test_cert_hash_sources_do_not_grow_across_sweeps():
+    data = core._new_cluster("C", "")
+    for day in ("2026-09-01", "2026-09-02", "2026-09-03"):
+        core._file_cert_hash(data, "a.example", "h1", "LE", None, f"{day}T00:00:00+00:00",
+                             sans=["a.example"])
+    entry = _hashes(data)["cert-sha256:h1"]
+    assert entry["sources"] == ["live TLS grab for a.example"]
+    assert entry["last_live"] == "2026-09-03T00:00:00+00:00"
+
+
+def test_a_rotation_supersedes_the_previous_hash_for_that_domain():
+    data = core._new_cluster("C", "")
+    core._file_cert_hash(data, "a.example", "h1", "LE", None, "2026-09-01T00:00:00+00:00")
+    core._file_cert_hash(data, "b.example", "hb", "LE", None, "2026-09-01T00:00:00+00:00")
+    core._file_cert_hash(data, "a.example", "h2", "LE", None, "2026-11-01T00:00:00+00:00")
+    hashes = _hashes(data)
+    assert hashes["cert-sha256:h1"]["lifecycle"] == "retired"
+    assert hashes["cert-sha256:h1"]["superseded_by"] == "cert-sha256:h2"
+    assert "lifecycle" not in hashes["cert-sha256:h2"]
+    assert "lifecycle" not in hashes["cert-sha256:hb"]
+
+
+def test_provider_certificates_are_not_filed(monkeypatch):
+    data = core._new_cluster("C", "")
+    many = [f"s{i}.example" for i in range(40)]
+    assert "SANs" in core._file_cert_hash(data, "a.example", "h1", "LE", None,
+                                          "2026-09-01T00:00:00+00:00", sans=many)
+    assert core._file_cert_hash(data, "a.example", "h2", "X", None, "2026-09-01T00:00:00+00:00",
+                                subject="CN = localhost") == "default certificate subject"
+    from cti.tracking import history
+    monkeypatch.setattr(history.cdn_ranges, "is_cdn", lambda ip: ip == "104.16.0.1")
+    assert "CDN" in core._file_cert_hash(data, "a.example", "h3", "X", None,
+                                         "2026-09-01T00:00:00+00:00", resolved=["104.16.0.1"])
+    assert data["observables"]["hashes"] == []
+
+
+# --------------------------------------------------------------------------- #
+# Candidates
+# --------------------------------------------------------------------------- #
+
+def _candidate_cluster(name="Cand"):
+    core.create_cluster(name)
+    meta = {"discovered_via": "tls.cert_sha256:abc", "candidate_reason": "1 identity fact",
+            "candidate_linked_to": "known.example"}
+    assert core.file_candidate(name, "new.example", "auto-pivot", meta)
+    return name
+
+
+def _queued(name):
+    # The queue lives beside DATA_DIR, which every test in this file shares,
+    # so it is filtered to this test's own cluster.
+    return [p["value"] for p in core.list_pending_fingerprints() if p["cluster"] == name]
+
+
+def test_a_filed_candidate_is_not_queued_for_fingerprinting():
+    name = _candidate_cluster("Cand Unqueued")
+    entry = core.load_cluster(name)["observables"]["domains"][0]
+    assert entry["lifecycle"] == "candidate"
+    assert _queued(name) == []
+
+
+def test_accepting_a_candidate_activates_and_queues_it():
+    name = _candidate_cluster("Cand Accepted")
+    core.accept_candidate(name, "NEW.example", "same kit as known.example")
+    data = core.load_cluster(name)
+    assert core.lifecycle_of(data["observables"]["domains"][0]) == "active"
+    assert "same kit" in data["hunt_log"][-1]["entry"]
+    assert _queued(name) == ["new.example"]
+
+
+def test_a_rejected_candidate_is_denied_for_good():
+    name = _candidate_cluster()
+    with pytest.raises(ValueError):
+        core.reject_candidate(name, "new.example", " ")
+    core.reject_candidate(name, "new.example", "parked page shared by a registrar")
+    data = core.load_cluster(name)
+    assert data["observables"]["domains"] == []
+    assert data["denylist"][0]["value"] == "new.example"
+    assert not core.file_candidate(name, "new.example", "auto-pivot", {})
+
+
+def test_only_candidates_can_be_accepted_or_rejected():
+    core.create_cluster("Plain")
+    core.add_observable("Plain", "urls", "https://x.example/", "r")
+    data = core.load_cluster("Plain")
+    data["observables"]["domains"].append(_entry(value="tracked.example"))
+    core.save_cluster(data)
+    with pytest.raises(ValueError):
+        core.accept_candidate("Plain", "tracked.example")
+    with pytest.raises(ValueError):
+        core.reject_candidate("Plain", "tracked.example", "no")
+
+
+def test_quiet_candidates_expire():
+    name = _candidate_cluster()
+    data = core.load_cluster(name)
+    data["observables"]["domains"][0]["first_seen"] = "2026-08-01T00:00:00+00:00"
+    core.save_cluster(data)
+    assert core.expire_candidates(name, now="2026-08-20T00:00:00+00:00") == []
+    assert core.expire_candidates(name, now="2026-09-05T00:00:00+00:00") == ["new.example"]
+    assert "never live" in core.load_cluster(name)["denylist"][0]["reason"]

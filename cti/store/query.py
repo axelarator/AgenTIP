@@ -276,7 +276,7 @@ latest_domain_change AS (
     SELECT indicator_value, max(detected_at) AS domain_change_at
     FROM attribute_changes
     WHERE attribute IN ('resolved_ip', 'cert', 'cert_hash')
-      AND change_type <> 'first_seen'
+      AND change_type NOT IN ('first_seen', 'cert_renewed')
     GROUP BY indicator_value
 )
 SELECT t.indicator_value, la.actor, k.indicator_type,
@@ -731,7 +731,7 @@ def indicator_profile(value: str) -> dict[str, Any]:
                 """SELECT max(detected_at) FROM attribute_changes
                    WHERE indicator_value = ?
                      AND attribute IN ('resolved_ip', 'cert', 'cert_hash')
-                     AND change_type <> 'first_seen'""", [value]).fetchone()
+                     AND change_type NOT IN ('first_seen', 'cert_renewed')""", [value]).fetchone()
             domain_change_at = changed[0] if changed else None
 
             selectors_here = _selector_detail(con, value)
@@ -866,7 +866,7 @@ def observable_history(ip: str) -> dict[str, Any]:
                 """SELECT max(detected_at) FROM attribute_changes
                    WHERE indicator_value = ?
                      AND attribute IN ('resolved_ip', 'cert', 'cert_hash')
-                     AND change_type <> 'first_seen'""", [ip]).fetchone()
+                     AND change_type NOT IN ('first_seen', 'cert_renewed')""", [ip]).fetchone()
             domain_change_at = changed[0] if changed else None
     except TrackingBusy:
         return {"error": "tracking DB busy (daily job likely running); retry shortly"}

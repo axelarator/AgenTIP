@@ -146,12 +146,14 @@ def export_navigator_layer(name: str) -> dict:
 
 
 @mcp.tool()
-def get_observables(name: str) -> dict:
+def get_observables(name: str, include_inactive: bool = False) -> dict:
     """Get all observables (hashes, domains, ips, urls, emails, cves,
     wallets, and the JA4+/JARM fingerprint categories: ja4, ja4s, ja4h,
     ja4l, ja4x, ja4t, ja4ts, ja4ssh, jarm) tracked for a cluster, with
-    provenance (report sources) and first/last seen."""
-    return core.get_observables(name)
+    provenance (report sources), first/last seen and lifecycle
+    (active/dormant/retired/candidate). Retired and candidate entries are
+    left out unless include_inactive=True."""
+    return core.get_observables(name, include_inactive)
 
 
 @mcp.tool()
@@ -196,6 +198,23 @@ def remove_observable(name: str, category: str, value: str) -> dict:
     "ja4", "ja4s", "ja4h", "ja4l", "ja4x", "ja4t", "ja4ts", "ja4ssh",
     "jarm"."""
     return core.remove_observable(name, category, value)
+
+
+@mcp.tool()
+def accept_candidate(name: str, value: str, note: str = "") -> dict:
+    """Accept a candidate the weekly expansion sweep filed (listed in the
+    digest's "New candidates" section): it becomes a normal tracked
+    indicator, starts exporting, and is queued for fingerprinting. `note`
+    goes in the hunt log with the link that justified it."""
+    return core.accept_candidate(name, value, note)
+
+
+@mcp.tool()
+def reject_candidate(name: str, value: str, reason: str) -> dict:
+    """Reject a candidate the weekly expansion sweep filed. It is removed
+    and put on the cluster's deny list with `reason`, so the sweep never
+    files it again. Use remove_observable for an accepted indicator."""
+    return core.reject_candidate(name, value, reason)
 
 
 @mcp.tool()
@@ -367,11 +386,13 @@ def ingest_report(source: str, cluster_name: str | None = None,
 
 
 @mcp.tool()
-def export_stix_bundle(name: str) -> dict:
+def export_stix_bundle(name: str, include_inactive: bool = False) -> dict:
     """Export a cluster as a STIX 2.1 bundle (Intrusion Set, Attack
     Patterns, Indicators, Relationships, Notes) for sharing with other
-    tools/orgs. Tracked observables are exported as Indicators."""
-    return core.export_stix_bundle(name)
+    tools/orgs. Tracked observables are exported as Indicators; retired
+    and candidate ones only with include_inactive=True (retired ones then
+    carry valid_until)."""
+    return core.export_stix_bundle(name, include_inactive)
 
 
 @mcp.tool()
@@ -380,8 +401,9 @@ def export_stix_ecosystem(name: str) -> dict:
     to (via add_relationship) as one self-contained STIX 2.1 bundle -
     unlike export_stix_bundle, every cross-cluster Relationship's
     target is guaranteed to actually be present as an object, not just
-    referenced by id."""
-    return core.export_stix_ecosystem(name)
+    referenced by id. Retired and candidate observables are left out
+    unless include_inactive=True."""
+    return core.export_stix_ecosystem(name, include_inactive)
 
 
 @mcp.tool()

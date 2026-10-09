@@ -597,10 +597,46 @@ def main() -> None:
             cluster, target, port = d["cluster"], d["target"], d["port"]
             for category in ("ja4s", "ja4ts", "ja4l"):
                 value = zeek_result.get(category)
-                if value:
-                    core.add_observable(cluster, category, value,
-                                         f"Zeek passive (tap107, via OpenSearch) handshake against "
-                                         f"{target}:{port} ({resolved_ip}), {hit_time}")
+                if not value:
+                    continue
+                source = (f"Zeek passive (tap107, via OpenSearch) handshake against "
+                          f"{target}:{port} ({resolved_ip}), {hit_time}")
+                if category == "ja4l":
+                    _replace_ja4l(cluster, f"{target}:{port}", value, source)
+                else:
+                    core.add_observable(cluster, category, value, source)
+
+
+def _replace_ja4l(cluster: str, measured_for: str, value: str, source: str) -> None:
+    """File a JA4L as the host's current latency, replacing the last one.
+
+    JA4L is a round-trip measurement, not an identifier: it moves with
+    network conditions on every probe. Adding each reading as a new
+    observable left jadeprox with 34 of them, none more meaningful than
+    the latest. One reading per target:port is kept.
+    """
+    data = core.load_cluster(cluster)
+    for entry in data["observables"].get("ja4l", []):
+        if entry["value"] != value and ja4l_target(entry) == measured_for:
+            core.remove_observable(cluster, "ja4l", entry["value"])
+    core.add_observable(cluster, "ja4l", value, source,
+                        metadata={"measured_for": measured_for})
+
+
+_AGAINST = re.compile(r"handshake against (\S+:\d+)")
+
+
+def ja4l_target(entry: dict) -> str | None:
+    """The target:port a JA4L entry was measured against - from its
+    `measured_for` field, or read out of the source text on entries filed
+    before that field existed."""
+    if entry.get("measured_for"):
+        return entry["measured_for"]
+    for source in entry.get("sources") or []:
+        m = _AGAINST.search(source)
+        if m:
+            return m.group(1)
+    return None
 
 
 if __name__ == "__main__":

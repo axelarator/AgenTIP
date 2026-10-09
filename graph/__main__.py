@@ -35,8 +35,10 @@ def _load_digest(day: str) -> dict:
             "digest_json": json.loads(js.read_text())}
 
 
-async def _run(which: str, day: str, *, dry_run: bool, skip_enrich: bool) -> int:
-    state: dict = {"day": day, "dry_run": dry_run, "skip_enrich": skip_enrich}
+async def _run(which: str, day: str, *, dry_run: bool, skip_enrich: bool,
+               force_expand: bool = False) -> int:
+    state: dict = {"day": day, "dry_run": dry_run, "skip_enrich": skip_enrich,
+                   "force_expand": force_expand}
     if which == "analyze":
         state.update(_load_digest(day))
         compiled = build_analyze()
@@ -72,6 +74,9 @@ def main() -> int:
                     help="analyze without saving correlations or the narrative")
     ap.add_argument("--skip-enrich", action="store_true",
                     help="collect without the network phase")
+    ap.add_argument("--expand", action="store_true",
+                    help="run the weekly coverage expansion today, whatever the weekday "
+                         "(CTI_EXPAND_WEEKDAY, default Monday)")
     ap.add_argument("--out", type=Path, default=REPO_ROOT / "docs",
                     help="where `draw` writes")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -98,7 +103,8 @@ def main() -> int:
         return 0
 
     return asyncio.run(_run(args.command, args.date,
-                            dry_run=args.dry_run, skip_enrich=args.skip_enrich))
+                            dry_run=args.dry_run, skip_enrich=args.skip_enrich,
+                            force_expand=args.expand))
 
 
 if __name__ == "__main__":

@@ -199,3 +199,68 @@ def test_findings_are_parsed_from_the_shapes_models_actually_emit(reply, expecte
 def test_a_reply_with_no_json_is_an_error_not_a_silent_empty():
     parsed, error = parse_findings("I could not find anything of note today.")
     assert parsed == [] and error
+
+
+# --------------------------------------------------------------------------- #
+# Lifecycle and renewal suppression
+# --------------------------------------------------------------------------- #
+
+def test_a_routine_renewal_never_reaches_a_specialist():
+    out = rank({"digest_json": _digest(attribute_changes=[
+        _change("a.example", "cert_hash", "cert_renewed", confidence="low"),
+        _change("b.example", "cert_hash", "cert_new", confidence="high")])})
+    assert [i.indicator for i in out["ranked"]["cert_tls"]] == ["b.example"]
+    renewal = next(i for i in out["items"] if i.indicator == "a.example")
+    assert "renewal" in renewal.suppressed
+
+
+def test_changes_on_dormant_hosts_are_dropped_but_links_are_not():
+    digest = _digest(
+        attribute_changes=[_change("quiet.example", "resolved_ip", "resolved_ip_changed"),
+                           _change("live.example", "resolved_ip", "resolved_ip_changed")],
+        lifecycle={"inactive": {"quiet.example": "dormant"}},
+        infrastructure_links={"promoted": [
+            {"seed": "quiet.example", "linked_to": "z.example", "reason": "r",
+             "identity": [["tls.cert_sha256", "c"]], "structural": [], "corroborating": []}]})
+    out = rank({"digest_json": digest})
+    assert [i.indicator for i in out["ranked"]["infra_change"]] == ["live.example"]
+    assert [i.indicator for i in out["ranked"]["infrastructure"]] == ["quiet.example"]
+
+
+def test_lifecycle_moves_are_grouped_for_the_digest():
+    from graph.nodes.collect import _lifecycle_moves
+    moves = _lifecycle_moves([
+        {"cluster": "kit", "ok": True, "result": {"lifecycle": [
+            {"category": "domains", "value": "a", "from": "dormant", "to": "active"},
+            {"category": "domains", "value": "b", "from": "active", "to": "dormant"},
+            {"category": "ips", "value": "c", "from": "dormant", "to": "retired"}]}},
+        {"cluster": "bad", "ok": False, "error": "x"}])
+    assert [m["value"] for m in moves["reactivated"]] == ["a"]
+    assert [m["value"] for m in moves["dormant"]] == ["b"]
+    assert [m["value"] for m in moves["retired"]] == ["c"]
+
+
+def test_the_digest_leads_with_reactivations_and_new_candidates():
+    from datetime import date
+    from cti.tracking import digest
+    sections = {
+        "lifecycle": {"reactivated": [{"cluster": "kit", "value": "back.example",
+                                       "from": "retired", "to": "active"}],
+                      "dormant": [{"cluster": "kit", "value": "q.example"}],
+                      "retired": [], "inactive": {"q.example": "dormant"}},
+        "coverage_expansion": {"filed_total": 1, "clusters": {"kit": {"filed": [
+            {"value": "new.example", "candidate_linked_to": "known.example",
+             "candidate_reason": "1 identity fact(s) (webamon.fp_ssl)",
+             "discovered_via": "webamon.fp_ssl:abc"}]}}},
+    }
+    assert digest._has_signals(sections)
+    body = digest.write(date(2026, 10, 5), sections).read_text()
+    assert "Reactivated infrastructure" in body and "back.example" in body
+    assert "New candidates" in body and "new.example" in body
+    assert "- kit: 1 dormant" in body
+
+
+def test_a_quiet_hosts_only_day_stays_quiet():
+    """Hosts going dormant is routine; it must not wake Stage B on its own."""
+    from cti.tracking import digest
+    assert not digest._has_signals({"lifecycle": {"dormant": [{"cluster": "k", "value": "v"}]}})

@@ -219,6 +219,8 @@ def enrich_and_write(state: dict) -> dict:
     # all-ok - visible only to someone who opened the JSON.
     shares = _unknown_share(results)
     sections["pivot_sweep"]["unknown"] = shares
+    sections["lifecycle"] = {**_lifecycle_moves(results),
+                             "inactive": _inactive_index(state.get("clusters") or [])}
     # How long the sweep's probe-VM calls queued for a slot against how long
     # they ran - see vm_proxy.stats.
     sections["pivot_sweep"]["probe_vm"] = vm_proxy.stats()
@@ -358,6 +360,75 @@ def corroborate(state: dict) -> dict:
         }
 
     sections["infrastructure_links"] = _phase(sections, "corroborate", _run) or {}
+    return {"sections": sections}
+
+
+def _lifecycle_moves(results: list[dict]) -> dict[str, list[dict]]:
+    """The sweep's lifecycle transitions, grouped by where they landed.
+
+    `reactivated` is the one worth reading first: a host that was dormant
+    or retired answering again is the actor coming back to infrastructure
+    everyone else stopped watching.
+    """
+    out: dict[str, list[dict]] = {"reactivated": [], "dormant": [], "retired": []}
+    for r in results:
+        if not r.get("ok"):
+            continue
+        for move in (r.get("result") or {}).get("lifecycle") or []:
+            row = {"cluster": r["cluster"], **move}
+            if move["to"] == "active" and move["from"] in ("dormant", "retired"):
+                out["reactivated"].append(row)
+            elif move["to"] in ("dormant", "retired"):
+                out[move["to"]].append(row)
+    return out
+
+
+def _inactive_index(clusters: list[str]) -> dict[str, str]:
+    """Indicator -> lifecycle for every domain and IP that is not active.
+    Carried in the digest so rank can drop changes on dormant hosts without
+    reading cluster files itself."""
+    index: dict[str, str] = {}
+    for slug in clusters:
+        try:
+            data = core.load_cluster(slug)
+        except Exception:                       # noqa: BLE001 - one bad file is not the day
+            log.exception("lifecycle index: could not read %s", slug)
+            continue
+        for cat in ("domains", "ips"):
+            for o in data["observables"][cat]:
+                state = core.lifecycle_of(o)
+                if state != "active":
+                    index[o["value"]] = state
+    return index
+
+
+def expand_coverage(state: dict) -> dict:
+    """Weekly: reverse-pivot each cluster's rare selectors and file what
+    passes the corroboration rule as candidates. Daily: expire candidates
+    nobody decided on. See cti/tracking/expand_coverage.py.
+
+    Off the expansion weekday this costs nothing but the expiry pass, which
+    is local. --skip-enrich skips the network half on any day.
+    """
+    from cti.tracking import expand_coverage as expansion
+
+    sections = dict(state.get("sections") or {})
+    clusters = state.get("clusters") or []
+
+    def _expire():
+        return {slug: gone for slug in clusters
+                if (gone := core.expire_candidates(slug))}
+
+    def _expand():
+        if state.get("skip_enrich") or _sweep_blocked(state):
+            return {"skipped": "skip_enrich or preflight blocked"}
+        return expansion.run(_day(state), forced=bool(state.get("force_expand")),
+                             clusters=clusters)
+
+    expired = _phase(sections, "expire_candidates", _expire) or {}
+    result = _phase(sections, "expand_coverage", _expand) or {}
+    result["expired"] = expired
+    sections["coverage_expansion"] = result
     return {"sections": sections}
 
 
