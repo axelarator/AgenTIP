@@ -99,8 +99,16 @@ def ingest_inbox(state: dict) -> dict:
         with store.connect() as con:
             return ingest.register_new_clusters(con)
 
+    def _netwatch():
+        # Load whatever the hourly netwatch cron left spooled; scanning is
+        # that cron's job, not the daily run's. A missing probe or empty
+        # spool is a no-op, not a failure.
+        from cti.netwatch import ingest as netwatch_ingest
+        return netwatch_ingest.ingest()
+
     sections["ingest"] = _phase(sections, "ingest", _ingest) or {}
     sections["register"] = _phase(sections, "register", _register) or {}
+    sections["netwatch"] = _phase(sections, "netwatch", _netwatch) or {}
     verdict, missing = preflight()
     sections.setdefault("status", {})["preflight"] = verdict
     if verdict != "ok":

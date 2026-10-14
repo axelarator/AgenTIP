@@ -171,6 +171,25 @@ and "slowest: sweep" says nothing about which cluster was slow. Real durations
 need a start timestamp taken inside each node, which LangGraph's update stream
 does not provide.
 
+## netwatch: scheduled re-scans of tracked infrastructure
+
+`python -m graph netwatch` scans the watchlist (built from the cluster
+files by lifecycle) from the probe and ingests the results into
+`service_snapshots`/`service_changes`, deriving the usual selectors and
+joining Zeek's passive fingerprints (ja4s/ja4ts/ja4l) back in from Wazuh.
+The daily run also drains anything left spooled. Cron:
+
+```
+# hourly: light re-fingerprint of hot/recently-moved hosts
+5 * * * *  . $HOME/.bashrc && cd ~/cti-graph && .venv/bin/python -m graph netwatch --tiers hot >> data/tracking/logs/netwatch.log 2>&1
+# daily, before the 06:15 pipeline: the heavier port sweep of stable active hosts
+0 6 * * *  . $HOME/.bashrc && cd ~/cti-graph && .venv/bin/python -m graph netwatch --tiers full >> data/tracking/logs/netwatch.log 2>&1
+```
+
+The probe side (worker + scanner tools + C2 templates) is deployed by
+re-running `probe_vm/setup_probe_vm.sh` as root on the probe VM; the
+forced-command keys deliberately cannot deploy code.
+
 ## Operating notes
 
 - **`CTI_PROBE_MAX_CONCURRENT`** (default 6) caps simultaneous probe-VM calls.

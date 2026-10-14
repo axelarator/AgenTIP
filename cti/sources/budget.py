@@ -67,6 +67,10 @@ PROVIDERS: dict[str, Provider] = {
     # than the daily number.
     "internetdb": Provider("CTI_INTERNETDB_BUDGET", 2000, 0.2),
     "mnemonic": Provider("CTI_MNEMONIC_BUDGET", 1000, 0.5),
+    # Our own probe, not a vendor: the cap is a guard against a runaway
+    # watchlist, counted in target-scans per day (one unit per host per
+    # scan, whatever ports it touches).
+    "netwatch": Provider("CTI_NETWATCH_BUDGET", 5000),
 }
 
 

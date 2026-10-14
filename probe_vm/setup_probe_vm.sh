@@ -142,6 +142,21 @@ if command -v naabu >/dev/null 2>&1; then
     || echo "   note: naabu lacks cap_net_raw, will use connect() scans"
 fi
 
+echo "== netwatch scanner tools (nuclei, zgrab2)"
+# The scheduled re-scanner adds per-port web probing with our own C2
+# templates (nuclei) and raw banners for odd ports (zgrab2). Both are Go,
+# installable through cti-provision too; here for a from-scratch build.
+if command -v go >/dev/null 2>&1; then
+  command -v nuclei >/dev/null 2>&1 || GOBIN=/usr/local/bin go install -v \
+    github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest >/dev/null 2>&1 \
+    || echo "   WARNING: nuclei failed to install"
+  command -v zgrab2 >/dev/null 2>&1 || GOBIN=/usr/local/bin go install -v \
+    github.com/zmap/zgrab2/cmd/zgrab2@latest >/dev/null 2>&1 \
+    || echo "   WARNING: zgrab2 failed to install (banner grab falls back to a raw socket)"
+else
+  echo "   WARNING: go not installed - skipping nuclei/zgrab2"
+fi
+
 echo "== docker + the analysis sandbox image"
 # The sandbox runs HERE, on the probe VM, not on the cti host. This VM
 # already did the download that found the open directory and already has
@@ -172,6 +187,54 @@ echo "== helper -> /opt/cti/probe_helper.py"
 # Root-owned so the probe user (whose key is forced to run it) can't edit it.
 install -d -m 0755 -o root -g root /opt/cti
 install -m 0755 -o root -g root "$HELPER_SRC" /opt/cti/probe_helper.py
+
+echo "== netwatch C2 templates -> /opt/cti/c2-templates"
+# Root-owned, read-only to the probe user: the worker runs them but the
+# forced-command key must not be able to add a template (that would be code
+# execution through nuclei). Update them by re-running this script.
+TEMPLATES_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/c2-templates"
+if [[ -d "$TEMPLATES_SRC" ]]; then
+  install -d -m 0755 -o root -g root /opt/cti/c2-templates
+  install -m 0644 -o root -g root "$TEMPLATES_SRC"/*.yaml /opt/cti/c2-templates/ 2>/dev/null || true
+  echo "   installed $(ls /opt/cti/c2-templates/*.yaml 2>/dev/null | wc -l) template(s)"
+else
+  echo "   WARNING: $TEMPLATES_SRC not found - C2 matching will be skipped"
+fi
+
+echo "== netwatch spool + worker"
+# The cti host submits scan jobs here; the worker drains them. Owned by the
+# probe user so the forced-command actions (which run as that user) can
+# write jobs and read results.
+install -d -m 0750 -o "$PROBE_USER" -g "$PROBE_USER" /var/spool/netwatch
+for sub in jobs running results done; do
+  install -d -m 0750 -o "$PROBE_USER" -g "$PROBE_USER" "/var/spool/netwatch/$sub"
+done
+cat > /etc/systemd/system/netwatch-worker.service <<UNIT
+[Unit]
+Description=cti-graph netwatch scan worker
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$PROBE_USER
+Group=$PROBE_USER
+ExecStart=/usr/bin/python3 /opt/cti/probe_helper.py --netwatch-worker
+Restart=always
+RestartSec=10
+# The worker only scans targets the cti host queued; keep it unprivileged.
+# (No ProtectHome/ProtectSystem: the ProjectDiscovery tools write their
+# config and template cache under the probe user's home.)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now netwatch-worker.service >/dev/null 2>&1 \
+  && echo "   netwatch-worker.service enabled" \
+  || echo "   WARNING: could not enable netwatch-worker.service"
 
 echo "== user $PROBE_USER"
 if ! id "$PROBE_USER" >/dev/null 2>&1; then

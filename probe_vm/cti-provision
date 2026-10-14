@@ -52,6 +52,9 @@ declare -A GO_TOOLS=(
   [naabu]="github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
   [cdncheck]="github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest"
   [asnmap]="github.com/projectdiscovery/asnmap/cmd/asnmap@latest"
+  # netwatch scanner (Phase 2): per-port web probing + our own C2 templates.
+  [nuclei]="github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
+  [zgrab2]="github.com/zmap/zgrab2/cmd/zgrab2@latest"
 )
 
 # Package name and binary name differ for some apt tools; checking for the

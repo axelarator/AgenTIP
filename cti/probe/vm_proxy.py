@@ -355,3 +355,22 @@ def observe(target: str, *, kind: str | None = None,
          "known_ports": list(ports or []),
          "ports": bool(scan_ports), "top_ports": top_ports},
         timeout=LONG_TIMEOUT if scan_ports else SUBFINDER_TIMEOUT)
+
+
+# --- netwatch: submit a scan batch, poll, collect ---------------------------
+# These mirror the forced-command actions probe_helper.py grew for scheduled
+# re-scans. submit returns at once (the worker scans in the background on the
+# VM); collect pulls back the JSONL it produced. The host never has to hold an
+# SSH connection open for the length of a scan.
+def netwatch_submit(job: dict[str, object]) -> dict[str, object]:
+    return _ssh_json_rpc({"action": "netwatch_submit", "job": job})
+
+
+def netwatch_status(job_id: str | None = None) -> dict[str, object]:
+    return _ssh_json_rpc({"action": "netwatch_status", "job_id": job_id})
+
+
+def netwatch_collect(job_id: str, *, purge: bool = False) -> dict[str, object]:
+    return _ssh_json_rpc(
+        {"action": "netwatch_collect", "job_id": job_id, "purge": purge},
+        timeout=LONG_TIMEOUT)

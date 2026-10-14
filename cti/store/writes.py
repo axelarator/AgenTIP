@@ -241,3 +241,56 @@ def upsert_opendir_samples(con: duckdb.DuckDBPyConnection, *, indicator_value: s
           _json(r.get("strings_sample")), _json(r.get("extracted")),
           r.get("verdict"), actor, analyzed_at] for r in results])
     return len(results)
+
+
+# --- netwatch service snapshots + change log --------------------------------
+_SNAPSHOT_COLUMNS = (
+    "scan_id", "scanned_at", "vantage", "profile", "target", "ip", "port",
+    "open", "actor", "banner_sha256", "cert_sha256", "spki_sha256",
+    "tls_issuer", "ja3s", "ja4s", "ja4ts", "ja4x", "jarm", "http_status",
+    "http_title", "http_server", "header_order", "body_sha256",
+    "favicon_mmh3", "hassh_server", "app_proto",
+)
+
+
+def upsert_service_snapshot(con: duckdb.DuckDBPyConnection, *, row: dict[str, Any]) -> None:
+    """One (scan_id, target, port) service row. `c2_hits` and `record` are
+    JSON; everything else is a flat column named in _SNAPSHOT_COLUMNS."""
+    cols = list(_SNAPSHOT_COLUMNS) + ["c2_hits", "record"]
+    values = [row.get(c) for c in _SNAPSHOT_COLUMNS]
+    values += [_json(row.get("c2_hits")), _json(row.get("record"))]
+    placeholders = ", ".join("?" for _ in cols)
+    updates = ", ".join(f"{c} = excluded.{c}" for c in cols
+                        if c not in ("scan_id", "target", "port"))
+    con.execute(
+        f"""INSERT INTO service_snapshots ({', '.join(cols)})
+            VALUES ({placeholders})
+            ON CONFLICT (scan_id, target, port) DO UPDATE SET {updates}""",
+        values)
+
+
+def record_service_change(con: duckdb.DuckDBPyConnection, *, detected_at,
+                          scan_id: str, target: str, port: int,
+                          actor: str | None, field: str, change_type: str,
+                          old_value: Any, new_value: Any) -> None:
+    con.execute(
+        """INSERT INTO service_changes
+             (detected_at, scan_id, target, port, actor, field, change_type,
+              old_value, new_value)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (scan_id, target, port, field) DO NOTHING""",
+        [detected_at, scan_id, target, port, actor, field, change_type,
+         _json(old_value), _json(new_value)])
+
+
+def latest_service_snapshot(con: duckdb.DuckDBPyConnection, target: str,
+                            port: int, *, before_scan_id: str) -> dict[str, Any] | None:
+    """The most recent snapshot of this (target, port) from an earlier scan,
+    the baseline a new scan is diffed against."""
+    cols = list(_SNAPSHOT_COLUMNS) + ["c2_hits", "record"]
+    rows = con.execute(
+        f"""SELECT {', '.join(cols)} FROM service_snapshots
+            WHERE target = ? AND port = ? AND scan_id <> ?
+            ORDER BY scanned_at DESC LIMIT 1""",
+        [target, port, before_scan_id]).fetchall()
+    return dict(zip(cols, rows[0])) if rows else None

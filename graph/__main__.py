@@ -6,6 +6,8 @@
     python -m graph collect --date 2026-09-18 # Stage A
     python -m graph daily   --date 2026-09-18 # both
     python -m graph trace   --date 2026-09-18 # summarize a recorded run
+    python -m graph netwatch                  # scan the watchlist + ingest
+    python -m graph netwatch --ingest-only    # just load what's spooled
 """
 from __future__ import annotations
 
@@ -68,8 +70,13 @@ async def _run(which: str, day: str, *, dry_run: bool, skip_enrich: bool,
 def main() -> int:
     ap = argparse.ArgumentParser(prog="graph", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["draw", "analyze", "collect", "daily", "trace"])
+    ap.add_argument("command",
+                    choices=["draw", "analyze", "collect", "daily", "trace", "netwatch"])
     ap.add_argument("--date", default=date.today().isoformat())
+    ap.add_argument("--tiers", default="hot,full",
+                    help="netwatch: which watchlist tiers to scan (comma-separated)")
+    ap.add_argument("--ingest-only", action="store_true",
+                    help="netwatch: skip scanning, just ingest the spool")
     ap.add_argument("--dry-run", action="store_true",
                     help="analyze without saving correlations or the narrative")
     ap.add_argument("--skip-enrich", action="store_true",
@@ -88,6 +95,14 @@ def main() -> int:
     if args.command == "draw":
         for name, path in write_all(args.out).items():
             print(f"{name:14s} {path}")
+        return 0
+
+    if args.command == "netwatch":
+        from cti.netwatch import jobs, ingest
+        if not args.ingest_only:
+            scan = jobs.run(tiers={t.strip() for t in args.tiers.split(",") if t.strip()})
+            print(f"scan: {scan}")
+        print(f"ingest: {ingest.ingest()}")
         return 0
 
     if args.command == "trace":

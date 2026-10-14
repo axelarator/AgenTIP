@@ -1,0 +1,29 @@
+id: cobalt-strike-default-cert
+
+info:
+  name: Cobalt Strike team server default TLS certificate
+  author: cti-graph
+  severity: high
+  description: >
+    Cobalt Strike ships a self-signed team-server certificate whose serial
+    is 8675309 (0x845FED) with a fixed Subject/Issuer DN. A server still
+    presenting it is an unconfigured team server. Narrow by design; a
+    customised profile will not match.
+  reference:
+    - https://www.recordedfuture.com/identifying-cobalt-strike-team-servers-in-the-wild
+  tags: c2,cobaltstrike,tls
+
+ssl:
+  - address: "{{Host}}:{{Port}}"
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: serial
+        words:
+          - "84:5F:ED"
+          - "8675309"
+        condition: or
+      - type: word
+        part: issuer_cn
+        words:
+          - "Major Cobalt Strike"
