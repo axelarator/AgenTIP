@@ -127,6 +127,7 @@ def _log_observation(con, value: str, indicator_type: str, actor: str | None,
             http_status=http.get("status"), http_title=http.get("title"),
             http_server=http.get("server"), http_final_url=http.get("final_url"),
             http_headers=http.get("headers") or None,
+            http_header_order=observe_source.header_order(http.get("raw_header")),
             http_tech=http.get("tech") or None)
 
     if tls:
@@ -141,6 +142,7 @@ def _log_observation(con, value: str, indicator_type: str, actor: str | None,
             tls_self_signed=tls.get("self_signed"),
             cert_revoked=tls.get("revoked"),
             tls_version=tls.get("tls_version"),
+            tls_ja3s=tls.get("ja3s"),
             tls_not_before=tls.get("not_before"), tls_not_after=tls.get("not_after"))
 
     if dns or whois or cdn_info:

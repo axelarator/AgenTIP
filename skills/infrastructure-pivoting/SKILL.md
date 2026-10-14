@@ -121,9 +121,14 @@ Configuration and registration facts. Coincidence is possible, which is why two 
 
 How the service behaves. Distinctive in combination, individually shared by every host running the same stack.
 
+- **`flow.app_proto`** — FlowCarp classed a session to both as the same application protocol from its statistics alone - most useful on a port where nothing parsed a banner.
+  - *Never:* a link on a common protocol. Only non-generic labels are recorded; 'tls' or 'http' on a web port is what every host says.
 - **`http.error_page_sha256`** — both hosts serve the same error page. Weak, but not nothing: the same origin-down page from the same CDN is a statement about shared hosting, and an unusual custom error page can be a real tell.
   - *Never:* a link, and especially not a shared deployment. Cloudflare's 521 'Web Server Is Down' page promoted three domains under three different registrations before this type existed, because a body hash was recorded whatever the status code said.
-- **`http.header_set`** — the same unusual response-header combination - typically the same server build or reverse proxy config.
+- **`http.header_order`** — the response headers arrive in the same ORDER - a property of the server build and proxy chain rather than its configuration, the HTTP analogue of JARM. Our own collection; webamon.fp_header_order is the same idea as a third party's digest.
+  - *Never:* anything off a CDN, and a link on a stock server: every default nginx of one version sends the same order.
+- **`http.header_set`** — the same unusual response-header combination - typically the same server build or reverse proxy config. Standard headers (date, content-type, caching, security headers) are dropped before the set is formed, so what is left is the part an operator or kit added.
+  - *Never:* anything off a CDN: the edge writes its own headers.
 - **`http.title`** — the same page title. Weak alone, useful when the title is itself distinctive and the body hash differs only by a timestamp.
 - **`net.cohosted_domain`** — a third-party index sees both names on one address. Corroborates a link established some other way; on its own it is a statement about the hosting, not the operator.
   - *Never:* a link on shared hosting, where every pair of addresses shares thousands of tenants. Backfilling it without that gate produced 5320 selectors from this repo's own data, nearly all Cloudflare tenants.
@@ -133,9 +138,18 @@ How the service behaves. Distinctive in combination, individually shared by ever
   - *Never:* the ports that are open NOW. The observation is someone else's, at an unknown time, so it can corroborate a link and must never be confused with net.port_set, which nmap confirmed.
 - **`net.port_set`** — the same open-port pattern. Unusual high ports are the interesting case - the source reporting keyed on RDP-over-TLS at 64350, 64330, 65535 and 65111.
   - *Never:* a link on a common set such as 22/80/443.
+- **`ssh.hassh_server`** — the same SSH server build and crypto configuration (HASSH of the server's KEXINIT).
+  - *Never:* operator identity: a default OpenSSH on one distro release is everywhere.
 - **`tls.default_subject`** — the same stock certificate subject - a self-signed cert left at its install-time defaults. Identifies the software build, the way JARM does, and is genuinely useful: two tracked hosts carrying the same one are running the same tool.
   - *Never:* operator identity. Every unconfigured deployment of that software shares it, so it corroborates a link and cannot make one.
-- **`tls.ja4s`** — the server side of the handshake matches.
+- **`tls.ja3s`** — the older, coarser server-hello digest - the same TLS library and settings answering the client tlsx sends.
+  - *Never:* operator identity, and it is not comparable with tls.ja4s.
+- **`tls.ja4s`** — the server side of the handshake matches: the same TLS version, cipher and extension choices in reply to the same client hello.
+  - *Never:* operator identity. Read passively from Zeek (ssl.log) for a session our own probe opened; never filled from a JA3S value, which was stored here by mistake until netwatch and could not match anything.
+- **`tls.ja4ts`** — the same TCP stack answering the SYN - window size, options and their order, so the same OS and kernel tuning.
+  - *Never:* a link on a stock OS: every default Ubuntu host shares it.
+- **`tls.ja4x`** — the certificate was generated the same WAY - the same issuer and subject field order and the same extensions, which is a property of the tool or script that minted it (a C2 framework's default cert, a kit's generator), not of the names in it.
+  - *Never:* a link between operators: every Let's Encrypt certificate shares a handful of values, so this means something only off a self-signed or private-CA certificate.
 - **`tls.jarm`** — the same TLS stack and configuration - consistent with the same C2 family or the same build.
   - *Never:* operator identity: JARM identifies software, not owners.
 - **`webamon.fp_cert_config`** — the same certificate configuration - key type, extensions, validity window shape.

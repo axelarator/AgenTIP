@@ -66,7 +66,10 @@ DIRSEARCH_CMD = ["dirsearch"]
 OPENSSL_CMD = ["openssl"]
 DIG_CMD = ["dig"]
 
-USER_AGENT = "Mozilla/5.0 (cti-agent probe)"
+# An ordinary browser string. The old "(cti-agent probe)" named the tool to
+# every server we touched, which is the one thing a probe must not do.
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 HTTP_TIMEOUT = 20
 TCP_PRECHECK_TIMEOUT = 3
 JARM_SUBPROCESS_TIMEOUT = 20
@@ -741,6 +744,9 @@ def _observe_http(target: str, known_ports: list | None = None) -> tuple[dict, s
         "favicon_path": r.get("favicon_path"),
         "tech": r.get("tech") or [],
         "headers": r.get("header") or {},
+        # `header` is a Go map and arrives sorted by key; the raw block keeps
+        # the order the server sent, which is what http.header_order reads.
+        "raw_header": r.get("raw_header"),
         "jarm": r.get("jarm"),
         "content_length": r.get("content_length"),
         "final_url": r.get("final_url") or r.get("url"),

@@ -38,6 +38,60 @@ _DEFAULT_TITLES = {
 }
 
 
+# Response headers nearly every server sends, or that only describe this
+# one response. What is left after dropping them is what a server build,
+# kit or operator chose to add. Names are compared in httpx's form
+# (lowercase, "-" as "_").
+_COMMON_HEADERS = frozenset({
+    "date", "server", "content_type", "content_length", "content_encoding",
+    "content_language", "content_disposition", "transfer_encoding",
+    "connection", "keep_alive", "expires", "cache_control", "pragma", "age",
+    "etag", "last_modified", "accept_ranges", "vary", "location", "via",
+    "set_cookie", "link", "upgrade", "alt_svc", "strict_transport_security",
+    "x_frame_options", "x_content_type_options", "x_xss_protection",
+    "referrer_policy", "content_security_policy", "permissions_policy",
+    "cross_origin_opener_policy", "cross_origin_embedder_policy",
+    "cross_origin_resource_policy", "access_control_allow_origin",
+    "nel", "report_to", "www_authenticate", "retry_after", "mime_version",
+})
+# Header families a CDN or cloud front end adds on every tenant's response.
+_EDGE_HEADER_PREFIXES = ("cf_", "x_amz_", "x_akamai", "x_azure", "x_msedge",
+                         "x_fastly", "x_served_by", "x_cache", "x_timer",
+                         "x_goog_", "x_vercel", "x_nf_", "server_timing")
+
+
+def header_set(headers: dict[str, Any] | None) -> list[str]:
+    """The response-header names left once standard and CDN headers go.
+
+    Names only. Values carry request ids and timestamps, so including them
+    would make every response unique.
+    """
+    names = set()
+    for name in (headers or {}):
+        key = str(name).strip().lower().replace("-", "_")
+        if not key or key in _COMMON_HEADERS or key.startswith(_EDGE_HEADER_PREFIXES):
+            continue
+        names.add(key)
+    return sorted(names)
+
+
+def header_order(raw_header: str | None) -> str | None:
+    """Response-header names in the order the server sent them.
+
+    Read from httpx's raw header block, because its `header` map is a Go map
+    and arrives sorted by key. The status line is skipped and repeats are
+    kept (two Set-Cookie lines are part of the shape).
+    """
+    if not raw_header:
+        return None
+    names = []
+    for line in raw_header.replace("\r\n", "\n").split("\n")[1:]:
+        name, sep, _ = line.partition(":")
+        if sep and name.strip() and " " not in name.strip():
+            names.append(name.strip().lower())
+    return ",".join(names) or None
+
+
 def _is_default_cert(subject: str | None) -> bool:
     """Whether a certificate subject identifies a stock build.
 
@@ -229,7 +283,21 @@ def selectors_from(result: dict[str, Any], *, target: str,
     if http.get("jarm"):
         yield "tls.jarm", http["jarm"]
     if tls.get("ja3s"):
-        yield "tls.ja4s", tls["ja3s"]
+        yield "tls.ja3s", tls["ja3s"]
+    if tls.get("ja4s"):
+        yield "tls.ja4s", tls["ja4s"]
+    # Headers off a CDN edge are the edge's, the same reason the body hash
+    # is suppressed there. A domain behind a CDN is skipped too, unlike the
+    # body: the edge rewrites and reorders headers but passes the body.
+    if not (on_shared_infra or cdn_failed):
+        names = header_set(http.get("headers"))
+        if names:
+            yield "http.header_set", names
+        # A stored observation carries the order already derived; a live
+        # one carries httpx's raw block.
+        order = http.get("header_order") or header_order(http.get("raw_header"))
+        if order:
+            yield "http.header_order", order
     if result.get("ports"):
         yield "net.port_set", result["ports"]
     title = (http.get("title") or "").strip()

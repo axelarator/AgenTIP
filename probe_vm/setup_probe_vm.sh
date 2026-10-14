@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bootstrap the lab probe VM (Debian/Ubuntu) for cti-agent: installs the
+# Bootstrap the lab probe VM (Debian/Ubuntu) for cti-graph: installs the
 # tools probe_helper.py shells out to, installs the helper, and creates the
 # SSH user whose key is pinned to it with a forced command. Idempotent.
 #

@@ -231,6 +231,10 @@ _SCALAR_FIELDS: tuple[tuple[str, str], ...] = (
     ("whois_registrant_email", "TEXT"),
     ("whois_created", "TEXT"),
     ("cdn_provider", "TEXT"),
+    # Our own fingerprints. http_header_order is the ordered name list from
+    # the raw header block; tls_ja3s was collected but never stored.
+    ("http_header_order", "TEXT"),
+    ("tls_ja3s", "TEXT"),
 )
 
 _JSON_FIELDS: tuple[str, ...] = (

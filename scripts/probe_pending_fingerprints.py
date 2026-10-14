@@ -8,7 +8,8 @@ concurrently rather than one at a time (see below):
 
   1. probe_helper.py on the lab probe VM (10.20.30.74) - generates
      a JARM scan and one ordinary TLS handshake against the target.
-  2. An OpenSearch query against the Arkime VM (10.20.0.18:9200) -
+  2. An OpenSearch query against the Zeek logs (Wazuh archives on
+     siem01 by default, through cti/sources/opensearch.py's tunnel) -
      reads back whatever that handshake produced in ssl.log/conn.log,
      which a separate ingestion pipeline already ships there reliably.
 
@@ -69,10 +70,9 @@ connect back out to the cti host's home-LAN segment - deliberate lab
 hygiene. This script runs as part of the cti_tools package (it imports
 core.py directly - no listener, nothing accepts inbound connections
 here) and *initiates* the SSH connection itself, outbound into the lab.
-The OpenSearch query is a plain outbound HTTPS call to the Arkime VM,
-which - per lab setup - is reachable directly from the cti host over
-the same Tailscale/home-LAN routes as the probe VM, not proxied through
-any other lab host.
+The OpenSearch query goes to the Wazuh indexer on siem01, which listens
+on localhost only; cti/sources/opensearch.py opens an outbound SSH
+forward through a login that can reach that one port and nothing else.
 
 Usage (run manually, or on a cron/systemd timer):
 
@@ -86,10 +86,8 @@ access. To check access on its own, without draining the queue:
     python3 probe_pending_fingerprints.py --check-access
 
 Requires: cti_tools importable (run from within the mcp-server venv/repo
-checkout); an SSH keypair authorized to reach the lab probe VM. No
-OpenSearch credential is required - the Arkime VM's OpenSearch (as of
-the 10.20.0.18 move) sits on plain HTTP with no login in front of it,
-lab-internal only.
+checkout); an SSH keypair authorized to reach the lab probe VM; the
+CTI_WAZUH_* settings for the read-only Zeek reader (see README).
 """
 from __future__ import annotations
 
@@ -235,8 +233,9 @@ def _lookup_ports(cluster: str, target: str) -> list[int]:
 # newest-indexed-ts query that used to be reimplemented here are now
 # cti/sources/opensearch.py. That module was generalized from this file
 # and said so in its own docstring, while this copy stayed behind and
-# drifted: it hardcoded the URL and index where the package version
-# reads CTI_OPENSEARCH_URL / CTI_OPENSEARCH_INDEX.
+# drifted: it hardcoded the URL and index. The client now picks the Zeek
+# backend (CTI_ZEEK_BACKEND, default wazuh) and hands back flat documents
+# with the legacy field names this script reads.
 _client = OpenSearchClient()
 
 
@@ -324,7 +323,8 @@ def collect_zeek_fingerprints_batch(resolved: list[tuple[str, int]], baseline_ts
             break
         ips = {ip for ip, _ in remaining}
         size = min(len(remaining) * 50, 5000)  # OpenSearch's default max_result_window
-        for hit in _client.sources({"terms": {"dst_ip": sorted(ips)}}, size=size):
+        for hit in _client.sources({"terms": {_client.field("dst_ip"): sorted(ips)}},
+                                   size=size):
             ip = hit.get("dst_ip")
             candidate_ports = ports_by_ip.get(ip)
             if candidate_ports is None or hit.get("ts", 0) <= baseline_ts:

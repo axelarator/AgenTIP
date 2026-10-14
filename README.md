@@ -222,22 +222,19 @@ Secrets stay in the environment (`~/.bashrc`, which cron sources):
 `WEBAMON_API_KEY`, `HONEYLABS_API_KEY`, `THREATFOX_API_KEY` (optional).
 Probe VM: `CTI_PROBE_HOST`, `CTI_PROBE_USER`, `CTI_PROBE_SSH_KEY`,
 `CTI_PROBE_KNOWN_HOSTS`, `CTI_PROBE_HELPER_CMD`.
+Zeek logs (Wazuh archives on siem01, read-only, through a forward-only SSH
+login set up by threat-hunt-lab): `CTI_ZEEK_BACKEND` (`wazuh`, or `arkime`
+for the legacy `zeek-*` history), `CTI_WAZUH_TUNNEL`, `CTI_WAZUH_SSH_KEY`,
+`CTI_WAZUH_KNOWN_HOSTS`, `CTI_WAZUH_USER`, `CTI_WAZUH_PASSWORD`.
 
-## Cutover
+## History
 
-`cti-agent` is untouched and its cron still runs. Two repos must not write
-the same DuckDB file — it is process-exclusive for read-write — so
-`data/` here is a snapshot, already migrated.
-
-1. Stop the old cron (`crontab -e`) and its dashboard
-   (`systemctl --user stop cti-dashboard`).
-2. Re-copy `data/` from `cti-agent` and re-run
-   `scripts/migrate_schema.py SOURCE DEST --verify`.
-3. Deploy the probe VM bootstrap: `probe_vm/setup_probe_vm.sh` (it builds
-   the sandbox image and fails if `--network=none` lets a container reach
-   the network).
-4. Install the cron lines `./setup.sh` prints.
-5. Run one day through both pipelines and diff the narratives.
+Forked from `cti-agent` at `096160c` (`.forked-from`). The cutover finished
+on 2026-09-19 (the old cron was removed then; its crontab is kept in
+`~/archive/cti-agent-backups/`), and `cti-agent` was archived and deleted on
+2026-10-14. To rebuild the probe VM, run `probe_vm/setup_probe_vm.sh`; it
+builds the sandbox image and fails if `--network=none` lets a container
+reach the network.
 
 Until then, point this checkout at its own copy with `CTI_DUCKDB_PATH`
 and `CTI_DASHBOARD_PORT`.
