@@ -146,6 +146,9 @@ echo "== netwatch scanner tools (nuclei, zgrab2)"
 # The scheduled re-scanner adds per-port web probing with our own C2
 # templates (nuclei) and raw banners for odd ports (zgrab2). Both are Go,
 # installable through cti-provision too; here for a from-scratch build.
+# cti-provision installs Go under /usr/local/go, which is not on root's PATH
+# by default - add it so `go install` is found the same way.
+[[ -x /usr/local/go/bin/go ]] && export PATH="/usr/local/go/bin:$PATH"
 if command -v go >/dev/null 2>&1; then
   command -v nuclei >/dev/null 2>&1 || GOBIN=/usr/local/bin go install -v \
     github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest >/dev/null 2>&1 \
