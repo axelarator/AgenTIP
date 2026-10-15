@@ -33,6 +33,8 @@ from datetime import date
 from typing import Any
 
 from .. import core, store
+from ..netwatch import rules as hunt_rules
+from ..netwatch.candidates import pdns as pdns_source
 from ..sources import budget, pivot, webamon
 from ..store import cdn as cdn_ranges
 from ..store import expand, rarity, selectors
@@ -164,34 +166,125 @@ def _verify(con, host: str, cluster_indicators: set[str]) -> expand.Candidate | 
     return best
 
 
+def _rule_candidates(slug: str, data: dict[str, Any], owners: dict[str, str],
+                     report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Hosts a cluster's own enabled hunt rules match in our snapshots.
+
+    A rule is a human-approved signature, so a snapshot host that matches it
+    and is not already tracked is filed straight away - the approval IS the
+    judgment the corroboration rule stands in for when nobody wrote a
+    signature. It is still only a `candidate`, so an analyst accepts it
+    before it exports.
+    """
+    rules = [r for r in hunt_rules.load()
+             if r.cluster == slug and r.action == "candidate"]
+    if not rules:
+        return []
+    skip = _tracked_values(data) | _denied(data)
+    filed: list[dict[str, Any]] = []
+    with store.connect() as con:
+        hits = hunt_rules.evaluate(con, rules)
+    for hit in hits:
+        host = hit["indicator"].lower().rstrip(".")
+        if host in skip:
+            continue
+        if host in owners:
+            report["owned_elsewhere"].append({"value": host, "cluster": owners[host]})
+            continue
+        if pivot.classify(host) == "ip" and cdn_ranges.is_cdn(host):
+            continue
+        terms = ", ".join(f"{t}={str(v)[:32]}" for t, v in hit.get("terms") or [])
+        filed.append({
+            "value": host, "enrich_kind": pivot.classify(host),
+            "lifecycle": "candidate",
+            "discovered_via": f"hunt-rule:{hit['rule']}",
+            "discovered_from": hit["rule"],
+            "candidate_reason": f"matches hunt rule {hit['rule']} ({terms})",
+            "candidate_linked_to": hit["rule"]})
+        skip.add(host)              # one rule filing per host per run
+    return filed
+
+
+def _pdns_candidates(data: dict[str, Any], owners: dict[str, str],
+                     report: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Co-hosted names and historical addresses of this cluster's live hosts.
+
+    Returns host -> provenance, to be swept and corroborated like a Webamon
+    reversal. A co-hosted name off a shared-hosting address is a stranger,
+    so those addresses are left out here and the corroboration rule is the
+    backstop for any that slip through.
+    """
+    skip = _tracked_values(data) | _denied(data)
+    via: dict[str, dict[str, Any]] = {}
+    for indicator in _live_indicators(data):
+        kind = pivot.classify(indicator)
+        for cand in pdns_source.host_candidates(indicator, kind):
+            host = cand.value
+            if host in skip or host in via:
+                continue
+            if host in owners:
+                report["owned_elsewhere"].append({"value": host, "cluster": owners[host]})
+                continue
+            if cand.kind == "ip" and cdn_ranges.is_cdn(host):
+                continue
+            via[host] = {"via": cand.discovered_via, "from": cand.discovered_from,
+                         "reason": cand.reason, "kind": cand.kind}
+    return via
+
+
 def expand_cluster(slug: str) -> dict[str, Any]:
-    """One cluster's expansion pass. Returns what it filed and why."""
+    """One cluster's expansion pass. Returns what it filed and why.
+
+    Order: our own sources first - enabled hunt rules over our snapshots,
+    then passive-DNS neighbours - and Webamon's reverse lookup only as a
+    fallback to fill the host budget. Nothing from Webamon is reached if our
+    own sources already found a run's worth of hosts.
+    """
     data = core.load_cluster(slug)
     report: dict[str, Any] = {"cluster": data["name"], "seeds": [], "reversed": 0,
-                              "swept": 0, "filed": [], "rejected_links": 0,
-                              "owned_elsewhere": [], "errors": []}
-    with store.connect() as con:
-        seeds = seeds_for(con, data)
-    report["seeds"] = [f"{s['selector_type']}={str(s['selector_value'])[:64]}" for s in seeds]
-    if not seeds:
-        return report
-
+                              "swept": 0, "filed": [], "rule_filed": [],
+                              "rejected_links": 0, "owned_elsewhere": [],
+                              "errors": []}
     owners = _owned_elsewhere(slug)
-    via: dict[str, dict[str, Any]] = {}
-    for seed in seeds:
-        if report.get("budget_exhausted"):
-            break
-        report["reversed"] += 1
-        for host in _new_hosts(data, seed, owners, report):
-            via.setdefault(host, seed)
+
+    # 1. Hunt rules: file matching snapshot hosts directly (no sweep needed -
+    # a matched host is already in our snapshots, so its selectors are too).
+    for meta in _rule_candidates(slug, data, owners, report):
+        host = meta.pop("value")
+        meta.pop("enrich_kind", None)
+        source = f"hunt-rule {now_iso()[:10]} via {meta['discovered_via'][:96]}"
+        if core.file_candidate(slug, host, source, meta):
+            report["rule_filed"].append({"value": host, **meta})
+
+    # 2. Passive DNS neighbours, then Webamon as the fallback.
+    via = _pdns_candidates(data, owners, report)
+    if len(via) < EXPAND_HOSTS_PER_CLUSTER:
+        with store.connect() as con:
+            seeds = seeds_for(con, data)
+        report["seeds"] = [f"{s['selector_type']}={str(s['selector_value'])[:64]}"
+                           for s in seeds]
+        for seed in seeds:
+            if report.get("budget_exhausted") or len(via) >= EXPAND_HOSTS_PER_CLUSTER:
+                break
+            report["reversed"] += 1
+            for host in _new_hosts(data, seed, owners, report):
+                via.setdefault(host, {
+                    "via": f"{seed['selector_type']}:{seed['selector_value']}",
+                    "from": seed["from"], "kind": "domain",
+                    "reason": f"carries {seed['selector_type']}"})
+
     hosts = list(via)[:EXPAND_HOSTS_PER_CLUSTER]
     if not hosts:
         return report
 
     # One sweep per new host writes its selectors, so the corroboration
     # rule has something to read. Recorded with no actor: the host is not
-    # attributed to anyone until an analyst accepts it.
-    results = core._sweep_lifecycle(hosts, [])
+    # attributed to anyone until an analyst accepts it. Domains and IPs go
+    # to their own lifecycle path (Webamon only ever yields domains; passive
+    # DNS adds both).
+    sweep_domains = [h for h in hosts if via[h].get("kind") != "ip"]
+    sweep_ips = [h for h in hosts if via[h].get("kind") == "ip"]
+    results = core._sweep_lifecycle(sweep_domains, sweep_ips)
     report["swept"] = len(hosts)
     note = core._record_enrichment(None, results)
     if note:
@@ -205,20 +298,22 @@ def expand_cluster(slug: str) -> dict[str, Any]:
             if link is None:
                 report["rejected_links"] += 1
                 continue
-            seed = via[host]
+            prov = via[host]
             filed.append((host, {
                 "lifecycle": "candidate",
-                "discovered_via": f"{seed['selector_type']}:{seed['selector_value']}",
-                "discovered_from": seed["from"],
+                "discovered_via": prov["via"],
+                "discovered_from": prov["from"],
                 "candidate_reason": link.reason,
                 "candidate_linked_to": link.indicator,
             }))
 
     for host, metadata in filed:
         source = f"auto-pivot {now_iso()[:10]} via {metadata['discovered_via'][:96]}"
+        category = "ips" if via[host].get("kind") == "ip" else "domains"
+        enrich_key = (category, host)
         core.file_candidate(slug, host, source, metadata,
-                            {("domains", host): results[("domains", host)]}
-                            if ("domains", host) in results else None)
+                            {enrich_key: results[enrich_key]}
+                            if enrich_key in results else None)
         report["filed"].append({"value": host, **metadata})
     return report
 
@@ -237,7 +332,8 @@ def run(day: date, *, forced: bool = False,
             log.exception("expansion failed for %s", slug)
             report = {"cluster": slug, "errors": [f"{type(e).__name__}: {e}"], "filed": []}
         out["clusters"][slug] = report
-        out["filed_total"] += len(report.get("filed") or [])
+        out["filed_total"] += (len(report.get("filed") or [])
+                               + len(report.get("rule_filed") or []))
         if report.get("budget_exhausted"):
             out["budget_exhausted"] = True
             break

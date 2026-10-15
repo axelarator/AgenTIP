@@ -8,6 +8,8 @@
     python -m graph trace   --date 2026-09-18 # summarize a recorded run
     python -m graph netwatch                  # scan the watchlist + ingest
     python -m graph netwatch --ingest-only    # just load what's spooled
+    python -m graph netwatch --discover       # queue neighbourhood sweep targets
+    python -m graph netwatch --certstream-seconds 120  # a bounded CT batch
 """
 from __future__ import annotations
 
@@ -77,6 +79,11 @@ def main() -> int:
                     help="netwatch: which watchlist tiers to scan (comma-separated)")
     ap.add_argument("--ingest-only", action="store_true",
                     help="netwatch: skip scanning, just ingest the spool")
+    ap.add_argument("--discover", action="store_true",
+                    help="netwatch: queue neighbourhood sweep targets, then scan")
+    ap.add_argument("--certstream-seconds", type=float, default=0.0,
+                    help="netwatch: consume the CT stream for N seconds and queue "
+                         "hits before scanning (needs certstream-server-go running)")
     ap.add_argument("--dry-run", action="store_true",
                     help="analyze without saving correlations or the narrative")
     ap.add_argument("--skip-enrich", action="store_true",
@@ -98,7 +105,13 @@ def main() -> int:
         return 0
 
     if args.command == "netwatch":
-        from cti.netwatch import jobs, ingest
+        from cti.netwatch import ingest, jobs
+        if args.discover:
+            from cti.netwatch.candidates import neighbourhood
+            print(f"neighbourhood: {neighbourhood.enqueue()}")
+        if args.certstream_seconds > 0:
+            from cti.netwatch.candidates import ct
+            print(f"certstream: {asyncio.run(ct.stream(seconds=args.certstream_seconds))}")
         if not args.ingest_only:
             scan = jobs.run(tiers={t.strip() for t in args.tiers.split(",") if t.strip()})
             print(f"scan: {scan}")

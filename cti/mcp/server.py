@@ -514,5 +514,46 @@ def validin_history(indicator: str, kind: str = "dns", reason: str = "") -> dict
                      "certificates or registration"}
 
 
+@mcp.tool()
+def netwatch_suggest_rule(cluster: str, min_hosts: int = 2) -> dict:
+    """Draft a hunt rule for a cluster from the selectors its hosts share.
+
+    Returns a DISABLED draft plus the supporting evidence (which selectors,
+    how many hosts carry each, their global counts). Nothing is written and
+    nothing is enabled: review it against graph/prompts/signature.md, tighten
+    the terms, and drop a file with `enabled: true` in data/hunt_rules/. A
+    good rule anchors on one structural/identity fact and tightens with one
+    or two behavioural ones; contextual facts never belong in it."""
+    from ..netwatch import rules as hunt_rules
+
+    try:
+        data = core.load_cluster(cluster)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"cannot load cluster {cluster!r}: {e}"}
+    indicators = [o["value"] for cat in ("domains", "ips")
+                  for o in data["observables"].get(cat, [])
+                  if core.lifecycle_of(o) == "active"]
+    with tracking.connect(read_only=True) as con:
+        return hunt_rules.suggest(con, indicators, cluster=cluster,
+                                  min_hosts=min_hosts)
+
+
+@mcp.tool()
+def netwatch_list_rules() -> dict:
+    """The hunt rules on disk, enabled and disabled, with their scope and
+    action. Read-only: a rule is a file in data/hunt_rules/."""
+    from ..netwatch import rules as hunt_rules
+
+    out = []
+    for rule in hunt_rules.load(enabled_only=False):
+        out.append({"id": rule.id, "cluster": rule.cluster,
+                    "enabled": rule.enabled, "scope": rule.scope,
+                    "action": rule.action, "source": rule.source,
+                    "terms": [{t: str(v)} for t, v in
+                              rule.terms("all") + rule.terms("any")],
+                    "ports": rule.ports, "note": rule.note})
+    return {"rules": out, "enabled": sum(1 for r in out if r["enabled"])}
+
+
 if __name__ == "__main__":
     mcp.run()

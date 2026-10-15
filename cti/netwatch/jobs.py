@@ -19,7 +19,7 @@ from typing import Any
 from ..probe import vm_proxy
 from ..sources import budget
 from ..util import data_dir
-from . import watchlist
+from . import queue, watchlist
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +79,12 @@ def run(*, tiers: set[str] | None = None,
     spool the results. Returns a summary; ingest() loads the spool."""
     tiers = tiers or {"hot", "full"}
     targets = watchlist.for_tiers(tiers, clusters=clusters)
+    # Candidate discovery (CT, neighbourhood) drops extra targets on the
+    # queue; take the ones this run's tiers cover and merge by value so a
+    # queued host already on the watchlist does not scan twice.
+    seen = {t["value"] for t in targets}
+    queued = [t for t in queue.drain(tiers=tiers) if t["value"] not in seen]
+    targets += queued
     if not targets:
         return {"targets": 0, "jobs": 0, "records": 0, "spooled": []}
 
@@ -102,5 +108,5 @@ def run(*, tiers: set[str] | None = None,
         records = _collect(job["job_id"])
         spooled.append(job["job_id"])
         total += len(records)
-    return {"targets": len(targets), "jobs": len(jobs),
+    return {"targets": len(targets), "queued": len(queued), "jobs": len(jobs),
             "records": total, "spooled": spooled}

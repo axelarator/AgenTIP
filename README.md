@@ -190,6 +190,46 @@ The probe side (worker + scanner tools + C2 templates) is deployed by
 re-running `probe_vm/setup_probe_vm.sh` as root on the probe VM; the
 forced-command keys deliberately cannot deploy code.
 
+### Hunt rules and candidate discovery
+
+A **hunt rule** (`data/hunt_rules/*.yaml`, see that dir's README) is a saved
+signature of a cluster's infrastructure — a combination of selector values
+and open ports — run against our own snapshots and against the Certificate
+Transparency stream. A match files a cluster `candidate` (reviewed before it
+exports) or alerts. Draft one from what a cluster's hosts already share with
+the `netwatch_suggest_rule` MCP tool and `graph/prompts/signature.md`; a rule
+is only matched once a human sets `enabled: true`.
+
+Three candidate sources of our own feed the existing expansion flow, ahead of
+the Webamon fallback:
+
+- **hunt rules** over `service_snapshots` (`cti/netwatch/rules.py`),
+- **passive DNS** co-hosted names and historical IPs (`candidates/pdns.py`),
+- **neighbourhood** — the announced /24 around each active IP, swept weekly
+  (`candidates/neighbourhood.py`), and
+- **CT** — a self-hosted certstream feed matched against CT-scoped rules
+  (`candidates/ct.py`).
+
+CT and neighbourhood drop extra scan targets on `data/netwatch/queue/`, which
+`graph netwatch` drains alongside the watchlist. To run them:
+
+```
+# weekly: queue the neighbourhood sweep, then scan the sweep tier
+30 6 * * 1  . $HOME/.bashrc && cd ~/cti-graph && .venv/bin/python -m graph netwatch --discover --tiers sweep >> data/tracking/logs/netwatch.log 2>&1
+```
+
+CT needs `certstream-server-go` running locally (it republishes the CT
+firehose on a websocket — no vendor, no key). Install it once and run it as a
+systemd **user** unit, then let the hourly hot run consume a bounded batch:
+
+```
+# ~/.config/systemd/user/certstream.service  (ExecStart=/usr/local/bin/certstream_server -serve_domain 127.0.0.1 -serve_port 4000)
+systemctl --user enable --now certstream.service
+
+# in crontab, a two-minute CT batch on the hour before the hot scan:
+3 * * * *  . $HOME/.bashrc && cd ~/cti-graph && .venv/bin/python -m graph netwatch --certstream-seconds 120 --ingest-only >> data/tracking/logs/netwatch.log 2>&1
+```
+
 ## Operating notes
 
 - **`CTI_PROBE_MAX_CONCURRENT`** (default 6) caps simultaneous probe-VM calls.
