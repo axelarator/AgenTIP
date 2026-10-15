@@ -30,7 +30,8 @@ from .writes import (record_findings,
                      record_active_scan, record_asn_change, upsert_actor,
                      upsert_opendir_files, upsert_opendir_samples,
                      upsert_zeek_match, upsert_service_snapshot,
-                     record_service_change, latest_service_snapshot)
+                     record_service_change, latest_service_snapshot,
+                     update_service_flow)
 
 __all__ = [
     "SPECS", "CORRELATION_TYPES", "QUERY_MAX_BYTES", "QUERY_MAX_ROWS",
@@ -45,4 +46,5 @@ __all__ = [
     "tracked_observables", "upsert_actor", "upsert_observation",
     "upsert_opendir_files", "upsert_opendir_samples", "upsert_zeek_match",
     "upsert_service_snapshot", "record_service_change", "latest_service_snapshot",
+    "update_service_flow",
 ]

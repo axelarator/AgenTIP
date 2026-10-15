@@ -170,11 +170,13 @@ def test_ingest_writes_snapshots_and_selectors():
 
 
 def test_ingest_diffs_against_the_previous_scan():
-    _spool([_record("scan1", "203.0.113.8", 443, tls={"cert_sha256": "1" * 64})])
+    # hex hashes with letters: an all-digit value parses as a JSON number
+    # and would hide that old/new are written to a JSON column.
+    _spool([_record("scan1", "203.0.113.8", 443, tls={"cert_sha256": "ab" * 32})])
     ingest.ingest(client=None)
-    _spool([_record("scan2", "203.0.113.8", 443, tls={"cert_sha256": "2" * 64}),
+    _spool([_record("scan2", "203.0.113.8", 443, tls={"cert_sha256": "cd" * 32}),
             _record("scan2", "203.0.113.8", 8443, open=True,
-                    tls={"cert_sha256": "9" * 64})])
+                    tls={"cert_sha256": "ef" * 32})])
     ingest.ingest(client=None)
     with store.connect(read_only=True) as con:
         rows = con.execute(

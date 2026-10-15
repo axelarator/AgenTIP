@@ -230,6 +230,44 @@ systemctl --user enable --now certstream.service
 3 * * * *  . $HOME/.bashrc && cd ~/cti-graph && .venv/bin/python -m graph netwatch --certstream-seconds 120 --ingest-only >> data/tracking/logs/netwatch.log 2>&1
 ```
 
+### FlowCarp: protocol labels for unnamed services
+
+A scan recognises HTTP and TLS. The host on an odd port answering with raw
+bytes — a Gh0st/njRAT listener, a bespoke C2 handshake — it cannot name.
+[FlowCarp](https://flowcarp.com) identifies a protocol from *flow
+statistics* alone (no parser, no payload signature) and ships models for the
+common families. `graph netwatch --flowcarp` runs it in **batch** after
+ingest, only over the sessions our own probe opened to services that got no
+HTTP/TLS label, pulling just those flows' pcap from Arkime:
+
+```
+python -m graph netwatch --flowcarp                 # scan, ingest, then label
+python -m graph netwatch --ingest-only --flowcarp   # label recent snapshots only
+```
+
+Why batch, not live: the community edition (CC BY-ND) labels at most 10k
+flows/day — live mode on the sniff NIC would spend that on port-scan SYNs.
+The `flowcarp` provider in `budget.py` caps it; a run stops labelling at the
+limit. The protocol fills the snapshot's `app_proto`; any malware-tagged
+alert is unioned into its `c2_hits` next to the nuclei hits, and both move
+through the same `service_changes` log (`app_proto_changed`,
+`c2_signature_hit`). It is entirely optional: a missing binary, a missing
+Arkime, or absent `CTI_ARKIME_*` is a clean skip.
+
+Ops: install the `flowcarp` binary on the agent VM (`CTI_FLOWCARP_BIN` to
+point elsewhere) and set `CTI_ARKIME_URL` plus `CTI_ARKIME_USER` /
+`CTI_ARKIME_PASSWORD` (viewer digest auth; `CTI_ARKIME_CA` for a private CA).
+An optional nightly label pass, after the full scan has been ingested:
+
+```
+40 6 * * *  . $HOME/.bashrc && cd ~/cti-graph && .venv/bin/python -m graph netwatch --ingest-only --flowcarp >> data/tracking/logs/netwatch.log 2>&1
+```
+
+Custom models are supported by the community edition (confirmed): collect
+≥10 sessions of a family into `data/flowcarp/training/<family>/`, build an
+`.fcp` into `data/flowcarp/models/`, and every label run loads it alongside
+the built-ins. See `data/flowcarp/training/README.md`.
+
 ## Operating notes
 
 - **`CTI_PROBE_MAX_CONCURRENT`** (default 6) caps simultaneous probe-VM calls.
@@ -285,6 +323,9 @@ Zeek logs (Wazuh archives on siem01, read-only, through a forward-only SSH
 login set up by threat-hunt-lab): `CTI_ZEEK_BACKEND` (`wazuh`, or `arkime`
 for the legacy `zeek-*` history), `CTI_WAZUH_TUNNEL`, `CTI_WAZUH_SSH_KEY`,
 `CTI_WAZUH_KNOWN_HOSTS`, `CTI_WAZUH_USER`, `CTI_WAZUH_PASSWORD`.
+FlowCarp (optional, `--flowcarp`): `CTI_ARKIME_URL`, `CTI_ARKIME_USER`,
+`CTI_ARKIME_PASSWORD`, `CTI_ARKIME_CA`, `CTI_FLOWCARP_BIN`,
+`CTI_FLOWCARP_DAILY_BUDGET`.
 
 ## History
 

@@ -71,6 +71,11 @@ PROVIDERS: dict[str, Provider] = {
     # watchlist, counted in target-scans per day (one unit per host per
     # scan, whatever ports it touches).
     "netwatch": Provider("CTI_NETWATCH_BUDGET", 5000),
+    # FlowCarp's community edition identifies protocols for at most 10k
+    # flows/day per organisation (CC BY-ND); past that it still extracts
+    # flows but labels nothing, so the cap is the licence, not courtesy.
+    # Counted in flows, one unit per flow FlowCarp reported this day.
+    "flowcarp": Provider("CTI_FLOWCARP_DAILY_BUDGET", 10000),
 }
 
 

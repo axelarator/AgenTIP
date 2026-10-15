@@ -10,6 +10,7 @@
     python -m graph netwatch --ingest-only    # just load what's spooled
     python -m graph netwatch --discover       # queue neighbourhood sweep targets
     python -m graph netwatch --certstream-seconds 120  # a bounded CT batch
+    python -m graph netwatch --flowcarp       # label unnamed services via FlowCarp
 """
 from __future__ import annotations
 
@@ -84,6 +85,10 @@ def main() -> int:
     ap.add_argument("--certstream-seconds", type=float, default=0.0,
                     help="netwatch: consume the CT stream for N seconds and queue "
                          "hits before scanning (needs certstream-server-go running)")
+    ap.add_argument("--flowcarp", action="store_true",
+                    help="netwatch: after ingest, label unnamed services with "
+                         "FlowCarp over their Arkime pcap (needs the flowcarp "
+                         "binary and CTI_ARKIME_*)")
     ap.add_argument("--dry-run", action="store_true",
                     help="analyze without saving correlations or the narrative")
     ap.add_argument("--skip-enrich", action="store_true",
@@ -112,10 +117,17 @@ def main() -> int:
         if args.certstream_seconds > 0:
             from cti.netwatch.candidates import ct
             print(f"certstream: {asyncio.run(ct.stream(seconds=args.certstream_seconds))}")
+        scan = None
         if not args.ingest_only:
             scan = jobs.run(tiers={t.strip() for t in args.tiers.split(",") if t.strip()})
             print(f"scan: {scan}")
         print(f"ingest: {ingest.ingest()}")
+        if args.flowcarp:
+            from cti.netwatch import flowcarp
+            # Scope to this run's scans when we just scanned; a standalone
+            # --ingest-only --flowcarp pass labels the most recent snapshots.
+            scan_ids = scan.get("spooled") if scan else None
+            print(f"flowcarp: {flowcarp.label_services(scan_ids=scan_ids)}")
         return 0
 
     if args.command == "trace":
