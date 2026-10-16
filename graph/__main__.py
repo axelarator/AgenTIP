@@ -11,6 +11,8 @@
     python -m graph netwatch --discover       # queue neighbourhood sweep targets
     python -m graph netwatch --certstream-seconds 120  # a bounded CT batch
     python -m graph netwatch --flowcarp       # label unnamed services via FlowCarp
+    python -m graph netwatch --win116         # also fetch due hosts as a Windows client
+    python -m graph netwatch --ingest-only --win116   # only the Windows-client pass
     python -m graph hunt 'tls.jarm:<hash> AND NOT net.asn:13335'   # key:value hunt
     python -m graph hunt 'net.port:8443 during:[2026-03-01,2026-04-30]' --json
     python -m graph hunt --pairs update-trellix.com            # what is it most like
@@ -158,6 +160,9 @@ def main() -> int:
                     help="netwatch: after ingest, label unnamed services with "
                          "FlowCarp over their Arkime pcap (needs the flowcarp "
                          "binary and CTI_ARKIME_*)")
+    ap.add_argument("--win116", action="store_true",
+                    help="netwatch: after ingest, fetch the hosts win116 is due to see "
+                         "as a Windows client (needs CTI_WIN_HOST / CTI_WIN_USER)")
     ap.add_argument("--dry-run", action="store_true",
                     help="analyze without saving correlations or the narrative")
     ap.add_argument("--skip-enrich", action="store_true",
@@ -197,6 +202,9 @@ def main() -> int:
             # --ingest-only --flowcarp pass labels the most recent snapshots.
             scan_ids = scan.get("spooled") if scan else None
             print(f"flowcarp: {flowcarp.label_services(scan_ids=scan_ids)}")
+        if args.win116:
+            from cti.netwatch import win116
+            print(f"win116: {win116.run()}")
         return 0
 
     if args.command == "hunt":

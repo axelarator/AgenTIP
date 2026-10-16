@@ -253,6 +253,17 @@ def hunt_pairs(indicator: str, other: str = "", limit: int = 25) -> dict:
 
 
 @mcp.tool()
+def indicator_coverage(value: str) -> dict:
+    """What has observed an indicator, from which vantage, and when: selector
+    spans per (source, vantage), service scans per vantage (probe = Linux
+    scanner, win116 = Windows client), and enrichment observations per
+    source. Use it to see what a profile is missing before trusting it."""
+    from ..store import coverage
+    with tracking.connect_retry(read_only=True) as con:
+        return coverage.coverage(con, value)
+
+
+@mcp.tool()
 def list_candidates(name: str, min_band: str = "weak") -> list[dict]:
     """Candidates proposed for a cluster by pivots, scans and hunt rules,
     best first, with their relatedness score and band (strong / probable /

@@ -123,6 +123,8 @@ How the service behaves. Distinctive in combination, individually shared by ever
 
 - **`flow.app_proto`** — FlowCarp classed a session to both as the same application protocol from its statistics alone - most useful on a port where nothing parsed a banner.
   - *Never:* a link on a common protocol. Only non-generic labels are recorded; 'tls' or 'http' on a web port is what every host says.
+- **`http.client_divergence`** — the server answers a Windows client differently from a scanner - a different status class, title, certificate or landing host when win116 asks than when the probe does. Payload gating: the real file for a victim's machine, a decoy or a 404 for everyone else. The value names what diverged, so two hosts gating the same way share it.
+  - *Never:* operator identity, and not a verdict on its own: a CDN's bot challenge or a geo rule can diverge too. Read it beside what each client was actually served.
 - **`http.error_page_sha256`** — both hosts serve the same error page. Weak, but not nothing: the same origin-down page from the same CDN is a statement about shared hosting, and an unusual custom error page can be a real tell.
   - *Never:* a link, and especially not a shared deployment. Cloudflare's 521 'Web Server Is Down' page promoted three domains under three different registrations before this type existed, because a body hash was recorded whatever the status code said.
 - **`http.header_order`** — the response headers arrive in the same ORDER - a property of the server build and proxy chain rather than its configuration, the HTTP analogue of JARM. Our own collection; webamon.fp_header_order is the same idea as a third party's digest.

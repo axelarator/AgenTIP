@@ -307,6 +307,15 @@ TYPES: dict[str, SelectorType] = {t.name: t for t in (
        "'Web Server Is Down' page promoted three domains under three "
        "different registrations before this type existed, because a body "
        "hash was recorded whatever the status code said"),
+    _t("http.client_divergence", "behavioural",
+       "the server answers a Windows client differently from a scanner - a "
+       "different status class, title, certificate or landing host when win116 "
+       "asks than when the probe does. Payload gating: the real file for a "
+       "victim's machine, a decoy or a 404 for everyone else. The value names "
+       "what diverged, so two hosts gating the same way share it",
+       "operator identity, and not a verdict on its own: a CDN's bot "
+       "challenge or a geo rule can diverge too. Read it beside what each "
+       "client was actually served"),
     _t("http.title", "behavioural",
        "the same page title. Weak alone, useful when the title is itself "
        "distinctive and the body hash differs only by a timestamp"),

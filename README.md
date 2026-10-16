@@ -273,6 +273,29 @@ systemctl --user enable --now certstream.service
 3 * * * *  . $HOME/.bashrc && cd ~/cti-graph && .venv/bin/python -m graph netwatch --certstream-seconds 120 --ingest-only >> data/tracking/logs/netwatch.log 2>&1
 ```
 
+### The Windows-client vantage (win116)
+
+The probe sees infrastructure as a Linux scanner does. `--win116` adds what
+a Windows machine is served: `probe_vm/win116/win_runner.ps1` (PowerShell
+5.1, .NET over Schannel, Edge User-Agent) runs on the Windows VM, reached
+over SSH by `cti/probe/win_proxy.py`. GET only; bodies are hashed and
+discarded, never written or rendered.
+
+    probe_vm/win116/deploy.sh                       # copy the runner, then self-check
+    python -m graph netwatch --ingest-only --win116 # one coverage-driven pass
+
+Each pass takes the members (and `probable`+ candidates) win116 has not seen
+within `CTI_WIN_REFRESH_DAYS` (default 7), never-seen first, at most
+`CTI_WIN_TARGETS_PER_RUN` (default 30). It records service snapshots and
+selectors with vantage `win116`, and `http.client_divergence` where the
+answer differs from the probe's: status class, title, certificate, landing
+host, or a TLS session Schannel could not open. `indicator_coverage` (MCP)
+shows which vantages and sources have observed an indicator, and when.
+
+Connection settings are environment-only (`CTI_WIN_HOST`, `CTI_WIN_USER`,
+optional `CTI_WIN_SSH_KEY` / `CTI_WIN_KNOWN_HOSTS` / `CTI_WIN_RUNNER`); with
+them unset the vantage reports itself unavailable and the pass is skipped.
+
 ### FlowCarp: protocol labels for unnamed services
 
 A scan recognises HTTP and TLS. The host on an odd port answering with raw
