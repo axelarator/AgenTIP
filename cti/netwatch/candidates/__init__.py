@@ -28,3 +28,8 @@ class Candidate:
     discovered_via: str           # a selector-shaped tag, e.g. net.historical_ip:1.2.3.4
     discovered_from: str          # the tracked indicator it was found through
     reason: str                   # human-readable, for the hunt log
+    # The passive-DNS window the link was live in, when the source gives
+    # one. Carried onto the candidate as a dated selector, so a name that
+    # shared an address years ago scores as the stranger it is.
+    first_seen: int | None = None
+    last_seen: int | None = None

@@ -443,6 +443,13 @@ def _enrich_with_honeylabs(pairs: set[tuple[str, str]]) -> None:
               file=sys.stderr)
         return
     for cluster, ip in sorted(pairs):
+        # Annotate members only. An IP a tracked domain merely resolved to is
+        # already a selector on that domain (net.resolved_ip); filing it here
+        # made it a cluster member on a HoneyLabs note's say-so, which is how
+        # 75.98.162.139 joined DragonForce with no report behind it.
+        tracked = {o["value"] for o in core.load_cluster(cluster)["observables"]["ips"]}
+        if ip not in tracked:
+            continue
         note = core.summarize_honeylabs(core.honeylabs_context(ip))
         if note:
             core.add_observable(cluster, "ips", ip, note)
@@ -595,32 +602,17 @@ def main() -> None:
                    .strftime("%Y-%m-%dT%H:%M:%SZ")) if hit_ts else today
         for d in entries:
             cluster, target, port = d["cluster"], d["target"], d["port"]
-            for category in ("ja4s", "ja4ts", "ja4l"):
+            # JA4S/JA4TS name their host in the source, so add_observable
+            # records them as dated selectors on it, not cluster indicators.
+            # JA4L is a round-trip latency, not an identifier, and is not
+            # filed at all.
+            for category in ("ja4s", "ja4ts"):
                 value = zeek_result.get(category)
                 if not value:
                     continue
                 source = (f"Zeek passive (tap107, via OpenSearch) handshake against "
                           f"{target}:{port} ({resolved_ip}), {hit_time}")
-                if category == "ja4l":
-                    _replace_ja4l(cluster, f"{target}:{port}", value, source)
-                else:
-                    core.add_observable(cluster, category, value, source)
-
-
-def _replace_ja4l(cluster: str, measured_for: str, value: str, source: str) -> None:
-    """File a JA4L as the host's current latency, replacing the last one.
-
-    JA4L is a round-trip measurement, not an identifier: it moves with
-    network conditions on every probe. Adding each reading as a new
-    observable left jadeprox with 34 of them, none more meaningful than
-    the latest. One reading per target:port is kept.
-    """
-    data = core.load_cluster(cluster)
-    for entry in data["observables"].get("ja4l", []):
-        if entry["value"] != value and ja4l_target(entry) == measured_for:
-            core.remove_observable(cluster, "ja4l", entry["value"])
-    core.add_observable(cluster, "ja4l", value, source,
-                        metadata={"measured_for": measured_for})
+                core.add_observable(cluster, category, value, source)
 
 
 _AGAINST = re.compile(r"handshake against (\S+:\d+)")

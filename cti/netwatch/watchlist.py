@@ -10,6 +10,12 @@ Tiers, by how live a host is:
   sweep  prefix-neighbourhood hosts (Phase 3) - the cluster's port_set
          only, at a low rate.
 
+Scored candidates from the membership store join the hot tier, best first
+and capped per cluster (CANDIDATES_PER_CLUSTER), at or above
+CTI_CANDIDATE_SCAN_BAND (default `weak`). A candidate is a proposal; the
+light profile is what lets it be scored on more than the one link that
+surfaced it.
+
 Retired hosts are not scanned. CDN edge addresses are dropped: scanning a
 Cloudflare IP fingerprints Cloudflare, not an operator (the same judgment
 the selector layer already makes).
@@ -19,12 +25,34 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .. import core
+import os
+
+from .. import core, membership
 from ..store import cdn
+from ..store import entities
 
 # A host whose lifecycle moved within this window is still "hot" even once
 # it is back to active, so a change gets a few days of close attention.
 RECENT_MOVE_DAYS = 7
+CANDIDATES_PER_CLUSTER = 25
+
+
+def _candidate_targets(slug: str, actor: str) -> list[dict[str, Any]]:
+    floor = os.environ.get("CTI_CANDIDATE_SCAN_BAND", "weak")
+    try:
+        found = membership.candidates(slug, min_band=floor)
+    except Exception:
+        return []
+    out = []
+    for row in found[:CANDIDATES_PER_CLUSTER]:
+        kind = entities.entity_type(row["entity"])
+        if kind not in ("domain", "ipv4"):
+            continue
+        out.append({"value": row["entity"], "kind": "ip" if kind == "ipv4" else "domain",
+                    "tier": "hot", "ports": [], "actor": actor, "cluster": slug,
+                    "lifecycle": "candidate", "score": row.get("score"),
+                    "band": row.get("band")})
+    return out
 
 
 def _tier(entry: dict[str, Any]) -> str | None:
@@ -62,6 +90,10 @@ def build(*, clusters: list[str] | None = None) -> list[dict[str, Any]]:
         except Exception:
             continue
         actor = data.get("name") or name
+        for target in _candidate_targets(core._slug(data), actor):
+            if target["kind"] == "ip" and cdn.available() and cdn.is_cdn(target["value"]):
+                continue
+            best.setdefault(target["value"], target)
         for category, kind in (("ips", "ip"), ("domains", "domain")):
             for entry in data["observables"].get(category, []):
                 value = (entry.get("value") or "").strip()

@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS selector_stats (
 );
 """
 
+# The interval detail behind each row above lives in selector_spans; it is
+# part of this schema so anything that creates the selector tables gets both.
+from .spans import SCHEMA as _SPAN_SCHEMA  # noqa: E402
+
+SCHEMA = SCHEMA + _SPAN_SCHEMA
+
 
 # --------------------------------------------------------------------------- #
 # The taxonomy
@@ -467,16 +473,27 @@ def rank(selector_type: str) -> int:
 def record(con: duckdb.DuckDBPyConnection, *, indicator_value: str,
            selector_type: str, selector_value: Any, observed_at,
            indicator_type: str | None = None, actor: str | None = None,
-           source: str | None = None) -> bool:
+           source: str | None = None, first_seen: Any = None,
+           last_seen: Any = None, vantage: str | None = None) -> bool:
     """Record one selector. Returns True if it was new.
 
     Values are normalized by `normalize()` so that a hash written in upper
     case by one tool and lower case by another does not become two selectors
     that fail to link.
+
+    `first_seen`/`last_seen` are for sources that report their own window -
+    passive DNS saying a name resolved somewhere from 2019 to 2020. Without
+    them the observation is dated `observed_at`, which is right for a scan
+    and wrong for history. Every call also folds into `selector_spans`,
+    which keeps the intervals this table's single first/last pair loses.
     """
     value = normalize(selector_type, selector_value)
     if value is None:
         return False
+    from . import spans
+
+    start = spans.to_ts(first_seen) or spans.to_ts(observed_at)
+    end = spans.to_ts(last_seen) or spans.to_ts(observed_at) or start
     existed = con.execute(
         "SELECT 1 FROM selectors WHERE selector_type = ? AND selector_value = ? "
         "AND indicator_value = ?", [selector_type, value, indicator_value]).fetchone()
@@ -485,18 +502,23 @@ def record(con: duckdb.DuckDBPyConnection, *, indicator_value: str,
                indicator_type, actor, source, first_seen, last_seen)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (selector_type, selector_value, indicator_value) DO UPDATE SET
-               last_seen = excluded.last_seen,
+               first_seen = least(selectors.first_seen, excluded.first_seen),
+               last_seen = greatest(selectors.last_seen, excluded.last_seen),
                actor = coalesce(excluded.actor, selectors.actor),
                indicator_type = coalesce(excluded.indicator_type, selectors.indicator_type)""",
         [selector_type, value, indicator_value, indicator_type, actor, source,
-         observed_at, observed_at])
+         start, end])
+    if start is not None:
+        spans.record(con, selector_type=selector_type, selector_value=value,
+                     indicator_value=indicator_value, source=source,
+                     start=start, end=end, vantage=vantage)
     return existed is None
 
 
 def record_many(con: duckdb.DuckDBPyConnection, *, indicator_value: str,
                 found: Iterable[tuple[str, Any]], observed_at,
                 indicator_type: str | None = None, actor: str | None = None,
-                source: str | None = None) -> list[str]:
+                source: str | None = None, vantage: str | None = None) -> list[str]:
     """Record many selectors for one indicator. Returns the types that were new."""
     fresh = []
     for selector_type, value in found:
@@ -507,7 +529,8 @@ def record_many(con: duckdb.DuckDBPyConnection, *, indicator_value: str,
         for one in values:
             if record(con, indicator_value=indicator_value, selector_type=selector_type,
                       selector_value=one, observed_at=observed_at,
-                      indicator_type=indicator_type, actor=actor, source=source):
+                      indicator_type=indicator_type, actor=actor, source=source,
+                      vantage=vantage):
                 fresh.append(selector_type)
     return fresh
 

@@ -71,5 +71,6 @@ def host_candidates(indicator: str, kind: str, *, limit: int = PDNS_LIMIT
             value=value, kind=value_kind,
             discovered_via=f"{via}:{indicator}",
             discovered_from=indicator,
-            reason=f"passive DNS {via.split('.')[-1]} of {indicator}{window}"))
+            reason=f"passive DNS {via.split('.')[-1]} of {indicator}{window}",
+            first_seen=rec.get("first_seen"), last_seen=rec.get("last_seen")))
     return out

@@ -140,8 +140,13 @@ def _expansion_lines(expansion: dict[str, Any]) -> list[str]:
              for row in report.get("filed") or []]
     if filed:
         lines += ["## New candidates (weekly expansion - accept_candidate / reject_candidate)", ""]
+        filed.sort(key=lambda sr: -(sr[1].get("score") or 0.0))
         for slug, row in filed:
-            lines.append(f"- **{row['value']}** -> {slug}, linked to {row.get('candidate_linked_to')}")
+            score = row.get("score")
+            scored = (f" — {row.get('band')} {score:.2f}" if isinstance(score, (int, float))
+                      else "")
+            lines.append(f"- **{row['value']}** -> {slug}{scored}, closest to "
+                         f"{row.get('candidate_linked_to')}")
             lines.append(f"  - {row.get('candidate_reason')}; found via "
                          f"{str(row.get('discovered_via'))[:96]}")
         lines.append("")

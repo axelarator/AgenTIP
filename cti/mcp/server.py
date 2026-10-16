@@ -13,7 +13,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .. import core
+from .. import core, membership
 from .. import store as tracking
 from ..sources import validin
 
@@ -202,19 +202,59 @@ def remove_observable(name: str, category: str, value: str) -> dict:
 
 @mcp.tool()
 def accept_candidate(name: str, value: str, note: str = "") -> dict:
-    """Accept a candidate the weekly expansion sweep filed (listed in the
-    digest's "New candidates" section): it becomes a normal tracked
-    indicator, starts exporting, and is queued for fingerprinting. `note`
-    goes in the hunt log with the link that justified it."""
+    """Accept a scored candidate (see list_candidates): it becomes a cluster
+    member, joins the cluster JSON, starts exporting, and is queued for
+    fingerprinting. `note` goes in the hunt log with the link that
+    justified it."""
     return core.accept_candidate(name, value, note)
 
 
 @mcp.tool()
 def reject_candidate(name: str, value: str, reason: str) -> dict:
-    """Reject a candidate the weekly expansion sweep filed. It is removed
-    and put on the cluster's deny list with `reason`, so the sweep never
-    files it again. Use remove_observable for an accepted indicator."""
+    """Reject a candidate. The membership store records the rejection with
+    `reason`, so no pivot or sweep ever files it again. Its evidence stays
+    in the store. Use remove_observable for a member."""
     return core.reject_candidate(name, value, reason)
+
+
+@mcp.tool()
+def list_candidates(name: str, min_band: str = "weak") -> list[dict]:
+    """Candidates proposed for a cluster by pivots, scans and hunt rules,
+    best first, with their relatedness score and band (strong / probable /
+    weak / noise). Candidates are never members until accept_candidate.
+    Use candidate_evidence for why a candidate scored what it did."""
+    rows = membership.candidates(core._slug(name), min_band=min_band)
+    return [{k: (str(v) if k in ("decided_at", "created_at") else v)
+             for k, v in r.items()} for r in rows]
+
+
+@mcp.tool()
+def candidate_evidence(name: str, value: str) -> dict:
+    """How strongly `value` relates to a cluster's members, and why: each
+    shared key:value pair with its class, artefact, time gap (days between
+    the two holders' spans; 0 = overlapping), global count and weight.
+    Works for any indicator, candidate or not. Read-only."""
+    data = core.load_cluster(name)
+    return membership.score(core._slug(data), value, members=core.member_values(data))
+
+
+@mcp.tool()
+def candidate_score_history(name: str, value: str) -> list[dict]:
+    """Every recorded score for a candidate, oldest first - how the
+    evidence for it has moved over time."""
+    with tracking.connect_retry(read_only=True) as con:
+        from ..store import entities
+        rows = entities.score_history(con, core._slug(name), value)
+    return [{"scored_at": str(r["scored_at"]), "score": r["score"], "band": r["band"]}
+            for r in rows]
+
+
+@mcp.tool()
+def rescore_candidates(name: str) -> list[dict]:
+    """Re-score every candidate on a cluster against its current members and
+    record the results (score history grows by one row each)."""
+    return [{"entity": r["entity"], "score": r["score"], "band": r["band"]}
+            for r in membership.rescore(core._slug(name))]
 
 
 @mcp.tool()
