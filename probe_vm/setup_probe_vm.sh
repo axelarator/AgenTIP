@@ -280,7 +280,9 @@ runuser -u "$PROBE_USER" -- docker info >/dev/null 2>&1 \
 # collects less is worse than one that says what is missing.
 echo "   observe toolchain:"
 for tool in httpx tlsx dnsx naabu cdncheck whois; do
-  if runuser -u "$PROBE_USER" -- command -v "$tool" >/dev/null 2>&1; then
+  # `command` is a shell builtin, so it needs a shell: run directly under
+  # runuser it never executes, and every tool read as MISSING.
+  if runuser -u "$PROBE_USER" -- sh -c 'command -v "$1"' _ "$tool" >/dev/null 2>&1; then
     printf "     %-10s ok\n" "$tool"
   else
     printf "     %-10s MISSING - observe will skip it and say so\n" "$tool"
