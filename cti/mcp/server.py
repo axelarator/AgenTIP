@@ -13,7 +13,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .. import core
+from .. import core, membership
 from .. import store as tracking
 from ..sources import validin
 
@@ -202,19 +202,105 @@ def remove_observable(name: str, category: str, value: str) -> dict:
 
 @mcp.tool()
 def accept_candidate(name: str, value: str, note: str = "") -> dict:
-    """Accept a candidate the weekly expansion sweep filed (listed in the
-    digest's "New candidates" section): it becomes a normal tracked
-    indicator, starts exporting, and is queued for fingerprinting. `note`
-    goes in the hunt log with the link that justified it."""
+    """Accept a scored candidate (see list_candidates): it becomes a cluster
+    member, joins the cluster JSON, starts exporting, and is queued for
+    fingerprinting. `note` goes in the hunt log with the link that
+    justified it."""
     return core.accept_candidate(name, value, note)
 
 
 @mcp.tool()
 def reject_candidate(name: str, value: str, reason: str) -> dict:
-    """Reject a candidate the weekly expansion sweep filed. It is removed
-    and put on the cluster's deny list with `reason`, so the sweep never
-    files it again. Use remove_observable for an accepted indicator."""
+    """Reject a candidate. The membership store records the rejection with
+    `reason`, so no pivot or sweep ever files it again. Its evidence stays
+    in the store. Use remove_observable for a member."""
     return core.reject_candidate(name, value, reason)
+
+
+@mcp.tool()
+def hunt_query(query: str, limit: int = 50) -> dict:
+    """Search everything the store has observed with Censys/Hunt.io-style
+    key:value terms. Keys: any selector type (tls.jarm, tls.cert_sha256,
+    tls.ja4x, http.body_sha256, http.favicon_mmh3, net.resolved_ip,
+    net.historical_ip, dns.ns_set, whois.registrar, ...), net.port,
+    indicator (exact or ~regex), type, cluster, role
+    (seed/accepted/candidate/rejected), band (strong/probable/weak/noise =
+    that or better), vantage, changed (with since:7d). Combine with AND
+    (implicit), OR, NOT, parentheses; values may be quoted, `*` for any,
+    `~"regex"`. Time: seen:>2026-09-01, seen:<DATE, during:[A,B] restrict
+    every selector term to spans overlapping that window.
+    Example: tls.default_subject:* AND net.port:8443 AND NOT role:rejected
+    Each hit lists its memberships and the dated spans it matched on."""
+    from ..store import hunt_query as H
+    try:
+        with tracking.connect_retry(read_only=True) as con:
+            return H.run(con, query, limit=limit)
+    except H.QueryError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def hunt_pairs(indicator: str, other: str = "", limit: int = 25) -> dict:
+    """What an indicator shares with others, when, and what it is worth.
+    With `other`: every key:value the two share, the gap between the spans
+    in which each held it (0 = at the same time), and the relatedness score
+    those add up to. Without: every indicator in the store it shares
+    anything with, scored pairwise and ranked, with their cluster
+    memberships - across all clusters, members and candidates alike."""
+    from ..store import hunt_query as H
+    with tracking.connect_retry(read_only=True) as con:
+        return H.pairs(con, indicator, other or None, limit=limit)
+
+
+@mcp.tool()
+def indicator_coverage(value: str) -> dict:
+    """What has observed an indicator, from which vantage, and when: selector
+    spans per (source, vantage), service scans per vantage (probe = Linux
+    scanner, win116 = Windows client), and enrichment observations per
+    source. Use it to see what a profile is missing before trusting it."""
+    from ..store import coverage
+    with tracking.connect_retry(read_only=True) as con:
+        return coverage.coverage(con, value)
+
+
+@mcp.tool()
+def list_candidates(name: str, min_band: str = "weak") -> list[dict]:
+    """Candidates proposed for a cluster by pivots, scans and hunt rules,
+    best first, with their relatedness score and band (strong / probable /
+    weak / noise). Candidates are never members until accept_candidate.
+    Use candidate_evidence for why a candidate scored what it did."""
+    rows = membership.candidates(core._slug(name), min_band=min_band)
+    return [{k: (str(v) if k in ("decided_at", "created_at") else v)
+             for k, v in r.items()} for r in rows]
+
+
+@mcp.tool()
+def candidate_evidence(name: str, value: str) -> dict:
+    """How strongly `value` relates to a cluster's members, and why: each
+    shared key:value pair with its class, artefact, time gap (days between
+    the two holders' spans; 0 = overlapping), global count and weight.
+    Works for any indicator, candidate or not. Read-only."""
+    data = core.load_cluster(name)
+    return membership.score(core._slug(data), value, members=core.member_values(data))
+
+
+@mcp.tool()
+def candidate_score_history(name: str, value: str) -> list[dict]:
+    """Every recorded score for a candidate, oldest first - how the
+    evidence for it has moved over time."""
+    with tracking.connect_retry(read_only=True) as con:
+        from ..store import entities
+        rows = entities.score_history(con, core._slug(name), value)
+    return [{"scored_at": str(r["scored_at"]), "score": r["score"], "band": r["band"]}
+            for r in rows]
+
+
+@mcp.tool()
+def rescore_candidates(name: str) -> list[dict]:
+    """Re-score every candidate on a cluster against its current members and
+    record the results (score history grows by one row each)."""
+    return [{"entity": r["entity"], "score": r["score"], "band": r["band"]}
+            for r in membership.rescore(core._slug(name))]
 
 
 @mcp.tool()

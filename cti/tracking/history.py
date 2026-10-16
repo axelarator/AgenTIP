@@ -83,21 +83,22 @@ def _log_passive(con, *, value: str, indicator_type: str, actor: str | None,
     # moved their own domain.
     if indicator_type != "domain":
         return
-    addresses = []
     for record in records:
         if record.get("rrtype") not in ("a", "aaaa"):
             continue
         answer = record.get("answer")
         # The same CDN gate the live path applies. Without it every domain
         # that ever sat behind Cloudflare links to every other one that did.
-        if answer and not cdn_ranges.is_cdn(answer):
-            addresses.append(answer)
-    if addresses:
-        tracking_store.selectors.record_many(
-            con, indicator_value=value,
-            found=[("net.historical_ip", a) for a in sorted(set(addresses))],
-            observed_at=observed_at, indicator_type=indicator_type,
-            actor=actor, source="mnemonic_pdns")
+        if not answer or cdn_ranges.is_cdn(answer):
+            continue
+        # Dated by the record's own window, not by when we asked. Stamping
+        # observed_at here made a 2019 tenancy look current, which is how a
+        # five-year-old co-resolution read as a link to a 2026 C2.
+        tracking_store.selectors.record(
+            con, indicator_value=value, selector_type="net.historical_ip",
+            selector_value=answer, observed_at=observed_at,
+            first_seen=record.get("first_seen"), last_seen=record.get("last_seen"),
+            indicator_type=indicator_type, actor=actor, source="mnemonic_pdns")
 
 
 def _log_observation(con, value: str, indicator_type: str, actor: str | None,
@@ -362,77 +363,4 @@ def _log_cluster_enrichment_history(
         # phase status by graph/nodes/collect.py, so widening this does not
         # make the failure quiet.
         return f"enrichment history not recorded: {type(e).__name__}: {e}"
-    return None
-def _provider_cert_reason(sans: list[str] | None, subject: str | None,
-                          resolved: list[str] | None) -> str | None:
-    """Why a certificate is the provider's rather than the operator's, or
-    None. Filing one of these onto a cluster's hash list makes it a pivot
-    that leads to every other customer of the same provider."""
-    if sans and len(sans) > observe_source.MAX_OPERATOR_SANS:
-        return f"{len(sans)} SANs - a hosting provider's certificate"
-    if observe_source._is_default_cert(subject):
-        return "default certificate subject"
-    if any(cdn_ranges.is_cdn(ip) for ip in (resolved or []) if isinstance(ip, str)):
-        return "served from a CDN edge"
-    return None
-
-
-def _file_cert_hash(data: dict[str, Any], domain: str, sha256: str,
-                    issuer: str | None, revoked: bool | None, now: str, *,
-                    sans: list[str] | None = None, subject: str | None = None,
-                    resolved: list[str] | None = None) -> str | None:
-    """Auto-file a certificate's own SHA256 fingerprint onto the cluster's
-    hashes list when pivot_cluster sees a new one for an already-tracked
-    domain - an attribute of infrastructure already being tracked (like
-    ASN/ports/cert issuer), not a new lead, so unlike a discovered
-    subdomain or hosted domain (flag-only) this auto-updates without
-    analyst confirmation. The `cert-sha256:` value prefix (distinct from
-    the existing `sha256:`/`sha1:`/`md5:` file-hash prefixes) plus the
-    explicit hash_kind field make this unambiguous as a certificate hash,
-    not a file hash; cert_for names the domain it belongs to.
-
-    Three rules keep the list from filling with provider churn:
-
-    - One source per domain, undated. The sweep used to append a new
-      "seen <date>" source every day, which is how one jadeprox hash
-      reached 56 sources saying the same thing. `last_seen` and
-      `last_live` carry the date instead.
-    - A provider's certificate (too many SANs, a default subject, a CDN
-      edge) is not filed at all; the reason is returned instead.
-    - When a domain presents a new certificate, the hashes previously
-      filed for that domain are marked superseded and retired: they stay
-      on record for history, but no longer export as current.
-    """
-    why_not = _provider_cert_reason(sans, subject, resolved)
-    if why_not:
-        return why_not
-    value = f"cert-sha256:{sha256}"
-    bucket = data["observables"]["hashes"]
-    source = f"live TLS grab for {domain}"
-    current = None
-    for entry in bucket:
-        if entry["value"] == value:
-            current = entry
-            if source not in entry["sources"]:
-                entry["sources"].append(source)
-            entry["last_seen"] = now
-            entry["last_live"] = now
-            entry["cert_issuer"] = issuer
-            entry["cert_revoked"] = revoked
-            if entry.get("lifecycle") in ("dormant", "retired"):
-                entry["lifecycle"] = "active"
-                entry["lifecycle_since"] = now
-                entry.pop("superseded_by", None)
-    if current is None:
-        bucket.append({
-            "value": value, "sources": [source], "first_seen": now, "last_seen": now,
-            "last_live": now, "hash_kind": "certificate", "cert_for": domain,
-            "cert_issuer": issuer, "cert_revoked": revoked,
-        })
-    for entry in bucket:
-        if (entry.get("hash_kind") == "certificate" and entry.get("cert_for") == domain
-                and entry["value"] != value and entry.get("lifecycle") != "retired"):
-            entry["lifecycle"] = "retired"
-            entry["lifecycle_since"] = now
-            entry["superseded_by"] = value
     return None

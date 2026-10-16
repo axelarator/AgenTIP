@@ -10,8 +10,8 @@ from datetime import date, datetime
 
 import pytest
 
-from cti import core, store
-from cti.store import expand, selectors
+from cti import core, membership, store
+from cti.store import selectors
 from cti.tracking import expand_coverage as X
 
 DAY = datetime(2026, 10, 5)
@@ -78,16 +78,39 @@ def test_seeds_are_promotable_priced_and_below_provider_scale(cluster):
         ("webamon.fp_ssl", "fp-rare")]
 
 
-def test_a_corroborated_host_is_filed_as_a_candidate(cluster):
+def test_swept_hosts_are_filed_as_scored_candidates(cluster):
     report = X.expand_cluster("Kit")
     assert cluster == [("webamon.fp_ssl", "fp-rare")]
-    assert [f["value"] for f in report["filed"]] == ["new.example"]
-    assert report["rejected_links"] == 1          # weak.example
-    entry = next(o for o in core.load_cluster("Kit")["observables"]["domains"]
-                 if o["value"] == "new.example")
-    assert entry["lifecycle"] == "candidate"
-    assert entry["discovered_via"] == "webamon.fp_ssl:fp-rare"
-    assert entry["candidate_linked_to"] == "known.example"
+    filed = {f["value"]: f for f in report["filed"]}
+    # new.example shares a rare identity fact; weak.example one structural
+    # fact. Both clear the default `weak` floor - as scored candidates, not
+    # members - and the identity link scores higher.
+    assert set(filed) == {"new.example", "weak.example"}
+    assert filed["new.example"]["score"] > filed["weak.example"]["score"]
+    assert filed["new.example"]["discovered_via"] == "webamon.fp_ssl:fp-rare"
+    assert filed["new.example"]["candidate_linked_to"] == "known.example"
+    # Candidates live in the membership store; the cluster JSON lists members.
+    assert {o["value"] for o in core.load_cluster("Kit")["observables"]["domains"]} == {
+        "known.example"}
+    assert {c["entity"] for c in membership.candidates("kit")} == {"new.example",
+                                                                   "weak.example"}
+
+
+def test_the_band_floor_decides_what_is_filed(cluster, monkeypatch):
+    monkeypatch.setenv("CTI_CANDIDATE_MIN_BAND", "strong")
+    report = X.expand_cluster("Kit")
+    assert report["filed"] == [] and report["rejected_links"] == 2
+    assert membership.candidates("kit") == []
+
+
+def test_a_filed_candidate_is_not_swept_again(cluster, monkeypatch):
+    X.expand_cluster("Kit")
+    swept = []
+    real = core._sweep_lifecycle
+    monkeypatch.setattr(core, "_sweep_lifecycle",
+                        lambda d, i, *a, **k: swept.extend(d) or real(d, i))
+    X.expand_cluster("Kit")
+    assert swept == []
 
 
 def test_denied_and_tracked_hosts_are_never_swept(cluster, monkeypatch):
@@ -106,7 +129,7 @@ def test_a_host_another_cluster_tracks_is_reported_not_filed(cluster):
         {"value": "new.example", "sources": ["r"], "first_seen": "x", "last_seen": "x"})
     core.save_cluster(data)
     report = X.expand_cluster("kit")
-    assert report["filed"] == []
+    assert "new.example" not in {f["value"] for f in report["filed"]}
     assert report["owned_elsewhere"] == [{"value": "new.example", "cluster": "Other"}]
 
 
@@ -122,15 +145,3 @@ def test_it_only_runs_on_the_expansion_day(monkeypatch):
     assert "skipped" in X.run(date(2026, 10, 6), clusters=[])     # a Tuesday
     assert "skipped" not in X.run(date(2026, 10, 5), clusters=[])  # a Monday
     assert "skipped" not in X.run(date(2026, 10, 6), forced=True, clusters=[])
-
-
-def test_a_link_only_through_a_cdn_address_does_not_count(monkeypatch):
-    monkeypatch.setattr(X.cdn_ranges, "is_cdn", lambda ip: ip.startswith("104.16."))
-    via_cdn = expand.Candidate("b", None, True, "r",
-                               structural=[("net.resolved_ip", "104.16.1.1"),
-                                           ("net.reverse_dns", "104.16.1.2")])
-    real = expand.Candidate("b", None, True, "r",
-                            structural=[("net.resolved_ip", "104.16.1.1"),
-                                        ("tls.san", "x.example")])
-    assert X._only_via_shared_address(via_cdn)
-    assert not X._only_via_shared_address(real)

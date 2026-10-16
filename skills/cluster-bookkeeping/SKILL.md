@@ -90,7 +90,7 @@ do not prune stale infrastructure by hand any more.
 | `active` | live evidence within 30 days (`last_live`) | yes | yes |
 | `dormant` | no live evidence for 30+ days; its change rows are dropped from the digest | yes | yes |
 | `retired` | no live evidence for 90+ days, or a superseded certificate hash | no | only with `include_inactive=True` |
-| `candidate` | filed by the weekly expansion sweep, awaiting your decision | yes | only with `include_inactive=True` |
+| `candidate` | legacy only: filed into the JSON before the membership store; new candidates live in the store (below) | yes | only with `include_inactive=True` |
 
 - **Live evidence:** a domain resolves (and is not sinkholed or expired),
   or an IP answers on HTTP, TLS or a scanned port. A routed prefix on its
@@ -105,30 +105,45 @@ do not prune stale infrastructure by hand any more.
   you pass `include_inactive=True`. Retired indicators then carry
   `valid_until`.
 - **Thresholds:** override with `CTI_DORMANT_DAYS` / `CTI_RETIRED_DAYS`.
-- **Certificate hashes:** one source per domain, not one per day. When a
-  domain presents a new certificate, the hash it replaced is marked
-  `superseded_by` and retired. A provider's certificate is never filed:
-  more than 16 SANs, a default subject, or served from a CDN edge.
+- **Certificate hashes** are not filed as observables any more. A
+  certificate is a dated `tls.cert_sha256` selector on its host; hunt it
+  with `hunt_query`. Hashes already in a cluster from a report stay.
 
-### Candidates: coverage that grows without a search
+### Members and candidates
 
-Once a week (`CTI_EXPAND_WEEKDAY`, default Monday, or force it with
-`python -m graph daily --expand`) the daily run reverse-pivots each
-cluster's rarest promotable selectors through Webamon. A new host is
-swept once, and is filed as a `candidate` only if it passes the
-corroboration rule against that cluster's own indicators: one identity
-fact, or two independent structural facts (see `skills/infrastructure-pivoting/`).
+A cluster's JSON lists its **members**: seeds (from a report, a STIX import,
+or your own `add_observable`) and candidates you accepted. Everything a
+pivot, scan or hunt rule surfaces is a **candidate** in the membership
+store, scored against the members - never written into the JSON.
 
-- **In the digest:** candidates appear under "New candidates" with the
-  link that justified them and the seed selector they came from.
-- **Deciding:** call `accept_candidate(name, value, note)` to make it a
-  tracked indicator. Call `reject_candidate(name, value, reason)` to drop
-  it and add it to the cluster's `denylist`; the sweep never files a
-  denied value again.
-- **Auto-reject:** a candidate with no live evidence for 30 days is
-  rejected automatically, with the reason recorded on the deny list.
-- **Not probed yet:** candidates are not queued for fingerprinting and
-  their certificates are not filed until you accept them.
+- **Score:** 0-1, with a band - `strong` (>= 0.80), `probable`, `weak`,
+  `noise` (< 0.20). It is built from what the candidate shares with the
+  members, weighted by selector class, rarity, and whether the two held
+  the value AT THE SAME TIME (see `skills/infrastructure-pivoting/`).
+  `candidate_evidence(name, value)` shows every pair behind it.
+- **Who files candidates:** `pivot_and_expand`, the weekly expansion
+  (`CTI_EXPAND_WEEKDAY`, default Monday, or `python -m graph daily
+  --expand`), passive-DNS neighbours and enabled hunt rules. The expansion
+  files a host only at `CTI_CANDIDATE_MIN_BAND` (default `weak`) or
+  better; below that its evidence is kept and nothing is filed.
+- **Listing:** `list_candidates(name, min_band="weak")`, the cluster's
+  Candidates tab in the dashboard, and the digest's "New candidates".
+- **Deciding:** `accept_candidate(name, value, note)` makes it a member: it
+  joins the JSON, exports, and is queued for fingerprinting.
+  `reject_candidate(name, value, reason)` records a rejection in the store;
+  nothing files that value for the cluster again.
+- **Expiry:** a candidate with no observed evidence for 30 days is
+  rejected automatically, with the reason recorded.
+- **Scanning:** candidates at `CTI_CANDIDATE_SCAN_BAND` (default `weak`)
+  or better get the light hot-tier netwatch scan, up to 25 per cluster,
+  so they are scored on more than the link that found them.
+- **Never automatic:** no path accepts a candidate, and no automatic path
+  can change a seed, an accepted member or a rejection.
+- **Over time:** every candidate is re-scored daily, and the digest's
+  "Candidate relatedness moved" section lists band changes;
+  `candidate_score_history(name, value)` shows the whole series. The same
+  digest reports fingerprints that changed on tracked hosts and new
+  Windows-client divergences.
 - **Cost:** up to 8 seeds per cluster and 10 new hosts swept per cluster
   each week. The reverse lookups are capped at `CTI_WEBAMON_EXPAND_BUDGET`
   (default 150) per day. Validin is not used, because it is manual-only.
@@ -184,6 +199,14 @@ These categories have no standard STIX 2.1 Cyber-observable type, so
 (like `cves` and `wallets`) they're tracked and exportable in this
 tool's own data model but silently omitted from `export_stix_bundle` /
 `export_stix_ecosystem` rather than forced into a nonstandard pattern.
+
+**Server fingerprints are selectors, not observables.** A `jarm`, `ja4s`,
+`ja4ts` or `ja4x` filed with a source that names the host it was measured
+on (`"JARM against host:443 via ..., DATE"`, or the Zeek handshake form the
+fingerprint pipeline writes) is recorded as a dated selector on that host,
+with the vantage, and kept out of the cluster JSON. One with no host in its
+source stays an observable. `ja4l` is a round-trip latency, not an
+identifier, and the pipeline no longer files it.
 
 Every domain/ip newly filed via `add_observable`, `ingest_report` or
 `import_stix_bundle` is queued for fingerprinting automatically.

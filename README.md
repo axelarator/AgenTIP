@@ -171,6 +171,65 @@ and "slowest: sweep" says nothing about which cluster was slow. Real durations
 need a start timestamp taken inside each node, which LangGraph's update stream
 does not provide.
 
+## Members, candidates, and when a link was a link
+
+A cluster's JSON used to be both the evidence and the verdict: whatever a
+pivot surfaced was written into `observables` as an active indicator.
+Undoing a bad link meant hand-editing records. On 2026-10-16 that was
+kakatown.com on JadeProx, which had shared an address with the vendor trio
+five years before they arrived.
+
+Now the two are separate, in DuckDB:
+
+- **`selector_spans`** - every selector with the intervals it was observed
+  in, per source and vantage. Passive DNS keeps its own record windows.
+  (All 43 historical-address rows had been dated by the day we asked.)
+- **`memberships`** - `seed` (a report, a STIX import, or the analyst),
+  `accepted`, `candidate`, `rejected`. Pivots, scans and hunt rules can
+  only create candidates. Only `accept_candidate` makes a member, and the
+  cluster JSON lists members alone.
+- **`relatedness_scores`** - every candidate scored against its cluster's
+  members: per shared artefact, class x rarity x time overlap, combined as
+  `1 - prod(1 - w)`. Bands: strong / probable / weak / noise. ASN weighs
+  nothing, a CDN edge weighs nothing, and a gap between two holders' spans
+  decays the weight. The history is append-only.
+
+`cti/membership.py` is the one door into this for core, the pipeline and
+the MCP server. `scripts/backfill_spans.py` and
+`scripts/rebuild_from_seeds.py` migrated the existing data (both dry-run
+by default).
+
+### Change over time
+
+Every day the collect stage re-scores each cluster's candidates against its
+current members (the score history grows a row per candidate per day), then
+`cti/store/timeline.py` reports what moved since the last run, as three
+digest sections:
+
+- **Candidate relatedness moved** - a band change since the last score
+  (`up` wakes the analysis; a new candidate is listed from `weak` up).
+- **Fingerprints changed on tracked hosts** - a JARM, JA4S/JA4X, SPKI,
+  serial, header order, nameserver set or registrant replaced on a seed,
+  member or candidate. Types the attribute detectors already report are
+  left to them, and nothing behind a CDN counts - its TLS is the CDN's.
+- **Served Windows clients something different** - the first time a host
+  shows a given `http.client_divergence`.
+
+### Hunting
+
+    python -m graph hunt 'tls.default_subject:* AND net.port:8443 AND NOT role:rejected'
+    python -m graph hunt '(net.resolved_ip:192.252.186.62 OR net.historical_ip:192.252.186.62) during:[2026-01-01,2026-12-31]'
+    python -m graph hunt --pairs update-trellix.com                 # what is it most like
+    python -m graph hunt --pairs kakatown.com update-trellix.com    # what two share, and when
+
+Censys-style `key:value` over everything observed: any selector type,
+`net.port`, `indicator`, `type`, `cluster`, `role`, `band`, `vantage`,
+`changed` (`since:`), with AND / OR / NOT, `*`, `~"regex"`, and
+`seen:` / `during:` time windows. The same engine backs the MCP tools
+`hunt_query` and `hunt_pairs`, the dashboard's Hunt and Pairs pages, the
+cluster Candidates tab, and hunt rules with a `query:` field. Grammar:
+`cti/store/hunt_query.py`.
+
 ## netwatch: scheduled re-scans of tracked infrastructure
 
 `python -m graph netwatch` scans the watchlist (built from the cluster
@@ -229,6 +288,29 @@ systemctl --user enable --now certstream.service
 # in crontab, a two-minute CT batch on the hour before the hot scan:
 3 * * * *  . $HOME/.bashrc && cd ~/cti-graph && .venv/bin/python -m graph netwatch --certstream-seconds 120 --ingest-only >> data/tracking/logs/netwatch.log 2>&1
 ```
+
+### The Windows-client vantage (win116)
+
+The probe sees infrastructure as a Linux scanner does. `--win116` adds what
+a Windows machine is served: `probe_vm/win116/win_runner.ps1` (PowerShell
+5.1, .NET over Schannel, Edge User-Agent) runs on the Windows VM, reached
+over SSH by `cti/probe/win_proxy.py`. GET only; bodies are hashed and
+discarded, never written or rendered.
+
+    probe_vm/win116/deploy.sh                       # copy the runner, then self-check
+    python -m graph netwatch --ingest-only --win116 # one coverage-driven pass
+
+Each pass takes the members (and `probable`+ candidates) win116 has not seen
+within `CTI_WIN_REFRESH_DAYS` (default 7), never-seen first, at most
+`CTI_WIN_TARGETS_PER_RUN` (default 30). It records service snapshots and
+selectors with vantage `win116`, and `http.client_divergence` where the
+answer differs from the probe's: status class, title, certificate, landing
+host, or a TLS session Schannel could not open. `indicator_coverage` (MCP)
+shows which vantages and sources have observed an indicator, and when.
+
+Connection settings are environment-only (`CTI_WIN_HOST`, `CTI_WIN_USER`,
+optional `CTI_WIN_SSH_KEY` / `CTI_WIN_KNOWN_HOSTS` / `CTI_WIN_RUNNER`); with
+them unset the vantage reports itself unavailable and the pass is skipped.
 
 ### FlowCarp: protocol labels for unnamed services
 

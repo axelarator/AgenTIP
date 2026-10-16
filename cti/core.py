@@ -35,6 +35,8 @@ from .sources import passive
 from .store import cdn as cdn_ranges
 from .tracking.analytics import SHARED_HOSTING_ASNS
 from .store import hosting
+from . import membership
+from .store import entities, psl
 from .store.changes import STALE_BASELINE_DAYS as _ATTR_STALE_BASELINE_DAYS
 from .util import repo_root
 
@@ -166,6 +168,12 @@ _EXTRACTION_EMPTY_WARNING = (
 
 def _nothing_extracted(extracted: dict[str, list[str]]) -> bool:
     return not any(extracted[c] for c in (*OBSERVABLE_CATEGORIES, "ttps"))
+
+
+def _slug(data_or_name: dict[str, Any] | str) -> str:
+    """The cluster's key in the membership store: its file stem."""
+    name = data_or_name["name"] if isinstance(data_or_name, dict) else data_or_name
+    return _path(name).stem
 
 
 def _path(name: str) -> Path:
@@ -877,7 +885,8 @@ def _add_observable_locked(name: str, category: str, value: str, source: str,
                            ) -> dict[str, Any]:
     data = load_cluster(name)  # re-read fresh; another writer may have raced in above
     extracted = {c: ([value] if c == category else []) for c in OBSERVABLE_CATEGORIES}
-    _, skipped = _merge_observables(data, extracted, source, enrichment=enrichment, metadata=metadata)
+    _, skipped = _merge_observables(data, extracted, source, enrichment=enrichment,
+                                    metadata=metadata, decided_by=entities.ANALYST)
     save_cluster(data)
     if skipped:
         data = {**data, "fingerprint_queue_skipped": skipped}
@@ -911,6 +920,11 @@ def remove_observable(name: str, category: str, value: str) -> dict[str, Any]:
         raise ValueError(f"no {category} observable matching {value!r} in cluster {name!r}")
     data["observables"][category] = kept
     save_cluster(data)
+    # The cluster's claim goes with the entry; the entity and its evidence
+    # stay in the store, where a later pivot can still find and score it.
+    for o in removed:
+        if membership.member_value(category, o["value"]):
+            membership.forget(_slug(data), o["value"])
     return {**data, "removed": [o["value"] for o in removed]}
 
 
@@ -934,65 +948,110 @@ def _find_entry(data: dict[str, Any], value: str) -> tuple[str, dict[str, Any]] 
 @_synchronized
 def file_candidate(name: str, value: str, source: str, metadata: dict[str, Any],
                    enrichment: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]
-                   | None = None) -> bool:
-    """File a host found by the expansion sweep as a `candidate`. Returns
-    False, filing nothing, if the cluster already tracks it or rejected it."""
+                   | None = None, links: list[dict[str, Any]] | None = None
+                   ) -> dict[str, Any] | bool:
+    """File a host a pivot, scan or rule surfaced as a scored `candidate`.
+
+    Candidates live in the membership store, not the cluster JSON: the JSON
+    lists members, and a candidate becomes one only through
+    accept_candidate. Returns the relatedness score (truthy), or False,
+    filing nothing, when the cluster already tracks the value, has a
+    verdict on it, or (legacy) lists it on the JSON deny list.
+
+    `links` are the dated selectors that surfaced the host - see
+    membership.file_candidate. `enrichment` is accepted for the old call
+    shape; the sweep that produced it has already recorded it to the store.
+    """
     data = load_cluster(name)
     needle = value.strip().lower()
     if _find_entry(data, needle) or needle in {d["value"].lower() for d in data["denylist"]}:
         return False
-    category = "ips" if pivot.classify(value) == "ip" else "domains"
-    extracted = {c: ([value] if c == category else []) for c in OBSERVABLE_CATEGORIES}
-    _merge_observables(data, extracted, source, enrichment=enrichment,
-                       metadata={**metadata, "lifecycle": "candidate",
-                                 "lifecycle_since": now_iso()})
+    via = str(metadata.get("discovered_via") or "?")[:96]
+    scored = membership.file_candidate(
+        _slug(data), value, origin=source, decided_by="pivot",
+        reason=metadata.get("candidate_reason") or f"found via {via}", links=links or (),
+        members=member_values(data))
+    if scored is None:
+        return False
     data["hunt_log"].append({"date": now_iso(), "entry": (
-        f"candidate {value} filed by the expansion sweep via "
-        f"{metadata.get('discovered_via', '?')[:96]}: {metadata.get('candidate_reason', '')}")})
+        f"candidate {value} filed via {via}: {scored['band']} "
+        f"({scored['score']:.2f}); {metadata.get('candidate_reason', '')}".rstrip("; "))})
     save_cluster(data)
-    return True
+    return scored
 
 
 @_synchronized
 def accept_candidate(name: str, value: str, note: str = "") -> dict[str, Any]:
-    """Promote a candidate to a tracked indicator: it starts exporting, is
-    queued for fingerprinting, and its certificate is filed on the next
-    sweep. Raises if `value` is not a candidate on this cluster."""
+    """Promote a candidate to a member: it joins the cluster JSON, starts
+    exporting and is queued for fingerprinting. Raises if `value` is not a
+    candidate on this cluster."""
     data = load_cluster(name)
     found = _find_entry(data, value)
-    if not found or lifecycle_of(found[1]) != "candidate":
-        raise ValueError(f"{value!r} is not a candidate on cluster {name!r}")
-    category, entry = found
     now = now_iso()
-    entry["lifecycle"] = "active"
-    entry["lifecycle_since"] = now
-    entry["accepted"] = now
+    if found and lifecycle_of(found[1]) == "candidate":
+        # A candidate filed before the membership store: it is already in
+        # the JSON, so promote it there and record the verdict beside it.
+        category, entry = found
+        entry["lifecycle"] = "active"
+        entry["lifecycle_since"] = now
+        entry["accepted"] = now
+        _set_role_analyst(_slug(data), entry["value"], "accepted",
+                          origin=(entry.get("sources") or [None])[0], reason=note or None)
+        worthy, _ = _is_probe_worthy(category, entry["value"])
+        if worthy:
+            _enqueue_pending_fingerprints(data["name"], [(category, entry["value"])])
+        reason = entry.get("candidate_reason", "")
+    else:
+        decided = membership.decide(_slug(data), value, "accepted", reason=note or None)
+        entry_value = decided["entity"]
+        category = "ips" if pivot.classify(entry_value) == "ip" else "domains"
+        extracted = {c: ([entry_value] if c == category else []) for c in OBSERVABLE_CATEGORIES}
+        _merge_observables(data, extracted, decided.get("origin") or "accepted candidate")
+        reason = decided.get("reason") or ""
+        entry = {"value": entry_value}
     data["hunt_log"].append({"date": now, "entry": (
-        f"accepted candidate {entry['value']} ({entry.get('candidate_reason', '')})"
-        + (f": {note}" if note else ""))})
-    worthy, _ = _is_probe_worthy(category, entry["value"])
-    if worthy:
-        _enqueue_pending_fingerprints(data["name"], [(category, entry["value"])])
+        f"accepted candidate {entry['value']} ({reason})" + (f": {note}" if note else ""))})
     save_cluster(data)
     return {"name": data["name"], "accepted": entry["value"], "category": category}
 
 
 @_synchronized
 def reject_candidate(name: str, value: str, reason: str) -> dict[str, Any]:
-    """Drop a candidate and put it on the cluster's deny list, so the
-    expansion sweep never files it again. Raises if `value` is not a
-    candidate on this cluster - an accepted indicator is pruned with
-    remove_observable instead."""
+    """Refuse a candidate for good: the membership store records the
+    rejection and the cluster never re-files it. Raises if `value` is not a
+    candidate on this cluster - a member is pruned with remove_observable."""
     if not reason.strip():
         raise ValueError("a reason is required - it is what stops the next analyst re-adding it")
     data = load_cluster(name)
     found = _find_entry(data, value)
-    if not found or lifecycle_of(found[1]) != "candidate":
-        raise ValueError(f"{value!r} is not a candidate on cluster {name!r}")
-    category, entry = found
-    _reject(data, category, entry, reason)
+    if found and lifecycle_of(found[1]) == "candidate":
+        category, entry = found
+        _reject(data, category, entry, reason)
+        _set_role_analyst(_slug(data), entry["value"], "rejected", reason=reason)
+        rejected = entry["value"]
+    else:
+        rejected = membership.decide(_slug(data), value, "rejected", reason=reason)["entity"]
+        data["hunt_log"].append({"date": now_iso(),
+                                 "entry": f"rejected candidate {rejected}: {reason}"})
     save_cluster(data)
-    return {"name": data["name"], "rejected": entry["value"], "reason": reason}
+    return {"name": data["name"], "rejected": rejected, "reason": reason}
+
+
+def member_values(data: dict[str, Any]) -> list[str]:
+    """The cluster JSON's member indicators: every indicator entry except a
+    legacy candidate. Retired and dormant hosts stay members - a link to a
+    host the operator used last year is still a link, and the span dates
+    decide how much it is worth."""
+    return [o["value"] for cat in membership.MEMBER_CATEGORIES
+            for o in data["observables"].get(cat, [])
+            if membership.member_value(cat, o["value"]) and lifecycle_of(o) != "candidate"]
+
+
+def _set_role_analyst(cluster: str, value: str, role: str, *, origin: str | None = None,
+                      reason: str | None = None) -> None:
+    with tracking_store.connect_retry(read_only=False) as con:
+        entities.set_role(con, cluster, value, role, decided_by=entities.ANALYST,
+                          origin=origin, reason=reason)
 
 
 def _reject(data: dict[str, Any], category: str, entry: dict[str, Any], reason: str) -> None:
@@ -1026,9 +1085,13 @@ def expire_candidates(name: str, now: str | None = None) -> list[str]:
                 _reject(data, cat, o, (f"no live evidence in {quiet} days as a candidate"
                                        + ("" if o.get("last_live") else " (never live)")))
                 expired.append(o["value"])
-    if expired:
+    stored = membership.expire(_slug(data), CANDIDATE_QUIET_DAYS, now)
+    for value in stored:
+        data["hunt_log"].append({"date": now, "entry": (
+            f"candidate {value} expired: no evidence in {CANDIDATE_QUIET_DAYS}+ days")})
+    if expired or stored:
         save_cluster(data)
-    return expired
+    return expired + stored
 
 
 # Pivot enrichment cache. Webamon calls count against a daily budget and
@@ -1797,28 +1860,11 @@ def pivot_cluster(name: str) -> dict[str, Any]:
                 if moved:
                     summary["lifecycle"].append(
                         {"category": cat, "value": o["value"], "from": moved[0], "to": moved[1]})
-                if cat == "domains":
-                    new_cert = o.get("cert") or {}
-                    new_sha256 = new_cert.get("sha256")
-                    # A candidate's certificate waits for accept_candidate:
-                    # filed now, it would export before the host is accepted.
-                    if new_sha256 and lifecycle_of(o) != "candidate":
-                        # Unconditional, not gated on "changed since last
-                        # sweep": _file_cert_hash's own bucket lookup
-                        # already dedupes by value (idempotent re-filing
-                        # just bumps last_seen/sources), and gating here
-                        # would miss the very first cert a domain ever
-                        # gets - add_observable's own add-time enrichment
-                        # sweep already stamps entry["cert"] before this
-                        # sweep ever runs (see _merge_observables), so a
-                        # "did it change from the cluster JSON's own
-                        # snapshot" check would never fire for that first
-                        # sighting.
-                        _file_cert_hash(data, o["value"], new_sha256, new_cert.get("issuer"),
-                                       new_cert.get("revoked"), now,
-                                       sans=new_cert.get("sans"),
-                                       subject=new_cert.get("subject"),
-                                       resolved=detail.get("resolved"))
+                # A certificate is a selector on its host (tls.cert_sha256,
+                # recorded by the observe pass), not a cluster indicator. It
+                # used to be filed here into `hashes`, which is how a default
+                # catch-all cert served for 248 strangers became a JadeProx
+                # observable.
                 row = {"value": o["value"], "status": status}
                 # Seconds per source lookup. Rides the summary into the run
                 # trace only - see _sweep_lifecycle for why not `detail`.
@@ -1858,7 +1904,7 @@ def pivot_cluster(name: str) -> dict[str, Any]:
 # - a bare global lookup here is what makes that patch take effect.
 from .clusters_render import write_markdown  # noqa: E402
 from .tracking.history import (  # noqa: E402
-    _file_cert_hash, _log_cluster_enrichment_history, _log_observation,
+    _log_cluster_enrichment_history, _log_observation,
     _record_opendir,
 )
 
@@ -1894,25 +1940,6 @@ def _record_enrichment(actor: str, enrichment: dict, *, when: str | None = None
         return None
     observed_at = datetime.fromisoformat(when or now_iso()).replace(tzinfo=None)
     return _log_cluster_enrichment_history(actor, observed_at, enrichment)
-
-
-def _file_new_observables(data: dict[str, Any], category: str, values: list[str],
-                           source: str,
-                           enrichment: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]
-                           | None = None) -> list[str]:
-    """Merge only values not already tracked on the cluster in `category`,
-    returning the ones actually added (deduped, order-preserving).
-    `enrichment`, if given, is a _sweep_lifecycle-shaped result keyed by
-    (category, value) - passed through to _merge_observables so a newly
-    filed indicator gets its own asn/ports/cert/tags snapshot, not just
-    whatever the parent pivot happened to fetch."""
-    existing = {o["value"] for o in data["observables"][category]}
-    new = [v for v in dict.fromkeys(values) if v and v not in existing]
-    if new:
-        extracted = {c: (new if c == category else []) for c in OBSERVABLE_CATEGORIES}
-        # skip list unused - caller's own confidence filter already applies
-        _merge_observables(data, extracted, source, enrichment=enrichment)
-    return new
 
 
 def pivot_and_expand(value: str, cluster_name: str,
@@ -2011,9 +2038,11 @@ def pivot_and_expand(value: str, cluster_name: str,
                           [v for cat, vs, _ in candidates if cat == "ips" for v in vs])
     enrichment = _sweep_lifecycle(new_domains, new_ips)  # unlocked - see docstring
 
+    # The new hosts' sweep goes to the store first, unattributed - they are
+    # nobody's until accepted - so the score below can read their selectors.
+    note = _record_enrichment(None, enrichment, when=now)
     result = _pivot_and_expand_merge(value, kind, cluster_name, now, candidates,
                                      review, enrichment)
-    note = _record_enrichment(result.get("name") or cluster_name, enrichment, when=now)
     if note:
         result["history_note"] = note
     return result
@@ -2035,29 +2064,58 @@ def _pivot_and_expand_merge(value: str, kind: str, cluster_name: str, now: str,
                             review: dict[str, Any],
                             enrichment: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]
                             ) -> dict[str, Any]:
-    """Locked write phase: re-read the cluster fresh (another writer may
-    have raced in while the network phase above ran unlocked) and file
-    everything in one go."""
+    """Locked write phase: file each new host as a scored candidate.
+
+    Nothing here touches the cluster's observables. A pivot proposes; the
+    relatedness score says how strongly, with its evidence, and
+    accept_candidate is the only way in. Each candidate carries the link
+    that found it as a dated selector: a subdomain sibling its registered
+    domain (`dns.apex`), a co-hosted name the pivoted address
+    (`net.resolved_ip`)."""
     data = load_cluster(cluster_name)
+    tracked = {o["value"].lower() for cat in ("domains", "ips")
+               for o in data["observables"][cat]}
     filed: dict[str, list[str]] = {}
+    scores: dict[str, dict[str, Any]] = {}
     for category, values, source in candidates:
-        added = _file_new_observables(data, category, values, source, enrichment=enrichment)
-        if added:
-            filed.setdefault(category, []).extend(added)
+        for candidate in dict.fromkeys(values):
+            if not candidate or candidate.lower() in tracked:
+                continue
+            if kind == "ip":
+                links = [{"selector_type": "net.resolved_ip", "value": value,
+                          "last": now, "source": "pivot_and_expand"}]
+            else:
+                apex = psl.apex_for_selector(candidate)
+                links = ([{"selector_type": "dns.apex", "value": apex, "last": now,
+                           "source": "pivot_and_expand"}] if apex else [])
+            scored = membership.file_candidate(
+                _slug(data), candidate, origin=source, decided_by="pivot",
+                reason=f"pivot_and_expand on {value}", links=links,
+                members=member_values(data))
+            if scored is None:
+                continue
+            filed.setdefault(category, []).append(candidate)
+            scores[candidate] = {"score": round(scored["score"], 3), "band": scored["band"],
+                                 "artefacts": scored["artefacts"]}
 
     filed = {c: sorted(set(v)) for c, v in filed.items() if v}
     total = sum(len(v) for v in filed.values())
     breakdown = ", ".join(f"{len(v)} {c}" for c, v in filed.items()) or "none"
-    entry = f"pivot_and_expand on {value}: filed {total} new indicator(s) ({breakdown})"
+    entry = f"pivot_and_expand on {value}: filed {total} candidate(s) ({breakdown})"
+    if scores:
+        entry += "; " + ", ".join(f"{v} {s['band']} {s['score']:.2f}"
+                                  for v, s in sorted(scores.items(),
+                                                     key=lambda kv: -kv[1]["score"])[:10])
     if review:
         n_review = sum(len(v) for v in review.values() if isinstance(v, list))
         if n_review:
-            entry += f"; {n_review} candidate(s) left for review"
+            entry += f"; {n_review} left for review"
     data["hunt_log"].append({"date": now, "entry": entry})
     save_cluster(data)
 
     return {"value": value, "kind": kind, "cluster": cluster_name,
-            "filed": filed, "review": review, "cluster_state": load_cluster(cluster_name)}
+            "filed": filed, "scores": scores, "review": review,
+            "cluster_state": load_cluster(cluster_name)}
 
 
 # --------------------------------------------------------------------------- #
@@ -2266,8 +2324,21 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                         enrichment: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]
                         | None = None,
                         metadata: dict[str, Any] | None = None,
+                        decided_by: str | None = None,
                         ) -> tuple[dict[str, int], list[dict[str, str]]]:
-    """enrichment, if given, is a _sweep_lifecycle-shaped result keyed by
+    """Merge extracted values into the cluster JSON, and record what they are.
+
+    `decided_by` names the authority filing them - `entities.REPORT` for a
+    report or STIX import, `entities.ANALYST` for add_observable - and the
+    indicator values are mirrored into the store as `seed` memberships.
+    Left None, nothing is mirrored (a caller that only refreshes JSON).
+
+    A server fingerprint (JARM, JA4S, JA4TS, JA4X) whose source names the
+    host it was measured on is not a cluster indicator: it is recorded as a
+    dated selector on that host and kept out of the JSON. One with no host
+    in its source stays an observable, as before.
+
+    enrichment, if given, is a _sweep_lifecycle-shaped result keyed by
     (category, value) - applied via _apply_enrichment_snapshot only onto
     entries genuinely new to this cluster (an already-tracked value just
     gets `source` appended, as before; its snapshot is pivot_cluster's job
@@ -2287,6 +2358,16 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
     skipped: list[dict[str, str]] = []  # entries tracked but not queued, with why
     ip_ports = ip_ports or {}
     enrichment = enrichment or {}
+    extracted = dict(extracted)
+    fingerprint_rows = []
+    for category in membership.SERVER_FINGERPRINTS:
+        keep = []
+        for value in extracted.get(category) or []:
+            row = membership.fingerprint_selector(category, value, source)
+            (fingerprint_rows.append(row) if row else keep.append(value))
+        extracted[category] = keep
+    if fingerprint_rows:
+        membership.record_fingerprints(fingerprint_rows, actor=data.get("name"))
     for category in OBSERVABLE_CATEGORIES:
         bucket = data["observables"][category]
         by_value = {o["value"]: o for o in bucket}
@@ -2326,21 +2407,6 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                     _apply_enrichment_snapshot(entry, category, detail, enr)
                     if status != "unknown" and _is_live(category, status, enr):
                         entry["last_live"] = now
-                    if category == "domains":
-                        # A genuinely new domain's very first cert sighting
-                        # happens right here (this add-time sweep), not on
-                        # a later pivot_cluster pass - file it now so the
-                        # sha256 is pivotable from the moment the domain is
-                        # tracked (see pivot_cluster's own matching call for
-                        # why this is unconditional, not gated on "changed").
-                        new_cert = entry.get("cert") or {}
-                        new_sha256 = new_cert.get("sha256")
-                        if new_sha256 and lifecycle_of(entry) != "candidate":
-                            _file_cert_hash(data, value, new_sha256, new_cert.get("issuer"),
-                                           new_cert.get("revoked"), now,
-                                           sans=new_cert.get("sans"),
-                                           subject=new_cert.get("subject"),
-                                           resolved=detail.get("resolved"))
                 bucket.append(entry)
                 added += 1
                 if category in _FINGERPRINTABLE_CATEGORIES:
@@ -2368,6 +2434,10 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
     # probe files would otherwise export ahead of the host they belong to.
     if newly_tracked and (metadata or {}).get("lifecycle") != "candidate":
         _enqueue_pending_fingerprints(data["name"], newly_tracked)
+    if decided_by:
+        membership.mirror_seeds(
+            _slug(data), [(c, v) for c in OBSERVABLE_CATEGORIES for v in extracted.get(c) or []],
+            origin=source, decided_by=decided_by)
     return counts, skipped
 
 
@@ -2615,7 +2685,8 @@ def _ingest_report_phase2(cluster_name: str, source: str, extracted: dict[str, A
         raise ClusterNotFound(f"No cluster named {cluster_name!r}")
 
     observable_counts, skipped = _merge_observables(
-        data, extracted, source, ip_ports=extracted.get("ip_ports"), enrichment=enrichment)
+        data, extracted, source, ip_ports=extracted.get("ip_ports"), enrichment=enrichment,
+        decided_by=entities.REPORT)
     _merge_ttps(data, extracted["ttps"], source)
     data["report_sources"].append({
         "source": source, "ingested": now_iso(),
@@ -2731,7 +2802,8 @@ def import_stix_bundle(bundle: dict[str, Any], name: str | None = None,
     skipped: list[dict[str, str]] = []
     if parsed_obs:
         extracted = {c: parsed_obs.get(c, []) for c in OBSERVABLE_CATEGORIES}
-        _, skipped = _merge_observables(data, extracted, f"STIX import ({parsed['stix_id']})")
+        _, skipped = _merge_observables(data, extracted, f"STIX import ({parsed['stix_id']})",
+                                        decided_by=entities.REPORT)
     save_cluster(data)
     if skipped:
         data = {**data, "fingerprint_queue_skipped": skipped}

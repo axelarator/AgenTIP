@@ -123,6 +123,8 @@ How the service behaves. Distinctive in combination, individually shared by ever
 
 - **`flow.app_proto`** — FlowCarp classed a session to both as the same application protocol from its statistics alone - most useful on a port where nothing parsed a banner.
   - *Never:* a link on a common protocol. Only non-generic labels are recorded; 'tls' or 'http' on a web port is what every host says.
+- **`http.client_divergence`** — the server answers a Windows client differently from a scanner - a different status class, title, certificate or landing host when win116 asks than when the probe does. Payload gating: the real file for a victim's machine, a decoy or a 404 for everyone else. The value names what diverged, so two hosts gating the same way share it.
+  - *Never:* operator identity, and not a verdict on its own: a CDN's bot challenge or a geo rule can diverge too. Read it beside what each client was actually served.
 - **`http.error_page_sha256`** — both hosts serve the same error page. Weak, but not nothing: the same origin-down page from the same CDN is a statement about shared hosting, and an unusual custom error page can be a real tell.
   - *Never:* a link, and especially not a shared deployment. Cloudflare's 521 'Web Server Is Down' page promoted three domains under three different registrations before this type existed, because a body hash was recorded whatever the status code said.
 - **`http.header_order`** — the response headers arrive in the same ORDER - a property of the server build and proxy chain rather than its configuration, the HTTP analogue of JARM. Our own collection; webamon.fp_header_order is the same idea as a third party's digest.
@@ -192,6 +194,40 @@ Structurally unable to promote a candidate, no matter how many indicators share 
   - *Never:* a link: 22 million scans share example.com's value.
 
 <!-- END GENERATED TAXONOMY -->
+
+## Time, scores and hunting
+
+A shared value is a link only if the two holders had it **at the same
+time**. Every selector is stored with the spans in which it was observed
+(passive DNS keeps its own record windows), and the relatedness score
+(`cti/store/relatedness.py`) weighs each shared artefact by class x rarity
+x time overlap: identity 0.85, structural 0.56, behavioural 0.12 (all
+behavioural facts together capped at 0.35, inside `weak`), contextual 0.
+A gap decays the weight - 30 days for addresses, 180 for content and
+key digests. Artefacts combine as `1 - prod(1 - w)`, so the rule above
+holds: one rare identity fact, or two independent structural ones,
+lands in `strong`. Anything measured on a CDN edge weighs nothing; a
+default or catch-all certificate counts as behavioural.
+
+The case this exists for: kakatown.com sat on 192.252.186.62 from 2019-08
+to 2020-08, and the JadeProx vendor trio arrived there in 2026-04. Same
+address, 2,270 days apart: `noise`.
+
+**Hunting** - `hunt_query` (MCP), `python -m graph hunt '<query>'`, or the
+dashboard's Hunt page. Censys-style `key:value` terms over everything the
+store has observed, with AND / OR / NOT / parentheses:
+
+    tls.default_subject:* AND net.port:8443 AND NOT role:rejected
+    (net.resolved_ip:192.252.186.62 OR net.historical_ip:192.252.186.62) during:[2026-01-01,2026-12-31]
+    cluster:jadeprox role:candidate band:probable
+    changed:tls.cert_sha256 since:7d
+
+Keys are selector types plus `net.port`, `indicator`, `type`, `cluster`,
+`role`, `band`, `vantage`, `changed`; `seen:` / `during:` set the time
+window. A hit says an indicator carried a value. `hunt_pairs(a)` says
+what `a` is most like across the whole store, scored pairwise;
+`hunt_pairs(a, b)` lists what two indicators share, when, and what it is
+worth. A hunt rule file can carry the same syntax as `query:`.
 
 ## Pivoting vs. probing
 

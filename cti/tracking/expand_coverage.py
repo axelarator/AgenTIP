@@ -15,13 +15,16 @@ This asks the outside question once a week, per cluster:
    Unpriced values are skipped, not assumed rare - the same rule rarity
    applies everywhere else.
 2. Reverse. `webamon.reverse_selector` for each seed: who else carries it.
-3. Verify. Every new host gets one full sweep, which writes its selectors,
-   and then has to pass the corroboration rule against THIS cluster's
-   indicators - one identity fact, or two independent structural ones.
-   Sharing the seed alone is not enough when the seed is structural.
-4. File. A host that passes is filed as a `candidate`: swept daily, shown
-   in the digest, but left out of exports until accept_candidate. A
-   rejected host goes on the cluster's deny list and is never re-filed.
+3. Score. Every new host gets one full sweep, which writes its selectors,
+   and is then scored against THIS cluster's members
+   (`store/relatedness.py`): class x rarity x time overlap per shared
+   artefact. Sharing the seed alone is worth what the seed is worth.
+4. File. A host at or above CTI_CANDIDATE_MIN_BAND (default `weak`) is
+   filed as a scored `candidate` in the membership store: shown in the
+   digest with its evidence, never exported until accept_candidate. One
+   below it is counted, not filed - its selectors stay in the store, so a
+   later pivot can still find and re-score it. A rejected host is never
+   re-filed.
 
 Validin is not used: its metered calls are manual-only by design.
 """
@@ -32,12 +35,12 @@ import os
 from datetime import date
 from typing import Any
 
-from .. import core, store
+from .. import core, membership, store
 from ..netwatch import rules as hunt_rules
 from ..netwatch.candidates import pdns as pdns_source
 from ..sources import budget, pivot, webamon
 from ..store import cdn as cdn_ranges
-from ..store import expand, rarity, selectors
+from ..store import rarity, selectors
 from ..util import now_iso
 
 log = logging.getLogger(__name__)
@@ -47,6 +50,7 @@ EXPAND_SELECTORS_PER_CLUSTER = 8
 # sweep (RDAP, observe, Webamon, subdomains), so this, not the reverse
 # lookups, is what bounds a run's cost.
 EXPAND_HOSTS_PER_CLUSTER = 10
+DEFAULT_MIN_BAND = "weak"
 BUDGET_KEY = "webamon_expand"
 DEFAULT_WEEKDAY = 0  # Monday
 
@@ -69,7 +73,16 @@ def _tracked_values(data: dict[str, Any]) -> set[str]:
 
 
 def _denied(data: dict[str, Any]) -> set[str]:
-    return {d["value"].lower() for d in data.get("denylist") or []}
+    """Values this cluster must not sweep again: rejected (the store's and the
+    legacy JSON deny list) and already-filed candidates, which are re-scored
+    as their own evidence arrives rather than re-discovered."""
+    stored = membership.values_with_role(core._slug(data), ("rejected", "candidate"))
+    return {d["value"].lower() for d in data.get("denylist") or []} | stored
+
+
+def min_band() -> str:
+    band = os.environ.get("CTI_CANDIDATE_MIN_BAND", DEFAULT_MIN_BAND)
+    return band if band in membership.BAND_ORDER else DEFAULT_MIN_BAND
 
 
 def _live_indicators(data: dict[str, Any]) -> list[str]:
@@ -140,32 +153,6 @@ def _new_hosts(data: dict[str, Any], seed: dict[str, Any], owners: dict[str, str
     return out
 
 
-def _only_via_shared_address(candidate: expand.Candidate) -> bool:
-    """True when every promoting fact is an address on a CDN edge.
-
-    The selector layer already refuses to record co-hosting selectors on
-    CDN space; this is the belt to that brace for the expansion path, where
-    a wrong link costs a candidate an analyst has to reject by hand.
-    """
-    facts = candidate.identity + candidate.structural
-    return bool(facts) and all(
-        t.startswith("net.") and cdn_ranges.is_cdn(str(v)) for t, v in facts)
-
-
-def _verify(con, host: str, cluster_indicators: set[str]) -> expand.Candidate | None:
-    """The strongest promoted link from `host` into this cluster, or None."""
-    best = None
-    for candidate in expand.candidates_for(con, host):
-        if not candidate.promoted or candidate.indicator.lower() not in cluster_indicators:
-            continue
-        if _only_via_shared_address(candidate):
-            continue
-        if best is None or (len(candidate.identity), len(candidate.structural)) > (
-                len(best.identity), len(best.structural)):
-            best = candidate
-    return best
-
-
 def _rule_candidates(slug: str, data: dict[str, Any], owners: dict[str, str],
                      report: dict[str, Any]) -> list[dict[str, Any]]:
     """Hosts a cluster's own enabled hunt rules match in our snapshots.
@@ -228,7 +215,14 @@ def _pdns_candidates(data: dict[str, Any], owners: dict[str, str],
             if cand.kind == "ip" and cdn_ranges.is_cdn(host):
                 continue
             via[host] = {"via": cand.discovered_via, "from": cand.discovered_from,
-                         "reason": cand.reason, "kind": cand.kind}
+                         "reason": cand.reason, "kind": cand.kind, "links": []}
+            if cand.kind == "domain" and cand.first_seen:
+                # A name found on one of our addresses carries that address,
+                # dated by the record - the window the score compares.
+                via[host]["links"].append({
+                    "selector_type": "net.historical_ip", "value": cand.discovered_from,
+                    "first": cand.first_seen, "last": cand.last_seen,
+                    "source": "mnemonic_pdns"})
     return via
 
 
@@ -253,8 +247,10 @@ def expand_cluster(slug: str) -> dict[str, Any]:
         host = meta.pop("value")
         meta.pop("enrich_kind", None)
         source = f"hunt-rule {now_iso()[:10]} via {meta['discovered_via'][:96]}"
-        if core.file_candidate(slug, host, source, meta):
-            report["rule_filed"].append({"value": host, **meta})
+        scored = core.file_candidate(slug, host, source, meta)
+        if scored:
+            report["rule_filed"].append({"value": host, **meta, "score": scored["score"],
+                                         "band": scored["band"]})
 
     # 2. Passive DNS neighbours, then Webamon as the fallback.
     via = _pdns_candidates(data, owners, report)
@@ -290,31 +286,24 @@ def expand_cluster(slug: str) -> dict[str, Any]:
     if note:
         report["errors"].append(note)
 
-    cluster_indicators = {v.lower() for v in _live_indicators(data)}
-    filed: list[tuple[str, dict[str, Any]]] = []
-    with store.connect() as con:
-        for host in hosts:
-            link = _verify(con, host, cluster_indicators)
-            if link is None:
-                report["rejected_links"] += 1
-                continue
-            prov = via[host]
-            filed.append((host, {
-                "lifecycle": "candidate",
-                "discovered_via": prov["via"],
-                "discovered_from": prov["from"],
-                "candidate_reason": link.reason,
-                "candidate_linked_to": link.indicator,
-            }))
-
-    for host, metadata in filed:
-        source = f"auto-pivot {now_iso()[:10]} via {metadata['discovered_via'][:96]}"
-        category = "ips" if via[host].get("kind") == "ip" else "domains"
-        enrich_key = (category, host)
-        core.file_candidate(slug, host, source, metadata,
-                            {enrich_key: results[enrich_key]}
-                            if enrich_key in results else None)
-        report["filed"].append({"value": host, **metadata})
+    floor = min_band()
+    members = core.member_values(data)
+    for host in hosts:
+        prov = via[host]
+        scored = membership.score(core._slug(data), host, members=members)
+        if not membership.band_at_least(scored["band"], floor):
+            report["rejected_links"] += 1
+            continue
+        top = scored["evidence"][0] if scored["evidence"] else {}
+        metadata = {
+            "discovered_via": prov["via"], "discovered_from": prov["from"],
+            "candidate_reason": (f"{scored['band']} {scored['score']:.2f}: " + ", ".join(
+                f"{k} {v:.2f}" for k, v in list(scored["artefacts"].items())[:3])),
+            "candidate_linked_to": top.get("member"),
+            "score": round(scored["score"], 3), "band": scored["band"]}
+        source = f"auto-pivot {now_iso()[:10]} via {prov['via'][:96]}"
+        if core.file_candidate(slug, host, source, metadata, links=prov.get("links")):
+            report["filed"].append({"value": host, **metadata})
     return report
 
 

@@ -328,8 +328,10 @@ def _wide_view_sql() -> str:
 
 
 def init_schema(con: duckdb.DuckDBPyConnection) -> None:
+    from .entities import SCHEMA as ENTITY_SCHEMA
     from .selectors import SCHEMA as SELECTOR_SCHEMA
 
     con.execute(SCHEMA)
     con.execute(SELECTOR_SCHEMA)
+    con.execute(ENTITY_SCHEMA)
     con.execute(_wide_view_sql())

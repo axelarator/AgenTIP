@@ -227,7 +227,8 @@ def ingest(*, client: Any = _UNSET, purge: bool = True) -> dict[str, Any]:
                 selectors += len(store.selectors.record_many(
                     con, indicator_value=target, found=found,
                     observed_at=observed_at, indicator_type=kind, actor=actor,
-                    source="netwatch"))
+                    source="netwatch",
+                    vantage=records[0].get("vantage") or "probe"))
 
     if purge:
         for path in files:

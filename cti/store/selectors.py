@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS selector_stats (
 );
 """
 
+# The interval detail behind each row above lives in selector_spans; it is
+# part of this schema so anything that creates the selector tables gets both.
+from .spans import SCHEMA as _SPAN_SCHEMA  # noqa: E402
+
+SCHEMA = SCHEMA + _SPAN_SCHEMA
+
 
 # --------------------------------------------------------------------------- #
 # The taxonomy
@@ -301,6 +307,15 @@ TYPES: dict[str, SelectorType] = {t.name: t for t in (
        "'Web Server Is Down' page promoted three domains under three "
        "different registrations before this type existed, because a body "
        "hash was recorded whatever the status code said"),
+    _t("http.client_divergence", "behavioural",
+       "the server answers a Windows client differently from a scanner - a "
+       "different status class, title, certificate or landing host when win116 "
+       "asks than when the probe does. Payload gating: the real file for a "
+       "victim's machine, a decoy or a 404 for everyone else. The value names "
+       "what diverged, so two hosts gating the same way share it",
+       "operator identity, and not a verdict on its own: a CDN's bot "
+       "challenge or a geo rule can diverge too. Read it beside what each "
+       "client was actually served"),
     _t("http.title", "behavioural",
        "the same page title. Weak alone, useful when the title is itself "
        "distinctive and the body hash differs only by a timestamp"),
@@ -403,9 +418,11 @@ _ARTEFACTS: dict[str, tuple[str, ...]] = {
     "response_headers": (
         "http.header_set", "http.header_order",
     ),
+    # A passive-DNS record of the same address is the same fact, dated
+    # differently; it must not count twice beside the live resolution.
     "address": (
-        "net.resolved_ip", "net.reverse_dns", "net.asn", "net.prefix",
-        "net.country",
+        "net.resolved_ip", "net.historical_ip", "net.reverse_dns", "net.asn",
+        "net.prefix", "net.country",
     ),
 }
 
@@ -467,16 +484,27 @@ def rank(selector_type: str) -> int:
 def record(con: duckdb.DuckDBPyConnection, *, indicator_value: str,
            selector_type: str, selector_value: Any, observed_at,
            indicator_type: str | None = None, actor: str | None = None,
-           source: str | None = None) -> bool:
+           source: str | None = None, first_seen: Any = None,
+           last_seen: Any = None, vantage: str | None = None) -> bool:
     """Record one selector. Returns True if it was new.
 
     Values are normalized by `normalize()` so that a hash written in upper
     case by one tool and lower case by another does not become two selectors
     that fail to link.
+
+    `first_seen`/`last_seen` are for sources that report their own window -
+    passive DNS saying a name resolved somewhere from 2019 to 2020. Without
+    them the observation is dated `observed_at`, which is right for a scan
+    and wrong for history. Every call also folds into `selector_spans`,
+    which keeps the intervals this table's single first/last pair loses.
     """
     value = normalize(selector_type, selector_value)
     if value is None:
         return False
+    from . import spans
+
+    start = spans.to_ts(first_seen) or spans.to_ts(observed_at)
+    end = spans.to_ts(last_seen) or spans.to_ts(observed_at) or start
     existed = con.execute(
         "SELECT 1 FROM selectors WHERE selector_type = ? AND selector_value = ? "
         "AND indicator_value = ?", [selector_type, value, indicator_value]).fetchone()
@@ -485,18 +513,23 @@ def record(con: duckdb.DuckDBPyConnection, *, indicator_value: str,
                indicator_type, actor, source, first_seen, last_seen)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (selector_type, selector_value, indicator_value) DO UPDATE SET
-               last_seen = excluded.last_seen,
+               first_seen = least(selectors.first_seen, excluded.first_seen),
+               last_seen = greatest(selectors.last_seen, excluded.last_seen),
                actor = coalesce(excluded.actor, selectors.actor),
                indicator_type = coalesce(excluded.indicator_type, selectors.indicator_type)""",
         [selector_type, value, indicator_value, indicator_type, actor, source,
-         observed_at, observed_at])
+         start, end])
+    if start is not None:
+        spans.record(con, selector_type=selector_type, selector_value=value,
+                     indicator_value=indicator_value, source=source,
+                     start=start, end=end, vantage=vantage)
     return existed is None
 
 
 def record_many(con: duckdb.DuckDBPyConnection, *, indicator_value: str,
                 found: Iterable[tuple[str, Any]], observed_at,
                 indicator_type: str | None = None, actor: str | None = None,
-                source: str | None = None) -> list[str]:
+                source: str | None = None, vantage: str | None = None) -> list[str]:
     """Record many selectors for one indicator. Returns the types that were new."""
     fresh = []
     for selector_type, value in found:
@@ -507,7 +540,8 @@ def record_many(con: duckdb.DuckDBPyConnection, *, indicator_value: str,
         for one in values:
             if record(con, indicator_value=indicator_value, selector_type=selector_type,
                       selector_value=one, observed_at=observed_at,
-                      indicator_type=indicator_type, actor=actor, source=source):
+                      indicator_type=indicator_type, actor=actor, source=source,
+                      vantage=vantage):
                 fresh.append(selector_type)
     return fresh
 
@@ -625,6 +659,11 @@ def normalize(selector_type: str, value: Any) -> str | None:
         text = canonical_dn(text)
 
     if selector_type == "http.body_sha256" and text in _EMPTY_BODY_SHA256:
+        return None
+    # An all-zero JARM is what the tool prints when nothing answered the
+    # handshake. 33 tracked hosts "shared" it, linking every dead endpoint
+    # to every other.
+    if selector_type == "tls.jarm" and not text.strip("0"):
         return None
     return text
 

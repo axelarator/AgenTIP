@@ -55,7 +55,9 @@ _BACKENDS: dict[str, dict[str, Any]] = {
         "ts_format": "epoch_millis",
     },
     "arkime": {
-        "url": os.environ.get("CTI_OPENSEARCH_URL", "http://10.20.0.18:9200"),
+        # The real address is lab topology and comes from the environment;
+        # this file is public, so the fallback names nothing.
+        "url": os.environ.get("CTI_OPENSEARCH_URL", "http://127.0.0.1:9200"),
         "index": os.environ.get("CTI_OPENSEARCH_INDEX", "zeek-*"),
         "fields": {"ts": "ts", "src_ip": "src_ip.keyword",
                    "dst_ip": "dst_ip.keyword", "src_port": "src_port",

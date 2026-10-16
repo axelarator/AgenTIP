@@ -10,6 +10,7 @@ import duckdb
 import pytest
 
 from cti import core, store
+from cti.store import entities
 from cti.netwatch import ingest, jobs, watchlist
 
 REPO = Path(__file__).resolve().parents[1]
@@ -73,6 +74,26 @@ def test_strongest_tier_and_port_union_win(monkeypatch):
     assert len(got) == 1
     assert got[0]["tier"] == "full"
     assert got[0]["ports"] == [443, 8443]
+
+
+def test_scored_candidates_join_the_hot_tier_above_the_floor(monkeypatch):
+    cl = _cluster(ips=[_ip("203.0.113.1", "active", since=_iso(NOW - timedelta(days=60)))])
+    monkeypatch.setattr(core, "list_clusters", lambda: ["apt-w"])
+    monkeypatch.setattr(core, "load_cluster", lambda n: cl)
+    monkeypatch.setattr(watchlist.cdn, "available", lambda: False)
+    with store.connect() as con:
+        for value, score, band in (("lead.example", 0.6, "probable"),
+                                   ("198.51.100.9", 0.3, "weak"),
+                                   ("stranger.example", 0.05, "noise")):
+            entities.file_candidate(con, "apt-w", value, origin="t", decided_by="pivot")
+            entities.record_score(con, "apt-w", value, score=score, band=band, evidence=[])
+    targets = {t["value"]: t for t in watchlist.build()}
+    assert targets["lead.example"]["tier"] == "hot"
+    assert targets["198.51.100.9"]["kind"] == "ip"
+    assert "stranger.example" not in targets
+    assert targets["203.0.113.1"]["tier"] == "full"
+    monkeypatch.setenv("CTI_CANDIDATE_SCAN_BAND", "probable")
+    assert "198.51.100.9" not in {t["value"] for t in watchlist.build()}
 
 
 # --------------------------------------------------------------------------- #
@@ -210,7 +231,7 @@ class _FakeZeek:
 
 
 def test_ingest_joins_passive_zeek_fingerprints(monkeypatch):
-    monkeypatch.setenv("CTI_PROBE_HOST", "10.20.30.74")
+    monkeypatch.setenv("CTI_PROBE_HOST", "10.99.0.74")
     _spool([_record("scanA", "203.0.113.11", 443,
                     tls={"cert_sha256": "c" * 64})])
     out = ingest.ingest(client=_FakeZeek())

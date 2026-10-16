@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from cti import core
+from cti import core, membership
 
 
 def stub_cert(monkeypatch, grab):
@@ -957,8 +957,10 @@ def test_add_observable_new_domain_captures_cert_snapshot(monkeypatch):
     assert domain["cert"]["sha256"] == "deadbeef"
     assert domain["cert"]["sans"] == ["evil.example", "mail.evil.example"]
     assert domain["cert"]["source"] == "observe_tls"
-    # The cert sha256 is auto-filed onto the cluster's hashes bucket.
-    assert any(h["value"] == "cert-sha256:deadbeef" for h in data["observables"]["hashes"])
+    # A certificate is a selector on its host, not a cluster indicator: it is
+    # no longer auto-filed into the hashes bucket.
+    assert not any(h["value"].startswith("cert-sha256:")
+                   for h in data["observables"]["hashes"])
 
 
 def test_add_observable_existing_value_does_not_re_enrich(monkeypatch):
@@ -1042,9 +1044,16 @@ def test_pivot_and_expand_new_sibling_captures_enrichment_snapshot(monkeypatch):
 
     result = core.pivot_and_expand("evil.example", "Expand Enrich")
     assert result["filed"]["domains"] == ["mail.evil.example"]
+    # The sibling is a candidate, scored on the apex it shares with the seed;
+    # its own sweep went to the store, not to the cluster JSON.
+    assert "dns.apex" in result["scores"]["mail.evil.example"]["artefacts"]
     data = core.get_cluster("Expand Enrich")
-    sibling = next(o for o in data["observables"]["domains"] if o["value"] == "mail.evil.example")
-    assert sibling["cert"]["issuer"] == "ZeroSSL"
+    assert "mail.evil.example" not in {o["value"] for o in data["observables"]["domains"]}
+    with core.tracking_store.connect(read_only=True) as con:
+        held = {r[0] for r in con.execute(
+            "SELECT selector_type FROM selectors WHERE indicator_value = 'mail.evil.example'"
+        ).fetchall()}
+    assert {"dns.apex", "tls.cert_sha256"} <= held
 
 
 def test_pivot_cluster_persists_cert_snapshot_onto_observable(stub_cluster_sweep_net):
@@ -1177,11 +1186,11 @@ def test_private_ip_is_tracked_but_not_queued():
     # dir across tests in the same session - so assert this value isn't
     # queued, not that the whole (possibly session-shared) queue is empty.
     core.create_cluster("Gate Test IP")
-    data = core.add_observable("Gate Test IP", "ips", "10.20.0.9", "report X")
-    assert any(o["value"] == "10.20.0.9" for o in data["observables"]["ips"])
-    assert not any(e["value"] == "10.20.0.9" for e in core.list_pending_fingerprints())
+    data = core.add_observable("Gate Test IP", "ips", "10.99.0.9", "report X")
+    assert any(o["value"] == "10.99.0.9" for o in data["observables"]["ips"])
+    assert not any(e["value"] == "10.99.0.9" for e in core.list_pending_fingerprints())
     assert data["fingerprint_queue_skipped"] == [
-        {"category": "ips", "value": "10.20.0.9",
+        {"category": "ips", "value": "10.99.0.9",
          "reason": "private/reserved/loopback/link-local address, not routable adversary infra"}
     ]
 
@@ -1613,8 +1622,11 @@ def test_pivot_and_expand_files_subfinder_siblings(monkeypatch):
     assert "unrelated.other.example" in result["review"]["other_hostnames"]
 
     data = core.get_cluster("Expand")
+    # Filed as scored candidates in the membership store, not as members.
     domains = {o["value"] for o in data["observables"]["domains"]}
-    assert {"mail.evil.example", "vpn.evil.example"} <= domains
+    assert not {"mail.evil.example", "vpn.evil.example"} & domains
+    assert {c["entity"] for c in membership.candidates("expand")} == {
+        "mail.evil.example", "vpn.evil.example"}
     # a hunt-log entry documents the expansion
     assert any("pivot_and_expand on evil.example" in h["entry"] for h in data["hunt_log"])
 
@@ -1929,8 +1941,7 @@ def test_the_moved_functions_are_still_reachable_through_core():
     """21 modules import core and several tests patch its attributes. The
     split is only safe because core re-exports what moved."""
     for name in ("_log_observation", "_record_opendir", "_record_enrichment",
-                 "_log_cluster_enrichment_history", "_file_cert_hash",
-                 "write_markdown"):
+                 "_log_cluster_enrichment_history", "write_markdown"):
         assert hasattr(core, name), name
 
 
@@ -2262,47 +2273,32 @@ def test_exports_leave_out_retired_and_candidates_unless_asked():
 
 
 # --------------------------------------------------------------------------- #
-# Certificate hash filing
+# Certificates and fingerprints are selectors, not indicators
 # --------------------------------------------------------------------------- #
 
-def _hashes(data):
-    return {h["value"]: h for h in data["observables"]["hashes"]}
+def test_a_server_fingerprint_with_its_host_becomes_a_selector():
+    core.create_cluster("FP")
+    data = core.add_observable("FP", "jarm", "2" * 62,
+                               "JARM against c2.example:443 via Win11 probe VM, 2026-07-25")
+    assert data["observables"]["jarm"] == []
+    with core.tracking_store.connect(read_only=True) as con:
+        row = con.execute("SELECT indicator_value, vantage, start_at FROM selector_spans "
+                          "WHERE selector_type = 'tls.jarm'").fetchone()
+    assert row[0] == "c2.example" and row[1] == "win116" and row[2].year == 2026
 
 
-def test_cert_hash_sources_do_not_grow_across_sweeps():
-    data = core._new_cluster("C", "")
-    for day in ("2026-09-01", "2026-09-02", "2026-09-03"):
-        core._file_cert_hash(data, "a.example", "h1", "LE", None, f"{day}T00:00:00+00:00",
-                             sans=["a.example"])
-    entry = _hashes(data)["cert-sha256:h1"]
-    assert entry["sources"] == ["live TLS grab for a.example"]
-    assert entry["last_live"] == "2026-09-03T00:00:00+00:00"
+def test_a_fingerprint_with_no_host_stays_an_observable():
+    core.create_cluster("FP Bare")
+    data = core.add_observable("FP Bare", "ja4s", "t130200_1302_a56c5b993250", "a report")
+    assert [o["value"] for o in data["observables"]["ja4s"]] == ["t130200_1302_a56c5b993250"]
 
 
-def test_a_rotation_supersedes_the_previous_hash_for_that_domain():
-    data = core._new_cluster("C", "")
-    core._file_cert_hash(data, "a.example", "h1", "LE", None, "2026-09-01T00:00:00+00:00")
-    core._file_cert_hash(data, "b.example", "hb", "LE", None, "2026-09-01T00:00:00+00:00")
-    core._file_cert_hash(data, "a.example", "h2", "LE", None, "2026-11-01T00:00:00+00:00")
-    hashes = _hashes(data)
-    assert hashes["cert-sha256:h1"]["lifecycle"] == "retired"
-    assert hashes["cert-sha256:h1"]["superseded_by"] == "cert-sha256:h2"
-    assert "lifecycle" not in hashes["cert-sha256:h2"]
-    assert "lifecycle" not in hashes["cert-sha256:hb"]
-
-
-def test_provider_certificates_are_not_filed(monkeypatch):
-    data = core._new_cluster("C", "")
-    many = [f"s{i}.example" for i in range(40)]
-    assert "SANs" in core._file_cert_hash(data, "a.example", "h1", "LE", None,
-                                          "2026-09-01T00:00:00+00:00", sans=many)
-    assert core._file_cert_hash(data, "a.example", "h2", "X", None, "2026-09-01T00:00:00+00:00",
-                                subject="CN = localhost") == "default certificate subject"
-    from cti.tracking import history
-    monkeypatch.setattr(history.cdn_ranges, "is_cdn", lambda ip: ip == "104.16.0.1")
-    assert "CDN" in core._file_cert_hash(data, "a.example", "h3", "X", None,
-                                         "2026-09-01T00:00:00+00:00", resolved=["104.16.0.1"])
-    assert data["observables"]["hashes"] == []
+def test_filed_indicators_are_seeded_in_the_store():
+    core.create_cluster("Seeded")
+    core.add_observable("Seeded", "urls", "https://x.example/a", "analyst note")
+    assert membership.role("seeded", "https://x.example/a") == "seed"
+    core.remove_observable("Seeded", "urls", "https://x.example/a")
+    assert membership.role("seeded", "https://x.example/a") is None
 
 
 # --------------------------------------------------------------------------- #
@@ -2323,18 +2319,25 @@ def _queued(name):
     return [p["value"] for p in core.list_pending_fingerprints() if p["cluster"] == name]
 
 
-def test_a_filed_candidate_is_not_queued_for_fingerprinting():
+def _slug(name):
+    return core._slug(name)
+
+
+def test_a_filed_candidate_is_scored_in_the_store_not_the_json():
     name = _candidate_cluster("Cand Unqueued")
-    entry = core.load_cluster(name)["observables"]["domains"][0]
-    assert entry["lifecycle"] == "candidate"
+    assert core.load_cluster(name)["observables"]["domains"] == []
+    [cand] = membership.candidates(_slug(name))
+    assert cand["entity"] == "new.example" and cand["band"] == "noise"
     assert _queued(name) == []
 
 
-def test_accepting_a_candidate_activates_and_queues_it():
+def test_accepting_a_candidate_makes_it_a_member_and_queues_it():
     name = _candidate_cluster("Cand Accepted")
     core.accept_candidate(name, "NEW.example", "same kit as known.example")
     data = core.load_cluster(name)
+    assert [o["value"] for o in data["observables"]["domains"]] == ["new.example"]
     assert core.lifecycle_of(data["observables"]["domains"][0]) == "active"
+    assert membership.role(_slug(name), "new.example") == "accepted"
     assert "same kit" in data["hunt_log"][-1]["entry"]
     assert _queued(name) == ["new.example"]
 
@@ -2344,9 +2347,8 @@ def test_a_rejected_candidate_is_denied_for_good():
     with pytest.raises(ValueError):
         core.reject_candidate(name, "new.example", " ")
     core.reject_candidate(name, "new.example", "parked page shared by a registrar")
-    data = core.load_cluster(name)
-    assert data["observables"]["domains"] == []
-    assert data["denylist"][0]["value"] == "new.example"
+    assert core.load_cluster(name)["observables"]["domains"] == []
+    assert membership.role(_slug(name), "new.example") == "rejected"
     assert not core.file_candidate(name, "new.example", "auto-pivot", {})
 
 
@@ -2363,10 +2365,13 @@ def test_only_candidates_can_be_accepted_or_rejected():
 
 
 def test_quiet_candidates_expire():
-    name = _candidate_cluster()
-    data = core.load_cluster(name)
-    data["observables"]["domains"][0]["first_seen"] = "2026-08-01T00:00:00+00:00"
-    core.save_cluster(data)
+    name = _candidate_cluster("Cand Quiet")
+    with core.tracking_store.connect() as con:
+        con.execute("UPDATE memberships SET created_at = TIMESTAMP '2026-08-01' "
+                    "WHERE entity = 'new.example'")
     assert core.expire_candidates(name, now="2026-08-20T00:00:00+00:00") == []
     assert core.expire_candidates(name, now="2026-09-05T00:00:00+00:00") == ["new.example"]
-    assert "never live" in core.load_cluster(name)["denylist"][0]["reason"]
+    with core.tracking_store.connect() as con:
+        row = con.execute("SELECT role, decided_by, reason FROM memberships "
+                          "WHERE entity = 'new.example'").fetchone()
+    assert row[0] == "rejected" and row[1] == "expiry" and "never observed" in row[2]
