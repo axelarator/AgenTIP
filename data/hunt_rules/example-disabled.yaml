@@ -1,0 +1,17 @@
+# Template. Disabled, so it is never matched. Copy it, give it a real id,
+# cluster, terms and note, then set `enabled: true`. See README.md.
+id: example-template
+cluster: null
+enabled: false
+note: >
+  A template, not a real signature. Replace every value. A good rule pins
+  one distinctive structural or identity fact (a self-signed cert's subject,
+  an apex, a SAN pattern) together with one or two behavioural ones (JARM,
+  header order, ja4s) so the COMBINATION is what discriminates.
+where:
+  all:
+    - tls.jarm: "00000000000000000000000000000000000000000000000000000000000000"
+    - http.header_order: "server,date,content-type"
+  ports: [443, 8443]
+scope: [snapshots]
+action: candidate

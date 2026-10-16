@@ -130,13 +130,16 @@ cti host always initiates outbound, in — never the reverse.
 
 Generating the probe traffic and reading back what it produced are two
 different things happening on two different machines, but as of this
-design they're one SSH hop plus one HTTP query, not two SSH hops.
-Earlier versions SSHed into a second VM (the Zeek sensor itself) and
-read `ssl.log`/`conn.log` directly off disk there — that's `mcp-server/scripts/zeek_log_query.py`,
-still present but **retired from the automated pipeline** (kept only
-for manual by-hand troubleshooting directly on a Zeek VM; nothing in
-`probe_pending_fingerprints.py` invokes it or the Zeek-VM SSH key
-anymore). Two real bugs, found only by testing against real multi-target
+design they're one SSH hop plus one HTTPS query, not two SSH hops.
+Since 2026-10-14 that query goes to the Zeek logs in Wazuh
+(`wazuh-archives-*` on siem01, through a forward-only SSH login; see
+`cti/sources/opensearch.py`); before that it went to the Arkime VM's
+`zeek-*` indices, whose fluent-bit feed stopped on 2026-10-12.
+Earlier still, versions SSHed into the Zeek sensor itself and read
+`ssl.log`/`conn.log` directly off disk with a `zeek_log_query.py` script.
+That script was retired from the pipeline and was not carried over when
+cti-agent was archived; for by-hand troubleshooting on the sensor, `jq`
+over `/opt/zeek/logs/current/*.log` does the same job. Two real bugs, found only by testing against real multi-target
 runs, drove the move off raw files:
 
 - **Log rotation races.** `logs/current/ssl.log` is periodically rotated

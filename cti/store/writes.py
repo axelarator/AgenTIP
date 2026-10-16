@@ -241,3 +241,92 @@ def upsert_opendir_samples(con: duckdb.DuckDBPyConnection, *, indicator_value: s
           _json(r.get("strings_sample")), _json(r.get("extracted")),
           r.get("verdict"), actor, analyzed_at] for r in results])
     return len(results)
+
+
+# --- netwatch service snapshots + change log --------------------------------
+_SNAPSHOT_COLUMNS = (
+    "scan_id", "scanned_at", "vantage", "profile", "target", "ip", "port",
+    "open", "actor", "banner_sha256", "cert_sha256", "spki_sha256",
+    "tls_issuer", "ja3s", "ja4s", "ja4ts", "ja4x", "jarm", "http_status",
+    "http_title", "http_server", "header_order", "body_sha256",
+    "favicon_mmh3", "hassh_server", "app_proto",
+)
+
+
+def upsert_service_snapshot(con: duckdb.DuckDBPyConnection, *, row: dict[str, Any]) -> None:
+    """One (scan_id, target, port) service row. `c2_hits` and `record` are
+    JSON; everything else is a flat column named in _SNAPSHOT_COLUMNS."""
+    cols = list(_SNAPSHOT_COLUMNS) + ["c2_hits", "record"]
+    values = [row.get(c) for c in _SNAPSHOT_COLUMNS]
+    values += [_json(row.get("c2_hits")), _json(row.get("record"))]
+    placeholders = ", ".join("?" for _ in cols)
+    updates = ", ".join(f"{c} = excluded.{c}" for c in cols
+                        if c not in ("scan_id", "target", "port"))
+    con.execute(
+        f"""INSERT INTO service_snapshots ({', '.join(cols)})
+            VALUES ({placeholders})
+            ON CONFLICT (scan_id, target, port) DO UPDATE SET {updates}""",
+        values)
+
+
+def record_service_change(con: duckdb.DuckDBPyConnection, *, detected_at,
+                          scan_id: str, target: str, port: int,
+                          actor: str | None, field: str, change_type: str,
+                          old_value: Any, new_value: Any) -> None:
+    # old/new are the raw values that moved - a bool, a cert hash, a list of
+    # c2 hits - and the columns are JSON, so always encode. (`_json` passes
+    # a bare string through as-is, which is right for a pre-serialized blob
+    # but would write an unquoted `njRAT` here and fail JSON validation.)
+    def enc(v: Any) -> str | None:
+        return None if v is None else json.dumps(v)
+    con.execute(
+        """INSERT INTO service_changes
+             (detected_at, scan_id, target, port, actor, field, change_type,
+              old_value, new_value)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (scan_id, target, port, field) DO NOTHING""",
+        [detected_at, scan_id, target, port, actor, field, change_type,
+         enc(old_value), enc(new_value)])
+
+
+def update_service_flow(con: duckdb.DuckDBPyConnection, *, scan_id: str,
+                        target: str, port: int, app_proto: str | None,
+                        c2_hits: list[str] | None) -> dict[str, Any] | None:
+    """Fold a FlowCarp result back onto one already-ingested snapshot.
+
+    FlowCarp runs after the scan is in the table, so it UPDATEs the row
+    rather than inserting: the protocol label fills `app_proto` (only when
+    FlowCarp found one - a null verdict must not erase a prior label), and
+    its malware alerts are *unioned* into whatever `c2_hits` the nuclei
+    templates already recorded, never replacing them. Returns the row's
+    values as they stood before the update, so the caller can diff against
+    the previous scan; None if the snapshot is gone.
+    """
+    row = con.execute(
+        "SELECT app_proto, c2_hits FROM service_snapshots "
+        "WHERE scan_id = ? AND target = ? AND port = ?",
+        [scan_id, target, port]).fetchone()
+    if row is None:
+        return None
+    prior_proto, prior_hits_json = row
+    prior_hits = json.loads(prior_hits_json) if prior_hits_json else []
+    merged_hits = sorted(set(prior_hits) | set(c2_hits or []))
+    new_proto = app_proto or prior_proto
+    con.execute(
+        "UPDATE service_snapshots SET app_proto = ?, c2_hits = ? "
+        "WHERE scan_id = ? AND target = ? AND port = ?",
+        [new_proto, _json(merged_hits or None), scan_id, target, port])
+    return {"app_proto": prior_proto, "c2_hits": prior_hits}
+
+
+def latest_service_snapshot(con: duckdb.DuckDBPyConnection, target: str,
+                            port: int, *, before_scan_id: str) -> dict[str, Any] | None:
+    """The most recent snapshot of this (target, port) from an earlier scan,
+    the baseline a new scan is diffed against."""
+    cols = list(_SNAPSHOT_COLUMNS) + ["c2_hits", "record"]
+    rows = con.execute(
+        f"""SELECT {', '.join(cols)} FROM service_snapshots
+            WHERE target = ? AND port = ? AND scan_id <> ?
+            ORDER BY scanned_at DESC LIMIT 1""",
+        [target, port, before_scan_id]).fetchall()
+    return dict(zip(cols, rows[0])) if rows else None

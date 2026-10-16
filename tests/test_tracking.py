@@ -11,6 +11,8 @@ from datetime import date, datetime, timedelta
 import duckdb
 import pytest
 
+from cti.sources.opensearch import OpenSearchClient, flatten_wazuh
+
 from contextlib import asynccontextmanager
 
 from cti import core
@@ -691,8 +693,10 @@ def test_enrich_without_key_skips_honeylabs(monkeypatch):
 
 # ---------------------------------------------------------------- xref
 
-class FakeOpenSearch:
-    def __init__(self, buckets):
+class FakeOpenSearch(OpenSearchClient):
+    """The real client's field mapping, with search() answered locally."""
+    def __init__(self, buckets, backend="arkime"):
+        super().__init__(backend=backend)
         self.buckets = buckets
         self.queries = []
 
@@ -702,40 +706,82 @@ class FakeOpenSearch:
         return {"aggregations": {"per_ip": {"buckets": self.buckets}}}
 
 
-def test_daily_xref_parses_aggregations():
+@pytest.mark.parametrize("backend, src_field, dst_field, ts_scale", [
+    ("arkime", "src_ip.keyword", "dst_ip.keyword", 1.0),
+    # `timestamp` is a date on Wazuh, so min/max come back in milliseconds
+    ("wazuh", "data.id_orig_h", "data.id_resp_h", 1000.0),
+])
+def test_daily_xref_parses_aggregations(backend, src_field, dst_field, ts_scale):
     buckets = [{"key": "203.0.113.7", "doc_count": 12,
                 "ports": {"buckets": [{"key": 445, "doc_count": 10}]},
-                "first_ts": {"value": 1_787_000_000.0},
-                "last_ts": {"value": 1_787_003_600.0},
+                "first_ts": {"value": 1_787_000_000.0 * ts_scale},
+                "last_ts": {"value": 1_787_003_600.0 * ts_scale},
                 "log_files": {"buckets": [{"key": "conn.log", "doc_count": 12}]}}]
-    client = FakeOpenSearch(buckets)
+    client = FakeOpenSearch(buckets, backend=backend)
     with store.connect() as con:
         _seed_actor_ip(con)
         result = opensearch_xref.run_daily_xref(con, TODAY, client=client)
         row = con.execute(
             "SELECT indicator_value, actor, direction, hit_count, ports, "
-            "log_files FROM zeek_matches WHERE direction='src'").fetchone()
+            "log_files, first_ts FROM zeek_matches WHERE direction='src'").fetchone()
     assert result["matches"] == 2  # same bucket for src and dst directions
     assert row[0] == "203.0.113.7" and row[1] == "APT-X"
     assert row[3] == 12
     assert json.loads(row[4]) == [445]
     assert json.loads(row[5]) == ["conn.log"]
-    # filters used the .keyword subfields
+    assert row[6] == datetime(2026, 8, 17, 20, 53, 20)
+    # filters used each backend's exact-match fields
     fields = [list(f["terms"].keys())[0]
               for q in client.queries for f in q["bool"]["filter"]
               if "terms" in f]
-    assert set(fields) == {"src_ip.keyword", "dst_ip.keyword"}
+    assert set(fields) == {src_field, dst_field}
 
 
 def test_daily_xref_unreachable_is_skip():
-    class Down:
+    class Down(OpenSearchClient):
         def search(self, *a, **k):
             raise opensearch_xref.OpenSearchError("connection refused")
 
     with store.connect() as con:
         _seed_actor_ip(con)
-        result = opensearch_xref.run_daily_xref(con, TODAY, client=Down())
+        result = opensearch_xref.run_daily_xref(con, TODAY, client=Down(backend="arkime"))
     assert "skipped" in result
+
+
+def test_a_wazuh_document_reads_like_a_legacy_zeek_one():
+    doc = flatten_wazuh({
+        "location": "/opt/zeek/logs/current/ssl.log",
+        "data": {"ts": "1787000000.25", "id_orig_h": "10.20.30.74", "id_orig_p": "51234",
+                 "id_resp_h": "203.0.113.7", "id_resp_p": "443",
+                 "established": "true", "ja4s": "t130200_1301_234ea6891581"}})
+    assert doc["src_ip"] == "10.20.30.74" and doc["dst_ip"] == "203.0.113.7"
+    assert doc["dst_port"] == 443 and doc["src_port"] == 51234
+    assert doc["ts"] == 1787000000.25
+    assert doc["log_file"].endswith("ssl.log")
+    assert doc["established"] is True
+    assert doc["ja4s"] == "t130200_1301_234ea6891581"
+
+
+def test_wazuh_queries_are_pinned_to_zeek_logs(monkeypatch):
+    """The archives hold every Wazuh event; an unpinned terms query on
+    data.id_resp_h would also match Windows or firewall events."""
+    client = OpenSearchClient(backend="wazuh")
+    sent = {}
+
+    class Conn:
+        def request(self, method, path, body, headers):
+            sent.update(json.loads(body), headers=headers)
+        def getresponse(self):
+            class R:
+                status = 200
+                def read(self):
+                    return b'{"hits": {"hits": []}}'
+            return R()
+
+    monkeypatch.setattr(client, "_connection", lambda: Conn())
+    client.search({"terms": {"data.id_resp_h": ["203.0.113.7"]}})
+    assert {"prefix": {"location": "/opt/zeek/logs/"}} in sent["query"]["bool"]["filter"]
+    assert sent["headers"]["Authorization"].startswith("Basic ")
 
 
 # ---------------------------------------------------------------- digest
@@ -1526,3 +1572,12 @@ def test_a_lone_selector_reports_no_carriers():
             actor="APT-X", source="observe")
     sel = store.indicator_profile("a.example")["selectors"][0]
     assert sel["carriers"] == []
+
+
+def test_wazuh_time_ranges_use_timestamp_in_epoch_seconds():
+    """data.ts is keyword in archives indexed before the typed template, and
+    a sort or range across both mappings fails with a class_cast_exception."""
+    assert OpenSearchClient(backend="wazuh").ts_range(gte=1.0, lt=2.5) == {
+        "range": {"timestamp": {"gte": 1000, "lt": 2500, "format": "epoch_millis"}}}
+    assert OpenSearchClient(backend="arkime").ts_range(gte=1.0) == {
+        "range": {"ts": {"gte": 1.0}}}

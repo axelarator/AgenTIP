@@ -39,6 +39,18 @@ data/tracking/*
 # LangGraph run traces (one JSONL per run) - runtime state, not intel.
 data/runs/
 
+# netwatch scan-target queue (transient work state) and spool (raw scan
+# JSONL before ingest) - not intel.
+data/netwatch/queue/
+data/netwatch/spool/
+
+# FlowCarp training captures and built models: pcap of malicious infra and
+# the .fcp models trained from it. The READMEs that document the layout ARE
+# committed; the data is not.
+data/flowcarp/training/**
+!data/flowcarp/training/README.md
+data/flowcarp/models/
+
 # Frontend build tooling. The built bundle in dashboard/static/ IS committed
 # (the lab VM serves it directly and nothing on that path has node), but the
 # dependency tree that produces it is not.

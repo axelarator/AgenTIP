@@ -1,0 +1,33 @@
+# ASNs whose addresses are multi-tenant by design: shared web hosting,
+# CDN edges and the big clouds. An ASN here means "one of this provider's
+# addresses carrying a cluster domain says nothing about who else is on
+# it". One ASN per line, '#' starts a comment.
+#
+# VPS-first providers (OVH, Hetzner, DigitalOcean, Vultr, Linode, M247...)
+# are deliberately NOT listed: actors rent dedicated addresses there, and
+# an ASN-wide rule would hide them. Their shared addresses are caught per
+# IP by the co-tenancy test in cti/store/hosting.py instead.
+
+# Big cloud / CDN (the original three first)
+16509   # Amazon
+45102   # Alibaba Cloud
+13335   # Cloudflare
+14618   # Amazon (AES)
+54113   # Fastly
+20940   # Akamai
+16625   # Akamai
+15169   # Google
+396982  # Google Cloud
+8075    # Microsoft
+
+# Shared web hosting and site builders
+47583   # Hostinger
+22612   # Namecheap
+26496   # GoDaddy
+398101  # GoDaddy
+46606   # Newfold Digital (Bluehost, HostGator) - Unified Layer
+8560    # IONOS
+2635    # Automattic (WordPress.com)
+58182   # Wix
+53831   # Squarespace
+36459   # GitHub (Pages)

@@ -45,6 +45,7 @@ CONFIDENCE_BASE = {
     "cert_issuer_changed": "high",
     "cert_sans_changed": "medium",
     "cert_new": "high",
+    "cert_renewed": "low",
     "ports_changed": "medium",
     "hostnames_changed": "medium",
     "ptr_changed": "medium",
@@ -169,6 +170,22 @@ def _classify_http(old: dict, new: dict) -> str | None:
     return "http_server_changed" if new["server"] != old["server"] else "http_title_changed"
 
 
+def _classify_cert_hash(old: dict, new: dict) -> str | None:
+    """A new sha256 is `cert_renewed` when issuer and SAN set match the
+    baseline, `cert_new` otherwise. A rotation that keeps both is the
+    provider's ACME client doing its job every 60-90 days; scored as
+    cert_new it was the most common item in the digest and the least
+    informative. When either side lacks issuer or SANs the rotation
+    cannot be shown to be routine, so it stays cert_new."""
+    if old["sha256"] == new["sha256"]:
+        return None
+    if (old.get("issuer") and new.get("issuer") and old.get("sans") and new.get("sans")
+            and canonical_dn(old["issuer"]) == canonical_dn(new["issuer"])
+            and set(old["sans"]) == set(new["sans"])):
+        return "cert_renewed"
+    return "cert_new"
+
+
 def _classify_subdomains(old: list, new: list) -> str | None:
     if sorted(old or []) == sorted(new or []):
         return None
@@ -236,15 +253,20 @@ SPECS: dict[str, AttributeSpec] = {
     ),
     "cert_hash": AttributeSpec(
         attribute="cert_hash", bare=False, source=CERT_SOURCES, guard="tls_sha256",
-        columns=("tls_sha256",),
-        classify=lambda old, new: None if old["sha256"] == new["sha256"] else "cert_new",
-        normalize_new=lambda c: ({"sha256": c["sha256"]} if c.get("sha256") else SKIP),
+        columns=("tls_sha256", "tls_issuer", "tls_sans"),
+        json_columns=frozenset({"tls_sans"}),
+        classify=_classify_cert_hash,
+        normalize_new=lambda c: ({"sha256": c["sha256"], "issuer": c.get("issuer"),
+                                  "sans": sorted(c.get("sans") or [])}
+                                 if c.get("sha256") else SKIP),
+        shape_old=lambda old: {"sha256": old["sha256"]},
+        shape_new=lambda new, old: {"sha256": new["sha256"]},
         note="A renewal always mints a new certificate and therefore a new "
              "sha256, which the `cert` spec treats as routine - so the hash "
-             "gets its own timeline. This is the one attribute whose change "
-             "is a genuine first-ever discovery rather than a changed value "
-             "on known infrastructure, and the only one auto-filed onto the "
-             "cluster's own hash list.",
+             "gets its own timeline. A rotation keeping issuer and SANs is "
+             "recorded as cert_renewed, which rank scores at zero; only a "
+             "rotation that changes either is cert_new. Issuer and SANs are "
+             "read for that comparison only - old/new values stay sha256.",
     ),
     "ip_hostnames": AttributeSpec(
         attribute="ip_hostnames", bare=True, source="webamon", guard="ip_hostnames",

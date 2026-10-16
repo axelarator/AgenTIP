@@ -938,3 +938,86 @@ def test_the_common_name_leads_the_canonical_form():
     """It is the attribute a reader looks for, and it is what tlsx and
     every CT log put first."""
     assert S.canonical_dn("C=US, O=Example, CN=leaf.example").startswith("CN=")
+
+
+# --------------------------------------------------------------------------- #
+# Fingerprints from our own probe: JA3S vs JA4S, response headers
+# --------------------------------------------------------------------------- #
+
+def test_a_ja3s_is_recorded_as_ja3s_never_as_ja4s():
+    """tlsx's ja3s_hash was yielded as tls.ja4s. A 32-hex MD5 stored under
+    JA4S can never equal a real JA4S read from Zeek, so the selector was
+    dead on arrival."""
+    got = _extracted(_OBSERVED)
+    assert got["tls.ja3s"] == "e" * 32
+    assert "tls.ja4s" not in got
+
+
+def test_a_real_ja4s_is_recorded_when_present():
+    result = {**_OBSERVED, "tls": {**_OBSERVED["tls"], "ja4s": "t130200_1301_234ea6891581"}}
+    assert _extracted(result)["tls.ja4s"] == "t130200_1301_234ea6891581"
+
+
+_RAW = ("HTTP/1.1 200 OK\r\nServer: nginx\r\nDate: Wed, 14 Oct 2026 10:00:00 GMT\r\n"
+        "Content-Type: text/html\r\nX-Panel-Build: 7.2\r\nSet-Cookie: a=1\r\n"
+        "Set-Cookie: b=2\r\nCF-Ray: 1234\r\n\r\n")
+
+
+def test_header_order_keeps_the_servers_order_and_repeats():
+    assert observe.header_order(_RAW) == (
+        "server,date,content-type,x-panel-build,set-cookie,set-cookie,cf-ray")
+
+
+def test_header_order_needs_a_raw_block():
+    assert observe.header_order(None) is None
+    assert observe.header_order("HTTP/1.1 204 No Content\r\n\r\n") is None
+
+
+def test_header_set_drops_standard_and_edge_headers():
+    headers = {"date": "x", "server": "nginx", "content_type": "text/html",
+               "x_panel_build": "7.2", "X-Powered-By": "PHP", "cf_ray": "1",
+               "x_amz_cf_id": "2"}
+    assert observe.header_set(headers) == ["x_panel_build", "x_powered_by"]
+
+
+def test_header_set_of_only_standard_headers_is_nothing():
+    assert observe.header_set({"date": "x", "server": "nginx"}) == []
+
+
+def test_header_selectors_come_from_the_response():
+    result = {**_OBSERVED, "http": {**_OBSERVED["http"],
+                                    "headers": {"date": "x", "x_panel_build": "7.2"},
+                                    "raw_header": _RAW}}
+    got = _extracted(result)
+    assert got["http.header_set"] == ["x_panel_build"]
+    assert got["http.header_order"].startswith("server,date,")
+
+
+def test_header_selectors_are_not_recorded_off_a_cdn():
+    result = {**_OBSERVED, "cdn": {"is_cdn": True},
+              "http": {**_OBSERVED["http"], "headers": {"x_panel_build": "7.2"},
+                       "raw_header": _RAW}}
+    got = _extracted(result)
+    assert "http.header_set" not in got and "http.header_order" not in got
+
+
+def test_a_stored_header_order_is_replayed_without_the_raw_block():
+    """The backfill rebuilds results from observation rows, which keep the
+    derived order rather than httpx's raw block."""
+    result = {**_OBSERVED, "http": {**_OBSERVED["http"], "header_order": "server,x-a"}}
+    assert _extracted(result)["http.header_order"] == "server,x-a"
+
+
+def test_header_set_and_order_count_as_one_response():
+    assert S.artefact("http.header_set") == S.artefact("http.header_order")
+
+
+def test_ja4x_is_part_of_the_certificate():
+    assert S.artefact("tls.ja4x") == S.artefact("tls.cert_sha256")
+
+
+@pytest.mark.parametrize("selector_type", [
+    "tls.ja3s", "tls.ja4x", "tls.ja4ts", "ssh.hassh_server",
+    "http.header_order", "flow.app_proto"])
+def test_new_fingerprints_cannot_promote_alone(selector_type):
+    assert not S.can_promote(selector_type)

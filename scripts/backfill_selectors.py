@@ -201,7 +201,8 @@ def _as_observe_result(rows_for_indicator: list[dict]) -> dict:
                     "content_type": row.get("content_type"),
                     "final_url": row.get("http_final_url"),
                     "tech": _json_list(row.get("http_tech")),
-                    "headers": _json_list(row.get("http_headers"))}
+                    "headers": _json_list(row.get("http_headers")),
+                    "header_order": row.get("http_header_order")}
         elif source == "observe_tls":
             tls = {"cert_sha256": row.get("tls_sha256"), "issuer": row.get("tls_issuer"),
                    "subject_dn": row.get("tls_subject"),
@@ -209,7 +210,8 @@ def _as_observe_result(rows_for_indicator: list[dict]) -> dict:
                    "serial": row.get("tls_serial"),
                    "spki_sha256": row.get("tls_spki_sha256"),
                    "self_signed": row.get("tls_self_signed"),
-                   "tls_version": row.get("tls_version")}
+                   "tls_version": row.get("tls_version"),
+                   "ja3s": row.get("tls_ja3s")}
         elif source == "observe_dns":
             dns = {"a": [], "aaaa": [], "ns": _json_list(row.get("dns_ns")),
                    "mx": _json_list(row.get("dns_mx")),

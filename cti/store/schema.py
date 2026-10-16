@@ -193,6 +193,58 @@ CREATE TABLE IF NOT EXISTS active_scans (
     zeek_last_ts  TIMESTAMP
 );
 
+-- netwatch: one row per (target, port) per scan, from our own probe. The
+-- flattened columns are what change detection and hunt rules compare; the
+-- full service record stays in `record`. A host that answered on nothing
+-- gets one row with port 0 and open = FALSE, so "went dark" is a fact
+-- rather than an absence.
+CREATE TABLE IF NOT EXISTS service_snapshots (
+    scan_id     TEXT NOT NULL,
+    scanned_at  TIMESTAMP NOT NULL,
+    vantage     TEXT NOT NULL,
+    profile     TEXT,
+    target      TEXT NOT NULL,
+    ip          TEXT,
+    port        INTEGER NOT NULL,
+    open        BOOLEAN,
+    actor       TEXT,
+    banner_sha256 TEXT,
+    cert_sha256 TEXT,
+    spki_sha256 TEXT,
+    tls_issuer  TEXT,
+    ja3s        TEXT,
+    ja4s        TEXT,
+    ja4ts       TEXT,
+    ja4x        TEXT,
+    jarm        TEXT,
+    http_status INTEGER,
+    http_title  TEXT,
+    http_server TEXT,
+    header_order TEXT,
+    body_sha256 TEXT,
+    favicon_mmh3 TEXT,
+    hassh_server TEXT,
+    app_proto   TEXT,
+    c2_hits     JSON,
+    record      JSON,
+    UNIQUE (scan_id, target, port)
+);
+
+CREATE SEQUENCE IF NOT EXISTS service_changes_seq;
+CREATE TABLE IF NOT EXISTS service_changes (
+    id          BIGINT PRIMARY KEY DEFAULT nextval('service_changes_seq'),
+    detected_at TIMESTAMP NOT NULL,
+    scan_id     TEXT NOT NULL,
+    target      TEXT NOT NULL,
+    port        INTEGER NOT NULL,
+    actor       TEXT,
+    field       TEXT NOT NULL,
+    change_type TEXT NOT NULL,
+    old_value   JSON,
+    new_value   JSON,
+    UNIQUE (scan_id, target, port, field)
+);
+
 """
 
 # Payload keys projected by observations_wide, in the order the old table
@@ -231,6 +283,10 @@ _SCALAR_FIELDS: tuple[tuple[str, str], ...] = (
     ("whois_registrant_email", "TEXT"),
     ("whois_created", "TEXT"),
     ("cdn_provider", "TEXT"),
+    # Our own fingerprints. http_header_order is the ordered name list from
+    # the raw header block; tls_ja3s was collected but never stored.
+    ("http_header_order", "TEXT"),
+    ("tls_ja3s", "TEXT"),
 )
 
 _JSON_FIELDS: tuple[str, ...] = (

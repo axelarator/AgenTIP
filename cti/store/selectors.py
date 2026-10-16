@@ -209,7 +209,38 @@ TYPES: dict[str, SelectorType] = {t.name: t for t in (
        "family or the same build",
        "operator identity: JARM identifies software, not owners"),
     _t("tls.ja4s", "behavioural",
-       "the server side of the handshake matches"),
+       "the server side of the handshake matches: the same TLS version, "
+       "cipher and extension choices in reply to the same client hello",
+       "operator identity. Read passively from Zeek (ssl.log) for a session "
+       "our own probe opened; never filled from a JA3S value, which was "
+       "stored here by mistake until netwatch and could not match anything"),
+    _t("tls.ja3s", "behavioural",
+       "the older, coarser server-hello digest - the same TLS library and "
+       "settings answering the client tlsx sends",
+       "operator identity, and it is not comparable with tls.ja4s"),
+    _t("tls.ja4x", "behavioural",
+       "the certificate was generated the same WAY - the same issuer and "
+       "subject field order and the same extensions, which is a property of "
+       "the tool or script that minted it (a C2 framework's default cert, a "
+       "kit's generator), not of the names in it",
+       "a link between operators: every Let's Encrypt certificate shares a "
+       "handful of values, so this means something only off a self-signed "
+       "or private-CA certificate"),
+    _t("tls.ja4ts", "behavioural",
+       "the same TCP stack answering the SYN - window size, options and "
+       "their order, so the same OS and kernel tuning",
+       "a link on a stock OS: every default Ubuntu host shares it"),
+    _t("ssh.hassh_server", "behavioural",
+       "the same SSH server build and crypto configuration (HASSH of the "
+       "server's KEXINIT)",
+       "operator identity: a default OpenSSH on one distro release is "
+       "everywhere"),
+    _t("flow.app_proto", "behavioural",
+       "FlowCarp classed a session to both as the same application "
+       "protocol from its statistics alone - most useful on a port where "
+       "nothing parsed a banner",
+       "a link on a common protocol. Only non-generic labels are recorded; "
+       "'tls' or 'http' on a web port is what every host says"),
     _t("whois.registrar", "behavioural",
        "both registered through the same registrar - worth noting beside a "
        "stronger link, since a bulk-registering operator tends to stay with "
@@ -231,7 +262,17 @@ TYPES: dict[str, SelectorType] = {t.name: t for t in (
        "a link on a common set such as 22/80/443"),
     _t("http.header_set", "behavioural",
        "the same unusual response-header combination - typically the same "
-       "server build or reverse proxy config"),
+       "server build or reverse proxy config. Standard headers (date, "
+       "content-type, caching, security headers) are dropped before the set "
+       "is formed, so what is left is the part an operator or kit added",
+       "anything off a CDN: the edge writes its own headers"),
+    _t("http.header_order", "behavioural",
+       "the response headers arrive in the same ORDER - a property of the "
+       "server build and proxy chain rather than its configuration, the HTTP "
+       "analogue of JARM. Our own collection; webamon.fp_header_order is the "
+       "same idea as a third party's digest",
+       "anything off a CDN, and a link on a stock server: every default "
+       "nginx of one version sends the same order"),
     _t("net.passive_port_set", "behavioural",
        "a third-party scan index saw the same open-port pattern on both. "
        "Useful because nobody had to send a packet for it",
@@ -351,12 +392,16 @@ _ARTEFACTS: dict[str, tuple[str, ...]] = {
     "certificate": (
         "tls.cert_sha256", "tls.spki_sha256", "tls.serial", "tls.subject_cn",
         "tls.san", "tls.issuer", "tls.default_subject", "tls.multi_san_cert",
-        "webamon.fp_ssl", "webamon.fp_cert_san", "webamon.fp_cert_config",
+        "tls.ja4x", "webamon.fp_ssl", "webamon.fp_cert_san", "webamon.fp_cert_config",
         "webamon.fp_cert_issuer",
     ),
     "page": (
         "http.body_sha256", "http.error_page_sha256", "http.title",
         "webamon.fp_dom", "webamon.fp_dom_structure",
+    ),
+    # Header set and header order are read off the same response.
+    "response_headers": (
+        "http.header_set", "http.header_order",
     ),
     "address": (
         "net.resolved_ip", "net.reverse_dns", "net.asn", "net.prefix",
@@ -567,7 +612,9 @@ def normalize(selector_type: str, value: Any) -> str | None:
     if not text or text.lower() in _JUNK:
         return None
 
-    if selector_type.endswith(("_sha256", "_mmh3", "jarm", "ja4s", "serial")):
+    if selector_type.endswith(("_sha256", "_mmh3", "jarm", "ja4s", "ja3s",
+                               "ja4x", "ja4ts", "hassh_server", "serial",
+                               "header_order", "app_proto")):
         text = text.lower()
     if selector_type.startswith(("dns.", "net.reverse_dns", "tls.subject_cn", "tls.san")):
         text = text.lower().rstrip(".")

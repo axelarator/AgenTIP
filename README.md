@@ -171,6 +171,103 @@ and "slowest: sweep" says nothing about which cluster was slow. Real durations
 need a start timestamp taken inside each node, which LangGraph's update stream
 does not provide.
 
+## netwatch: scheduled re-scans of tracked infrastructure
+
+`python -m graph netwatch` scans the watchlist (built from the cluster
+files by lifecycle) from the probe and ingests the results into
+`service_snapshots`/`service_changes`, deriving the usual selectors and
+joining Zeek's passive fingerprints (ja4s/ja4ts/ja4l) back in from Wazuh.
+The daily run also drains anything left spooled. Cron:
+
+```
+# hourly: light re-fingerprint of hot/recently-moved hosts
+5 * * * *  . $HOME/.bashrc && cd ~/cti-graph && .venv/bin/python -m graph netwatch --tiers hot >> data/tracking/logs/netwatch.log 2>&1
+# daily, before the 06:15 pipeline: the heavier port sweep of stable active hosts
+0 6 * * *  . $HOME/.bashrc && cd ~/cti-graph && .venv/bin/python -m graph netwatch --tiers full >> data/tracking/logs/netwatch.log 2>&1
+```
+
+The probe side (worker + scanner tools + C2 templates) is deployed by
+re-running `probe_vm/setup_probe_vm.sh` as root on the probe VM; the
+forced-command keys deliberately cannot deploy code.
+
+### Hunt rules and candidate discovery
+
+A **hunt rule** (`data/hunt_rules/*.yaml`, see that dir's README) is a saved
+signature of a cluster's infrastructure — a combination of selector values
+and open ports — run against our own snapshots and against the Certificate
+Transparency stream. A match files a cluster `candidate` (reviewed before it
+exports) or alerts. Draft one from what a cluster's hosts already share with
+the `netwatch_suggest_rule` MCP tool and `graph/prompts/signature.md`; a rule
+is only matched once a human sets `enabled: true`.
+
+Three candidate sources of our own feed the existing expansion flow, ahead of
+the Webamon fallback:
+
+- **hunt rules** over `service_snapshots` (`cti/netwatch/rules.py`),
+- **passive DNS** co-hosted names and historical IPs (`candidates/pdns.py`),
+- **neighbourhood** — the announced /24 around each active IP, swept weekly
+  (`candidates/neighbourhood.py`), and
+- **CT** — a self-hosted certstream feed matched against CT-scoped rules
+  (`candidates/ct.py`).
+
+CT and neighbourhood drop extra scan targets on `data/netwatch/queue/`, which
+`graph netwatch` drains alongside the watchlist. To run them:
+
+```
+# weekly: queue the neighbourhood sweep, then scan the sweep tier
+30 6 * * 1  . $HOME/.bashrc && cd ~/cti-graph && .venv/bin/python -m graph netwatch --discover --tiers sweep >> data/tracking/logs/netwatch.log 2>&1
+```
+
+CT needs `certstream-server-go` running locally (it republishes the CT
+firehose on a websocket — no vendor, no key). Install it once and run it as a
+systemd **user** unit, then let the hourly hot run consume a bounded batch:
+
+```
+# ~/.config/systemd/user/certstream.service  (ExecStart=/usr/local/bin/certstream_server -serve_domain 127.0.0.1 -serve_port 4000)
+systemctl --user enable --now certstream.service
+
+# in crontab, a two-minute CT batch on the hour before the hot scan:
+3 * * * *  . $HOME/.bashrc && cd ~/cti-graph && .venv/bin/python -m graph netwatch --certstream-seconds 120 --ingest-only >> data/tracking/logs/netwatch.log 2>&1
+```
+
+### FlowCarp: protocol labels for unnamed services
+
+A scan recognises HTTP and TLS. The host on an odd port answering with raw
+bytes — a Gh0st/njRAT listener, a bespoke C2 handshake — it cannot name.
+[FlowCarp](https://flowcarp.com) identifies a protocol from *flow
+statistics* alone (no parser, no payload signature) and ships models for the
+common families. `graph netwatch --flowcarp` runs it in **batch** after
+ingest, only over the sessions our own probe opened to services that got no
+HTTP/TLS label, pulling just those flows' pcap from Arkime:
+
+```
+python -m graph netwatch --flowcarp                 # scan, ingest, then label
+python -m graph netwatch --ingest-only --flowcarp   # label recent snapshots only
+```
+
+Why batch, not live: the community edition (CC BY-ND) labels at most 10k
+flows/day — live mode on the sniff NIC would spend that on port-scan SYNs.
+The `flowcarp` provider in `budget.py` caps it; a run stops labelling at the
+limit. The protocol fills the snapshot's `app_proto`; any malware-tagged
+alert is unioned into its `c2_hits` next to the nuclei hits, and both move
+through the same `service_changes` log (`app_proto_changed`,
+`c2_signature_hit`). It is entirely optional: a missing binary, a missing
+Arkime, or absent `CTI_ARKIME_*` is a clean skip.
+
+Ops: install the `flowcarp` binary on the agent VM (`CTI_FLOWCARP_BIN` to
+point elsewhere) and set `CTI_ARKIME_URL` plus `CTI_ARKIME_USER` /
+`CTI_ARKIME_PASSWORD` (viewer digest auth; `CTI_ARKIME_CA` for a private CA).
+An optional nightly label pass, after the full scan has been ingested:
+
+```
+40 6 * * *  . $HOME/.bashrc && cd ~/cti-graph && .venv/bin/python -m graph netwatch --ingest-only --flowcarp >> data/tracking/logs/netwatch.log 2>&1
+```
+
+Custom models are supported by the community edition (confirmed): collect
+≥10 sessions of a family into `data/flowcarp/training/<family>/`, build an
+`.fcp` into `data/flowcarp/models/`, and every label run loads it alongside
+the built-ins. See `data/flowcarp/training/README.md`.
+
 ## Operating notes
 
 - **`CTI_PROBE_MAX_CONCURRENT`** (default 6) caps simultaneous probe-VM calls.
@@ -222,22 +319,22 @@ Secrets stay in the environment (`~/.bashrc`, which cron sources):
 `WEBAMON_API_KEY`, `HONEYLABS_API_KEY`, `THREATFOX_API_KEY` (optional).
 Probe VM: `CTI_PROBE_HOST`, `CTI_PROBE_USER`, `CTI_PROBE_SSH_KEY`,
 `CTI_PROBE_KNOWN_HOSTS`, `CTI_PROBE_HELPER_CMD`.
+Zeek logs (Wazuh archives on siem01, read-only, through a forward-only SSH
+login set up by threat-hunt-lab): `CTI_ZEEK_BACKEND` (`wazuh`, or `arkime`
+for the legacy `zeek-*` history), `CTI_WAZUH_TUNNEL`, `CTI_WAZUH_SSH_KEY`,
+`CTI_WAZUH_KNOWN_HOSTS`, `CTI_WAZUH_USER`, `CTI_WAZUH_PASSWORD`.
+FlowCarp (optional, `--flowcarp`): `CTI_ARKIME_URL`, `CTI_ARKIME_USER`,
+`CTI_ARKIME_PASSWORD`, `CTI_ARKIME_CA`, `CTI_FLOWCARP_BIN`,
+`CTI_FLOWCARP_DAILY_BUDGET`.
 
-## Cutover
+## History
 
-`cti-agent` is untouched and its cron still runs. Two repos must not write
-the same DuckDB file — it is process-exclusive for read-write — so
-`data/` here is a snapshot, already migrated.
-
-1. Stop the old cron (`crontab -e`) and its dashboard
-   (`systemctl --user stop cti-dashboard`).
-2. Re-copy `data/` from `cti-agent` and re-run
-   `scripts/migrate_schema.py SOURCE DEST --verify`.
-3. Deploy the probe VM bootstrap: `probe_vm/setup_probe_vm.sh` (it builds
-   the sandbox image and fails if `--network=none` lets a container reach
-   the network).
-4. Install the cron lines `./setup.sh` prints.
-5. Run one day through both pipelines and diff the narratives.
+Forked from `cti-agent` at `096160c` (`.forked-from`). The cutover finished
+on 2026-09-19 (the old cron was removed then; its crontab is kept in
+`~/archive/cti-agent-backups/`), and `cti-agent` was archived and deleted on
+2026-10-14. To rebuild the probe VM, run `probe_vm/setup_probe_vm.sh`; it
+builds the sandbox image and fails if `--network=none` lets a container
+reach the network.
 
 Until then, point this checkout at its own copy with `CTI_DUCKDB_PATH`
 and `CTI_DASHBOARD_PORT`.

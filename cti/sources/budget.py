@@ -52,6 +52,10 @@ class Provider:
 
 PROVIDERS: dict[str, Provider] = {
     "webamon": Provider("CTI_WEBAMON_DAILY_BUDGET", 1000),
+    # The weekly expansion sweep's reverse lookups, counted separately so
+    # one run cannot spend the day's enrichment budget. Each lookup also
+    # spends a `webamon` unit; this is the cap, not a second bill.
+    "webamon_expand": Provider("CTI_WEBAMON_EXPAND_BUDGET", 150),
     "honeylabs": Provider("CTI_HL_BUDGET", 400, 6.0),
     "rdap": Provider("CTI_RDAP_CAP", 150),
     "validin": Provider("CTI_VALIDIN_DAILY_BUDGET", 10, 0.0,
@@ -63,6 +67,15 @@ PROVIDERS: dict[str, Provider] = {
     # than the daily number.
     "internetdb": Provider("CTI_INTERNETDB_BUDGET", 2000, 0.2),
     "mnemonic": Provider("CTI_MNEMONIC_BUDGET", 1000, 0.5),
+    # Our own probe, not a vendor: the cap is a guard against a runaway
+    # watchlist, counted in target-scans per day (one unit per host per
+    # scan, whatever ports it touches).
+    "netwatch": Provider("CTI_NETWATCH_BUDGET", 5000),
+    # FlowCarp's community edition identifies protocols for at most 10k
+    # flows/day per organisation (CC BY-ND); past that it still extracts
+    # flows but labels nothing, so the cap is the licence, not courtesy.
+    # Counted in flows, one unit per flow FlowCarp reported this day.
+    "flowcarp": Provider("CTI_FLOWCARP_DAILY_BUDGET", 10000),
 }
 
 

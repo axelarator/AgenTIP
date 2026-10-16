@@ -6,6 +6,11 @@
     python -m graph collect --date 2026-09-18 # Stage A
     python -m graph daily   --date 2026-09-18 # both
     python -m graph trace   --date 2026-09-18 # summarize a recorded run
+    python -m graph netwatch                  # scan the watchlist + ingest
+    python -m graph netwatch --ingest-only    # just load what's spooled
+    python -m graph netwatch --discover       # queue neighbourhood sweep targets
+    python -m graph netwatch --certstream-seconds 120  # a bounded CT batch
+    python -m graph netwatch --flowcarp       # label unnamed services via FlowCarp
 """
 from __future__ import annotations
 
@@ -35,8 +40,10 @@ def _load_digest(day: str) -> dict:
             "digest_json": json.loads(js.read_text())}
 
 
-async def _run(which: str, day: str, *, dry_run: bool, skip_enrich: bool) -> int:
-    state: dict = {"day": day, "dry_run": dry_run, "skip_enrich": skip_enrich}
+async def _run(which: str, day: str, *, dry_run: bool, skip_enrich: bool,
+               force_expand: bool = False) -> int:
+    state: dict = {"day": day, "dry_run": dry_run, "skip_enrich": skip_enrich,
+                   "force_expand": force_expand}
     if which == "analyze":
         state.update(_load_digest(day))
         compiled = build_analyze()
@@ -66,12 +73,29 @@ async def _run(which: str, day: str, *, dry_run: bool, skip_enrich: bool) -> int
 def main() -> int:
     ap = argparse.ArgumentParser(prog="graph", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["draw", "analyze", "collect", "daily", "trace"])
+    ap.add_argument("command",
+                    choices=["draw", "analyze", "collect", "daily", "trace", "netwatch"])
     ap.add_argument("--date", default=date.today().isoformat())
+    ap.add_argument("--tiers", default="hot,full",
+                    help="netwatch: which watchlist tiers to scan (comma-separated)")
+    ap.add_argument("--ingest-only", action="store_true",
+                    help="netwatch: skip scanning, just ingest the spool")
+    ap.add_argument("--discover", action="store_true",
+                    help="netwatch: queue neighbourhood sweep targets, then scan")
+    ap.add_argument("--certstream-seconds", type=float, default=0.0,
+                    help="netwatch: consume the CT stream for N seconds and queue "
+                         "hits before scanning (needs certstream-server-go running)")
+    ap.add_argument("--flowcarp", action="store_true",
+                    help="netwatch: after ingest, label unnamed services with "
+                         "FlowCarp over their Arkime pcap (needs the flowcarp "
+                         "binary and CTI_ARKIME_*)")
     ap.add_argument("--dry-run", action="store_true",
                     help="analyze without saving correlations or the narrative")
     ap.add_argument("--skip-enrich", action="store_true",
                     help="collect without the network phase")
+    ap.add_argument("--expand", action="store_true",
+                    help="run the weekly coverage expansion today, whatever the weekday "
+                         "(CTI_EXPAND_WEEKDAY, default Monday)")
     ap.add_argument("--out", type=Path, default=REPO_ROOT / "docs",
                     help="where `draw` writes")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -83,6 +107,27 @@ def main() -> int:
     if args.command == "draw":
         for name, path in write_all(args.out).items():
             print(f"{name:14s} {path}")
+        return 0
+
+    if args.command == "netwatch":
+        from cti.netwatch import ingest, jobs
+        if args.discover:
+            from cti.netwatch.candidates import neighbourhood
+            print(f"neighbourhood: {neighbourhood.enqueue()}")
+        if args.certstream_seconds > 0:
+            from cti.netwatch.candidates import ct
+            print(f"certstream: {asyncio.run(ct.stream(seconds=args.certstream_seconds))}")
+        scan = None
+        if not args.ingest_only:
+            scan = jobs.run(tiers={t.strip() for t in args.tiers.split(",") if t.strip()})
+            print(f"scan: {scan}")
+        print(f"ingest: {ingest.ingest()}")
+        if args.flowcarp:
+            from cti.netwatch import flowcarp
+            # Scope to this run's scans when we just scanned; a standalone
+            # --ingest-only --flowcarp pass labels the most recent snapshots.
+            scan_ids = scan.get("spooled") if scan else None
+            print(f"flowcarp: {flowcarp.label_services(scan_ids=scan_ids)}")
         return 0
 
     if args.command == "trace":
@@ -98,7 +143,8 @@ def main() -> int:
         return 0
 
     return asyncio.run(_run(args.command, args.date,
-                            dry_run=args.dry_run, skip_enrich=args.skip_enrich))
+                            dry_run=args.dry_run, skip_enrich=args.skip_enrich,
+                            force_expand=args.expand))
 
 
 if __name__ == "__main__":

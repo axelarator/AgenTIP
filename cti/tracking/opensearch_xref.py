@@ -1,5 +1,5 @@
 """Daily cross-reference of tracked-actor IPs against the lab's Zeek
-logs in OpenSearch.
+logs (Wazuh archives by default; see cti/sources/opensearch.py).
 
 Pre-computes aggregate matches into the zeek_matches table so the
 Stage B agent reads a handful of rows instead of querying OpenSearch
@@ -19,10 +19,10 @@ from .. import store
 log = logging.getLogger(__name__)
 
 _CHUNK = 512
-# The lab's zeek-* mapping (checked live 2026-08-21) stores src_ip /
-# dst_ip / log_file as text with a .keyword subfield; terms filters and
-# aggregations both use .keyword for exact matching.
-_DIRECTIONS = {"src": "src_ip.keyword", "dst": "dst_ip.keyword"}
+# Logical field names; the client maps them to whichever backend holds the
+# Zeek logs (exact-match fields in both, so terms filters and aggregations
+# agree).
+_DIRECTIONS = {"src": "src_ip", "dst": "dst_ip"}
 
 
 def _day_bounds_epoch(day: date) -> tuple[float, float]:
@@ -55,18 +55,20 @@ def run_daily_xref(con: duckdb.DuckDBPyConnection, day: date,
     try:
         for i in range(0, len(ips), _CHUNK):
             chunk = ips[i:i + _CHUNK]
-            for direction, field in _DIRECTIONS.items():
+            for direction, logical in _DIRECTIONS.items():
+                field = client.field(logical)
+                ts = client.field("ts")
                 query = {"bool": {"filter": [
                     {"terms": {field: chunk}},
-                    {"range": {"ts": {"gte": lo, "lt": hi}}},
+                    client.ts_range(gte=lo, lt=hi),
                 ]}}
                 aggs = {"per_ip": {
                     "terms": {"field": field, "size": len(chunk)},
                     "aggs": {
-                        "ports": {"terms": {"field": "dst_port", "size": 10}},
-                        "first_ts": {"min": {"field": "ts"}},
-                        "last_ts": {"max": {"field": "ts"}},
-                        "log_files": {"terms": {"field": "log_file.keyword", "size": 5}},
+                        "ports": {"terms": {"field": client.field("dst_port"), "size": 10}},
+                        "first_ts": {"min": {"field": ts}},
+                        "last_ts": {"max": {"field": ts}},
+                        "log_files": {"terms": {"field": client.field("log_file"), "size": 5}},
                     },
                 }}
                 payload = client.search(query, size=0, aggs=aggs)
@@ -80,8 +82,10 @@ def run_daily_xref(con: duckdb.DuckDBPyConnection, day: date,
                         actor=ip_actor.get(ip),
                         ports=[int(b["key"]) for b
                                in bucket.get("ports", {}).get("buckets", [])],
-                        first_ts=_epoch_to_dt(bucket.get("first_ts", {}).get("value")),
-                        last_ts=_epoch_to_dt(bucket.get("last_ts", {}).get("value")),
+                        first_ts=_epoch_to_dt(client.agg_epoch(
+                            bucket.get("first_ts", {}).get("value"))),
+                        last_ts=_epoch_to_dt(client.agg_epoch(
+                            bucket.get("last_ts", {}).get("value"))),
                         log_files=[str(b["key"]) for b
                                    in bucket.get("log_files", {}).get("buckets", [])])
                     matches += 1

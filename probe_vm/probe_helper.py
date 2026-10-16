@@ -66,7 +66,10 @@ DIRSEARCH_CMD = ["dirsearch"]
 OPENSSL_CMD = ["openssl"]
 DIG_CMD = ["dig"]
 
-USER_AGENT = "Mozilla/5.0 (cti-agent probe)"
+# An ordinary browser string. The old "(cti-agent probe)" named the tool to
+# every server we touched, which is the one thing a probe must not do.
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 HTTP_TIMEOUT = 20
 TCP_PRECHECK_TIMEOUT = 3
 JARM_SUBPROCESS_TIMEOUT = 20
@@ -741,6 +744,9 @@ def _observe_http(target: str, known_ports: list | None = None) -> tuple[dict, s
         "favicon_path": r.get("favicon_path"),
         "tech": r.get("tech") or [],
         "headers": r.get("header") or {},
+        # `header` is a Go map and arrives sorted by key; the raw block keeps
+        # the order the server sent, which is what http.header_order reads.
+        "raw_header": r.get("raw_header"),
         "jarm": r.get("jarm"),
         "content_length": r.get("content_length"),
         "final_url": r.get("final_url") or r.get("url"),
@@ -1067,6 +1073,330 @@ def _looks_like_ip(value: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# netwatch: scheduled re-scans of tracked infrastructure
+#
+# The cti host can never connect back here, so it drives this in three
+# forced-command calls: submit_job drops a job file in the spool, a
+# long-running worker (systemd, same forced-command user) drains it, and
+# collect_results streams back the JSONL the worker produced. One scan
+# writes one service record per (ip, port) - the shape cti/netwatch ingests
+# into service_snapshots. Every request this host makes is on the mirrored
+# bridge, so Zeek fingerprints the same sessions in parallel.
+# --------------------------------------------------------------------------- #
+NUCLEI_CMD = ["nuclei"]
+ZGRAB2_CMD = ["zgrab2"]
+C2_TEMPLATES_DIR = os.environ.get("CTI_C2_TEMPLATES", "/opt/cti/c2-templates")
+SPOOL_ROOT = Path(os.environ.get("CTI_NETWATCH_SPOOL", "/var/spool/netwatch"))
+
+# Ports worth checking beyond whatever a cluster already recorded. C2
+# frameworks and admin panels cluster here; kept short so a "full" profile
+# stays minutes, not hours.
+C2_PORTS = [443, 80, 8080, 8443, 4443, 8000, 8888, 9001, 50050, 1080,
+            7443, 2096, 2087, 8081, 8089, 9443, 10443, 4444, 5555, 3389]
+PROFILE_PORTS = {"hot": [443, 80, 8443, 8080]}
+NETWATCH_HTTP_TIMEOUT = 20
+NETWATCH_BANNER_TIMEOUT = 8
+
+
+def _json_records(cmd: list, stdin_text: str, timeout: int,
+                   extra: list | None = None) -> list:
+    records, _ = _run_json(cmd + (extra or []), stdin_text, timeout)
+    return records
+
+
+def _netwatch_ports(target: str, profile: str, known_ports: list) -> tuple[list[int], str | None]:
+    """The ports a scan will look at, by profile.
+
+    hot/sweep trust what the caller already knows (a cluster's port_set or
+    the standard web ports) and send no scan packets of their own beyond the
+    service probes. full adds a naabu top-1000 plus the C2 port list, so a
+    service on an odd high port is found the first time, not only after it
+    shows up in a report.
+    """
+    known = [int(p) for p in (known_ports or []) if str(p).isdigit()]
+    if profile == "full":
+        found, error = _observe_ports(target, 1000)
+        return sorted(set(found) | set(C2_PORTS) | set(known)), error
+    if profile == "sweep":
+        return sorted(set(known)) or [443], None
+    return sorted(set(known) | set(PROFILE_PORTS["hot"])), None
+
+
+def _httpx_by_port(target: str, ports: list[int]) -> dict[int, dict]:
+    """One httpx record per port, keyed by port."""
+    if not ports:
+        return {}
+    records = _json_records(
+        HTTPX_CMD + ["-json", "-silent", "-no-color", "-hash", "sha256",
+                     "-favicon", "-title", "-web-server", "-tech-detect",
+                     "-include-response-header", "-jarm", "-status-code",
+                     "-timeout", str(NETWATCH_HTTP_TIMEOUT), "-retries", "0",
+                     "-disable-update-check", "-p", ",".join(map(str, ports))],
+        stdin_text=target, timeout=OBSERVE_TOOL_TIMEOUT)
+    out: dict[int, dict] = {}
+    for r in records:
+        port = r.get("port")
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            continue
+        hashes = r.get("hash") or {}
+        out[port] = {
+            "status": r.get("status_code"), "title": r.get("title"),
+            "server": r.get("webserver"), "tech": r.get("tech") or [],
+            "body_sha256": hashes.get("body_sha256") or hashes.get("body-sha256"),
+            "favicon_mmh3": r.get("favicon"), "jarm": r.get("jarm"),
+            "headers": r.get("header") or {}, "raw_header": r.get("raw_header"),
+            "final_url": r.get("final_url") or r.get("url"),
+        }
+    return out
+
+
+def _tlsx_by_port(target: str, ports: list[int]) -> dict[int, dict]:
+    """One tlsx record per port, keyed by port, with the SPKI hash computed
+    locally the same way the observe pass does."""
+    if not ports:
+        return {}
+    records = _json_records(
+        TLSX_CMD + ["-json", "-silent", "-nc", "-serial", "-hash", "sha256",
+                    "-so", "-san", "-cn", "-tls-version", "-cipher", "-cert",
+                    "-timeout", "10", "-disable-update-check",
+                    "-p", ",".join(map(str, ports))],
+        stdin_text=target, timeout=OBSERVE_TOOL_TIMEOUT)
+    out: dict[int, dict] = {}
+    for r in records:
+        port = r.get("port")
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            continue
+        fingerprint = r.get("fingerprint_hash") or {}
+        out[port] = {
+            "issuer": r.get("issuer_dn"), "subject_cn": r.get("subject_cn"),
+            "subject_dn": r.get("subject_dn"), "sans": r.get("subject_an") or [],
+            "serial": r.get("serial"), "cert_sha256": fingerprint.get("sha256"),
+            "spki_sha256": _spki_sha256(r.get("certificate")),
+            "ja3s": r.get("ja3s_hash"), "tls_version": r.get("tls_version"),
+            "self_signed": bool(r.get("self_signed")),
+        }
+    return out
+
+
+def _banner_sha256(resolved_ip: str, port: int) -> str | None:
+    """A cheap raw-TCP banner for a port that spoke no HTTP or TLS.
+
+    Prefers zgrab2 when present (it knows real protocols); otherwise opens
+    one socket, reads what the service volunteers, and hashes it. The hash
+    is the selector - two hosts whose unknown service answers with the same
+    bytes are running the same thing.
+    """
+    if _tool_present(ZGRAB2_CMD):
+        records = _json_records(
+            ZGRAB2_CMD + ["banner", "--port", str(port), "--timeout", "8"],
+            stdin_text=resolved_ip, timeout=NETWATCH_BANNER_TIMEOUT + 5)
+        for r in records:
+            data = (((r.get("data") or {}).get("banner") or {}).get("result") or {})
+            raw = data.get("banner")
+            if raw:
+                return hashlib.sha256(raw.encode(errors="replace")).hexdigest()
+        return None
+    try:
+        with socket.create_connection((resolved_ip, port), timeout=NETWATCH_BANNER_TIMEOUT) as sock:
+            sock.settimeout(NETWATCH_BANNER_TIMEOUT)
+            chunk = sock.recv(2048)
+    except OSError:
+        return None
+    return hashlib.sha256(chunk).hexdigest() if chunk else None
+
+
+def _nuclei_c2(target: str, ports: list[int]) -> list[str]:
+    """Run our own C2 templates against the target; return the template IDs
+    that matched. No network if the templates dir or nuclei is absent."""
+    if not ports or not _tool_present(NUCLEI_CMD) or not os.path.isdir(C2_TEMPLATES_DIR):
+        return []
+    urls = "\n".join(f"{target}:{p}" for p in ports)
+    records = _json_records(
+        NUCLEI_CMD + ["-jsonl", "-silent", "-nc", "-duc", "-t", C2_TEMPLATES_DIR,
+                      "-timeout", "10"],
+        stdin_text=urls, timeout=NAABU_TIMEOUT)
+    hits = []
+    for r in records:
+        tid = r.get("template-id") or r.get("templateID")
+        if tid:
+            hits.append(tid)
+    return sorted(set(hits))
+
+
+def _scan_target(entry: dict, vantage: str, profile: str, scan_id: str) -> list[dict]:
+    """One target -> a service record per open port (plus a single dark row
+    when nothing answered). Shapes the record cti/netwatch ingests."""
+    target = (entry.get("value") or entry.get("target") or "").strip()
+    known_ports = entry.get("ports") or entry.get("known_ports") or []
+    actor = entry.get("actor")
+    ts = _now_iso()
+    base = {"scan_id": scan_id, "ts": ts, "vantage": vantage, "profile": profile,
+            "target": target, "actor": actor}
+    try:
+        resolved_ip = resolve_target_ip(target)
+    except Exception as e:
+        return [{**base, "ip": None, "port": 0, "open": False,
+                 "error": f"resolve failed: {e}"}]
+
+    ports, port_error = _netwatch_ports(target, profile, known_ports)
+    live = [p for p in ports if tcp_precheck(resolved_ip, p)]
+    if not live:
+        return [{**base, "ip": resolved_ip, "port": 0, "open": False,
+                 "error": port_error}]
+
+    http = _httpx_by_port(target, live)
+    tls = _tlsx_by_port(target, live)
+    c2_by_port: dict[int, list[str]] = {}
+    for tid in _nuclei_c2(target, live):
+        c2_by_port.setdefault(0, []).append(tid)   # template output is not per-port
+
+    records = []
+    for port in live:
+        h = http.get(port) or {}
+        t = tls.get(port) or {}
+        rec = {**base, "ip": resolved_ip, "port": port, "open": True,
+               "transport": "tcp",
+               "sni": None if is_ip_literal(target) else target,
+               "http": h or None, "tls": t or None,
+               "c2_hits": c2_by_port.get(0, []) or None}
+        if not h and not t:
+            rec["banner_sha256"] = _banner_sha256(resolved_ip, port)
+        records.append(rec)
+    # One ordinary handshake on each live TLS port so Zeek has something to
+    # fingerprint (ja4s/ja4ts/ja4l), read back on the cti side from Wazuh.
+    for port in live:
+        if tls.get(port) is not None:
+            try:
+                run_tls_handshake(target, resolved_ip, port)
+            except Exception:
+                pass
+    return records
+
+
+# --- the spool: submit / status / collect, plus the worker loop ------------
+def _spool_dirs() -> dict[str, Path]:
+    dirs = {name: SPOOL_ROOT / name
+            for name in ("jobs", "running", "results", "done")}
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
+def action_netwatch_submit(request: dict) -> dict:
+    """{job_id, profile, vantage, targets:[{value,ports,actor}...]} -> {job_id, queued}
+
+    Writes the job atomically into the spool. The worker, not this call,
+    does the scanning - a submit returns in milliseconds however large the
+    batch."""
+    job = request.get("job") or request
+    job_id = str(job.get("job_id") or f"{int(time.time())}-{os.getpid()}")
+    targets = job.get("targets") or []
+    if not targets:
+        return {"error": "no targets"}
+    dirs = _spool_dirs()
+    payload = {"job_id": job_id, "profile": job.get("profile") or "hot",
+               "vantage": job.get("vantage") or "probe",
+               "submitted_at": _now_iso(), "targets": targets}
+    tmp = dirs["jobs"] / f".{job_id}.tmp"
+    tmp.write_text(json.dumps(payload))
+    tmp.rename(dirs["jobs"] / f"{job_id}.json")
+    return {"job_id": job_id, "queued": len(targets)}
+
+
+def action_netwatch_status(request: dict) -> dict:
+    """{job_id?} -> queue depth, or one job's state."""
+    dirs = _spool_dirs()
+    job_id = request.get("job_id")
+    if job_id:
+        state = ("done" if (dirs["done"] / f"{job_id}.json").exists()
+                 else "running" if (dirs["running"] / f"{job_id}.json").exists()
+                 else "queued" if (dirs["jobs"] / f"{job_id}.json").exists()
+                 else "unknown")
+        results = dirs["results"] / f"{job_id}.jsonl"
+        return {"job_id": job_id, "state": state,
+                "has_results": results.exists()}
+    return {"queued": len(list(dirs["jobs"].glob("*.json"))),
+            "running": len(list(dirs["running"].glob("*.json"))),
+            "done": len(list(dirs["done"].glob("*.json")))}
+
+
+def action_netwatch_collect(request: dict) -> dict:
+    """{job_id, purge?} -> {records:[...], done}. With purge, the results and
+    the done-marker are removed after they are handed back."""
+    dirs = _spool_dirs()
+    job_id = request.get("job_id")
+    if not job_id:
+        return {"error": "job_id required"}
+    results = dirs["results"] / f"{job_id}.jsonl"
+    done = (dirs["done"] / f"{job_id}.json").exists()
+    records = []
+    if results.exists():
+        for line in results.read_text().splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    if request.get("purge") and done:
+        results.unlink(missing_ok=True)
+        (dirs["done"] / f"{job_id}.json").unlink(missing_ok=True)
+    return {"job_id": job_id, "records": records, "done": done}
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def run_netwatch_worker(poll_interval: float = 5.0, once: bool = False) -> int:
+    """Drain the jobs spool forever (systemd service on the probe VM).
+
+    Claims a job by renaming it into running/ (atomic, so a second worker
+    can't take the same one), scans each target, writes results/<id>.jsonl,
+    then moves the job into done/. A crash mid-job leaves the file in
+    running/; it is requeued on startup.
+    """
+    dirs = _spool_dirs()
+    for stale in dirs["running"].glob("*.json"):
+        stale.rename(dirs["jobs"] / stale.name)
+    while True:
+        jobs = sorted(dirs["jobs"].glob("*.json"), key=lambda p: p.stat().st_mtime)
+        for job_path in jobs:
+            running = dirs["running"] / job_path.name
+            try:
+                job_path.rename(running)
+            except OSError:
+                continue
+            try:
+                job = json.loads(running.read_text())
+            except (OSError, json.JSONDecodeError):
+                running.rename(dirs["done"] / running.name)
+                continue
+            out = dirs["results"] / f"{job['job_id']}.jsonl"
+            with out.open("w") as fh:
+                for entry in job.get("targets", []):
+                    try:
+                        for rec in _scan_target(entry, job.get("vantage", "probe"),
+                                                job.get("profile", "hot"), job["job_id"]):
+                            fh.write(json.dumps(rec) + "\n")
+                    except Exception as e:
+                        fh.write(json.dumps({
+                            "scan_id": job["job_id"], "ts": _now_iso(),
+                            "target": entry.get("value") or entry.get("target"),
+                            "port": 0, "open": False,
+                            "error": f"scan crashed: {type(e).__name__}: {e}"}) + "\n")
+            running.rename(dirs["done"] / running.name)
+        if once:
+            return 0
+        time.sleep(poll_interval)
+
+
+# --------------------------------------------------------------------------- #
 # dispatch
 # --------------------------------------------------------------------------- #
 _ACTIONS = {
@@ -1082,6 +1412,9 @@ _ACTIONS = {
     "wayback_cdx": action_wayback_cdx,
     "nmap": action_nmap,
     "dirsearch": action_dirsearch,
+    "netwatch_submit": action_netwatch_submit,
+    "netwatch_status": action_netwatch_status,
+    "netwatch_collect": action_netwatch_collect,
 }
 
 
@@ -1108,6 +1441,8 @@ def main() -> int:
     if "--check-access" in sys.argv[1:]:
         json.dump(check_access(), sys.stdout)
         return 0
+    if "--netwatch-worker" in sys.argv[1:]:
+        return run_netwatch_worker(once="--once" in sys.argv[1:])
     try:
         request = json.loads(sys.stdin.read() or "{}")
         action = request.get("action", "jarm_probe")

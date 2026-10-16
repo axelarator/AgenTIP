@@ -26,7 +26,10 @@ observables". This subsystem's daily enrichment (HoneyLabs + registry
 lookups, and `pivot_cluster`'s live TLS/HTTP/DNS + Webamon + subdomain
 sweep with attribute-change detection) is the deliberate, contained
 exception - a budgeted daily loop, confined to IPs/domains of tracked
-actors. Webamon calls are capped at CTI_WEBAMON_DAILY_BUDGET (default
+actors. The one widening: the weekly coverage expansion sends that same
+light-touch sweep, once, to at most 10 new hosts per cluster that share
+a rare promotable selector with the cluster, before deciding whether to
+file them as candidates. Webamon calls are capped at CTI_WEBAMON_DAILY_BUDGET (default
 1000/day); the live checks run from the lab probe VM and are
 light-touch (DNS, one TLS handshake, one HTTP GET per domain). The
 loud tools - nmap and dirsearch via `active_scan` - are never run by
@@ -182,25 +185,35 @@ actor's median).
 
 ## Daily loop and files
 
-Stage A (cron 06:15, `mcp-server/scripts/daily_tracking.py`, pure
-Python): ingest `data/tracking/inbox/*.csv|json` (header
+One cron job at 06:15 runs `python -m graph daily`, which does collect
+then analyze in a single process (`graph/build.py`).
+
+Collect ingests `data/tracking/inbox/*.csv|json` (header
 `ip,actor,campaign,date_observed,source_url`; processed files move to
-`archive/`), budgeted enrichment, the `pivot_cluster` sweep (live
-TLS/HTTP/DNS + Webamon + subdomain attribute-change detection),
-analytics, then
-writes `data/tracking/digests/<date>.md`. Zeek/OpenSearch/Arkime
-cross-referencing is NOT part of this script at all (no flag for it) -
-it's a separate, on-demand capability
-(`cti_tools.tracking.opensearch_xref.run_daily_xref`), useful right
-after probing a cluster's indicators or running malware that generated
-VM network traffic, but deliberately outside the daily narrative.
-Stage B (cron 06:45, `daily_narrative.sh`): one headless agent pass
-over the digest, saving correlations and
-`data/tracking/narratives/<date>.md`; a `NO ACTIVITY` digest skips
-the agent entirely.
+`archive/`), then runs the `pivot_cluster` sweep per cluster in parallel.
+The sweep does live TLS/HTTP/DNS, Webamon and subdomain attribute-change
+detection, and ages each indicator's lifecycle. After the sweep, collect
+runs budgeted enrichment, analytics and corroborate, then
+`expand_coverage`, which expires stale candidates daily and reverse-pivots
+for new ones on the expansion weekday. Last, it writes
+`data/tracking/digests/<date>.md`.
+
+Zeek/OpenSearch/Arkime cross-referencing is NOT part of this loop. It is
+a separate, on-demand capability
+(`cti_tools.tracking.opensearch_xref.run_daily_xref`), useful right after
+probing a cluster's indicators or running malware that generated VM
+network traffic, but deliberately outside the daily narrative.
+
+Analyze runs rank, the specialist agents and narrate over the digest. It
+saves correlations and `data/tracking/narratives/<date>.md`. A
+`NO ACTIVITY` digest skips the agents entirely. Rank drops routine
+certificate renewals (`cert_renewed`), changes on dormant or retired
+indicators, and shared-hosting rows (ASN list in
+`cti/store/data/shared_hosting_asns.txt`, plus CDN PTRs) before any model
+sees them.
 
 To ingest a new threat report: drop the CSV/JSON in the inbox and
-either wait for the next run or run Stage A manually. One-time seeding
+either wait for the next run or run `python -m graph collect`. One-time seeding
 from the cluster store: `daily_tracking.py --seed`.
 
 ## Budget etiquette

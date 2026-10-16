@@ -34,6 +34,7 @@ from . import store as tracking_store
 from .sources import passive
 from .store import cdn as cdn_ranges
 from .tracking.analytics import SHARED_HOSTING_ASNS
+from .store import hosting
 from .store.changes import STALE_BASELINE_DAYS as _ATTR_STALE_BASELINE_DAYS
 from .util import repo_root
 
@@ -266,6 +267,7 @@ def _new_cluster(name: str, description: str) -> dict[str, Any]:
         "observables": {c: [] for c in OBSERVABLE_CATEGORIES},
         "report_sources": [],  # [{source, ingested, observables_found, ttps_found}]
         "relationships": [],  # [{relationship_type, target_cluster, target_stix_id, description, source, created}]
+        "denylist": [],  # [{value, reason, date}] - rejected candidates, never re-filed
     }
 
 
@@ -281,7 +283,8 @@ def _migrate(data: dict[str, Any]) -> dict[str, Any]:
         "adversary": "unknown", "capability": "unknown",
         "infrastructure": "unknown", "victim": "unknown",
     })
-    for key in ("ttps", "hunt_log", "detections", "gaps", "report_sources", "relationships"):
+    for key in ("ttps", "hunt_log", "detections", "gaps", "report_sources", "relationships",
+                "denylist"):
         data.setdefault(key, [])
     data.setdefault("observables", {})
     for category in OBSERVABLE_CATEGORIES:
@@ -771,11 +774,26 @@ def export_navigator_layer(name: str) -> dict[str, Any]:
     }
 
 
-def get_observables(name: str) -> dict[str, Any]:
+def _without_inactive(data: dict[str, Any]) -> dict[str, Any]:
+    """A copy of the cluster with retired and candidate observables left
+    out - what detections and shared exports should see. Dormant entries
+    stay: quiet is not gone, and a blocklist that drops a host the week
+    before it comes back is worse than one that carries it a while."""
+    out = dict(data)
+    out["observables"] = {
+        cat: [o for o in items if lifecycle_of(o) not in INACTIVE_LIFECYCLES]
+        for cat, items in data["observables"].items()}
+    return out
+
+
+def get_observables(name: str, include_inactive: bool = False) -> dict[str, Any]:
     """Return just the observables block for a cluster (hashes, domains,
     ips, urls) plus the list of report sources they came from — the
-    quick "what's tied to this cluster" view."""
+    quick "what's tied to this cluster" view. Retired and candidate
+    entries are left out unless include_inactive=True."""
     data = load_cluster(name)
+    if not include_inactive:
+        data = _without_inactive(data)
     return {
         "name": data["name"],
         "observables": data["observables"],
@@ -894,6 +912,123 @@ def remove_observable(name: str, category: str, value: str) -> dict[str, Any]:
     data["observables"][category] = kept
     save_cluster(data)
     return {**data, "removed": [o["value"] for o in removed]}
+
+
+# --------------------------------------------------------------------------- #
+# Candidates - hosts the weekly expansion sweep found, awaiting a decision
+# --------------------------------------------------------------------------- #
+# Auto-reject a candidate with no live evidence for this long - see
+# expire_candidates.
+CANDIDATE_QUIET_DAYS = 30
+
+
+def _find_entry(data: dict[str, Any], value: str) -> tuple[str, dict[str, Any]] | None:
+    needle = value.strip().lower()
+    for cat in ("domains", "ips"):
+        for o in data["observables"][cat]:
+            if o["value"].lower() == needle:
+                return cat, o
+    return None
+
+
+@_synchronized
+def file_candidate(name: str, value: str, source: str, metadata: dict[str, Any],
+                   enrichment: dict[tuple[str, str], tuple[str, dict[str, Any], dict[str, Any]]]
+                   | None = None) -> bool:
+    """File a host found by the expansion sweep as a `candidate`. Returns
+    False, filing nothing, if the cluster already tracks it or rejected it."""
+    data = load_cluster(name)
+    needle = value.strip().lower()
+    if _find_entry(data, needle) or needle in {d["value"].lower() for d in data["denylist"]}:
+        return False
+    category = "ips" if pivot.classify(value) == "ip" else "domains"
+    extracted = {c: ([value] if c == category else []) for c in OBSERVABLE_CATEGORIES}
+    _merge_observables(data, extracted, source, enrichment=enrichment,
+                       metadata={**metadata, "lifecycle": "candidate",
+                                 "lifecycle_since": now_iso()})
+    data["hunt_log"].append({"date": now_iso(), "entry": (
+        f"candidate {value} filed by the expansion sweep via "
+        f"{metadata.get('discovered_via', '?')[:96]}: {metadata.get('candidate_reason', '')}")})
+    save_cluster(data)
+    return True
+
+
+@_synchronized
+def accept_candidate(name: str, value: str, note: str = "") -> dict[str, Any]:
+    """Promote a candidate to a tracked indicator: it starts exporting, is
+    queued for fingerprinting, and its certificate is filed on the next
+    sweep. Raises if `value` is not a candidate on this cluster."""
+    data = load_cluster(name)
+    found = _find_entry(data, value)
+    if not found or lifecycle_of(found[1]) != "candidate":
+        raise ValueError(f"{value!r} is not a candidate on cluster {name!r}")
+    category, entry = found
+    now = now_iso()
+    entry["lifecycle"] = "active"
+    entry["lifecycle_since"] = now
+    entry["accepted"] = now
+    data["hunt_log"].append({"date": now, "entry": (
+        f"accepted candidate {entry['value']} ({entry.get('candidate_reason', '')})"
+        + (f": {note}" if note else ""))})
+    worthy, _ = _is_probe_worthy(category, entry["value"])
+    if worthy:
+        _enqueue_pending_fingerprints(data["name"], [(category, entry["value"])])
+    save_cluster(data)
+    return {"name": data["name"], "accepted": entry["value"], "category": category}
+
+
+@_synchronized
+def reject_candidate(name: str, value: str, reason: str) -> dict[str, Any]:
+    """Drop a candidate and put it on the cluster's deny list, so the
+    expansion sweep never files it again. Raises if `value` is not a
+    candidate on this cluster - an accepted indicator is pruned with
+    remove_observable instead."""
+    if not reason.strip():
+        raise ValueError("a reason is required - it is what stops the next analyst re-adding it")
+    data = load_cluster(name)
+    found = _find_entry(data, value)
+    if not found or lifecycle_of(found[1]) != "candidate":
+        raise ValueError(f"{value!r} is not a candidate on cluster {name!r}")
+    category, entry = found
+    _reject(data, category, entry, reason)
+    save_cluster(data)
+    return {"name": data["name"], "rejected": entry["value"], "reason": reason}
+
+
+def _reject(data: dict[str, Any], category: str, entry: dict[str, Any], reason: str) -> None:
+    now = now_iso()
+    data["observables"][category] = [o for o in data["observables"][category]
+                                     if o is not entry]
+    data["denylist"].append({"value": entry["value"], "reason": reason, "date": now,
+                             "discovered_via": entry.get("discovered_via")})
+    data["hunt_log"].append({"date": now, "entry": f"rejected candidate {entry['value']}: {reason}"})
+
+
+@_synchronized
+def expire_candidates(name: str, now: str | None = None) -> list[str]:
+    """Reject candidates with no live evidence for CANDIDATE_QUIET_DAYS -
+    never seen live since being filed, or gone quiet since. A candidate
+    nobody has decided on in that time is not going to become a lead.
+    Returns the values rejected."""
+    now = now or now_iso()
+    data = load_cluster(name)
+    expired = []
+    for cat in ("domains", "ips"):
+        for o in list(data["observables"][cat]):
+            if lifecycle_of(o) != "candidate":
+                continue
+            since = o.get("last_live") or o.get("first_seen") or now
+            try:
+                quiet = (datetime.fromisoformat(now) - datetime.fromisoformat(since)).days
+            except (ValueError, TypeError):
+                continue
+            if quiet >= CANDIDATE_QUIET_DAYS:
+                _reject(data, cat, o, (f"no live evidence in {quiet} days as a candidate"
+                                       + ("" if o.get("last_live") else " (never live)")))
+                expired.append(o["value"])
+    if expired:
+        save_cluster(data)
+    return expired
 
 
 # Pivot enrichment cache. Webamon calls count against a daily budget and
@@ -1028,7 +1163,7 @@ def _pdns(value: str, *, asn: int | None = None) -> dict[str, Any]:
     meaningless, and the same gate already protects webamon_ip and the
     co-hosting selectors.
     """
-    if asn is not None and asn in SHARED_HOSTING_ASNS:
+    if hosting.is_shared_asn(asn):
         return {"skipped": "shared hosting - passive DNS would return the "
                            "provider's tenants, not this actor's history"}
     if cdn_ranges.is_cdn(value):
@@ -1422,12 +1557,19 @@ def _apply_enrichment_snapshot(entry: dict[str, Any], category: str,
         webamon_ip = enrichment.get("webamon_ip")
         if isinstance(webamon_ip, dict) and "error" not in webamon_ip:
             # Hosted domains Webamon has scanned on this IP. Suppress when the
-            # IP sits in a known shared-hosting ASN - those are every other
-            # tenant, not this actor's infra (same rationale as the retired
-            # Hackertarget co-hosting signal; see SHARED_HOSTING_ASNS).
-            asn = entry.get("asn")
-            if asn not in SHARED_HOSTING_ASNS:
-                hosts = webamon_ip.get("domains") or []
+            # IP is shared hosting - those are every other tenant, not this
+            # actor's infra (same rationale as the retired Hackertarget
+            # co-hosting signal). The verdict is stamped on the entry so
+            # rank and the expansion sweep read the same answer.
+            hosts = webamon_ip.get("domains") or []
+            ptr = enrichment.get("ptr")
+            shared, why = hosting.is_shared(
+                asn=entry.get("asn"),
+                ptr=ptr.get("hostname") if isinstance(ptr, dict) else None)
+            if shared:
+                entry["shared_hosting"] = why
+            else:
+                entry.pop("shared_hosting", None)
                 if hosts:
                     entry["ip_hostnames"] = sorted(set(entry.get("ip_hostnames") or []) | set(hosts))
             _stamp_webamon_summary(entry, webamon_ip)
@@ -1484,6 +1626,111 @@ def _apply_enrichment_snapshot(entry: dict[str, Any], category: str,
 
 
 
+# --------------------------------------------------------------------------- #
+# Indicator lifecycle
+# --------------------------------------------------------------------------- #
+# `last_seen` on an observable means "last re-filed", not "last seen live":
+# a domain that died in July still reads as current. `last_live` is the
+# sweep's own answer, and `lifecycle` is what it ages into:
+#
+#   active    -> dormant after DORMANT_DAYS with no live evidence
+#   dormant   -> retired after RETIRED_DAYS with no live evidence
+#   any state -> active the first time live evidence comes back
+#   candidate    filed by the expansion sweep, awaiting accept/reject;
+#                ages like active but never becomes active on its own
+#
+# Retired entries are kept, for history and find_observable, but are no
+# longer swept and are left out of exports. Dormant ones are still swept so
+# a reactivation is seen; rank drops their change rows meanwhile.
+LIFECYCLE_STATES = ("active", "dormant", "retired", "candidate")
+INACTIVE_LIFECYCLES = ("retired", "candidate")
+_DORMANT_DAYS_DEFAULT = 30
+_RETIRED_DAYS_DEFAULT = 90
+
+
+def _env_days(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+def dormant_days() -> int:
+    return _env_days("CTI_DORMANT_DAYS", _DORMANT_DAYS_DEFAULT)
+
+
+def retired_days() -> int:
+    return _env_days("CTI_RETIRED_DAYS", _RETIRED_DAYS_DEFAULT)
+
+
+def lifecycle_of(entry: dict[str, Any]) -> str:
+    return entry.get("lifecycle") or "active"
+
+
+def _is_live(category: str, status: str, enrichment: dict[str, Any]) -> bool:
+    """Did this sweep see the host doing something?
+
+    A domain is live when it resolves and is neither sinkholed nor expired -
+    pivot.classify_domain_lifecycle already orders those checks. An IP is
+    only live when something answered on it: being in a routed prefix says
+    the network exists, not that the actor is still using the address.
+    """
+    if category == "domains":
+        return status == "active"
+    if status != "routed":
+        return False
+    observed = enrichment.get("observe") or {}
+    if not isinstance(observed, dict):
+        return False
+    tls = observed.get("tls") or {}
+    http = observed.get("http") or {}
+    # `responded` is per observe stage. Only the stages that contact the
+    # host count - `cdn` is a range lookup and answers for any address. A
+    # port scan that found something open is a raw-TCP C2 still listening.
+    responded = observed.get("responded") or {}
+    return (bool(tls.get("cert_sha256")) or isinstance(http.get("status"), int)
+            or any(responded.get(stage) for stage in ("http", "tls", "ports")))
+
+
+def _age_lifecycle(entry: dict[str, Any], now: str, live: bool) -> tuple[str, str] | None:
+    """Move an entry along the lifecycle. Returns (from, to) on a change.
+
+    With no `last_live` at all, the clock runs from `first_seen`: a host
+    filed from a report and never once seen live is as dormant as one that
+    went quiet.
+    """
+    before = lifecycle_of(entry)
+    if live:
+        entry["last_live"] = now
+        after = "candidate" if before == "candidate" else "active"
+    else:
+        since = entry.get("last_live") or entry.get("first_seen") or now
+        try:
+            quiet = (datetime.fromisoformat(now) - datetime.fromisoformat(since)).days
+        except (ValueError, TypeError):
+            quiet = 0
+        if before == "candidate":
+            after = "candidate"
+        elif quiet >= retired_days():
+            after = "retired"
+        elif quiet >= dormant_days():
+            after = "dormant"
+        else:
+            after = before
+    if after == before and "lifecycle" in entry:
+        return None
+    entry["lifecycle"] = after
+    if after != before or "lifecycle_since" not in entry:
+        entry["lifecycle_since"] = now
+    return (before, after) if after != before else None
+
+
+def sweep_targets(data: dict[str, Any], category: str) -> list[str]:
+    """Values the daily sweep re-checks: everything but retired entries."""
+    return [o["value"] for o in data["observables"][category]
+            if lifecycle_of(o) != "retired"]
+
+
 def pivot_cluster(name: str) -> dict[str, Any]:
     """Sweep every tracked domain and IP for a cluster through the free
     pivot sources and stamp a lifecycle status onto each, turning a
@@ -1516,8 +1763,8 @@ def pivot_cluster(name: str) -> dict[str, Any]:
     final write-back takes the lock, re-reading the cluster so it applies
     onto current on-disk state."""
     data = load_cluster(name)  # existence check + snapshot the values to check
-    domains = [o["value"] for o in data["observables"]["domains"]]
-    ips = [o["value"] for o in data["observables"]["ips"]]
+    domains = sweep_targets(data, "domains")
+    ips = sweep_targets(data, "ips")
 
     # Network phase: concurrent, no lock held.
     known_ports = {o["value"]: o["ports"]
@@ -1531,7 +1778,8 @@ def pivot_cluster(name: str) -> dict[str, Any]:
     now = now_iso()
     with _data_lock():
         data = load_cluster(name)
-        summary: dict[str, Any] = {"name": data["name"], "checked": now, "domains": [], "ips": []}
+        summary: dict[str, Any] = {"name": data["name"], "checked": now, "domains": [], "ips": [],
+                                   "lifecycle": []}
         for cat in ("domains", "ips"):
             for o in data["observables"][cat]:
                 found = results.get((cat, o["value"]))
@@ -1542,10 +1790,19 @@ def pivot_cluster(name: str) -> dict[str, Any]:
                 o["status_checked"] = now
                 o["status_detail"] = detail
                 _apply_enrichment_snapshot(o, cat, detail, enrichment)
+                # A failed lookup is no evidence either way, so it neither
+                # refreshes last_live nor ages the entry.
+                moved = (None if status == "unknown"
+                         else _age_lifecycle(o, now, _is_live(cat, status, enrichment)))
+                if moved:
+                    summary["lifecycle"].append(
+                        {"category": cat, "value": o["value"], "from": moved[0], "to": moved[1]})
                 if cat == "domains":
                     new_cert = o.get("cert") or {}
                     new_sha256 = new_cert.get("sha256")
-                    if new_sha256:
+                    # A candidate's certificate waits for accept_candidate:
+                    # filed now, it would export before the host is accepted.
+                    if new_sha256 and lifecycle_of(o) != "candidate":
                         # Unconditional, not gated on "changed since last
                         # sweep": _file_cert_hash's own bucket lookup
                         # already dedupes by value (idempotent re-filing
@@ -1558,7 +1815,10 @@ def pivot_cluster(name: str) -> dict[str, Any]:
                         # snapshot" check would never fire for that first
                         # sighting.
                         _file_cert_hash(data, o["value"], new_sha256, new_cert.get("issuer"),
-                                       new_cert.get("revoked"), now)
+                                       new_cert.get("revoked"), now,
+                                       sans=new_cert.get("sans"),
+                                       subject=new_cert.get("subject"),
+                                       resolved=detail.get("resolved"))
                 row = {"value": o["value"], "status": status}
                 # Seconds per source lookup. Rides the summary into the run
                 # trace only - see _sweep_lifecycle for why not `detail`.
@@ -1733,10 +1993,11 @@ def pivot_and_expand(value: str, cluster_name: str,
         ripe = _cached_pivot("ripestat", value, lambda: pivot.ripestat_lookup(value))
         asn_list = ripe.get("asn") if isinstance(ripe, dict) else None
         asn = asn_int(asn_list)  # RIPEstat gives strings; see _asn_int
-        if hosted and asn in SHARED_HOSTING_ASNS:
+        shared, why = hosting.is_shared(asn=asn)
+        if hosted and shared:
             review["cohosted_domains_suppressed"] = (
                 f"{len(hosted)} co-hosted domains suppressed - "
-                f"{value} is in a shared-hosting ASN ({asn})")
+                f"{value} is shared hosting ({why})")
             hosted = []
         if include_cohosted:
             candidates.append(("domains", hosted,
@@ -2036,6 +2297,13 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                 if source not in entry["sources"]:
                     entry["sources"].append(source)
                 entry["last_seen"] = now
+                # New reporting on a dormant or retired host is evidence it
+                # matters again; put it back in the sweep. A candidate is
+                # left alone - only accept_candidate promotes one.
+                if (lifecycle_of(entry) in ("dormant", "retired")
+                        and (metadata or {}).get("lifecycle") != "candidate"):
+                    entry["lifecycle"] = "active"
+                    entry["lifecycle_since"] = now
                 # Refresh the snapshot if this call actually fetched one.
                 # It used to be dropped, on the reasoning that refreshing a
                 # tracked value is pivot_cluster's job - but the caller has
@@ -2054,8 +2322,10 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                     entry.update(metadata)
                 found = enrichment.get((category, value))
                 if found:
-                    _, detail, enr = found
+                    status, detail, enr = found
                     _apply_enrichment_snapshot(entry, category, detail, enr)
+                    if status != "unknown" and _is_live(category, status, enr):
+                        entry["last_live"] = now
                     if category == "domains":
                         # A genuinely new domain's very first cert sighting
                         # happens right here (this add-time sweep), not on
@@ -2065,9 +2335,12 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                         # why this is unconditional, not gated on "changed").
                         new_cert = entry.get("cert") or {}
                         new_sha256 = new_cert.get("sha256")
-                        if new_sha256:
+                        if new_sha256 and lifecycle_of(entry) != "candidate":
                             _file_cert_hash(data, value, new_sha256, new_cert.get("issuer"),
-                                           new_cert.get("revoked"), now)
+                                           new_cert.get("revoked"), now,
+                                           sans=new_cert.get("sans"),
+                                           subject=new_cert.get("subject"),
+                                           resolved=detail.get("resolved"))
                 bucket.append(entry)
                 added += 1
                 if category in _FINGERPRINTABLE_CATEGORIES:
@@ -2091,7 +2364,9 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                     if port not in ports:
                         ports.append(port)
         counts[category] = added
-    if newly_tracked:
+    # A candidate is not probed until it is accepted: the fingerprints the
+    # probe files would otherwise export ahead of the host they belong to.
+    if newly_tracked and (metadata or {}).get("lifecycle") != "candidate":
         _enqueue_pending_fingerprints(data["name"], newly_tracked)
     return counts, skipped
 
@@ -2356,16 +2631,17 @@ def _ingest_report_phase2(cluster_name: str, source: str, extracted: dict[str, A
     return data
 
 
-def export_stix_bundle(name: str) -> dict[str, Any]:
+def export_stix_bundle(name: str, include_inactive: bool = False) -> dict[str, Any]:
     """Export the cluster as a STIX 2.1 bundle (Intrusion Set + Attack
     Patterns + Indicators + Relationships + Notes) for sharing outside
     this tool. Tracked observables become Indicators tied to the
-    Intrusion Set."""
+    Intrusion Set. Retired and candidate observables are left out unless
+    include_inactive=True."""
     data = load_cluster(name)
-    return stix.to_bundle(data)
+    return stix.to_bundle(data if include_inactive else _without_inactive(data))
 
 
-def export_stix_ecosystem(name: str) -> dict[str, Any]:
+def export_stix_ecosystem(name: str, include_inactive: bool = False) -> dict[str, Any]:
     """Export this cluster and every cluster it's (transitively) related
     to via add_relationship as one self-contained STIX 2.1 bundle.
 
@@ -2399,7 +2675,8 @@ def export_stix_ecosystem(name: str) -> dict[str, Any]:
     if name not in visited:
         raise ClusterNotFound(f"No cluster named {name!r}")
 
-    bundles = [stix.to_bundle(data) for data in visited.values()]
+    bundles = [stix.to_bundle(data if include_inactive else _without_inactive(data))
+               for data in visited.values()]
     return stix.merge_bundles(bundles)
 
 

@@ -83,6 +83,7 @@ class CTIState(TypedDict, total=False):
     # --- collect (Stage A) ---
     day: str
     skip_enrich: bool
+    force_expand: bool                     # run the weekly expansion today
     clusters: list[str]
     sweep_results: Annotated[list[dict[str, Any]], operator.add]
     sections: dict[str, Any]

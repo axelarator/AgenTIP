@@ -249,6 +249,8 @@ def to_bundle(data: dict[str, Any]) -> dict[str, Any]:
                 "pattern": pattern,
                 "pattern_type": "stix",
                 "valid_from": first,
+                **({"valid_until": o.get("lifecycle_since") or last}
+                   if o.get("lifecycle") == "retired" else {}),
                 # Custom prop so the exact category round-trips even for
                 # patterns pattern_to_observable could otherwise only
                 # approximate; parsing falls back to the pattern if absent.

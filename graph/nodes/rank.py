@@ -8,7 +8,7 @@ at most 3 noteworthy items". On a real day that digest is dominated by
 four of the sixteen attribute changes are Cloudflare and AWS addresses
 (104.21.60.187, 172.67.200.55, 15.197.148.33, 3.33.130.190), each
 listing hundreds of unrelated tenant domains, each row kilobytes wide.
-Those rows are not signal - `analytics.SHARED_HOSTING_ASNS` already
+Those rows are not signal - `cti/store/hosting.py` already
 knows those ASNs, and the skill already says a hosted-domain list on
 shared hosting is never a lead - but the model paid for them in context
 and weighed them against its 3-item budget anyway.
@@ -26,7 +26,7 @@ import json
 from typing import Any
 
 from cti.sources.pivot import is_shared_hosting_hostname
-from cti.tracking.analytics import SHARED_HOSTING_ASNS
+from cti.store.hosting import is_shared_asn
 from cti.util import asn_int
 
 from ..state import ATTRIBUTE_FAMILY, FAMILY_ATTRIBUTES, CTIState, Item
@@ -70,6 +70,9 @@ CHANGE_WEIGHT = {
     "selector_link": 4.0,
     "cert_issuer_changed": 3.0,
     "cert_new": 2.5,
+    # Same issuer, same SANs, new sha256: the ACME client doing its job.
+    # Kept in the store for history, never worth a specialist's slot.
+    "cert_renewed": 0.0,
     "webamon_fingerprint_changed": 3.0,
     "ports_changed": 2.5,
     "asn_change": 2.5,
@@ -112,7 +115,7 @@ def _looks_like_shared_hosting(item: Item, asn_by_indicator: dict[str, int]) -> 
         # exists to surface.
         return False
     asn = asn_by_indicator.get(item.indicator)
-    if asn is not None and asn in SHARED_HOSTING_ASNS:
+    if is_shared_asn(asn):
         return True
     if item.attribute == "ptr":
         for value in (item.old_value, item.new_value):
@@ -271,11 +274,23 @@ def _items_from_infrastructure_links(digest: dict[str, Any]) -> list[Item]:
     return out
 
 
-def score(item: Item, asn_by_indicator: dict[str, int]) -> Item:
+def score(item: Item, asn_by_indicator: dict[str, int],
+          lifecycle: dict[str, str] | None = None) -> Item:
     base = CHANGE_WEIGHT.get(item.change_type, 1.0)
     item.score = base * CONFIDENCE_WEIGHT.get(item.confidence, 1.0)
+    state = (lifecycle or {}).get(item.indicator, "active")
 
-    if _looks_like_shared_hosting(item, asn_by_indicator):
+    if item.change_type == "cert_renewed":
+        item.suppressed = (
+            "routine renewal: same issuer and SANs, new sha256 - the "
+            "provider's ACME client, not the actor")
+        item.score = 0.0
+    elif state in ("dormant", "retired") and item.family != "infrastructure":
+        item.suppressed = (
+            f"{state} indicator: no live evidence for weeks, so a change on "
+            "it is most likely the provider recycling the address or name")
+        item.score = 0.0
+    elif _looks_like_shared_hosting(item, asn_by_indicator):
         item.suppressed = (
             "shared hosting: a change on a CDN or big-cloud address says "
             "something about the provider's tenants, not about this actor")
@@ -296,7 +311,10 @@ def rank(state: CTIState) -> dict:
              + _items_from_open_directories(digest)
              + _items_from_infrastructure_links(digest))
     asn_by_indicator = _asn_index(digest, [i.indicator for i in items])
-    items = [score(item, asn_by_indicator) for item in items]
+    # Written by collect (enrich_and_write) after the sweep, so a host that
+    # came back today is already active here and keeps its changes.
+    lifecycle = (digest.get("lifecycle") or {}).get("inactive") or {}
+    items = [score(item, asn_by_indicator, lifecycle) for item in items]
 
     ranked: dict[str, list[Item]] = {}
     for family in FAMILY_ATTRIBUTES:

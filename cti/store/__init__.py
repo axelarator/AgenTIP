@@ -29,7 +29,9 @@ from .writes import (record_findings,
                      CORRELATION_TYPES, insert_correlation, latest_asn_for,
                      record_active_scan, record_asn_change, upsert_actor,
                      upsert_opendir_files, upsert_opendir_samples,
-                     upsert_zeek_match)
+                     upsert_zeek_match, upsert_service_snapshot,
+                     record_service_change, latest_service_snapshot,
+                     update_service_flow)
 
 __all__ = [
     "SPECS", "CORRELATION_TYPES", "QUERY_MAX_BYTES", "QUERY_MAX_ROWS",
@@ -43,4 +45,6 @@ __all__ = [
     "record_attribute_change", "run_readonly_query", "save_correlation",
     "tracked_observables", "upsert_actor", "upsert_observation",
     "upsert_opendir_files", "upsert_opendir_samples", "upsert_zeek_match",
+    "upsert_service_snapshot", "record_service_change", "latest_service_snapshot",
+    "update_service_flow",
 ]

@@ -104,7 +104,52 @@ def _has_signals(sections: dict[str, Any]) -> bool:
         # day whose only finding was "these two hosts are one operation"
         # rendered as "no activity" and never woke Stage B.
         or (sections.get("infrastructure_links") or {}).get("promoted")
+        # A host coming back from dormant, or a new candidate, is the news
+        # the lifecycle and expansion exist to deliver.
+        or (sections.get("lifecycle") or {}).get("reactivated")
+        or (sections.get("coverage_expansion") or {}).get("filed_total")
     )
+
+
+def _lifecycle_lines(lifecycle: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    back = lifecycle.get("reactivated") or []
+    if back:
+        lines += ["## Reactivated infrastructure (was dormant or retired, live again)", ""]
+        lines += [f"- **{m['value']}** ({m['cluster']}): {m['from']} -> active" for m in back]
+        lines.append("")
+    quiet = [(state, m) for state in ("dormant", "retired")
+             for m in lifecycle.get(state) or []]
+    if quiet:
+        # One line per cluster, not per host: a host going quiet is routine,
+        # and twenty of them should not push the leads off the page.
+        by_cluster: dict[str, dict[str, int]] = {}
+        for state, m in quiet:
+            counts = by_cluster.setdefault(m["cluster"], {})
+            counts[state] = counts.get(state, 0) + 1
+        lines += ["## Went quiet", ""]
+        lines += [f"- {cluster}: " + ", ".join(f"{n} {state}" for state, n in counts.items())
+                  for cluster, counts in sorted(by_cluster.items())]
+        lines.append("")
+    return lines
+
+
+def _expansion_lines(expansion: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    filed = [(slug, row) for slug, report in (expansion.get("clusters") or {}).items()
+             for row in report.get("filed") or []]
+    if filed:
+        lines += ["## New candidates (weekly expansion - accept_candidate / reject_candidate)", ""]
+        for slug, row in filed:
+            lines.append(f"- **{row['value']}** -> {slug}, linked to {row.get('candidate_linked_to')}")
+            lines.append(f"  - {row.get('candidate_reason')}; found via "
+                         f"{str(row.get('discovered_via'))[:96]}")
+        lines.append("")
+    expired = expansion.get("expired") or {}
+    if expired:
+        lines += ["_Candidates auto-rejected (no live evidence in 30 days): "
+                  + "; ".join(f"{slug}: {', '.join(v)}" for slug, v in expired.items()) + "_", ""]
+    return lines
 
 
 def write(day: date, sections: dict[str, Any]) -> Path:
@@ -179,6 +224,9 @@ def write(day: date, sections: dict[str, Any]) -> Path:
                         ["ip", "actor", "change_type", "old_asn", "new_asn",
                          "new_netname", "confidence"])
         lines.append("")
+
+    lines += _lifecycle_lines(sections.get("lifecycle") or {})
+    lines += _expansion_lines(sections.get("coverage_expansion") or {})
 
     links = sections.get("infrastructure_links") or {}
     promoted = links.get("promoted") or []
