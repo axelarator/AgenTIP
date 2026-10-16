@@ -241,7 +241,7 @@ call does it with one fewer moving part.
   and OpenSearch access (sequential, before and after the dispatch phase)
   never overlap in time within a single run.
 
-  The Arkime VM moved to 10.20.0.18 as of 2026-07-27, and its OpenSearch
+  The Arkime VM moved (2026-07-27; address in CTI_OPENSEARCH_URL), and its OpenSearch
   no longer sits behind a login — it's plain HTTP, lab-internal only, no
   credential to set. Just run:
 

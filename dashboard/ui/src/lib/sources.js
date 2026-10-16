@@ -7,8 +7,13 @@
 import { truncate } from "./format.js";
 
 const JARM_SOURCE_RE = /^JARM against (.+):(\d+) via .+, (\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}Z)?)$/;
-const ZEEK_SOURCE_RE = /^Zeek passive \(tap107, via OpenSearch\) handshake against (.+):(\d+) \(([\d.]+)\), (\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}Z)?)$/;
-const ARKIME_BASE = "http://10.20.0.18:8005/sessions";
+// Any sensor name: it comes from CTI_ZEEK_SENSOR when the pipeline writes it.
+const ZEEK_SOURCE_RE = /^Zeek passive \([^)]*\) handshake against (.+):(\d+) \(([\d.]+)\), (\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}Z)?)$/;
+// Set from /api/config at startup (CTI_ARKIME_URL on the server). Null until
+// then, and when unset no Arkime link is offered - the lab's address is not
+// baked into the bundle.
+let ARKIME_BASE = null;
+export function setArkimeBase(url) { ARKIME_BASE = url || null; }
 // Wide enough for a little clock/ingestion lag, tight enough that the link
 // points at "when probing took place" rather than a whole-day guess.
 const ARKIME_PROBE_WINDOW_SECS = 5 * 60;
@@ -29,7 +34,7 @@ export function parseProbeSource(source) {
 
 export function arkimeSessionUrl(source) {
   const p = parseProbeSource(source);
-  if (!p || !p.ip) return null;
+  if (!ARKIME_BASE || !p || !p.ip) return null;
   const precise = p.when.includes("T");
   const ts = Date.parse(precise ? p.when : `${p.when}T00:00:00Z`) / 1000;
   const start = precise ? ts - ARKIME_PROBE_WINDOW_SECS : ts;

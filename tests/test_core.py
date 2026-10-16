@@ -1186,11 +1186,11 @@ def test_private_ip_is_tracked_but_not_queued():
     # dir across tests in the same session - so assert this value isn't
     # queued, not that the whole (possibly session-shared) queue is empty.
     core.create_cluster("Gate Test IP")
-    data = core.add_observable("Gate Test IP", "ips", "10.20.0.9", "report X")
-    assert any(o["value"] == "10.20.0.9" for o in data["observables"]["ips"])
-    assert not any(e["value"] == "10.20.0.9" for e in core.list_pending_fingerprints())
+    data = core.add_observable("Gate Test IP", "ips", "10.99.0.9", "report X")
+    assert any(o["value"] == "10.99.0.9" for o in data["observables"]["ips"])
+    assert not any(e["value"] == "10.99.0.9" for e in core.list_pending_fingerprints())
     assert data["fingerprint_queue_skipped"] == [
-        {"category": "ips", "value": "10.20.0.9",
+        {"category": "ips", "value": "10.99.0.9",
          "reason": "private/reserved/loopback/link-local address, not routable adversary infra"}
     ]
 

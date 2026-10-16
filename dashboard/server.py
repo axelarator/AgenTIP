@@ -205,6 +205,15 @@ def _limit(request, default: int = 100) -> int:
         return default
 
 
+async def config(request):
+    """Lab-specific settings the frontend needs, read from the environment so
+    no address is baked into the committed bundle. CTI_ARKIME_URL is the same
+    variable the FlowCarp pcap pull uses."""
+    arkime = (os.environ.get("CTI_ARKIME_VIEWER_URL")
+              or os.environ.get("CTI_ARKIME_URL") or "").rstrip("/")
+    return JSONResponse({"arkime_sessions_url": f"{arkime}/sessions" if arkime else None})
+
+
 async def hunt(request):
     """Run a key:value hunt query (cti/store/hunt_query.py). ?q=&limit="""
     from cti.store import hunt_query
@@ -357,6 +366,7 @@ async def run_detail(request):
 
 
 routes = [
+    Route("/api/config", config),
     Route("/api/stats", stats),
     Route("/api/clusters", list_clusters),
     Route("/api/clusters/{name}", get_cluster),

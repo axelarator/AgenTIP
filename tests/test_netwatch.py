@@ -231,7 +231,7 @@ class _FakeZeek:
 
 
 def test_ingest_joins_passive_zeek_fingerprints(monkeypatch):
-    monkeypatch.setenv("CTI_PROBE_HOST", "10.20.30.74")
+    monkeypatch.setenv("CTI_PROBE_HOST", "10.99.0.74")
     _spool([_record("scanA", "203.0.113.11", 443,
                     tls={"cert_sha256": "c" * 64})])
     out = ingest.ingest(client=_FakeZeek())

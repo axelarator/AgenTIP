@@ -72,7 +72,8 @@ import time
 
 # --- probe VM connection (from the environment - see module docstring) ------
 PROBE_USER = os.environ.get("CTI_PROBE_USER", "detonate")
-PROBE_HOST = os.environ.get("CTI_PROBE_HOST", "10.20.30.74")
+# No default: the probe's address is lab topology, and this file is public.
+PROBE_HOST = os.environ.get("CTI_PROBE_HOST", "")
 PROBE_SSH_KEY = os.path.expanduser(
     os.environ.get("CTI_PROBE_SSH_KEY", "~/.ssh/id_ed25519_probe"))
 PROBE_KNOWN_HOSTS = os.path.expanduser(
@@ -166,6 +167,9 @@ def _record(action: str, wait: float, run: float, timed_out: bool) -> None:
 
 
 def _ssh_json_rpc(request: dict[str, object], timeout: int | None = None) -> dict[str, object]:
+    if not PROBE_HOST:
+        raise VMProxyError("CTI_PROBE_HOST is not set - the probe VM's address comes "
+                           "from the environment (see the module docstring)")
     limit = timeout if timeout is not None else SSH_TIMEOUT
     action = str(request.get("action", "?"))
     queued = time.monotonic()

@@ -751,10 +751,10 @@ def test_daily_xref_unreachable_is_skip():
 def test_a_wazuh_document_reads_like_a_legacy_zeek_one():
     doc = flatten_wazuh({
         "location": "/opt/zeek/logs/current/ssl.log",
-        "data": {"ts": "1787000000.25", "id_orig_h": "10.20.30.74", "id_orig_p": "51234",
+        "data": {"ts": "1787000000.25", "id_orig_h": "10.99.0.74", "id_orig_p": "51234",
                  "id_resp_h": "203.0.113.7", "id_resp_p": "443",
                  "established": "true", "ja4s": "t130200_1301_234ea6891581"}})
-    assert doc["src_ip"] == "10.20.30.74" and doc["dst_ip"] == "203.0.113.7"
+    assert doc["src_ip"] == "10.99.0.74" and doc["dst_ip"] == "203.0.113.7"
     assert doc["dst_port"] == 443 and doc["src_port"] == 51234
     assert doc["ts"] == 1787000000.25
     assert doc["log_file"].endswith("ssl.log")

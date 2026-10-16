@@ -6,7 +6,7 @@ One remote hop and one HTTPS query per target, not two SSH hops - and,
 as of this change, every target in a queued batch is dispatched
 concurrently rather than one at a time (see below):
 
-  1. probe_helper.py on the lab probe VM (10.20.30.74) - generates
+  1. probe_helper.py on the lab probe VM (CTI_PROBE_HOST) - generates
      a JARM scan and one ordinary TLS handshake against the target.
   2. An OpenSearch query against the Zeek logs (Wazuh archives on
      siem01 by default, through cti/sources/opensearch.py's tunnel) -
@@ -610,10 +610,14 @@ def main() -> None:
                 value = zeek_result.get(category)
                 if not value:
                     continue
-                source = (f"Zeek passive (tap107, via OpenSearch) handshake against "
+                source = (f"Zeek passive ({ZEEK_SENSOR}, via OpenSearch) handshake against "
                           f"{target}:{port} ({resolved_ip}), {hit_time}")
                 core.add_observable(cluster, category, value, source)
 
+
+# The sensor named in Zeek provenance strings. From the environment, because
+# the sensor's name is lab topology and this file is public.
+ZEEK_SENSOR = os.environ.get("CTI_ZEEK_SENSOR", "zeek")
 
 _AGAINST = re.compile(r"handshake against (\S+:\d+)")
 
