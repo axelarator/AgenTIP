@@ -747,7 +747,8 @@ def _observe_http(target: str, known_ports: list | None = None) -> tuple[dict, s
         # `header` is a Go map and arrives sorted by key; the raw block keeps
         # the order the server sent, which is what http.header_order reads.
         "raw_header": r.get("raw_header"),
-        "jarm": r.get("jarm"),
+        # httpx emits `jarm_hash`; `jarm` was read here and was always None.
+        "jarm": r.get("jarm_hash") or r.get("jarm"),
         "content_length": r.get("content_length"),
         "final_url": r.get("final_url") or r.get("url"),
         "cdn": r.get("cdn_name"),
@@ -1145,7 +1146,8 @@ def _httpx_by_port(target: str, ports: list[int]) -> dict[int, dict]:
             "status": r.get("status_code"), "title": r.get("title"),
             "server": r.get("webserver"), "tech": r.get("tech") or [],
             "body_sha256": hashes.get("body_sha256") or hashes.get("body-sha256"),
-            "favicon_mmh3": r.get("favicon"), "jarm": r.get("jarm"),
+            "favicon_mmh3": r.get("favicon"),
+            "jarm": r.get("jarm_hash") or r.get("jarm"),   # httpx's field is jarm_hash
             "headers": r.get("header") or {}, "raw_header": r.get("raw_header"),
             "final_url": r.get("final_url") or r.get("url"),
         }
@@ -1157,12 +1159,18 @@ def _tlsx_by_port(target: str, ports: list[int]) -> dict[int, dict]:
     locally the same way the observe pass does."""
     if not ports:
         return {}
-    records = _json_records(
-        TLSX_CMD + ["-json", "-silent", "-nc", "-serial", "-hash", "sha256",
-                    "-so", "-san", "-cn", "-tls-version", "-cipher", "-cert",
-                    "-timeout", "10", "-disable-update-check",
-                    "-p", ",".join(map(str, ports))],
-        stdin_text=target, timeout=OBSERVE_TOOL_TIMEOUT)
+    # No -san/-cn/-so: tlsx refuses to combine those display probes with any
+    # other ("san or cn flag cannot be used with other probes") and exits,
+    # so every netwatch scan recorded no certificate at all. -json returns
+    # the whole certificate without them. -cert (the PEM, for the SPKI hash)
+    # is retried without, the same way the observe pass does.
+    base = TLSX_CMD + ["-json", "-silent", "-nc", "-serial", "-hash", "sha256",
+                       "-tls-version", "-cipher", "-timeout", "10",
+                       "-disable-update-check", "-p", ",".join(map(str, ports))]
+    records, error = _run_json(base + ["-cert"], stdin_text=target,
+                               timeout=OBSERVE_TOOL_TIMEOUT)
+    if error:
+        records, _ = _run_json(base, stdin_text=target, timeout=OBSERVE_TOOL_TIMEOUT)
     out: dict[int, dict] = {}
     for r in records:
         port = r.get("port")

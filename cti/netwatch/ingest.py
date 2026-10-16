@@ -91,6 +91,25 @@ def _passive_fingerprints(client: OpenSearchClient | None, vantage: str,
     return out
 
 
+def intercepted_ports() -> set[int]:
+    """Ports something on the probe's egress path answers for every target.
+
+    Measured 2026-10-16: TCP/53 to five unrelated hosts on four providers
+    completed the handshake, sent 0 bytes and closed at an identical 0.48 s
+    or 2.47 s, while real resolvers on the same path answered with 48-300
+    bytes. naabu reports that as open on every host it touches. A port in
+    this set counts as open only with an application answer behind it.
+    """
+    raw = os.environ.get("CTI_NETWATCH_INTERCEPTED_PORTS", "53")
+    return {int(p) for p in raw.split(",") if p.strip().isdigit()}
+
+
+def _intercepted(rec: dict[str, Any]) -> bool:
+    return (bool(rec.get("open")) and int(rec.get("port") or 0) in intercepted_ports()
+            and not (rec.get("http") or rec.get("tls") or rec.get("banner_sha256")
+                     or rec.get("app_proto")))
+
+
 def _flatten(rec: dict[str, Any], passive: dict[str, Any]) -> dict[str, Any]:
     """A scan record (+ passive fingerprints) -> a service_snapshots row."""
     http = rec.get("http") or {}
@@ -159,11 +178,14 @@ def _observe_result(records: list[dict[str, Any]], passive_by_port: dict[int, di
                 open_ports.append(rec["port"])
         if rec.get("http") and not http:
             http = dict(rec["http"])
-        if rec.get("tls") and not tls:
-            tls = dict(rec["tls"])
-            passive = passive_by_port.get(rec["port"], {})
-            if passive.get("ja4s"):
-                tls["ja4s"] = passive["ja4s"]
+        if rec.get("tls") and not tls.get("cert_sha256"):
+            tls = {**dict(rec["tls"]), **({"ja4s": tls["ja4s"]} if tls.get("ja4s") else {})}
+        # Zeek's JA4S is the server's own answer, recorded whether or not the
+        # active TLS grab produced a certificate - it was only ever attached
+        # beside one, so while tlsx failed no JA4S became a selector at all.
+        passive = passive_by_port.get(rec.get("port"), {})
+        if passive.get("ja4s") and "ja4s" not in tls:
+            tls["ja4s"] = passive["ja4s"]
     return {"http": http, "tls": tls, "dns": {}, "whois": {},
             "cdn": {}, "ports": open_ports or None, "errors": {}}
 
@@ -203,6 +225,10 @@ def ingest(*, client: Any = _UNSET, purge: bool = True) -> dict[str, Any]:
     snapshots = changes = selectors = 0
     with store.connect_retry(read_only=False) as con:
         for (scan_id, target), records in by_target.items():
+            # Before anything reads `open`: the snapshot, the diff and the
+            # port-set selector must all see an intercepted port as closed.
+            records = [{**r, "open": False, "intercepted": True} if _intercepted(r) else r
+                       for r in records]
             passive_by_port: dict[int, dict] = {}
             for rec in records:
                 if not rec.get("open") or not rec.get("ip"):

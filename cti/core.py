@@ -1998,6 +1998,10 @@ def pivot_and_expand(value: str, cluster_name: str,
         # surfaced for review rather than auto-filed (a shared kit isn't
         # proof of the same operator).
         wm = _webamon_domain(value)
+        if isinstance(wm, dict) and wm.get("error"):
+            # Said, not swallowed: an empty pivot reads as "nothing found",
+            # and a rate-limited one is "could not look".
+            review["source_errors"] = {"webamon": wm["error"]}
         latest = wm.get("latest") if isinstance(wm, dict) and "error" not in wm else None
         if isinstance(latest, dict):
             fp = latest.get("fingerprint") or {}
@@ -2013,6 +2017,8 @@ def pivot_and_expand(value: str, cluster_name: str,
                 review["webamon_fingerprint_siblings"] = fp_siblings
     else:  # ip
         wm = _webamon_ip(value)
+        if isinstance(wm, dict) and wm.get("error"):
+            review["source_errors"] = {"webamon": wm["error"]}
         hosted = wm.get("domains", []) if isinstance(wm, dict) and "error" not in wm else []
         # Same shared-hosting guard the automatic sweep uses: a shared-
         # hosting ASN's hosted domains are every other tenant, not this
@@ -2110,6 +2116,8 @@ def _pivot_and_expand_merge(value: str, kind: str, cluster_name: str, now: str,
         n_review = sum(len(v) for v in review.values() if isinstance(v, list))
         if n_review:
             entry += f"; {n_review} left for review"
+        for source, error in (review.get("source_errors") or {}).items():
+            entry += f"; {source} unavailable ({error}) - incomplete, not a negative"
     data["hunt_log"].append({"date": now, "entry": entry})
     save_cluster(data)
 

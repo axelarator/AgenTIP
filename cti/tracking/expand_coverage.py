@@ -290,6 +290,7 @@ def expand_cluster(slug: str) -> dict[str, Any]:
     members = core.member_values(data)
     for host in hosts:
         prov = via[host]
+        membership.record_links(host, prov.get("links") or (), origin=prov["via"])
         scored = membership.score(core._slug(data), host, members=members)
         if not membership.band_at_least(scored["band"], floor):
             report["rejected_links"] += 1

@@ -1704,6 +1704,21 @@ def test_pivot_and_expand_suppresses_cohosted_domains_for_shared_hosting_ip(monk
     assert str(shared_asn) in result["review"]["cohosted_domains_suppressed"]
 
 
+def test_a_rate_limited_pivot_says_so_instead_of_finding_nothing(monkeypatch):
+    """Webamon's 429 was dropped, so a pivot that could not look reported
+    the same empty result as one that looked and found nothing."""
+    monkeypatch.setattr(core.webamon, "search_ip",
+                        lambda ip, size=50: {"error": "webamon rate limited"})
+    monkeypatch.setattr(core.pivot, "ripestat_lookup", lambda ip: {"asn": [64500]})
+    core.create_cluster("Expand Limited")
+    core.add_observable("Expand Limited", "ips", "185.10.10.11", "seed")
+    result = core.pivot_and_expand("185.10.10.11", "Expand Limited", include_cohosted=True)
+    assert result["filed"] == {}
+    assert result["review"]["source_errors"] == {"webamon": "webamon rate limited"}
+    entry = core.get_cluster("Expand Limited")["hunt_log"][-1]["entry"]
+    assert "incomplete, not a negative" in entry
+
+
 def test_pivot_and_expand_rejects_hash(monkeypatch):
     core.create_cluster("Expand Hash")
     with pytest.raises(ValueError):

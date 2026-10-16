@@ -245,3 +245,72 @@ def test_ingest_joins_passive_zeek_fingerprints(monkeypatch):
         sels = {t for (t,) in con.execute(
             "SELECT selector_type FROM selectors WHERE source='netwatch'").fetchall()}
     assert "tls.ja4s" in sels
+
+
+# --------------------------------------------------------------------------- #
+# Defects found by the CL-STA-1178 end-to-end run (2026-10-16)
+# --------------------------------------------------------------------------- #
+
+def test_an_intercepted_port_is_not_open():
+    """TCP/53 was 'open' on every target: something on the egress path
+    accepts it and sends nothing. Without an application answer it is not
+    a service, and must not reach the snapshot or the port-set selector."""
+    _spool([_record("scanI", "203.0.113.20", 53),
+            _record("scanI", "203.0.113.20", 443, http={"status": 200, "title": "x"})])
+    ingest.ingest(client=None)
+    with store.connect(read_only=True) as con:
+        opened = dict(con.execute("SELECT port, open FROM service_snapshots "
+                                  "WHERE target='203.0.113.20'").fetchall())
+        ports = con.execute("SELECT selector_value FROM selectors WHERE "
+                            "indicator_value='203.0.113.20' AND selector_type='net.port_set'"
+                            ).fetchone()
+    assert opened == {53: False, 443: True}
+    assert ports == ("443",)
+
+
+def test_a_real_service_on_an_intercepted_port_still_counts():
+    _spool([_record("scanJ", "203.0.113.21", 53, banner_sha256="b" * 64)])
+    ingest.ingest(client=None)
+    with store.connect(read_only=True) as con:
+        assert con.execute("SELECT open FROM service_snapshots "
+                           "WHERE target='203.0.113.21'").fetchone()[0] is True
+
+
+def test_tlsx_is_not_given_the_probes_it_refuses_to_combine(probe_helper, monkeypatch):
+    ph = probe_helper
+    calls = []
+
+    def run(cmd, stdin_text, timeout):
+        calls.append(cmd)
+        return [{"port": "443", "fingerprint_hash": {"sha256": "AB" * 32},
+                 "subject_dn": "CN=x", "issuer_dn": "CN=ca"}], None
+
+    monkeypatch.setattr(ph, "_run_json", run)
+    out = ph._tlsx_by_port("x.example", [443])
+    assert out[443]["cert_sha256"] == "AB" * 32
+    assert not {"-san", "-cn", "-so"} & set(calls[0])
+
+
+def test_httpx_jarm_is_read_from_jarm_hash(probe_helper, monkeypatch):
+    ph = probe_helper
+    monkeypatch.setattr(ph, "_json_records", lambda *a, **k: [
+        {"port": "443", "status_code": 200, "jarm_hash": "2ad2ad16d2ad2ad"}])
+    assert ph._httpx_by_port("x.example", [443])[443]["jarm"] == "2ad2ad16d2ad2ad"
+
+
+def test_zeek_ja4s_is_a_selector_even_without_a_certificate(monkeypatch):
+    monkeypatch.setenv("CTI_PROBE_HOST", "10.99.0.74")
+    _spool([_record("scanK", "203.0.113.22", 443, http={"status": 200, "title": "V2Board"})])
+    ingest.ingest(client=_FakeZeek())
+    with store.connect(read_only=True) as con:
+        assert con.execute("SELECT selector_value FROM selectors WHERE indicator_value="
+                           "'203.0.113.22' AND selector_type='tls.ja4s'").fetchone() == (
+            "t1204h2_c030_abc",)
+
+
+def test_a_later_ports_certificate_is_not_lost_behind_an_earlier_ja4s():
+    passive = {80: {"ja4s": "t1"}, 443: {"ja4s": "t2"}}
+    result = ingest._observe_result(
+        [_record("s", "x", 80, http={"status": 301}),
+         _record("s", "x", 443, tls={"cert_sha256": "c" * 64})], passive)
+    assert result["tls"]["cert_sha256"] == "c" * 64 and result["tls"]["ja4s"] == "t1"
