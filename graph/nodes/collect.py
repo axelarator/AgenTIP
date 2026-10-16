@@ -18,12 +18,12 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from langgraph.types import Send
 
-from cti import core, store
+from cti import core, membership, store
 from cti.probe import vm_proxy
 from cti.tracking import analytics, digest, enrich, ingest
 
@@ -411,12 +411,17 @@ def _inactive_index(clusters: list[str]) -> dict[str, str]:
 
 
 def expand_coverage(state: dict) -> dict:
-    """Weekly: reverse-pivot each cluster's rare selectors and file what
-    passes the corroboration rule as candidates. Daily: expire candidates
-    nobody decided on. See cti/tracking/expand_coverage.py.
+    """Candidates and change over time.
 
-    Off the expansion weekday this costs nothing but the expiry pass, which
-    is local. --skip-enrich skips the network half on any day.
+    Weekly: reverse-pivot each cluster's rare selectors and file scored
+    candidates (cti/tracking/expand_coverage.py). Daily: expire candidates
+    nobody decided on, re-score every candidate against its cluster's
+    current members (the score history grows by a row each), and collect
+    what moved in the last day - band moves, value changes on tracked
+    hosts, new Windows-client divergences (cti/store/timeline.py).
+
+    Off the expansion weekday everything here is local. --skip-enrich skips
+    the network half on any day.
     """
     from cti.tracking import expand_coverage as expansion
 
@@ -433,10 +438,28 @@ def expand_coverage(state: dict) -> dict:
         return expansion.run(_day(state), forced=bool(state.get("force_expand")),
                              clusters=clusters)
 
+    def _rescore():
+        out = {}
+        for slug in clusters:
+            scored = membership.rescore(core._slug(slug))
+            if scored:
+                out[slug] = [{"entity": r["entity"], "band": r["band"],
+                              "score": round(r["score"], 3)} for r in scored]
+        return out
+
+    def _timeline():
+        from cti.store import timeline
+        until = datetime.now(timezone.utc).replace(tzinfo=None)
+        with store.connect_retry(read_only=True) as con:
+            return timeline.changes(con, since=until - timedelta(days=1), until=until,
+                                    clusters=[core._slug(c) for c in clusters] or None)
+
     expired = _phase(sections, "expire_candidates", _expire) or {}
     result = _phase(sections, "expand_coverage", _expand) or {}
     result["expired"] = expired
     sections["coverage_expansion"] = result
+    sections["candidate_scores"] = _phase(sections, "rescore_candidates", _rescore) or {}
+    sections["timeline"] = _phase(sections, "timeline", _timeline) or {}
     return {"sections": sections}
 
 

@@ -139,6 +139,11 @@ store, scored against the members - never written into the JSON.
   so they are scored on more than the link that found them.
 - **Never automatic:** no path accepts a candidate, and no automatic path
   can change a seed, an accepted member or a rejection.
+- **Over time:** every candidate is re-scored daily, and the digest's
+  "Candidate relatedness moved" section lists band changes;
+  `candidate_score_history(name, value)` shows the whole series. The same
+  digest reports fingerprints that changed on tracked hosts and new
+  Windows-client divergences.
 - **Cost:** up to 8 seeds per cluster and 10 new hosts swept per cluster
   each week. The reverse lookups are capped at `CTI_WEBAMON_EXPAND_BUDGET`
   (default 150) per day. Validin is not used, because it is manual-only.

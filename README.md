@@ -199,6 +199,22 @@ the MCP server. `scripts/backfill_spans.py` and
 `scripts/rebuild_from_seeds.py` migrated the existing data (both dry-run
 by default).
 
+### Change over time
+
+Every day the collect stage re-scores each cluster's candidates against its
+current members (the score history grows a row per candidate per day), then
+`cti/store/timeline.py` reports what moved since the last run, as three
+digest sections:
+
+- **Candidate relatedness moved** - a band change since the last score
+  (`up` wakes the analysis; a new candidate is listed from `weak` up).
+- **Fingerprints changed on tracked hosts** - a JARM, JA4S/JA4X, SPKI,
+  serial, header order, nameserver set or registrant replaced on a seed,
+  member or candidate. Types the attribute detectors already report are
+  left to them, and nothing behind a CDN counts - its TLS is the CDN's.
+- **Served Windows clients something different** - the first time a host
+  shows a given `http.client_divergence`.
+
 ### Hunting
 
     python -m graph hunt 'tls.default_subject:* AND net.port:8443 AND NOT role:rejected'

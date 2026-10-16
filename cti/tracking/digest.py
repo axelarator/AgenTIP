@@ -108,6 +108,13 @@ def _has_signals(sections: dict[str, Any]) -> bool:
         # the lifecycle and expansion exist to deliver.
         or (sections.get("lifecycle") or {}).get("reactivated")
         or (sections.get("coverage_expansion") or {}).get("filed_total")
+        # A candidate whose evidence moved it up a band, a tracked host whose
+        # fingerprint changed, or a host now serving Windows clients something
+        # different - each is the change-over-time the store exists to show.
+        or any(m.get("direction") == "up"
+               for m in (sections.get("timeline") or {}).get("band_moves") or [])
+        or (sections.get("timeline") or {}).get("value_changes")
+        or (sections.get("timeline") or {}).get("client_divergences")
     )
 
 
@@ -154,6 +161,39 @@ def _expansion_lines(expansion: dict[str, Any]) -> list[str]:
     if expired:
         lines += ["_Candidates auto-rejected (no live evidence in 30 days): "
                   + "; ".join(f"{slug}: {', '.join(v)}" for slug, v in expired.items()) + "_", ""]
+    return lines
+
+
+def _timeline_lines(timeline: dict[str, Any]) -> list[str]:
+    """What moved since the last run: band moves, value changes on tracked
+    hosts, new client divergences. See cti/store/timeline.py."""
+    lines: list[str] = []
+    moves = timeline.get("band_moves") or []
+    if moves:
+        lines += ["## Candidate relatedness moved", ""]
+        arrow = {"up": "↑", "down": "↓", "new": "new"}
+        for m in moves:
+            before = (f"{m['from_band']} {m['from_score']:.2f} → "
+                      if m.get("from_band") else "")
+            lines.append(f"- {arrow[m['direction']]} **{m['entity']}** ({m['cluster']}): "
+                         f"{before}{m['to_band']} {m['to_score']:.2f}")
+        lines.append("")
+    changed = timeline.get("value_changes") or []
+    if changed:
+        lines += ["## Fingerprints changed on tracked hosts", ""]
+        for c in changed:
+            where = f" via {c['vantage']}" if c.get("vantage") else ""
+            lines.append(f"- **{c['indicator']}** ({', '.join(c['memberships'])}): "
+                         f"`{c['selector_type']}` {str(c['old_value'])[:48]} → "
+                         f"{str(c['new_value'])[:48]}{where}")
+        lines.append("")
+    diverged = timeline.get("client_divergences") or []
+    if diverged:
+        lines += ["## Served Windows clients something different", ""]
+        for d in diverged:
+            lines.append(f"- **{d['target']}**:{d['port']} ({', '.join(d['memberships'])}): "
+                         f"`{d['diverged']}` — the probe and win116 got different answers")
+        lines.append("")
     return lines
 
 
@@ -232,6 +272,7 @@ def write(day: date, sections: dict[str, Any]) -> Path:
 
     lines += _lifecycle_lines(sections.get("lifecycle") or {})
     lines += _expansion_lines(sections.get("coverage_expansion") or {})
+    lines += _timeline_lines(sections.get("timeline") or {})
 
     links = sections.get("infrastructure_links") or {}
     promoted = links.get("promoted") or []
