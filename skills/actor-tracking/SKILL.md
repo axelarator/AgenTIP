@@ -113,13 +113,12 @@ directly (there is no `daily_tracking.py` flag for this).
     `cert_sans_changed`. A same-issuer renewal with unchanged SANs is
     not recorded at all (routine, not a signal).
   - `cert_hash` - a tracked domain's live certificate SHA256; `cert_new`
-    (a genuinely new cert - every renewal mints one). The new hash is
-    also auto-filed onto the cluster's own `hashes` observable list as
-    `cert-sha256:<hash>` (`hash_kind: "certificate"`, `cert_for:
-    <domain>`), and exports to STIX as an x509-certificate - this is
-    the one attribute type that updates a tracked observable
-    automatically, since it's intrinsic to infrastructure already
-    tracked, not a lead.
+    (a genuinely new cert - every renewal mints one). The hash is
+    recorded as a dated `tls.cert_sha256` selector on the domain, not
+    filed into the cluster's `hashes`: a certificate is a property of a
+    host, and filing it as an indicator is how a default catch-all cert
+    served for 248 strangers became a JadeProx observable. Hunt it with
+    `hunt_query("tls.cert_sha256:<hash>")`.
   - `http` - `http_server_changed` or `http_title_changed` (a changed
     landing page or server banner - often a kit swap or takedown).
   - `webamon_fingerprint` - `webamon_fingerprint_changed` (Webamon's
@@ -127,8 +126,8 @@ directly (there is no `daily_tracking.py` flag for this).
   - `ip_hostnames` - `ip_hostnames_changed` (new domains Webamon saw on
     a tracked IP; suppressed on shared-hosting ASNs). Flag-only.
   - `subdomains` - `subdomains_changed` (new subfinder/Wayback
-    subdomains under a tracked domain). Flag-only here; file them with
-    `pivot_and_expand`.
+    subdomains under a tracked domain). Flag-only here; `pivot_and_expand`
+    files them as scored candidates.
   - `infostealer_hits` - new infostealer-log hits for a tracked domain
     (Webamon; plaintext passwords are never stored). The count is the
     rows that actually named the domain, re-checked client-side - the

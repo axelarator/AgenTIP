@@ -48,6 +48,12 @@ export function parseHash(raw) {
       return rest[0] ? { name: "run", date: rest[0] } : { name: "runs" };
     case "search":
       return { name: "search", query: rest.join("/") };
+    // A hunt query contains '/', ':' and spaces, so everything after the
+    // head is the query, joined back exactly as it was split.
+    case "hunt":
+      return { name: "hunt", query: rest.join("/") };
+    case "pairs":
+      return { name: "pairs", a: rest[0], b: rest[1] || null };
     default:
       return { name: "overview" };
   }
@@ -68,4 +74,6 @@ export const href = {
   findings: (d) => `#/findings/${encodeURIComponent(d)}`,
   narrative: (d) => `#/narratives/${encodeURIComponent(d)}`,
   run: (d) => `#/runs/${encodeURIComponent(d)}`,
+  hunt: (q) => `#/hunt/${encodeURIComponent(q)}`,
+  pairs: (a, b) => `#/pairs/${encodeURIComponent(a)}${b ? "/" + encodeURIComponent(b) : ""}`,
 };

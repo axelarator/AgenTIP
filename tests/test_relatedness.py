@@ -380,3 +380,24 @@ def test_an_ip_a_seed_domain_resolves_to_is_linked(con):
     result = R.score_candidate(con, "c", "75.98.162.139")
     assert result.band == "probable"
     assert any(p.member == "turnkeyaiagents.com" for p in result.pairs)
+
+
+def test_a_live_resolution_and_a_pdns_record_of_one_address_meet(con):
+    """kakatown's pDNS record and update-trellix's live resolution name the
+    same IP; the span gap, not the type name, decides what it is worth."""
+    seed(con, "c", "update-trellix.com")
+    add(con, "update-trellix.com", "net.resolved_ip", "192.252.186.62",
+        first="2026-04-09", last="2026-10-16")
+    add(con, "kakatown.com", "net.historical_ip", "192.252.186.62",
+        first="2019-08-26", last="2020-08-02", source="validin_dns")
+    add(con, "fresh.example", "net.historical_ip", "192.252.186.62",
+        first="2026-09-01", last="2026-10-01", source="validin_dns")
+    kaka = R.score_candidate(con, "c", "kakatown.com")
+    fresh = R.score_candidate(con, "c", "fresh.example")
+    assert kaka.pairs and kaka.band == "noise"
+    assert fresh.score > kaka.score and fresh.pairs[0].gap_days == 0.0
+
+
+def test_an_all_zero_jarm_links_nothing():
+    assert S.normalize("tls.jarm", "0" * 62) is None
+    assert S.normalize("tls.jarm", "27d40d40d00040d1dc42d43d00041d") is not None

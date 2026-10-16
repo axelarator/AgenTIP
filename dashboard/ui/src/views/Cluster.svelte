@@ -15,6 +15,7 @@
   import Gaps from "./cluster/Gaps.svelte";
   import HuntLog from "./cluster/HuntLog.svelte";
   import Relationships from "./cluster/Relationships.svelte";
+  import Candidates from "./cluster/Candidates.svelte";
 
   let { slug, tab } = $props();
   const res = resource(() => `/api/clusters/${encodeURIComponent(slug)}`);
@@ -22,6 +23,7 @@
   const BODY = {
     diamond: Diamond, reports: Reports, ttps: Ttps, observables: Observables,
     detections: Detections, gaps: Gaps, hunt_log: HuntLog, relationships: Relationships,
+    candidates: Candidates,
   };
 
   function tabsFor(data) {
@@ -31,6 +33,7 @@
       ["ttps", "TTPs", data.ttps.length],
       ["observables", "Observables",
         Object.values(data.observables).reduce((a, v) => a + v.length, 0)],
+      ["candidates", "Candidates", null],
       ["detections", "Detections", data.detections.length],
       ["gaps", "Gaps", data.gaps.length],
       ["hunt_log", "Hunt log", data.hunt_log.length],

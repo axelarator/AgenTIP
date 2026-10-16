@@ -18,6 +18,8 @@
   import Runs from "./views/Runs.svelte";
   import RunDetail from "./views/RunDetail.svelte";
   import Search from "./views/Search.svelte";
+  import Hunt from "./views/Hunt.svelte";
+  import Pairs from "./views/Pairs.svelte";
 
   initTheme();
   loadSidebar().catch(() => { /* the views report their own failures */ });
@@ -27,7 +29,7 @@
     overview: "overview", technique: "techniques", techniques: "techniques",
     queue: "queue", indicators: "indicators", indicator: "indicators",
     selector: "indicators", findings: "findings", narrative: "narratives",
-    narratives: "narratives", run: "runs", runs: "runs",
+    narratives: "narratives", run: "runs", runs: "runs", hunt: "hunt", pairs: "hunt",
   };
   const section = $derived(SECTION[$route.name] ?? null);
 
@@ -54,6 +56,7 @@
 
   const NAV = [
     ["overview", "#/overview", "Overview"],
+    ["hunt", "#/hunt", "Hunt"],
     ["techniques", "#/techniques", "Technique matrix"],
     ["queue", "#/queue", "Fingerprint queue"],
     ["indicators", "#/indicators", "Indicators"],
@@ -143,6 +146,10 @@
         <RunDetail date={$route.date} />
       {:else if $route.name === "search"}
         <Search query={$route.query} />
+      {:else if $route.name === "hunt"}
+        <Hunt query={$route.query} />
+      {:else if $route.name === "pairs"}
+        <Pairs a={$route.a} b={$route.b} />
       {:else}
         <Overview />
       {/if}

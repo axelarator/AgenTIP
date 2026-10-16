@@ -409,9 +409,11 @@ _ARTEFACTS: dict[str, tuple[str, ...]] = {
     "response_headers": (
         "http.header_set", "http.header_order",
     ),
+    # A passive-DNS record of the same address is the same fact, dated
+    # differently; it must not count twice beside the live resolution.
     "address": (
-        "net.resolved_ip", "net.reverse_dns", "net.asn", "net.prefix",
-        "net.country",
+        "net.resolved_ip", "net.historical_ip", "net.reverse_dns", "net.asn",
+        "net.prefix", "net.country",
     ),
 }
 
@@ -648,6 +650,11 @@ def normalize(selector_type: str, value: Any) -> str | None:
         text = canonical_dn(text)
 
     if selector_type == "http.body_sha256" and text in _EMPTY_BODY_SHA256:
+        return None
+    # An all-zero JARM is what the tool prints when nothing answered the
+    # handshake. 33 tracked hosts "shared" it, linking every dead endpoint
+    # to every other.
+    if selector_type == "tls.jarm" and not text.strip("0"):
         return None
     return text
 

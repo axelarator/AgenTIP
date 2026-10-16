@@ -11,6 +11,12 @@
     python -m graph netwatch --discover       # queue neighbourhood sweep targets
     python -m graph netwatch --certstream-seconds 120  # a bounded CT batch
     python -m graph netwatch --flowcarp       # label unnamed services via FlowCarp
+    python -m graph hunt 'tls.jarm:<hash> AND NOT net.asn:13335'   # key:value hunt
+    python -m graph hunt 'net.port:8443 during:[2026-03-01,2026-04-30]' --json
+    python -m graph hunt --pairs update-trellix.com            # what is it most like
+    python -m graph hunt --pairs kakatown.com update-trellix.com   # what two share, when
+
+Hunt syntax is documented in cti/store/hunt_query.py.
 """
 from __future__ import annotations
 
@@ -70,11 +76,74 @@ async def _run(which: str, day: str, *, dry_run: bool, skip_enrich: bool,
     return 0
 
 
+def _hunt(args) -> int:
+    from cti import store
+    from cti.store import hunt_query
+
+    if not args.query:
+        raise SystemExit("hunt needs a query, or --pairs and one or two indicators")
+    try:
+        if args.explain and not args.pairs:
+            print(json.dumps(hunt_query.explain(" ".join(args.query)), indent=1))
+            return 0
+        with store.connect_retry(read_only=True) as con:
+            if args.pairs:
+                if len(args.query) > 2:
+                    raise SystemExit("--pairs takes one indicator, or two to compare")
+                out = hunt_query.pairs(con, args.query[0],
+                                       args.query[1] if len(args.query) == 2 else None,
+                                       limit=args.limit)
+            else:
+                out = hunt_query.run(con, " ".join(args.query), limit=args.limit)
+    except hunt_query.QueryError as e:
+        raise SystemExit(f"query error: {e}")
+    if args.json:
+        print(json.dumps(out, indent=1, default=str))
+        return 0
+
+    def members(ms):
+        return ", ".join(f"{m['cluster']}:{m['role']}" + (f"/{m['band']}" if m.get("band") else "")
+                         for m in ms) or "-"
+
+    if args.pairs and "other" in out:
+        print(f"{out['indicator']} <-> {out['other']}: {out['band']} {out['score']:.2f}")
+        for e in out["evidence"]:
+            gap = "overlap" if e["gap_days"] == 0 else (
+                "undated" if e["gap_days"] is None else f"{e['gap_days']:.0f}d apart")
+            print(f"  {e['weight']:.3f}  {e['class']:11s} {e['type']}={e['value']}  "
+                  f"({gap}{'; ' + e['note'] if e.get('note') else ''})")
+    elif args.pairs:
+        print(f"{out['indicator']}: {out['shared_values']} shared values")
+        for r in out["related"]:
+            print(f"  {r['band']:9s} {r['score']:.2f}  {r['other']:40s} "
+                  f"{', '.join(list(r['artefacts'])[:3]):40s} [{members(r['memberships'])}]")
+    else:
+        window = out["window"]
+        span = (f" in [{window['from'] or '...'}, {window['to'] or '...'}]"
+                if window["from"] or window["to"] else "")
+        print(f"{out['total']} match(es){span}; showing {out['returned']}")
+        for r in out["results"]:
+            print(f"  {r['indicator']:45s} [{members(r['memberships'])}]")
+            for m in r["matched"][:4]:
+                print(f"      {m['type']}={str(m['value'])[:64]}  {m['from'][:10]}..{m['to'][:10]}"
+                      f"  {m['source']}{'/' + m['vantage'] if m.get('vantage') else ''}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="graph", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command",
-                    choices=["draw", "analyze", "collect", "daily", "trace", "netwatch"])
+                    choices=["draw", "analyze", "collect", "daily", "trace", "netwatch",
+                             "hunt"])
+    ap.add_argument("query", nargs="*",
+                    help="hunt: the key:value query (quote it), or with --pairs one or "
+                         "two indicators")
+    ap.add_argument("--pairs", action="store_true",
+                    help="hunt: show what an indicator shares, with whom and when")
+    ap.add_argument("--limit", type=int, default=50, help="hunt: maximum results")
+    ap.add_argument("--json", action="store_true", help="hunt: print JSON")
+    ap.add_argument("--explain", action="store_true", help="hunt: print the compiled SQL")
     ap.add_argument("--date", default=date.today().isoformat())
     ap.add_argument("--tiers", default="hot,full",
                     help="netwatch: which watchlist tiers to scan (comma-separated)")
@@ -99,7 +168,7 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=REPO_ROOT / "docs",
                     help="where `draw` writes")
     ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_intermixed_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(name)s: %(message)s")
@@ -129,6 +198,9 @@ def main() -> int:
             scan_ids = scan.get("spooled") if scan else None
             print(f"flowcarp: {flowcarp.label_services(scan_ids=scan_ids)}")
         return 0
+
+    if args.command == "hunt":
+        return _hunt(args)
 
     if args.command == "trace":
         files = run_files(args.date)

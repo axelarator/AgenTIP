@@ -184,6 +184,79 @@ async def selector_detail(request):
     return JSONResponse(result)
 
 
+def _store_read(fn):
+    """Run `fn(con)` on a read-only store connection, mapping a busy store to
+    the 503 the frontend renders as a state rather than a failure."""
+    import duckdb
+
+    try:
+        with tracking_store.connect_retry(read_only=True) as con:
+            return JSONResponse(fn(con))
+    except tracking_store.TrackingBusy as e:
+        return JSONResponse({"error": f"tracking database busy: {e}"}, status_code=503)
+    except duckdb.Error as e:
+        return JSONResponse({"error": f"tracking database unavailable: {e}"}, status_code=503)
+
+
+def _limit(request, default: int = 100) -> int:
+    try:
+        return max(1, min(int(request.query_params.get("limit", default)), 500))
+    except ValueError:
+        return default
+
+
+async def hunt(request):
+    """Run a key:value hunt query (cti/store/hunt_query.py). ?q=&limit="""
+    from cti.store import hunt_query
+
+    query = (request.query_params.get("q") or "").strip()
+    if not query:
+        return JSONResponse({"error": "q is required"}, status_code=400)
+    try:
+        hunt_query.compile_query(query)
+    except hunt_query.QueryError as e:
+        return JSONResponse({"error": str(e), "query": query}, status_code=400)
+    return _store_read(lambda con: hunt_query.run(con, query, limit=_limit(request)))
+
+
+async def pairs(request):
+    """What an indicator shares, with whom and when. ?a=[&b=]&limit="""
+    from cti.store import hunt_query
+
+    a = (request.query_params.get("a") or "").strip()
+    if not a:
+        return JSONResponse({"error": "a is required"}, status_code=400)
+    b = (request.query_params.get("b") or "").strip() or None
+    return _store_read(lambda con: hunt_query.pairs(con, a, b, limit=_limit(request, 25)))
+
+
+async def cluster_candidates(request):
+    """A cluster's candidates, best first; with ?value=, that one's evidence
+    against the cluster's members."""
+    from cti.store import entities, relatedness
+
+    name = request.path_params["name"]
+    try:
+        data = core.load_cluster(name)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    slug = core._slug(data)
+    value = request.query_params.get("value")
+
+    def read(con):
+        if value:
+            members = {m["entity"] for m in entities.members(con, slug)} | {
+                entities.canonical(v) for v in core.member_values(data)}
+            return relatedness.score_against(con, value, members).to_dict()
+        found = entities.members(con, slug, roles=("candidate", "rejected"))
+        found.sort(key=lambda r: (r["role"] != "candidate", -(r.get("score") or 0.0)))
+        return {"cluster": data["name"], "candidates": [
+            {k: (str(v) if k in ("decided_at", "created_at") and v else v)
+             for k, v in r.items()} for r in found]}
+
+    return _store_read(read)
+
+
 async def findings_index(request):
     result = tracking_store.finding_days()
     if "error" in result:
@@ -287,6 +360,9 @@ routes = [
     Route("/api/stats", stats),
     Route("/api/clusters", list_clusters),
     Route("/api/clusters/{name}", get_cluster),
+    Route("/api/clusters/{name}/candidates", cluster_candidates),   # [?value=]
+    Route("/api/hunt", hunt),                                        # ?q=&limit=
+    Route("/api/pairs", pairs),                                      # ?a=[&b=]
     Route("/api/techniques", techniques),
     Route("/api/techniques/{technique_id}", technique_detail),
     Route("/api/observables/search", observable_search),

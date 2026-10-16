@@ -171,6 +171,49 @@ and "slowest: sweep" says nothing about which cluster was slow. Real durations
 need a start timestamp taken inside each node, which LangGraph's update stream
 does not provide.
 
+## Members, candidates, and when a link was a link
+
+A cluster's JSON used to be both the evidence and the verdict: whatever a
+pivot surfaced was written into `observables` as an active indicator.
+Undoing a bad link meant hand-editing records. On 2026-10-16 that was
+kakatown.com on JadeProx, which had shared an address with the vendor trio
+five years before they arrived.
+
+Now the two are separate, in DuckDB:
+
+- **`selector_spans`** - every selector with the intervals it was observed
+  in, per source and vantage. Passive DNS keeps its own record windows.
+  (All 43 historical-address rows had been dated by the day we asked.)
+- **`memberships`** - `seed` (a report, a STIX import, or the analyst),
+  `accepted`, `candidate`, `rejected`. Pivots, scans and hunt rules can
+  only create candidates. Only `accept_candidate` makes a member, and the
+  cluster JSON lists members alone.
+- **`relatedness_scores`** - every candidate scored against its cluster's
+  members: per shared artefact, class x rarity x time overlap, combined as
+  `1 - prod(1 - w)`. Bands: strong / probable / weak / noise. ASN weighs
+  nothing, a CDN edge weighs nothing, and a gap between two holders' spans
+  decays the weight. The history is append-only.
+
+`cti/membership.py` is the one door into this for core, the pipeline and
+the MCP server. `scripts/backfill_spans.py` and
+`scripts/rebuild_from_seeds.py` migrated the existing data (both dry-run
+by default).
+
+### Hunting
+
+    python -m graph hunt 'tls.default_subject:* AND net.port:8443 AND NOT role:rejected'
+    python -m graph hunt '(net.resolved_ip:192.252.186.62 OR net.historical_ip:192.252.186.62) during:[2026-01-01,2026-12-31]'
+    python -m graph hunt --pairs update-trellix.com                 # what is it most like
+    python -m graph hunt --pairs kakatown.com update-trellix.com    # what two share, and when
+
+Censys-style `key:value` over everything observed: any selector type,
+`net.port`, `indicator`, `type`, `cluster`, `role`, `band`, `vantage`,
+`changed` (`since:`), with AND / OR / NOT, `*`, `~"regex"`, and
+`seen:` / `during:` time windows. The same engine backs the MCP tools
+`hunt_query` and `hunt_pairs`, the dashboard's Hunt and Pairs pages, the
+cluster Candidates tab, and hunt rules with a `query:` field. Grammar:
+`cti/store/hunt_query.py`.
+
 ## netwatch: scheduled re-scans of tracked infrastructure
 
 `python -m graph netwatch` scans the watchlist (built from the cluster

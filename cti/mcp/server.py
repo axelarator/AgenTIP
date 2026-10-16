@@ -218,6 +218,41 @@ def reject_candidate(name: str, value: str, reason: str) -> dict:
 
 
 @mcp.tool()
+def hunt_query(query: str, limit: int = 50) -> dict:
+    """Search everything the store has observed with Censys/Hunt.io-style
+    key:value terms. Keys: any selector type (tls.jarm, tls.cert_sha256,
+    tls.ja4x, http.body_sha256, http.favicon_mmh3, net.resolved_ip,
+    net.historical_ip, dns.ns_set, whois.registrar, ...), net.port,
+    indicator (exact or ~regex), type, cluster, role
+    (seed/accepted/candidate/rejected), band (strong/probable/weak/noise =
+    that or better), vantage, changed (with since:7d). Combine with AND
+    (implicit), OR, NOT, parentheses; values may be quoted, `*` for any,
+    `~"regex"`. Time: seen:>2026-09-01, seen:<DATE, during:[A,B] restrict
+    every selector term to spans overlapping that window.
+    Example: tls.default_subject:* AND net.port:8443 AND NOT role:rejected
+    Each hit lists its memberships and the dated spans it matched on."""
+    from ..store import hunt_query as H
+    try:
+        with tracking.connect_retry(read_only=True) as con:
+            return H.run(con, query, limit=limit)
+    except H.QueryError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def hunt_pairs(indicator: str, other: str = "", limit: int = 25) -> dict:
+    """What an indicator shares with others, when, and what it is worth.
+    With `other`: every key:value the two share, the gap between the spans
+    in which each held it (0 = at the same time), and the relatedness score
+    those add up to. Without: every indicator in the store it shares
+    anything with, scored pairwise and ranked, with their cluster
+    memberships - across all clusters, members and candidates alike."""
+    from ..store import hunt_query as H
+    with tracking.connect_retry(read_only=True) as con:
+        return H.pairs(con, indicator, other or None, limit=limit)
+
+
+@mcp.tool()
 def list_candidates(name: str, min_band: str = "weak") -> list[dict]:
     """Candidates proposed for a cluster by pivots, scans and hunt rules,
     best first, with their relatedness score and band (strong / probable /

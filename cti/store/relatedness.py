@@ -177,19 +177,37 @@ class Relatedness:
                     self.pairs, key=lambda p: -p.weight)]}
 
 
+# Types that state the same fact from different sources. A live lookup
+# (net.resolved_ip) and a passive-DNS record (net.historical_ip) both say
+# "this name pointed at this address", each with its own dates, so a name
+# on an address in 2019 and another on it in 2026 meet here - and the span
+# gap, not the type name, decides what that is worth.
+_EQUIVALENT = {"net.resolved_ip": ("net.resolved_ip", "net.historical_ip"),
+               "net.historical_ip": ("net.resolved_ip", "net.historical_ip")}
+
+
+def _types(selector_type: str) -> tuple[str, ...]:
+    return _EQUIVALENT.get(selector_type, (selector_type,))
+
+
+def _in(types: tuple[str, ...]) -> str:
+    return ", ".join("?" for _ in types)
+
+
 def _spans(con, selector_type: str, value: str, indicator: str
            ) -> list[tuple[datetime, datetime]]:
+    types = _types(selector_type)
     found = con.execute(
-        "SELECT start_at, end_at FROM selector_spans WHERE selector_type = ? "
+        f"SELECT start_at, end_at FROM selector_spans WHERE selector_type IN ({_in(types)}) "
         "AND selector_value = ? AND indicator_value = ?",
-        [selector_type, value, indicator]).fetchall()
+        [*types, value, indicator]).fetchall()
     if found:
         return [(a, b) for a, b in found]
     # A row recorded before spans existed: its first/last is the best window.
     legacy = con.execute(
-        "SELECT first_seen, last_seen FROM selectors WHERE selector_type = ? "
+        f"SELECT first_seen, last_seen FROM selectors WHERE selector_type IN ({_in(types)}) "
         "AND selector_value = ? AND indicator_value = ?",
-        [selector_type, value, indicator]).fetchall()
+        [*types, value, indicator]).fetchall()
     return [(a, b) for a, b in legacy if a is not None and b is not None]
 
 
@@ -209,10 +227,11 @@ def _activity(con, indicator: str) -> list[tuple[datetime, datetime]]:
 
 
 def _holders(con, selector_type: str, value: str) -> list[str]:
+    types = _types(selector_type)
     return [r[0] for r in con.execute(
         "SELECT DISTINCT indicator_value FROM selectors "
-        "WHERE selector_type = ? AND selector_value = ?",
-        [selector_type, value]).fetchall()]
+        f"WHERE selector_type IN ({_in(types)}) AND selector_value = ?",
+        [*types, value]).fetchall()]
 
 
 def _catchall_address(con, selector_type: str, value: str) -> str | None:

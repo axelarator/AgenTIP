@@ -19,6 +19,13 @@ A rule runs against two things:
   subject CN, issuer, apex) as a pre-filter. A match queues the names for a
   scan, and the snapshot rule confirms the rest once the scan lands.
 
+A snapshot rule may instead carry a `query:` in the hunt language
+(`cti/store/hunt_query.py`) - the same engine `graph hunt` and the MCP
+`hunt_query` tool run, so an ad-hoc hunt that proves useful becomes a
+standing rule by pasting it into a file. `where.ports`, if given, still
+intersects. A query cannot be evaluated against a bare certificate, so a
+query-only rule is snapshot-scoped.
+
 Nothing here enables a rule. `suggest` drafts one from what a cluster's
 hosts share, a human reads it, and only a file on disk with `enabled: true`
 is ever matched. The whole point is that a signature is deliberate.
@@ -61,6 +68,7 @@ class Rule:
     id: str
     where: dict[str, Any]
     scope: list[str] = field(default_factory=lambda: ["snapshots"])
+    query: str | None = None
     action: str = "candidate"
     cluster: str | None = None
     enabled: bool = False
@@ -88,10 +96,18 @@ def _coerce(raw: dict[str, Any], source: str | None) -> Rule | None:
         log.warning("hunt rule in %s has no id; skipped", source)
         return None
     where = raw.get("where") or {}
+    query = (raw.get("query") or "").strip() or None
     if not isinstance(where, dict) or not (
-            where.get("all") or where.get("any") or where.get("ports")):
-        log.warning("hunt rule %s has an empty `where`; skipped", rid)
+            query or where.get("all") or where.get("any") or where.get("ports")):
+        log.warning("hunt rule %s has neither a `query` nor a `where`; skipped", rid)
         return None
+    if query:
+        from ..store import hunt_query
+        try:
+            hunt_query.compile_query(query)
+        except hunt_query.QueryError as e:
+            log.warning("hunt rule %s has a query that does not parse (%s); skipped", rid, e)
+            return None
     scope = [s for s in (raw.get("scope") or ["snapshots"]) if s in VALID_SCOPES]
     if not scope:
         log.warning("hunt rule %s has no valid scope; skipped", rid)
@@ -100,7 +116,7 @@ def _coerce(raw: dict[str, Any], source: str | None) -> Rule | None:
     if action not in VALID_ACTIONS:
         log.warning("hunt rule %s has action %r; skipped", rid, action)
         return None
-    rule = Rule(id=rid, where=where, scope=scope, action=action,
+    rule = Rule(id=rid, where=where, scope=scope, action=action, query=query,
                 cluster=raw.get("cluster"), enabled=bool(raw.get("enabled")),
                 note=raw.get("note"), source=source)
     # An unknown selector type can never match anything in our table, so a
@@ -163,6 +179,12 @@ def compile_sql(rule: Rule) -> tuple[str, list[Any]]:
     params: list[Any] = []
     pieces: list[str] = []
 
+    if rule.query:
+        from ..store import hunt_query
+        compiled = hunt_query.compile_query(rule.query)
+        pieces.append(compiled.sql)
+        params.extend(compiled.params)
+
     all_terms = rule.terms("all")
     if all_terms:
         pieces.append(" INTERSECT ".join(
@@ -207,9 +229,12 @@ def evaluate(con: duckdb.DuckDBPyConnection, rules: Iterable[Rule]
         for indicator in hits:
             if indicator is None:
                 continue
+            terms = rule.terms("all") + rule.terms("any")
+            if rule.query:
+                terms = [("query", rule.query)] + terms
             out.append({"rule": rule.id, "cluster": rule.cluster,
                         "action": rule.action, "indicator": indicator,
-                        "terms": rule.terms("all") + rule.terms("any")})
+                        "terms": terms})
     return out
 
 

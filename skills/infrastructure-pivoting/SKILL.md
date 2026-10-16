@@ -193,6 +193,40 @@ Structurally unable to promote a candidate, no matter how many indicators share 
 
 <!-- END GENERATED TAXONOMY -->
 
+## Time, scores and hunting
+
+A shared value is a link only if the two holders had it **at the same
+time**. Every selector is stored with the spans in which it was observed
+(passive DNS keeps its own record windows), and the relatedness score
+(`cti/store/relatedness.py`) weighs each shared artefact by class x rarity
+x time overlap: identity 0.85, structural 0.56, behavioural 0.12 (all
+behavioural facts together capped at 0.35, inside `weak`), contextual 0.
+A gap decays the weight - 30 days for addresses, 180 for content and
+key digests. Artefacts combine as `1 - prod(1 - w)`, so the rule above
+holds: one rare identity fact, or two independent structural ones,
+lands in `strong`. Anything measured on a CDN edge weighs nothing; a
+default or catch-all certificate counts as behavioural.
+
+The case this exists for: kakatown.com sat on 192.252.186.62 from 2019-08
+to 2020-08, and the JadeProx vendor trio arrived there in 2026-04. Same
+address, 2,270 days apart: `noise`.
+
+**Hunting** - `hunt_query` (MCP), `python -m graph hunt '<query>'`, or the
+dashboard's Hunt page. Censys-style `key:value` terms over everything the
+store has observed, with AND / OR / NOT / parentheses:
+
+    tls.default_subject:* AND net.port:8443 AND NOT role:rejected
+    (net.resolved_ip:192.252.186.62 OR net.historical_ip:192.252.186.62) during:[2026-01-01,2026-12-31]
+    cluster:jadeprox role:candidate band:probable
+    changed:tls.cert_sha256 since:7d
+
+Keys are selector types plus `net.port`, `indicator`, `type`, `cluster`,
+`role`, `band`, `vantage`, `changed`; `seen:` / `during:` set the time
+window. A hit says an indicator carried a value. `hunt_pairs(a)` says
+what `a` is most like across the whole store, scored pairwise;
+`hunt_pairs(a, b)` lists what two indicators share, when, and what it is
+worth. A hunt rule file can carry the same syntax as `query:`.
+
 ## Pivoting vs. probing
 
 These are different operations against someone else's infrastructure and
