@@ -85,7 +85,7 @@ async def stats(request):
     activity.sort(key=lambda e: e["date"], reverse=True)
     return JSONResponse({
         "cluster_count": len(names),
-        "pending_fingerprint_count": len(core.list_pending_fingerprints()),
+        "candidate_count": _open_candidates(),
         "recent_activity": activity[:20],
         **totals,
     })
@@ -123,8 +123,15 @@ async def observable_search(request):
     return JSONResponse({"query": q, "exact": exact, "partial": partial[:200]})
 
 
-async def pending_fingerprints(request):
-    return JSONResponse(core.list_pending_fingerprints())
+def _open_candidates() -> int | None:
+    """Candidates waiting on an analyst, across every cluster. None when the
+    store is busy - a missing count, not a zero."""
+    try:
+        with tracking_store.connect_retry(read_only=True, attempts=1) as con:
+            return con.execute("SELECT count(*) FROM memberships "
+                               "WHERE role = 'candidate'").fetchone()[0]
+    except Exception:
+        return None
 
 
 async def tracking_observables(request):
@@ -376,7 +383,6 @@ routes = [
     Route("/api/techniques", techniques),
     Route("/api/techniques/{technique_id}", technique_detail),
     Route("/api/observables/search", observable_search),
-    Route("/api/pending-fingerprints", pending_fingerprints),
     # Before the catch-all Mount("/") below - Starlette matches in order.
     Route("/api/indicators", indicator_index),
     Route("/api/indicators/{value:path}", indicator_detail),

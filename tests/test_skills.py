@@ -165,7 +165,7 @@ def test_no_skill_carries_the_probe_vm_runbook():
 def test_the_runbook_survived_the_move():
     doc = (REPO / "docs" / "probe-vm.md").read_text()
     for marker in ("authorized_keys", "_is_probe_worthy",
-                   "Automating the handoff"):
+                   "What gets scanned"):
         assert marker in doc, marker
 
 

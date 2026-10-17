@@ -10,8 +10,6 @@ timeout constant and its own idea of what an error looks like:
                                             keyed by status (401/403/429)
   report_ingest.fetch_text               -> urllib, raised its own error
   opensearch_client.search               -> http.client, retry-once
-  (+ a byte-equivalent copy of the last one inside
-   scripts/probe_pending_fingerprints.py)
 
 ## The two backends, and why the choice is explicit
 

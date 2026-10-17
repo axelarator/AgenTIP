@@ -286,6 +286,13 @@ def selectors_from(result: dict[str, Any], *, target: str,
         yield "tls.ja3s", tls["ja3s"]
     if tls.get("ja4s"):
         yield "tls.ja4s", tls["ja4s"]
+    # The server's TCP answer (Zeek conn.log, the same pinned session) and
+    # how its certificate was generated. Both were collected and never
+    # turned into selectors.
+    if tls.get("ja4ts"):
+        yield "tls.ja4ts", tls["ja4ts"]
+    if tls.get("ja4x"):
+        yield "tls.ja4x", tls["ja4x"]
     # Headers off a CDN edge are the edge's, the same reason the body hash
     # is suppressed there. A domain behind a CDN is skipped too, unlike the
     # body: the edge rewrites and reorders headers but passes the body.

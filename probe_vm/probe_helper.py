@@ -2,7 +2,7 @@
 ordinary port on the same mirrored bridge as the Zeek sensor - so every
 request it makes is captured to Zeek/OpenSearch/Arkime for read-back).
 The active half of the enrichment handoff: the cti host
-(cti_tools/vm_proxy.py and probe_pending_fingerprints.py) sends this one
+(cti/probe/vm_proxy.py and the netwatch jobs) sends this one
 JSON request on stdin and reads one JSON response on stdout, per the SSH
 forced-command protocol.
 
@@ -12,12 +12,8 @@ Standalone - not part of the cti_tools package. Standard library plus
 Every action names a tracked indicator and is meant to originate from
 this VM rather than the analyst's own host.
 
-Actions (selected by the request's "action" field; "jarm_probe" is the
-default for back-compat with the original single-purpose helper):
+Actions (selected by the request's "action" field, which is required):
 
-  tls_handshake {target, port}                   -> {resolved_ip, error}
-  jarm_probe   deprecated alias of tls_handshake; jarm is always None (JARM
-               comes from netwatch's httpx -jarm since 2026-10-17)
   http_fetch   {url, method, headers, data,      -> {status, body, error}
                 insecure}
   resolve_dns  {host}                            -> {status, addrs}|{status:nxdomain}|{status:error,error}
@@ -49,6 +45,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -112,7 +109,7 @@ def resolve_target_ip(target: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# tls_handshake: the session the fingerprint queue reads back from Zeek
+# TCP pre-check and one plain handshake (used by the netwatch worker)
 # --------------------------------------------------------------------------- #
 def tcp_precheck(resolved_ip: str, port: int) -> bool:
     try:
@@ -136,38 +133,7 @@ def run_tls_handshake(target: str, resolved_ip: str, port: int) -> None:
             pass
 
 
-def action_tls_handshake(request: dict) -> dict:
-    """One ordinary TLS handshake to target:port, for Zeek to fingerprint.
-
-    This is what the fingerprint queue needs from the probe. It used to run
-    salesforce/jarm.py first; that was retired 2026-10-17 because httpx's
-    own -jarm, which every netwatch scan already runs, gave the same value
-    on every host both had measured at the same time.
-    """
-    target = request["target"]
-    port = int(request.get("port") or 443)
-    try:
-        resolved_ip = resolve_target_ip(target)
-    except Exception as e:
-        return {"resolved_ip": None, "error": f"DNS resolution failed for {target!r}: {e}"}
-    response: dict[str, object] = {"resolved_ip": resolved_ip, "error": None}
-    if not tcp_precheck(resolved_ip, port):
-        response["error"] = (f"port {port} on {resolved_ip} refused/unreachable during a "
-                             f"{TCP_PRECHECK_TIMEOUT}s TCP pre-check")
-        return response
-    try:
-        run_tls_handshake(target, resolved_ip, port)
-    except Exception as e:
-        response["error"] = f"handshake failed: {e}"
-    return response
-
-
-def action_jarm_probe(request: dict) -> dict:
-    """Deprecated alias of tls_handshake, kept so a cti host that has not
-    been updated keeps working. It no longer runs JARM: `jarm` is None."""
-    return {"jarm": None, **action_tls_handshake(request)}
-
-
+# --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
 # http_fetch (ported)
 # --------------------------------------------------------------------------- #
@@ -1406,8 +1372,6 @@ def run_netwatch_worker(poll_interval: float = 5.0, once: bool = False) -> int:
 _ACTIONS = {
     "observe": action_observe,
     "fetch_and_analyze": action_fetch_and_analyze,
-    "tls_handshake": action_tls_handshake,
-    "jarm_probe": action_jarm_probe,
     "http_fetch": action_http_fetch,
     "resolve_dns": action_resolve_dns,
     "resolve_ptr": action_resolve_ptr,
@@ -1450,7 +1414,7 @@ def main() -> int:
         return run_netwatch_worker(once="--once" in sys.argv[1:])
     try:
         request = json.loads(sys.stdin.read() or "{}")
-        action = request.get("action", "jarm_probe")
+        action = request.get("action")
     except Exception as e:
         json.dump({"error": f"bad request: {e}"}, sys.stdout)
         return 1

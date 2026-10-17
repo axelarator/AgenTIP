@@ -298,6 +298,6 @@ Done. On the cti host:
        export CTI_PROBE_USER=$PROBE_USER
        export CTI_PROBE_SSH_KEY=~/.ssh/id_ed25519_probe
        export CTI_PROBE_KNOWN_HOSTS=~/.ssh/known_hosts_probe
-  3. Re-run ./setup.sh, restart the harness, then:
-       .venv/bin/python scripts/probe_pending_fingerprints.py --check-access
+  3. Re-run ./setup.sh, restart the harness, then check a scan round-trips:
+       .venv/bin/python -m graph netwatch --tiers hot
 EOF

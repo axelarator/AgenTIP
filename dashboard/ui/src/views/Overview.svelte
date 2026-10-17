@@ -33,8 +33,8 @@
       <StatTile label="TTPs logged" value={s.ttp_count} />
       <StatTile label="Detections" value={s.detection_count} />
       <StatTile label="Open gaps" value={s.gap_count} />
-      <StatTile label="Pending fingerprints" value={s.pending_fingerprint_count}
-                accent={s.pending_fingerprint_count > 0} />
+      <StatTile label="Open candidates" value={s.candidate_count ?? "—"}
+                accent={s.candidate_count > 0} />
     </div>
 
     {#if latest.findings.length}

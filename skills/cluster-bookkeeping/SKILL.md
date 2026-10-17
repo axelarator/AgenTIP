@@ -202,20 +202,19 @@ tool's own data model but silently omitted from `export_stix_bundle` /
 
 **Server fingerprints are selectors, not observables.** A `jarm`, `ja4s`,
 `ja4ts` or `ja4x` filed with a source that names the host it was measured
-on (`"JARM against host:443 via ..., DATE"`, or the Zeek handshake form the
-fingerprint pipeline writes) is recorded as a dated selector on that host,
+on (`"JARM against host:443 via ..., DATE"`, or the Zeek handshake form
+`"Zeek passive (...) handshake against host:443 (ip), DATE"`) is recorded as a dated selector on that host,
 with the vantage, and kept out of the cluster JSON. One with no host in its
 source stays an observable. `ja4l` is a round-trip latency, not an
-identifier, and the pipeline no longer files it.
+identifier, and is not filed.
 
 Every domain/ip newly filed via `add_observable`, `ingest_report` or
-`import_stix_bundle` is queued for fingerprinting automatically.
-`list_pending_fingerprints()` peeks at the queue;
-`pop_pending_fingerprints()` returns everything waiting and clears it
-atomically, which is the call a fingerprinting script should make each
-cycle. Already-tracked values are never re-queued. How that queue is
-drained, what `_is_probe_worthy` rejects before anything reaches it, and
-the whole probe-VM pipeline are in `docs/probe-vm.md`.
+`import_stix_bundle` is scanned by netwatch from its next hourly pass -
+JARM (httpx), and JA4S/JA4TS from Zeek on the pinned tlsx session - unless
+it fails `_is_probe_worthy` (private, IPv6, a public resolver, a major
+vendor's own domain), in which case it comes back under `scan_skipped`.
+There is no queue to drain: the old fingerprint queue was retired on
+2026-10-17. See `docs/probe-vm.md`.
 
 
 ## Ingesting threat reports
@@ -410,8 +409,7 @@ first, to create the venv and wire those files): `list_clusters`,
 `add_relationship`, `add_gap`, `update_gap`, `remove_gap`, `export_navigator_layer`,
 `export_stix_bundle`, `export_stix_ecosystem`, `import_stix_bundle`,
 `get_observables`, `find_observable`, `add_observable`,
-`remove_observable`, `list_pending_fingerprints`,
-`pop_pending_fingerprints`, `requeue_fingerprint`, `pivot_observable`,
+`remove_observable`, `pivot_observable`,
 `pivot_cluster`, `pivot_and_expand`, `active_scan` (probing — only when
 asked), `analyze_report`, `ingest_report`.
 

@@ -16,6 +16,11 @@ CTI_CANDIDATE_SCAN_BAND (default `weak`). A candidate is a proposal; the
 light profile is what lets it be scored on more than the one link that
 surfaced it.
 
+Nothing that fails core._is_probe_worthy is scanned - private and
+reserved addresses, IPv6 (no route from the probe), public resolvers and
+major vendors' own domains. That gate used to sit on the fingerprint
+queue, which netwatch replaced.
+
 Retired hosts are not scanned. CDN edge addresses are dropped: scanning a
 Cloudflare IP fingerprints Cloudflare, not an operator (the same judgment
 the selector layer already makes).
@@ -93,6 +98,9 @@ def build(*, clusters: list[str] | None = None) -> list[dict[str, Any]]:
         for target in _candidate_targets(core._slug(data), actor):
             if target["kind"] == "ip" and cdn.available() and cdn.is_cdn(target["value"]):
                 continue
+            if not core._is_probe_worthy("ips" if target["kind"] == "ip" else "domains",
+                                         target["value"])[0]:
+                continue
             best.setdefault(target["value"], target)
         for category, kind in (("ips", "ip"), ("domains", "domain")):
             for entry in data["observables"].get(category, []):
@@ -100,6 +108,8 @@ def build(*, clusters: list[str] | None = None) -> list[dict[str, Any]]:
                 if not value:
                     continue
                 if kind == "ip" and cdn.available() and cdn.is_cdn(value):
+                    continue
+                if not core._is_probe_worthy(category, value)[0]:
                     continue
                 tier = _tier(entry)
                 if tier is None:

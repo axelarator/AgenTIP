@@ -37,7 +37,23 @@ def _ip(value, lifecycle, since=None, ports=(443,)):
     return e
 
 
+def _gate_open(monkeypatch):
+    """These fixtures use the documentation ranges, which the scan gate
+    (rightly) refuses; tiering is what is under test here."""
+    monkeypatch.setattr(core, "_is_probe_worthy", lambda category, value: (True, ""))
+
+
+def test_the_watchlist_applies_the_scan_gate(monkeypatch):
+    cl = _cluster(ips=[_ip("10.1.2.3", "active"), _ip("8.8.8.8", "active"),
+                       _ip("185.220.101.47", "active")])
+    monkeypatch.setattr(core, "list_clusters", lambda: ["c"])
+    monkeypatch.setattr(core, "load_cluster", lambda n: cl)
+    monkeypatch.setattr(watchlist.cdn, "available", lambda: False)
+    assert [t["value"] for t in watchlist.build()] == ["185.220.101.47"]
+
+
 def test_tiers_follow_lifecycle(monkeypatch):
+    _gate_open(monkeypatch)
     cl = _cluster(ips=[
         _ip("203.0.113.1", "active", since=_iso(NOW - timedelta(days=60))),   # full
         _ip("203.0.113.2", "active", since=_iso(NOW - timedelta(days=2))),    # hot (moved)
@@ -55,6 +71,7 @@ def test_tiers_follow_lifecycle(monkeypatch):
 
 
 def test_cdn_ips_are_dropped(monkeypatch):
+    _gate_open(monkeypatch)
     cl = _cluster(ips=[_ip("1.1.1.1", "active")])
     monkeypatch.setattr(core, "list_clusters", lambda: ["c"])
     monkeypatch.setattr(core, "load_cluster", lambda n: cl)
@@ -64,6 +81,7 @@ def test_cdn_ips_are_dropped(monkeypatch):
 
 
 def test_strongest_tier_and_port_union_win(monkeypatch):
+    _gate_open(monkeypatch)
     a = _cluster(ips=[_ip("203.0.113.9", "dormant", ports=[443])])          # hot
     b = _cluster(ips=[_ip("203.0.113.9", "active",
                           since=_iso(NOW - timedelta(days=90)), ports=[8443])])  # full
@@ -77,6 +95,7 @@ def test_strongest_tier_and_port_union_win(monkeypatch):
 
 
 def test_scored_candidates_join_the_hot_tier_above_the_floor(monkeypatch):
+    _gate_open(monkeypatch)
     cl = _cluster(ips=[_ip("203.0.113.1", "active", since=_iso(NOW - timedelta(days=60)))])
     monkeypatch.setattr(core, "list_clusters", lambda: ["apt-w"])
     monkeypatch.setattr(core, "load_cluster", lambda n: cl)
@@ -252,7 +271,7 @@ def test_ingest_joins_passive_zeek_fingerprints(monkeypatch):
     with store.connect(read_only=True) as con:
         sels = {t for (t,) in con.execute(
             "SELECT selector_type FROM selectors WHERE source='netwatch'").fetchall()}
-    assert "tls.ja4s" in sels
+    assert {"tls.ja4s", "tls.ja4ts"} <= sels
 
 
 # --------------------------------------------------------------------------- #
@@ -324,14 +343,11 @@ def test_a_later_ports_certificate_is_not_lost_behind_an_earlier_ja4s():
     assert result["tls"]["cert_sha256"] == "c" * 64 and result["tls"]["ja4s"] == "t1"
 
 
-def test_the_helper_no_longer_runs_jarm(probe_helper, monkeypatch):
+def test_the_fingerprint_queues_actions_are_gone(probe_helper):
+    """Retired 2026-10-17: JARM comes from netwatch's httpx -jarm and the
+    server fingerprints from netwatch's pinned tlsx session. The pre-check
+    and handshake helpers stay - the netwatch worker uses them."""
     ph = probe_helper
+    assert "jarm_probe" not in ph._ACTIONS and "tls_handshake" not in ph._ACTIONS
     assert not hasattr(ph, "run_jarm") and not hasattr(ph, "JARM_CMD")
-    monkeypatch.setattr(ph, "resolve_target_ip", lambda t: "203.0.113.30")
-    monkeypatch.setattr(ph, "tcp_precheck", lambda ip, port: True)
-    shook = []
-    monkeypatch.setattr(ph, "run_tls_handshake", lambda t, ip, port: shook.append((t, ip, port)))
-    assert ph.action_tls_handshake({"target": "x.example", "port": 8443}) == {
-        "resolved_ip": "203.0.113.30", "error": None}
-    legacy = ph.action_jarm_probe({"target": "x.example", "port": 8443})
-    assert legacy["jarm"] is None and shook == [("x.example", "203.0.113.30", 8443)] * 2
+    assert callable(ph.tcp_precheck) and callable(ph.run_tls_handshake)

@@ -214,8 +214,9 @@ def _observe_result(records: list[dict[str, Any]], passive_by_port: dict[int, di
         # active TLS grab produced a certificate - it was only ever attached
         # beside one, so while tlsx failed no JA4S became a selector at all.
         passive = passive_by_port.get(rec.get("port"), {})
-        if passive.get("ja4s") and "ja4s" not in tls:
-            tls["ja4s"] = passive["ja4s"]
+        for field in ("ja4s", "ja4ts", "ja4x"):
+            if passive.get(field) and field not in tls:
+                tls[field] = passive[field]
     return {"http": http, "tls": tls, "dns": {}, "whois": {},
             "cdn": {}, "ports": open_ports or None, "errors": {}}
 
