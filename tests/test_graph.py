@@ -264,3 +264,36 @@ def test_a_quiet_hosts_only_day_stays_quiet():
     """Hosts going dormant is routine; it must not wake Stage B on its own."""
     from cti.tracking import digest
     assert not digest._has_signals({"lifecycle": {"dormant": [{"cluster": "k", "value": "v"}]}})
+
+
+# --------------------------------------------------------------------------- #
+# A specialist that runs out of turns still answers (2026-10-17)
+# --------------------------------------------------------------------------- #
+
+def test_a_specialist_out_of_turns_answers_without_tools(monkeypatch):
+    import asyncio
+
+    from graph import sdk
+    from graph.nodes import analyze
+    from graph.state import Item
+
+    calls = []
+
+    async def fake_run_turn(**kw):
+        calls.append(kw)
+        if kw["allowed_tools"]:
+            return sdk.TurnResult(text="", error="ResultError: Claude Code returned an error "
+                                                 "result: Reached maximum number of turns (6)")
+        return sdk.TurnResult(text='[{"headline": "cert rotated", "detail": "d", '
+                                   '"indicators": ["x.example"], "confidence": "low"}]')
+
+    monkeypatch.setattr(analyze, "run_turn", fake_run_turn)
+    monkeypatch.setattr(analyze, "load_prompt", lambda family: "prompt")
+    node = analyze.make_specialist("cert_tls")
+    item = Item(family="cert_tls", attribute="cert_hash", actor="A", indicator="x.example",
+                change_type="cert_new", confidence="medium", detected_at=None,
+                old_value=None, new_value=None)
+    out = asyncio.run(node({"day": "2026-10-17", "ranked": {"cert_tls": [item]}}))
+    assert [f.headline for f in out["findings"]] == ["cert rotated"]
+    assert "6-turn limit" in out["errors"][0]
+    assert calls[1]["allowed_tools"] == [] and calls[1]["max_turns"] == 1

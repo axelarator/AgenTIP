@@ -61,10 +61,33 @@ def _parse_ts(value: Any) -> datetime:
     return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
 
 
+# Which of our clients' sessions the server-side fingerprints are read from.
+# A server answers each client hello differently - measured 2026-10-17, 74 of
+# 130 servers gave httpx and tlsx different JA4S, while every client got a
+# stable answer of its own - so a JA4S only means something per client.
+# Pinned to tlsx: the dedicated TLS client, used by both the sweep and
+# netwatch, stable on all 88 servers it reached. The value is the cipher-hash
+# part of tlsx's own JA4 (the middle field), which holds across SNI/no-SNI.
+DEFAULT_JA4S_CLIENT_HASH = "e8f1e7e78f70"
+
+
+def ja4s_client_hash() -> str:
+    return os.environ.get("CTI_JA4S_CLIENT_HASH", DEFAULT_JA4S_CLIENT_HASH)
+
+
+def _pinned_client(ja4: str | None) -> bool:
+    parts = (ja4 or "").split("_")
+    return len(parts) == 3 and parts[1] == ja4s_client_hash()
+
+
 def _passive_fingerprints(client: OpenSearchClient | None, vantage: str,
                           ip: str, port: int, scan_epoch: float) -> dict[str, Any]:
-    """ja4s (ssl.log) and ja4ts/ja4l (conn.log) for the session our probe
-    opened to ip:port around scan time. Unreachable Zeek is a skip."""
+    """ja4s/ja4x (ssl.log) and ja4ts/ja4l (conn.log) for the pinned client's
+    session to ip:port around scan time. Unreachable Zeek is a skip.
+
+    The TCP fingerprints come from the same session (joined on Zeek's uid):
+    a server's SYN-ACK also depends on the client's SYN.
+    """
     probe_ip = _VANTAGE_IP.get(vantage)
     if client is None or not probe_ip or not ip:
         return {}
@@ -75,19 +98,26 @@ def _passive_fingerprints(client: OpenSearchClient | None, vantage: str,
             client.ts_range(gte=scan_epoch - _JOIN_LOOKBACK,
                             lt=scan_epoch + _JOIN_LOOKAHEAD)]
     try:
-        for hit in client.sources({"bool": {"filter": base}}, size=50):
-            lf = hit.get("log_file", "")
-            if lf.endswith("ssl.log"):
-                if hit.get("ja4s") and not out.get("ja4s"):
-                    out["ja4s"] = hit["ja4s"]
-                if hit.get("ja4x") and not out.get("ja4x"):
-                    out["ja4x"] = hit["ja4x"]
-            elif lf.endswith("conn.log"):
-                for f in ("ja4ts", "ja4l"):
-                    if hit.get(f) and not out.get(f):
-                        out[f] = hit[f]
+        hits = client.sources({"bool": {"filter": base}}, size=200)
     except OpenSearchError as e:
         log.warning("passive join unavailable: %s", e)
+        return out
+    ssl = [h for h in hits if h.get("log_file", "").endswith("ssl.log")]
+    pinned = [h for h in ssl if _pinned_client(h.get("ja4"))]
+    if ssl and not pinned:
+        log.warning("no session from the pinned TLS client (JA4 cipher hash %s) to %s:%s "
+                    "among %d - if tlsx was upgraded, set CTI_JA4S_CLIENT_HASH",
+                    ja4s_client_hash(), ip, port, len(ssl))
+    for hit in pinned:
+        for f in ("ja4s", "ja4x"):
+            if hit.get(f) and not out.get(f):
+                out[f] = hit[f]
+    uids = {h.get("uid") for h in pinned if h.get("uid")}
+    for hit in hits:
+        if hit.get("log_file", "").endswith("conn.log") and hit.get("uid") in uids:
+            for f in ("ja4ts", "ja4l"):
+                if hit.get(f) and not out.get(f):
+                    out[f] = hit[f]
     return out
 
 

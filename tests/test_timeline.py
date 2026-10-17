@@ -91,6 +91,23 @@ def test_a_fingerprint_that_changed_on_a_tracked_host(con):
     assert change["memberships"] == ["jadeprox:seed"]
 
 
+def test_two_tools_disagreeing_is_not_a_change(con):
+    """2026-10-17: Zeek's JA4S differs by which scanner opened the session,
+    and the old Windows JARM tool and httpx's JARM disagree."""
+    add(con, "c2.example", "tls.ja4s", "t130200_1301_aaa", NOW - timedelta(days=10), source="observe")
+    add(con, "c2.example", "tls.ja4s", "t130200_1303_aaa", NOW - timedelta(hours=3), source="netwatch")
+    add(con, "c2.example", "tls.jarm", "1" * 62, NOW - timedelta(days=10), source="migration:jarm", vantage="win116")
+    add(con, "c2.example", "tls.jarm", "3" * 62, NOW - timedelta(hours=3), source="netwatch", vantage="probe")
+    assert T.value_changes(con, since=SINCE, until=NOW) == []
+
+
+def test_a_host_alternating_between_two_values_is_not_a_change(con):
+    add(con, "c2.example", "tls.serial", "aa", NOW - timedelta(days=10))
+    add(con, "c2.example", "tls.serial", "bb", NOW - timedelta(days=5))
+    add(con, "c2.example", "tls.serial", "aa", NOW - timedelta(hours=3))
+    assert T.value_changes(con, since=SINCE, until=NOW) == []
+
+
 def test_a_first_sighting_is_not_a_change(con):
     add(con, "c2.example", "tls.jarm", "1" * 62, NOW - timedelta(hours=3))
     assert T.value_changes(con, since=SINCE, until=NOW) == []

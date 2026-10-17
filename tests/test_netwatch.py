@@ -224,9 +224,17 @@ class _FakeZeek:
     def ts_range(self, **kw):
         return self._real.ts_range(**kw)
     def sources(self, query, size=50):
+        # Two clients to the same port: the server answers each differently.
+        # Only the pinned client's (tlsx's) session, and its own conn row,
+        # may supply the fingerprints.
         return [
-            {"log_file": "/opt/zeek/logs/current/ssl.log", "ja4s": "t1204h2_c030_abc"},
-            {"log_file": "/opt/zeek/logs/current/conn.log",
+            {"log_file": "/opt/zeek/logs/current/ssl.log", "uid": "C-httpx",
+             "ja4": "t13d251100_b78ed14e2fd0_f50d94e863eb", "ja4s": "t130200_1303_xxx"},
+            {"log_file": "/opt/zeek/logs/current/ssl.log", "uid": "C-tlsx",
+             "ja4": "t13d311100_e8f1e7e78f70_d41ae481755e", "ja4s": "t1204h2_c030_abc"},
+            {"log_file": "/opt/zeek/logs/current/conn.log", "uid": "C-httpx",
+             "ja4ts": "29200_2-4-8-1-3_1424_7", "ja4l": "1_1"},
+            {"log_file": "/opt/zeek/logs/current/conn.log", "uid": "C-tlsx",
              "ja4ts": "65535_2-1-3_1440_8", "ja4l": "108_128_756"}]
 
 

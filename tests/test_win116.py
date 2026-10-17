@@ -92,13 +92,41 @@ def test_the_same_answer_does_not_diverge():
 
 def test_payload_gating_is_named_by_what_diverged():
     base = {"status": 404, "title": "Not Found", "cert": "d" * 64, "final_url": None}
-    assert W.divergence(base, _seen(), "x.example") == "cert,status:404>200,title"
+    assert W.divergence(base, _seen(), "x.example") == "cert,status:404>200"
 
 
-def test_a_redirect_only_the_windows_client_gets():
-    base = {"status": 200, "title": None, "cert": None, "final_url": "https://x.example/"}
-    seen = _seen(title=None, cert=None, final="https://cdn.payload.example/setup.msi")
-    assert W.divergence(base, seen, "x.example") == "redirect"
+def test_two_served_pages_with_different_titles_diverge():
+    base = {"status": 200, "title": "Parked", "cert": None, "final_url": None}
+    assert W.divergence(base, _seen(title="Invoice viewer", cert=None), "x.example") == "title"
+
+
+def test_a_redirect_only_the_windows_client_gets_is_a_status_class():
+    base = {"status": 200, "title": "Home", "cert": None, "final_url": None}
+    assert W.divergence(base, _seen(status=302, title=None, cert=None),
+                        "x.example") == "status:200>302"
+
+
+def test_an_entity_encoded_or_truncated_title_is_the_same_title():
+    """2026-10-17: the runner's raw '&#8211;' and its 200-character cut read
+    as a different title from httpx's decoded, full one."""
+    long = "Comunidades Parentais – " + "x" * 400
+    base = {"status": 200, "title": long, "cert": None, "final_url": None}
+    raw = "Comunidades Parentais &#8211; " + "x" * 170   # 200 raw chars, shorter decoded
+    seen = win_proxy.shape({"target": "x", "url": "https://x/", "status": 200, "title": raw})
+    assert seen["http"]["title"].startswith("Comunidades Parentais –")
+    assert W.divergence(base, seen, "x.example") is None
+
+
+def test_a_short_different_title_is_still_different():
+    base = {"status": 200, "title": "Login", "cert": None, "final_url": None}
+    assert W.divergence(base, _seen(title="Log", cert=None), "x.example") == "title"
+
+
+def test_the_same_redirect_on_both_sides_is_not_divergence():
+    """2026-10-17: .NET followed redirects and httpx did not, so every
+    http->https 301 read as status:301>200 plus a title change."""
+    base = {"status": 301, "title": "301 Moved Permanently", "cert": None, "final_url": None}
+    assert W.divergence(base, _seen(status=301, title="Moved", cert=None), "x.example") is None
 
 
 def test_a_tls_session_only_the_scanner_could_open():
@@ -177,7 +205,7 @@ def test_a_run_records_snapshots_selectors_and_divergence(configured, monkeypatc
     report = W.run(targets=[_target("gate.example")], now=NOW)
     assert report["answered"] == 1
     assert report["divergent"] == [{"target": "gate.example", "port": 443,
-                                    "diverged": "status:404>200,title"}]
+                                    "diverged": "status:404>200"}]
     with store.connect(read_only=True) as con:
         snaps = con.execute("SELECT port, open FROM service_snapshots WHERE vantage = 'win116' "
                             "ORDER BY port").fetchall()

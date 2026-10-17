@@ -22,6 +22,7 @@ this file, which is public:
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import subprocess
@@ -89,9 +90,13 @@ def shape(raw: dict[str, Any]) -> dict[str, Any]:
     subject = _canonical_subject(cert.get("subject_dn"))
     http = {}
     if raw.get("status") is not None:
-        http = {"status": raw["status"], "title": raw.get("title"),
+        # The runner returns the raw <title>; httpx decodes entities, so the
+        # same page read as "&#8211;" here and "–" there - a false divergence.
+        title = html.unescape(raw["title"]) if raw.get("title") else raw.get("title")
+        http = {"status": raw["status"], "title": title,
                 "server": raw.get("server"), "body_sha256": raw.get("body_sha256"),
-                "headers": raw.get("headers") or {}, "final_url": raw.get("final_url")}
+                "headers": raw.get("headers") or {}, "final_url": raw.get("final_url"),
+                "location": raw.get("location")}
     tls = {}
     if cert.get("sha256"):
         tls = {"cert_sha256": cert["sha256"], "subject_dn": subject,
