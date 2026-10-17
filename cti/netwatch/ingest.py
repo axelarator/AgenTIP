@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import store
+from ..sources import ja4x as ja4x_mod
 from ..sources import observe as observe_source
 from ..sources.opensearch import OpenSearchClient, OpenSearchError
 from .jobs import spool_dir
@@ -141,9 +142,16 @@ def _intercepted(rec: dict[str, Any]) -> bool:
 
 
 def _flatten(rec: dict[str, Any], passive: dict[str, Any]) -> dict[str, Any]:
-    """A scan record (+ passive fingerprints) -> a service_snapshots row."""
+    """A scan record (+ passive fingerprints) -> a service_snapshots row.
+
+    JA4X is computed here from the certificate's PEM, which is then dropped
+    from the stored record: it is ~2 KB per port per scan, and the digest it
+    yields (with cert_sha256 beside it) is what anything reads back."""
     http = rec.get("http") or {}
     tls = rec.get("tls") or {}
+    ja4x = passive.get("ja4x") or ja4x_mod.for_tls(tls)
+    if tls.get("pem"):
+        rec = {**rec, "tls": {k: v for k, v in tls.items() if k != "pem"}}
     return {
         "scan_id": rec["scan_id"], "scanned_at": _parse_ts(rec.get("ts")),
         "vantage": rec.get("vantage") or "probe", "profile": rec.get("profile"),
@@ -153,7 +161,7 @@ def _flatten(rec: dict[str, Any], passive: dict[str, Any]) -> dict[str, Any]:
         "cert_sha256": tls.get("cert_sha256"), "spki_sha256": tls.get("spki_sha256"),
         "tls_issuer": tls.get("issuer"), "ja3s": tls.get("ja3s"),
         "ja4s": passive.get("ja4s"), "ja4ts": passive.get("ja4ts"),
-        "ja4x": passive.get("ja4x"),
+        "ja4x": ja4x,
         "jarm": http.get("jarm"), "http_status": http.get("status"),
         "http_title": http.get("title"), "http_server": http.get("server"),
         "header_order": observe_source.header_order(http.get("raw_header")),

@@ -15,6 +15,7 @@ from typing import Any, Iterator
 from ..store import cdn as cdn_ranges
 from ..store import psl
 from ..store.selectors import TYPES
+from . import ja4x as ja4x_mod
 
 # Above this many SANs a certificate belongs to a hosting provider rather
 # than an operator. See the gate in selectors_from for the measurement.
@@ -291,8 +292,9 @@ def selectors_from(result: dict[str, Any], *, target: str,
     # turned into selectors.
     if tls.get("ja4ts"):
         yield "tls.ja4ts", tls["ja4ts"]
-    if tls.get("ja4x"):
-        yield "tls.ja4x", tls["ja4x"]
+    ja4x = ja4x_mod.for_tls(tls)     # computed from the certificate
+    if ja4x:
+        yield "tls.ja4x", ja4x
     # Headers off a CDN edge are the edge's, the same reason the body hash
     # is suppressed there. A domain behind a CDN is skipped too, unlike the
     # body: the edge rewrites and reorders headers but passes the body.

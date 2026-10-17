@@ -42,6 +42,7 @@ from typing import Any
 
 from .. import membership, store
 from ..probe import win_proxy
+from ..sources import ja4x as ja4x_mod
 from ..sources import observe as observe_source
 from ..store import entities
 from . import watchlist
@@ -201,6 +202,9 @@ def run(*, targets: list[dict[str, Any]] | None = None,
             answered += is_open
             kind = "ip" if t["kind"] == "ip" else "domain"
             diverged = divergence(_baseline(con, t["value"], port, now), seen, t["value"])
+            ja4x = ja4x_mod.for_tls(tls)
+            stored = ({**seen, "tls": {k: v for k, v in tls.items() if k != "der_b64"}}
+                      if tls.get("der_b64") else seen)
             store.upsert_service_snapshot(con, row={
                 "scan_id": scan_id, "scanned_at": now, "vantage": win_proxy.VANTAGE,
                 "profile": "client", "target": t["value"], "ip": None, "port": port,
@@ -208,7 +212,7 @@ def run(*, targets: list[dict[str, Any]] | None = None,
                 "cert_sha256": tls.get("cert_sha256"), "tls_issuer": tls.get("issuer"),
                 "http_status": http.get("status"), "http_title": http.get("title"),
                 "http_server": http.get("server"), "body_sha256": http.get("body_sha256"),
-                "record": seen})
+                "ja4x": ja4x, "record": stored})
             if is_open:
                 selectors_written += len(store.selectors.record_many(
                     con, indicator_value=t["value"],

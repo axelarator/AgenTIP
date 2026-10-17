@@ -78,6 +78,8 @@ function Get-CertInfo($cert) {
         not_before = $cert.NotBefore.ToUniversalTime().ToString('o')
         not_after  = $cert.NotAfter.ToUniversalTime().ToString('o')
         sans       = $sans
+        # The certificate itself, for JA4X (computed on the cti host).
+        der_b64    = [Convert]::ToBase64String($cert.RawData)
     }
 }
 

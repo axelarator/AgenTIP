@@ -100,6 +100,7 @@ def shape(raw: dict[str, Any]) -> dict[str, Any]:
     tls = {}
     if cert.get("sha256"):
         tls = {"cert_sha256": cert["sha256"], "subject_dn": subject,
+               "der_b64": cert.get("der_b64"),   # for JA4X
                "issuer": _canonical_subject(cert.get("issuer")),
                "serial": cert.get("serial"), "sans": cert.get("sans") or [],
                "not_before": cert.get("not_before"), "not_after": cert.get("not_after")}

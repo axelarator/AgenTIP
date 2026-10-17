@@ -829,6 +829,8 @@ def _observe_tls(target: str, known_ports: list | None = None) -> tuple[dict, st
         "serial": r.get("serial"),
         "cert_sha256": fingerprint.get("sha256"),
         "spki_sha256": _spki_sha256(r.get("certificate")),
+        # The PEM itself: the cti host computes JA4X from it (Zeek cannot).
+        "pem": r.get("certificate"),
         "not_before": r.get("not_before"),
         "not_after": r.get("not_after"),
         "self_signed": _flag("self_signed"),
@@ -1146,6 +1148,7 @@ def _tlsx_by_port(target: str, ports: list[int]) -> dict[int, dict]:
             "subject_dn": r.get("subject_dn"), "sans": r.get("subject_an") or [],
             "serial": r.get("serial"), "cert_sha256": fingerprint.get("sha256"),
             "spki_sha256": _spki_sha256(r.get("certificate")),
+            "pem": r.get("certificate"),   # for JA4X, computed on the cti host
             "ja3s": r.get("ja3s_hash"), "tls_version": r.get("tls_version"),
             "self_signed": bool(r.get("self_signed")),
         }
