@@ -236,6 +236,12 @@ systemctl daemon-reload
 systemctl enable --now netwatch-worker.service >/dev/null 2>&1 \
   && echo "   netwatch-worker.service enabled" \
   || echo "   WARNING: could not enable netwatch-worker.service"
+# `enable --now` leaves an already-running worker on the OLD helper: the
+# worker imports probe_helper.py once at start. It used to crash every idle
+# cycle and so restart onto new code by accident; it no longer does.
+systemctl restart netwatch-worker.service \
+  && echo "   netwatch-worker.service restarted onto this helper" \
+  || echo "   WARNING: could not restart netwatch-worker.service"
 
 echo "== user $PROBE_USER"
 if ! id "$PROBE_USER" >/dev/null 2>&1; then

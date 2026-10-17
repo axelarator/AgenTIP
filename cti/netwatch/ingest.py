@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,36 @@ _VANTAGE_IP = {
 # Zeek -> Wazuh ingest lags capture; widen the window on both sides.
 _JOIN_LOOKBACK = 120.0
 _JOIN_LOOKAHEAD = 900.0
+
+
+def _wait_for_zeek(client, newest_epoch: float) -> bool:
+    """Wait until the SIEM has indexed past the scan's last record.
+
+    Ingest runs seconds after a scan, and tlsx's session - the one the
+    fingerprints are pinned to - is the last a scan opens, so it was often
+    not indexed yet and the join found nothing (2026-10-17). Bounded by
+    CTI_ZEEK_WAIT seconds (default 120); on timeout the join proceeds with
+    whatever is indexed. Returns whether the index caught up.
+    """
+    limit = float(os.environ.get("CTI_ZEEK_WAIT", "120"))
+    deadline = time.monotonic() + limit
+    while True:
+        try:
+            if client.current_max_ts() >= newest_epoch + _ZEEK_SETTLE:
+                return True
+        except OpenSearchError as e:
+            log.warning("could not read Zeek index freshness: %s", e)
+            return False
+        if time.monotonic() >= deadline:
+            log.warning("Zeek index not past %.0f after %.0fs; joining with what is indexed",
+                        newest_epoch, limit)
+            return False
+        time.sleep(5)
+
+
+# Past a scan's last record, how far the index must have reached: a session
+# the scan opened can still be in flight for a few seconds after it.
+_ZEEK_SETTLE = 30.0
 
 # (field on the snapshot) -> change_type when it differs from the baseline.
 _DIFF_FIELDS = {
@@ -106,7 +137,7 @@ def _passive_fingerprints(client: OpenSearchClient | None, vantage: str,
     ssl = [h for h in hits if h.get("log_file", "").endswith("ssl.log")]
     pinned = [h for h in ssl if _pinned_client(h.get("ja4"))]
     if ssl and not pinned:
-        log.warning("no session from the pinned TLS client (JA4 cipher hash %s) to %s:%s "
+        log.info("no session from the pinned TLS client (JA4 cipher hash %s) to %s:%s "
                     "among %d - if tlsx was upgraded, set CTI_JA4S_CLIENT_HASH",
                     ja4s_client_hash(), ip, port, len(ssl))
     for hit in pinned:
@@ -263,6 +294,10 @@ def ingest(*, client: Any = _UNSET, purge: bool = True) -> dict[str, Any]:
 
     snapshots = changes = selectors = 0
     with store.connect_retry(read_only=False) as con:
+        if client is not None and by_target:
+            newest = max(_parse_ts(r.get("ts")).replace(tzinfo=timezone.utc).timestamp()
+                         for recs in by_target.values() for r in recs)
+            _wait_for_zeek(client, newest)
         for (scan_id, target), records in by_target.items():
             # Before anything reads `open`: the snapshot, the diff and the
             # port-set selector must all see an intercepted port as closed.
