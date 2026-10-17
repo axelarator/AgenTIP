@@ -355,29 +355,48 @@ def test_the_fingerprint_queues_actions_are_gone(probe_helper):
     assert callable(ph.tcp_precheck) and callable(ph.run_tls_handshake)
 
 
-def test_ingest_waits_for_zeek_to_index_the_scan(monkeypatch):
-    """tlsx's session is the last a scan opens; joining before the SIEM has
-    indexed it found nothing (2026-10-17)."""
-    reads = []
+def test_ingest_retries_until_zeek_has_indexed_the_pinned_session(monkeypatch):
+    """tlsx's session is the last a scan opens; joining before the SIEM had
+    indexed it found nothing (2026-10-17). A port where tlsx returned a
+    certificate is retried until that session appears."""
+    calls = []
 
     class Lagging(_FakeZeek):
-        def current_max_ts(self):
-            reads.append(1)
-            return 0.0 if len(reads) < 3 else 9e12
+        def sources(self, query, size=50):
+            calls.append(1)
+            return [] if len(calls) < 3 else super().sources(query, size)
 
     monkeypatch.setattr(ingest.time, "sleep", lambda s: None)
     monkeypatch.setenv("CTI_PROBE_HOST", "10.99.0.74")
     _spool([_record("scanW", "203.0.113.50", 443, tls={"cert_sha256": "c" * 64})])
     ingest.ingest(client=Lagging())
-    assert len(reads) == 3
+    assert len(calls) == 3
+    with store.connect(read_only=True) as con:
+        assert con.execute("SELECT ja4s FROM service_snapshots WHERE target='203.0.113.50'"
+                           ).fetchone()[0] == "t1204h2_c030_abc"
+
+
+def test_a_plain_http_port_is_not_waited_for(monkeypatch):
+    calls = []
+
+    class Empty(_FakeZeek):
+        def sources(self, query, size=50):
+            calls.append(1)
+            return []
+
+    monkeypatch.setattr(ingest.time, "sleep", lambda s: (_ for _ in ()).throw(AssertionError("waited")))
+    monkeypatch.setenv("CTI_PROBE_HOST", "10.99.0.74")
+    _spool([_record("scanH", "203.0.113.52", 80, http={"status": 200})])
+    ingest.ingest(client=Empty())
+    assert calls == [1]
 
 
 def test_ingest_gives_up_waiting_and_still_ingests(monkeypatch):
-    class Stuck(_FakeZeek):
-        def current_max_ts(self):
-            return 0.0
+    class Never(_FakeZeek):
+        def sources(self, query, size=50):
+            return []
 
     monkeypatch.setenv("CTI_ZEEK_WAIT", "0")
     monkeypatch.setenv("CTI_PROBE_HOST", "10.99.0.74")
     _spool([_record("scanV", "203.0.113.51", 443, tls={"cert_sha256": "c" * 64})])
-    assert ingest.ingest(client=Stuck())["snapshots"] == 1
+    assert ingest.ingest(client=Never())["snapshots"] == 1

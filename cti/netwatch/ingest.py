@@ -44,34 +44,45 @@ _JOIN_LOOKBACK = 120.0
 _JOIN_LOOKAHEAD = 900.0
 
 
-def _wait_for_zeek(client, newest_epoch: float) -> bool:
-    """Wait until the SIEM has indexed past the scan's last record.
+def _join_all(client, by_target: dict) -> dict[tuple, dict[int, dict]]:
+    """The passive fingerprints for every open (scan, target, port), retrying
+    the ones Zeek should have but has not indexed yet.
 
     Ingest runs seconds after a scan, and tlsx's session - the one the
     fingerprints are pinned to - is the last a scan opens, so it was often
-    not indexed yet and the join found nothing (2026-10-17). Bounded by
-    CTI_ZEEK_WAIT seconds (default 120); on timeout the join proceeds with
-    whatever is indexed. Returns whether the index caught up.
+    not indexed yet (2026-10-17). A port where tlsx returned a certificate
+    must have that session, so only those are retried: every 10 seconds,
+    for at most CTI_ZEEK_WAIT seconds (default 120). Waiting on the index's
+    overall freshness instead failed in a quiet lab, where nothing newer
+    than the scan itself ever arrives.
     """
-    limit = float(os.environ.get("CTI_ZEEK_WAIT", "120"))
-    deadline = time.monotonic() + limit
-    while True:
-        try:
-            if client.current_max_ts() >= newest_epoch + _ZEEK_SETTLE:
-                return True
-        except OpenSearchError as e:
-            log.warning("could not read Zeek index freshness: %s", e)
-            return False
-        if time.monotonic() >= deadline:
-            log.warning("Zeek index not past %.0f after %.0fs; joining with what is indexed",
-                        newest_epoch, limit)
-            return False
-        time.sleep(5)
-
-
-# Past a scan's last record, how far the index must have reached: a session
-# the scan opened can still be in flight for a few seconds after it.
-_ZEEK_SETTLE = 30.0
+    out: dict[tuple, dict[int, dict]] = {}
+    pending: list[tuple] = []
+    for key, records in by_target.items():
+        out[key] = {}
+        for rec in records:
+            if not rec.get("open") or not rec.get("ip"):
+                continue
+            args = (client, rec.get("vantage") or "probe", rec["ip"], rec["port"],
+                    _parse_ts(rec.get("ts")).replace(tzinfo=timezone.utc).timestamp())
+            out[key][rec["port"]] = _passive_fingerprints(*args)
+            if rec.get("tls") and not out[key][rec["port"]].get("ja4s"):
+                pending.append((key, rec["port"], args))
+    deadline = time.monotonic() + float(os.environ.get("CTI_ZEEK_WAIT", "120"))
+    while pending and time.monotonic() < deadline:
+        time.sleep(10)
+        still = []
+        for key, port, args in pending:
+            found = _passive_fingerprints(*args)
+            if found.get("ja4s"):
+                out[key][port] = found
+            else:
+                still.append((key, port, args))
+        pending = still
+    if pending:
+        log.warning("Zeek had no pinned session for %d TLS port(s) after the wait: %s",
+                    len(pending), ", ".join(f"{k[1]}:{p}" for k, p, _ in pending[:5]))
+    return out
 
 # (field on the snapshot) -> change_type when it differs from the baseline.
 _DIFF_FIELDS = {
@@ -294,23 +305,13 @@ def ingest(*, client: Any = _UNSET, purge: bool = True) -> dict[str, Any]:
 
     snapshots = changes = selectors = 0
     with store.connect_retry(read_only=False) as con:
-        if client is not None and by_target:
-            newest = max(_parse_ts(r.get("ts")).replace(tzinfo=timezone.utc).timestamp()
-                         for recs in by_target.values() for r in recs)
-            _wait_for_zeek(client, newest)
+        # Before anything reads `open`: the join, the snapshot, the diff and
+        # the port-set selector must all see an intercepted port as closed.
+        by_target = {key: [{**r, "open": False, "intercepted": True} if _intercepted(r) else r
+                           for r in records] for key, records in by_target.items()}
+        joined = _join_all(client, by_target) if client is not None else {}
         for (scan_id, target), records in by_target.items():
-            # Before anything reads `open`: the snapshot, the diff and the
-            # port-set selector must all see an intercepted port as closed.
-            records = [{**r, "open": False, "intercepted": True} if _intercepted(r) else r
-                       for r in records]
-            passive_by_port: dict[int, dict] = {}
-            for rec in records:
-                if not rec.get("open") or not rec.get("ip"):
-                    continue
-                passive_by_port[rec["port"]] = _passive_fingerprints(
-                    client, rec.get("vantage") or "probe", rec["ip"],
-                    rec["port"], _parse_ts(rec.get("ts")).replace(
-                        tzinfo=timezone.utc).timestamp())
+            passive_by_port = joined.get((scan_id, target), {})
             actor = next((r.get("actor") for r in records if r.get("actor")), None)
             kind = "ip" if records and records[0].get("ip") == target else "domain"
             observed_at = _parse_ts(records[0].get("ts"))
