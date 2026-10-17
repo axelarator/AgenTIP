@@ -67,12 +67,10 @@ if ! command -v dirsearch >/dev/null; then
   PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install dirsearch
 fi
 
-echo "== jarm (salesforce/jarm -> /opt/jarm, probe_helper.JARM_CMD)"
-if [[ -d /opt/jarm/.git ]]; then
-  git -C /opt/jarm pull -q --ff-only || echo "   (jarm update skipped)"
-else
-  git clone -q https://github.com/salesforce/jarm /opt/jarm
-fi
+# salesforce/jarm (/opt/jarm) is no longer installed: since 2026-10-17 JARM
+# comes from httpx -jarm in every netwatch scan, which gave the same value
+# on every host both measured at the same time. An existing /opt/jarm is
+# left alone and unused; remove it by hand if you like.
 
 echo "== cti-provision (the bounded provisioning command)"
 # A SECOND key, pinned to its own forced command, lets the tooling install

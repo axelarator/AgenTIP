@@ -104,16 +104,31 @@ def test_resolve_dns_inconclusive_error(monkeypatch):
     assert vm_proxy.resolve_dns("nope.invalid") is None
 
 
-def test_probe_jarm_sends_jarm_probe_action(monkeypatch):
-    captured = {}
+def test_tls_handshake_sends_the_handshake_action(monkeypatch):
+    captured = []
 
     def fake_rpc(request):
-        captured.update(request)
+        captured.append(request)
+        return {"resolved_ip": "1.2.3.4", "error": None}
+    monkeypatch.setattr(vm_proxy, "_ssh_json_rpc", fake_rpc)
+    result = vm_proxy.tls_handshake("example.com", 443)
+    assert captured == [{"action": "tls_handshake", "target": "example.com", "port": 443}]
+    assert result == {"resolved_ip": "1.2.3.4", "error": None}
+
+
+def test_an_old_helper_is_asked_for_jarm_probe_and_its_jarm_dropped(monkeypatch):
+    """A helper deployed before JARM was retired has no tls_handshake."""
+    actions = []
+
+    def fake_rpc(request):
+        actions.append(request["action"])
+        if request["action"] == "tls_handshake":
+            return {"error": "unknown action: 'tls_handshake'"}
         return {"jarm": "abc", "resolved_ip": "1.2.3.4", "error": None}
     monkeypatch.setattr(vm_proxy, "_ssh_json_rpc", fake_rpc)
-    result = vm_proxy.probe_jarm("example.com", 443)
-    assert captured == {"action": "jarm_probe", "target": "example.com", "port": 443}
-    assert result["jarm"] == "abc"
+    result = vm_proxy.tls_handshake("example.com", 443)
+    assert actions == ["tls_handshake", "jarm_probe"]
+    assert "jarm" not in result and result["resolved_ip"] == "1.2.3.4"
 
 
 def test_ssh_json_rpc_uses_default_timeout(monkeypatch):

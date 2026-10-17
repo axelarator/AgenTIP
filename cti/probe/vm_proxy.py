@@ -31,8 +31,9 @@ Protocol: one JSON object on stdin, one JSON object on stdout, handled
 by probe_helper.py on the VM (see that module for the full request/
 response shapes per action). Actions:
 
-- "jarm_probe" (default, back-compat with requests that omit "action"):
-  active TLS/JARM fingerprinting - see probe_jarm().
+- "tls_handshake": one ordinary TLS handshake for Zeek to fingerprint -
+  see tls_handshake(). ("jarm_probe", the original default action, is now
+  a deprecated alias that no longer runs JARM.)
 - "http_fetch": fetch a URL from the VM, return status/body - what
   pivot.py's RDAP/RIPEstat/ThreatFox lookups run through instead of
   calling urllib directly from this host. Accepts an optional "data"
@@ -213,8 +214,17 @@ def _ssh_json_rpc(request: dict[str, object], timeout: int | None = None) -> dic
         raise VMProxyError(f"non-JSON response from {PROBE_HOST!r}: {proc.stdout!r}") from e
 
 
-def probe_jarm(target: str, port: int) -> dict[str, object]:
-    return _ssh_json_rpc({"action": "jarm_probe", "target": target, "port": port})
+def tls_handshake(target: str, port: int) -> dict[str, object]:
+    """One ordinary TLS handshake from the probe, for Zeek to fingerprint.
+
+    A helper deployed before 2026-10-17 has no `tls_handshake` action; it is
+    asked for `jarm_probe` instead, whose JARM result is dropped here - JARM
+    now comes from netwatch's httpx -jarm."""
+    result = _ssh_json_rpc({"action": "tls_handshake", "target": target, "port": port})
+    if str(result.get("error") or "").startswith("unknown action"):
+        result = _ssh_json_rpc({"action": "jarm_probe", "target": target, "port": port})
+        result.pop("jarm", None)
+    return result
 
 
 

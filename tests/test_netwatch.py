@@ -322,3 +322,16 @@ def test_a_later_ports_certificate_is_not_lost_behind_an_earlier_ja4s():
         [_record("s", "x", 80, http={"status": 301}),
          _record("s", "x", 443, tls={"cert_sha256": "c" * 64})], passive)
     assert result["tls"]["cert_sha256"] == "c" * 64 and result["tls"]["ja4s"] == "t1"
+
+
+def test_the_helper_no_longer_runs_jarm(probe_helper, monkeypatch):
+    ph = probe_helper
+    assert not hasattr(ph, "run_jarm") and not hasattr(ph, "JARM_CMD")
+    monkeypatch.setattr(ph, "resolve_target_ip", lambda t: "203.0.113.30")
+    monkeypatch.setattr(ph, "tcp_precheck", lambda ip, port: True)
+    shook = []
+    monkeypatch.setattr(ph, "run_tls_handshake", lambda t, ip, port: shook.append((t, ip, port)))
+    assert ph.action_tls_handshake({"target": "x.example", "port": 8443}) == {
+        "resolved_ip": "203.0.113.30", "error": None}
+    legacy = ph.action_jarm_probe({"target": "x.example", "port": 8443})
+    assert legacy["jarm"] is None and shook == [("x.example", "203.0.113.30", 8443)] * 2

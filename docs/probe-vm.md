@@ -267,11 +267,13 @@ call does it with one fewer moving part.
   file's presence on disk.
 - `probe_helper.py` runs on the Linux probe VM (needs nothing from this
   repo — standalone, standard library plus `certifi`, shelling out to
-  `dig`/`openssl`/`nmap`/`subfinder`/`dirsearch`/Salesforce `jarm` for
+  `dig`/`openssl`/`nmap`/`subfinder`/`dirsearch` for
   the actions that need them; it also serves the pivot sources' and the
   enrichment sweep's `http_fetch`/`resolve_dns`/`http_probe`/
-  etc. — see its module docstring). For a `jarm_probe` job (one
-  target/port pair — see below) it:
+  etc. — see its module docstring). For a `tls_handshake` job (one
+  target/port pair — see below; formerly `jarm_probe`, which also ran
+  Salesforce `jarm` until JARM moved to netwatch's httpx `-jarm` on
+  2026-10-17) it:
   resolves the target to an IP once (Zeek's logs only ever key on the
   resolved address, never a hostname string) and reuses that same IP for
   the handshake rather than letting the connection call re-resolve it —
@@ -280,8 +282,7 @@ call does it with one fewer moving part.
   first, silently pointing the OpenSearch query at an address nothing
   was ever sent to. Then, if `tcp_precheck()` (a bare TCP connect test
   against the resolved IP and requested port, a few seconds' timeout)
-  finds something actually listening, it runs a JARM scan (the one value
-  nothing passive produces) and fires one ordinary TLS handshake — via
+  finds something actually listening, it fires one ordinary TLS handshake — via
   Python's own `ssl`/`socket` modules rather than shelling out to
   `openssl`, so nothing extra needs installing — purely to give the
   target something real to respond to. The handshake's own result is

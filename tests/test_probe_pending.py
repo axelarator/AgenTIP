@@ -44,13 +44,13 @@ def test_a_probe_goes_through_vm_proxy(script, monkeypatch):
     call; the swallowed exception turned it into "probe failed" for every
     target."""
     calls = []
-    monkeypatch.setattr(vm_proxy, "probe_jarm",
+    monkeypatch.setattr(vm_proxy, "tls_handshake",
                         lambda target, port: calls.append((target, port)) or
-                        {"jarm": "j" * 62, "resolved_ip": "203.0.113.9"})
+                        {"resolved_ip": "203.0.113.9", "error": None})
     out = script._dispatch_one({"cluster": "C", "target": "x.example", "port": 443})
     assert calls == [("x.example", 443)]
     assert out["probe_error"] is None
-    assert out["probe_result"]["jarm"] == "j" * 62
+    assert out["probe_result"]["resolved_ip"] == "203.0.113.9"
 
 
 def test_no_bare_probe_call_remains_in_the_script():
@@ -59,7 +59,8 @@ def test_no_bare_probe_call_remains_in_the_script():
     import re
     src = SCRIPT.read_text()
     bare = [l for l in src.splitlines()
-            if re.search(r"(?<![\w.])probe_(?:win|jarm)\(", l) and not l.lstrip().startswith("#")]
+            if re.search(r"(?<![\w.])(?:probe_(?:win|jarm)|tls_handshake)\(", l)
+            and not l.lstrip().startswith("#") and "def " not in l]
     assert bare == []
 
 
@@ -75,7 +76,7 @@ def test_a_batch_where_every_probe_fails_puts_the_queue_back(script, monkeypatch
     def boom(target, port):
         raise RuntimeError("the helper is broken")
 
-    monkeypatch.setattr(vm_proxy, "probe_jarm", boom)
+    monkeypatch.setattr(vm_proxy, "tls_handshake", boom)
     with pytest.raises(SystemExit) as exc:
         script.main()
     assert "every one of 4 probes failed" in str(exc.value)
@@ -93,21 +94,36 @@ def test_a_partial_failure_is_left_alone(script, monkeypatch):
     filed = []
     monkeypatch.setattr(core, "add_observable", lambda *a, **k: filed.append(a))
 
+    probed = []
+
     def flaky(target, port):
+        probed.append(target)
         if target == "h0.example":
             raise RuntimeError("connection refused")
-        return {"jarm": "j" * 62, "resolved_ip": None}
+        return {"resolved_ip": None, "error": None}
 
-    monkeypatch.setattr(vm_proxy, "probe_jarm", flaky)
+    monkeypatch.setattr(vm_proxy, "tls_handshake", flaky)
     script.main()                                     # must not exit
     assert requeued == []
-    assert len(filed) == 3, "the three that worked were filed"
+    assert sorted(probed) == sorted(e["value"] for e in _QUEUE)
+
+
+def test_the_queue_never_files_a_jarm(script, monkeypatch):
+    """JARM was retired from the queue 2026-10-17; even an old helper that
+    still returns one must not have it filed."""
+    monkeypatch.setattr(core, "pop_pending_fingerprints", lambda: list(_QUEUE[:1]))
+    filed = []
+    monkeypatch.setattr(core, "add_observable", lambda *a, **k: filed.append(a))
+    monkeypatch.setattr(vm_proxy, "tls_handshake",
+                        lambda target, port: {"jarm": "j" * 62, "resolved_ip": None})
+    script.main()
+    assert not [f for f in filed if f[1] == "jarm"]
 
 
 def test_an_empty_queue_is_a_quiet_no_op(script, monkeypatch):
     monkeypatch.setattr(core, "pop_pending_fingerprints", lambda: [])
     called = []
-    monkeypatch.setattr(vm_proxy, "probe_jarm", lambda *a: called.append(a))
+    monkeypatch.setattr(vm_proxy, "tls_handshake", lambda *a: called.append(a))
     script.main()
     assert called == []
 

@@ -15,7 +15,9 @@ this VM rather than the analyst's own host.
 Actions (selected by the request's "action" field; "jarm_probe" is the
 default for back-compat with the original single-purpose helper):
 
-  jarm_probe   {target, port}                    -> {jarm, resolved_ip, error}
+  tls_handshake {target, port}                   -> {resolved_ip, error}
+  jarm_probe   deprecated alias of tls_handshake; jarm is always None (JARM
+               comes from netwatch's httpx -jarm since 2026-10-17)
   http_fetch   {url, method, headers, data,      -> {status, body, error}
                 insecure}
   resolve_dns  {host}                            -> {status, addrs}|{status:nxdomain}|{status:error,error}
@@ -59,7 +61,6 @@ except Exception:  # certifi optional; fall back to the system store
     _CA_FILE = None
 
 # --- adjust for your environment --------------------------------------------
-JARM_CMD = ["python3", "/opt/jarm/jarm.py"]      # salesforce/jarm CLI
 SUBFINDER_CMD = ["subfinder"]
 NMAP_CMD = ["nmap"]
 DIRSEARCH_CMD = ["dirsearch"]
@@ -72,7 +73,6 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 HTTP_TIMEOUT = 20
 TCP_PRECHECK_TIMEOUT = 3
-JARM_SUBPROCESS_TIMEOUT = 20
 HTTP_PROBE_MAX_BYTES = 512_000        # bounded body read for http_probe
 WAYBACK_TIMEOUT = 30
 NMAP_TIMEOUT = 600
@@ -112,7 +112,7 @@ def resolve_target_ip(target: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# jarm_probe (ported from win_probe_helper.py)
+# tls_handshake: the session the fingerprint queue reads back from Zeek
 # --------------------------------------------------------------------------- #
 def tcp_precheck(resolved_ip: str, port: int) -> bool:
     try:
@@ -120,15 +120,6 @@ def tcp_precheck(resolved_ip: str, port: int) -> bool:
             return True
     except OSError:
         return False
-
-
-def run_jarm(target: str, port: int) -> str | None:
-    proc = subprocess.run([*JARM_CMD, "-p", str(port), target],
-                          capture_output=True, text=True, timeout=JARM_SUBPROCESS_TIMEOUT)
-    line = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
-    if ":" not in line:
-        return None
-    return line.split(":", 1)[1].strip() or None
 
 
 def run_tls_handshake(target: str, resolved_ip: str, port: int) -> None:
@@ -145,31 +136,36 @@ def run_tls_handshake(target: str, resolved_ip: str, port: int) -> None:
             pass
 
 
-def action_jarm_probe(request: dict) -> dict:
+def action_tls_handshake(request: dict) -> dict:
+    """One ordinary TLS handshake to target:port, for Zeek to fingerprint.
+
+    This is what the fingerprint queue needs from the probe. It used to run
+    salesforce/jarm.py first; that was retired 2026-10-17 because httpx's
+    own -jarm, which every netwatch scan already runs, gave the same value
+    on every host both had measured at the same time.
+    """
     target = request["target"]
     port = int(request.get("port") or 443)
-    response: dict[str, object] = {"jarm": None, "resolved_ip": None, "error": None}
     try:
         resolved_ip = resolve_target_ip(target)
-        response["resolved_ip"] = resolved_ip
     except Exception as e:
-        return {"jarm": None, "resolved_ip": None,
-                "error": f"DNS resolution failed for {target!r}: {e}"}
+        return {"resolved_ip": None, "error": f"DNS resolution failed for {target!r}: {e}"}
+    response: dict[str, object] = {"resolved_ip": resolved_ip, "error": None}
     if not tcp_precheck(resolved_ip, port):
         response["error"] = (f"port {port} on {resolved_ip} refused/unreachable during a "
                              f"{TCP_PRECHECK_TIMEOUT}s TCP pre-check")
         return response
     try:
-        response["jarm"] = run_jarm(target, port)
-    except Exception as e:
-        response["error"] = f"jarm failed: {e}"
-    try:
         run_tls_handshake(target, resolved_ip, port)
     except Exception as e:
-        existing = response.get("error")
-        response["error"] = (f"{existing}; handshake failed: {e}" if existing
-                             else f"handshake failed: {e}")
+        response["error"] = f"handshake failed: {e}"
     return response
+
+
+def action_jarm_probe(request: dict) -> dict:
+    """Deprecated alias of tls_handshake, kept so a cti host that has not
+    been updated keeps working. It no longer runs JARM: `jarm` is None."""
+    return {"jarm": None, **action_tls_handshake(request)}
 
 
 # --------------------------------------------------------------------------- #
@@ -1410,6 +1406,7 @@ def run_netwatch_worker(poll_interval: float = 5.0, once: bool = False) -> int:
 _ACTIONS = {
     "observe": action_observe,
     "fetch_and_analyze": action_fetch_and_analyze,
+    "tls_handshake": action_tls_handshake,
     "jarm_probe": action_jarm_probe,
     "http_fetch": action_http_fetch,
     "resolve_dns": action_resolve_dns,
@@ -1427,15 +1424,15 @@ _ACTIONS = {
 
 
 def _tool_present(cmd: list[str]) -> bool:
-    # An interpreter + script command (JARM_CMD) needs the script on disk
-    # too - `which python3` alone would report jarm present when it isn't.
+    # An interpreter + script command needs the script on disk too -
+    # `which python3` alone would report the tool present when it isn't.
     return bool(shutil.which(cmd[0])) and all(
         os.path.exists(a) for a in cmd[1:] if a.startswith("/"))
 
 
 def check_access() -> dict:
     tools = {name: _tool_present(cmd) for name, cmd in {
-        "jarm": JARM_CMD, "subfinder": SUBFINDER_CMD, "nmap": NMAP_CMD,
+        "subfinder": SUBFINDER_CMD, "nmap": NMAP_CMD,
         "dirsearch": DIRSEARCH_CMD, "openssl": OPENSSL_CMD, "dig": DIG_CMD,
         # the observe pass - each optional, each reported so a half-provisioned
         # VM says so instead of quietly returning less

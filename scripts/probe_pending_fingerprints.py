@@ -6,8 +6,10 @@ One remote hop and one HTTPS query per target, not two SSH hops - and,
 as of this change, every target in a queued batch is dispatched
 concurrently rather than one at a time (see below):
 
-  1. probe_helper.py on the lab probe VM (CTI_PROBE_HOST) - generates
-     a JARM scan and one ordinary TLS handshake against the target.
+  1. probe_helper.py on the lab probe VM (CTI_PROBE_HOST) - one
+     ordinary TLS handshake against the target. (It also ran a reference
+     JARM scan until 2026-10-17; JARM now comes from netwatch's httpx
+     -jarm, which agreed with it on every host measured at the same time.)
   2. An OpenSearch query against the Zeek logs (Wazuh archives on
      siem01 by default, through cti/sources/opensearch.py's tunnel) -
      reads back whatever that handshake produced in ssl.log/conn.log,
@@ -126,8 +128,6 @@ from cti.sources.opensearch import OpenSearchClient  # noqa: E402
 # index/pipeline, re-verify with the same kind of sample query before
 # trusting multi-port results.
 _DST_PORT_FIELD = "dst_port"
-
-SOURCE_LABEL = "lab probe VM"
 
 # Concurrent SSH channels dispatched to the probe VM at once, multiplexed
 # over the one shared ControlMaster connection (see vm_proxy.py) rather
@@ -409,7 +409,7 @@ def _dispatch_one(job: dict[str, object]) -> dict[str, object]:
     # of a whole-day guess (see dashboard/ui/src/lib/sources.js's arkimeSessionUrl).
     probe_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
-        probe_result = vm_proxy.probe_jarm(target, port)
+        probe_result = vm_proxy.tls_handshake(target, port)
     except ProbeError as e:
         return {"cluster": cluster, "target": target, "port": port, "probe_time": probe_time,
                 "probe_result": None, "probe_error": str(e)}
@@ -556,10 +556,6 @@ def main() -> None:
         probe_result = d["probe_result"]
         if probe_result.get("error"):
             print(f"probe reported an error for {target!r} (port {port}): {probe_result['error']}", file=sys.stderr)
-
-        if probe_result.get("jarm"):
-            core.add_observable(cluster, "jarm", probe_result["jarm"],
-                                 f"JARM against {target}:{port} via {SOURCE_LABEL}, {d['probe_time']}")
 
         resolved_ip = probe_result.get("resolved_ip")
         if resolved_ip:
