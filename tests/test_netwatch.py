@@ -37,7 +37,23 @@ def _ip(value, lifecycle, since=None, ports=(443,)):
     return e
 
 
+def _gate_open(monkeypatch):
+    """These fixtures use the documentation ranges, which the scan gate
+    (rightly) refuses; tiering is what is under test here."""
+    monkeypatch.setattr(core, "_is_probe_worthy", lambda category, value: (True, ""))
+
+
+def test_the_watchlist_applies_the_scan_gate(monkeypatch):
+    cl = _cluster(ips=[_ip("10.1.2.3", "active"), _ip("8.8.8.8", "active"),
+                       _ip("185.220.101.47", "active")])
+    monkeypatch.setattr(core, "list_clusters", lambda: ["c"])
+    monkeypatch.setattr(core, "load_cluster", lambda n: cl)
+    monkeypatch.setattr(watchlist.cdn, "available", lambda: False)
+    assert [t["value"] for t in watchlist.build()] == ["185.220.101.47"]
+
+
 def test_tiers_follow_lifecycle(monkeypatch):
+    _gate_open(monkeypatch)
     cl = _cluster(ips=[
         _ip("203.0.113.1", "active", since=_iso(NOW - timedelta(days=60))),   # full
         _ip("203.0.113.2", "active", since=_iso(NOW - timedelta(days=2))),    # hot (moved)
@@ -55,6 +71,7 @@ def test_tiers_follow_lifecycle(monkeypatch):
 
 
 def test_cdn_ips_are_dropped(monkeypatch):
+    _gate_open(monkeypatch)
     cl = _cluster(ips=[_ip("1.1.1.1", "active")])
     monkeypatch.setattr(core, "list_clusters", lambda: ["c"])
     monkeypatch.setattr(core, "load_cluster", lambda n: cl)
@@ -64,6 +81,7 @@ def test_cdn_ips_are_dropped(monkeypatch):
 
 
 def test_strongest_tier_and_port_union_win(monkeypatch):
+    _gate_open(monkeypatch)
     a = _cluster(ips=[_ip("203.0.113.9", "dormant", ports=[443])])          # hot
     b = _cluster(ips=[_ip("203.0.113.9", "active",
                           since=_iso(NOW - timedelta(days=90)), ports=[8443])])  # full
@@ -77,6 +95,7 @@ def test_strongest_tier_and_port_union_win(monkeypatch):
 
 
 def test_scored_candidates_join_the_hot_tier_above_the_floor(monkeypatch):
+    _gate_open(monkeypatch)
     cl = _cluster(ips=[_ip("203.0.113.1", "active", since=_iso(NOW - timedelta(days=60)))])
     monkeypatch.setattr(core, "list_clusters", lambda: ["apt-w"])
     monkeypatch.setattr(core, "load_cluster", lambda n: cl)
@@ -223,10 +242,20 @@ class _FakeZeek:
         return self._real.field(k)
     def ts_range(self, **kw):
         return self._real.ts_range(**kw)
+    def current_max_ts(self):
+        return 9e12          # always caught up
     def sources(self, query, size=50):
+        # Two clients to the same port: the server answers each differently.
+        # Only the pinned client's (tlsx's) session, and its own conn row,
+        # may supply the fingerprints.
         return [
-            {"log_file": "/opt/zeek/logs/current/ssl.log", "ja4s": "t1204h2_c030_abc"},
-            {"log_file": "/opt/zeek/logs/current/conn.log",
+            {"log_file": "/opt/zeek/logs/current/ssl.log", "uid": "C-httpx",
+             "ja4": "t13d251100_b78ed14e2fd0_f50d94e863eb", "ja4s": "t130200_1303_xxx"},
+            {"log_file": "/opt/zeek/logs/current/ssl.log", "uid": "C-tlsx",
+             "ja4": "t13d311100_e8f1e7e78f70_d41ae481755e", "ja4s": "t1204h2_c030_abc"},
+            {"log_file": "/opt/zeek/logs/current/conn.log", "uid": "C-httpx",
+             "ja4ts": "29200_2-4-8-1-3_1424_7", "ja4l": "1_1"},
+            {"log_file": "/opt/zeek/logs/current/conn.log", "uid": "C-tlsx",
              "ja4ts": "65535_2-1-3_1440_8", "ja4l": "108_128_756"}]
 
 
@@ -244,4 +273,130 @@ def test_ingest_joins_passive_zeek_fingerprints(monkeypatch):
     with store.connect(read_only=True) as con:
         sels = {t for (t,) in con.execute(
             "SELECT selector_type FROM selectors WHERE source='netwatch'").fetchall()}
-    assert "tls.ja4s" in sels
+    assert {"tls.ja4s", "tls.ja4ts"} <= sels
+
+
+# --------------------------------------------------------------------------- #
+# Defects found by the CL-STA-1178 end-to-end run (2026-10-16)
+# --------------------------------------------------------------------------- #
+
+def test_an_intercepted_port_is_not_open():
+    """TCP/53 was 'open' on every target: something on the egress path
+    accepts it and sends nothing. Without an application answer it is not
+    a service, and must not reach the snapshot or the port-set selector."""
+    _spool([_record("scanI", "203.0.113.20", 53),
+            _record("scanI", "203.0.113.20", 443, http={"status": 200, "title": "x"})])
+    ingest.ingest(client=None)
+    with store.connect(read_only=True) as con:
+        opened = dict(con.execute("SELECT port, open FROM service_snapshots "
+                                  "WHERE target='203.0.113.20'").fetchall())
+        ports = con.execute("SELECT selector_value FROM selectors WHERE "
+                            "indicator_value='203.0.113.20' AND selector_type='net.port_set'"
+                            ).fetchone()
+    assert opened == {53: False, 443: True}
+    assert ports == ("443",)
+
+
+def test_a_real_service_on_an_intercepted_port_still_counts():
+    _spool([_record("scanJ", "203.0.113.21", 53, banner_sha256="b" * 64)])
+    ingest.ingest(client=None)
+    with store.connect(read_only=True) as con:
+        assert con.execute("SELECT open FROM service_snapshots "
+                           "WHERE target='203.0.113.21'").fetchone()[0] is True
+
+
+def test_tlsx_is_not_given_the_probes_it_refuses_to_combine(probe_helper, monkeypatch):
+    ph = probe_helper
+    calls = []
+
+    def run(cmd, stdin_text, timeout):
+        calls.append(cmd)
+        return [{"port": "443", "fingerprint_hash": {"sha256": "AB" * 32},
+                 "subject_dn": "CN=x", "issuer_dn": "CN=ca"}], None
+
+    monkeypatch.setattr(ph, "_run_json", run)
+    out = ph._tlsx_by_port("x.example", [443])
+    assert out[443]["cert_sha256"] == "AB" * 32
+    assert not {"-san", "-cn", "-so"} & set(calls[0])
+
+
+def test_httpx_jarm_is_read_from_jarm_hash(probe_helper, monkeypatch):
+    ph = probe_helper
+    monkeypatch.setattr(ph, "_json_records", lambda *a, **k: [
+        {"port": "443", "status_code": 200, "jarm_hash": "2ad2ad16d2ad2ad"}])
+    assert ph._httpx_by_port("x.example", [443])[443]["jarm"] == "2ad2ad16d2ad2ad"
+
+
+def test_zeek_ja4s_is_a_selector_even_without_a_certificate(monkeypatch):
+    monkeypatch.setenv("CTI_PROBE_HOST", "10.99.0.74")
+    _spool([_record("scanK", "203.0.113.22", 443, http={"status": 200, "title": "V2Board"})])
+    ingest.ingest(client=_FakeZeek())
+    with store.connect(read_only=True) as con:
+        assert con.execute("SELECT selector_value FROM selectors WHERE indicator_value="
+                           "'203.0.113.22' AND selector_type='tls.ja4s'").fetchone() == (
+            "t1204h2_c030_abc",)
+
+
+def test_a_later_ports_certificate_is_not_lost_behind_an_earlier_ja4s():
+    passive = {80: {"ja4s": "t1"}, 443: {"ja4s": "t2"}}
+    result = ingest._observe_result(
+        [_record("s", "x", 80, http={"status": 301}),
+         _record("s", "x", 443, tls={"cert_sha256": "c" * 64})], passive)
+    assert result["tls"]["cert_sha256"] == "c" * 64 and result["tls"]["ja4s"] == "t1"
+
+
+def test_the_fingerprint_queues_actions_are_gone(probe_helper):
+    """Retired 2026-10-17: JARM comes from netwatch's httpx -jarm and the
+    server fingerprints from netwatch's pinned tlsx session. The pre-check
+    and handshake helpers stay - the netwatch worker uses them."""
+    ph = probe_helper
+    assert "jarm_probe" not in ph._ACTIONS and "tls_handshake" not in ph._ACTIONS
+    assert not hasattr(ph, "run_jarm") and not hasattr(ph, "JARM_CMD")
+    assert callable(ph.tcp_precheck) and callable(ph.run_tls_handshake)
+
+
+def test_ingest_retries_until_zeek_has_indexed_the_pinned_session(monkeypatch):
+    """tlsx's session is the last a scan opens; joining before the SIEM had
+    indexed it found nothing (2026-10-17). A port where tlsx returned a
+    certificate is retried until that session appears."""
+    calls = []
+
+    class Lagging(_FakeZeek):
+        def sources(self, query, size=50):
+            calls.append(1)
+            return [] if len(calls) < 3 else super().sources(query, size)
+
+    monkeypatch.setattr(ingest.time, "sleep", lambda s: None)
+    monkeypatch.setenv("CTI_PROBE_HOST", "10.99.0.74")
+    _spool([_record("scanW", "203.0.113.50", 443, tls={"cert_sha256": "c" * 64})])
+    ingest.ingest(client=Lagging())
+    assert len(calls) == 3
+    with store.connect(read_only=True) as con:
+        assert con.execute("SELECT ja4s FROM service_snapshots WHERE target='203.0.113.50'"
+                           ).fetchone()[0] == "t1204h2_c030_abc"
+
+
+def test_a_plain_http_port_is_not_waited_for(monkeypatch):
+    calls = []
+
+    class Empty(_FakeZeek):
+        def sources(self, query, size=50):
+            calls.append(1)
+            return []
+
+    monkeypatch.setattr(ingest.time, "sleep", lambda s: (_ for _ in ()).throw(AssertionError("waited")))
+    monkeypatch.setenv("CTI_PROBE_HOST", "10.99.0.74")
+    _spool([_record("scanH", "203.0.113.52", 80, http={"status": 200})])
+    ingest.ingest(client=Empty())
+    assert calls == [1]
+
+
+def test_ingest_gives_up_waiting_and_still_ingests(monkeypatch):
+    class Never(_FakeZeek):
+        def sources(self, query, size=50):
+            return []
+
+    monkeypatch.setenv("CTI_ZEEK_WAIT", "0")
+    monkeypatch.setenv("CTI_PROBE_HOST", "10.99.0.74")
+    _spool([_record("scanV", "203.0.113.51", 443, tls={"cert_sha256": "c" * 64})])
+    assert ingest.ingest(client=Never())["snapshots"] == 1

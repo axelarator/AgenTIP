@@ -1,6 +1,6 @@
 <script>
   import { route } from "./lib/router.js";
-  import { clusters, pendingCount, inNetworkCount, loadSidebar } from "./lib/store.js";
+  import { clusters, inNetworkCount, loadSidebar } from "./lib/store.js";
   import { formatDateOnly, confidenceColor } from "./lib/format.js";
   import { initTheme, toggleTheme } from "./lib/theme.js";
 
@@ -8,7 +8,6 @@
   import Cluster from "./views/Cluster.svelte";
   import Techniques from "./views/Techniques.svelte";
   import TechniqueDetail from "./views/TechniqueDetail.svelte";
-  import Queue from "./views/Queue.svelte";
   import Indicators from "./views/Indicators.svelte";
   import Indicator from "./views/Indicator.svelte";
   import Findings from "./views/Findings.svelte";
@@ -27,7 +26,7 @@
   // Which sidebar entry a route belongs to.
   const SECTION = {
     overview: "overview", technique: "techniques", techniques: "techniques",
-    queue: "queue", indicators: "indicators", indicator: "indicators",
+    indicators: "indicators", indicator: "indicators",
     selector: "indicators", findings: "findings", narrative: "narratives",
     narratives: "narratives", run: "runs", runs: "runs", hunt: "hunt", pairs: "hunt",
   };
@@ -58,7 +57,6 @@
     ["overview", "#/overview", "Overview"],
     ["hunt", "#/hunt", "Hunt"],
     ["techniques", "#/techniques", "Technique matrix"],
-    ["queue", "#/queue", "Fingerprint queue"],
     ["indicators", "#/indicators", "Indicators"],
     ["findings", "#/findings", "Findings"],
     ["narratives", "#/narratives", "Daily narrative"],
@@ -87,7 +85,6 @@
         {#each NAV as [key, to, label]}
           <a class="nav-link" class:is-active={section === key} href={to}>
             <span>{label}</span>
-            {#if key === "queue" && $pendingCount}<span class="nav-badge">{$pendingCount}</span>{/if}
             {#if key === "indicators" && $inNetworkCount}<span class="nav-badge">{$inNetworkCount}</span>{/if}
           </a>
         {/each}
@@ -126,8 +123,6 @@
         <Techniques />
       {:else if $route.name === "technique"}
         <TechniqueDetail id={$route.id} />
-      {:else if $route.name === "queue"}
-        <Queue />
       {:else if $route.name === "indicators"}
         <Indicators />
       {:else if $route.name === "indicator"}

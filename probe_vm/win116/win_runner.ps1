@@ -15,8 +15,12 @@
   Actions:
     check  - {ok, ps_version, os, user}
     fetch  - {targets:[{target, url}], ua?, timeout?, max_bytes?}
-             -> {results:[{target, url, final_url, status, headers, server,
-                 title, body_sha256, body_len, cert{...}, error}]}
+             -> {results:[{target, url, final_url, location, status, headers,
+                 server, title, body_sha256, body_len, cert{...}, error}]}
+
+  Redirects are NOT followed: the first response is what is reported, the
+  same thing the probe's httpx reports, so the two are compared like for
+  like. Following them made every http->https 301 read as a divergence.
 
   Safety: GET only. A body is read up to max_bytes, hashed, and discarded -
   nothing is written to disk, rendered or executed. Certificates are
@@ -74,11 +78,13 @@ function Get-CertInfo($cert) {
         not_before = $cert.NotBefore.ToUniversalTime().ToString('o')
         not_after  = $cert.NotAfter.ToUniversalTime().ToString('o')
         sans       = $sans
+        # The certificate itself, for JA4X (computed on the cti host).
+        der_b64    = [Convert]::ToBase64String($cert.RawData)
     }
 }
 
 function Invoke-Fetch($t, [string]$ua, [int]$timeout, [int]$maxBytes) {
-    $out = [ordered]@{ target = $t.target; url = $t.url; final_url = $null; status = $null
+    $out = [ordered]@{ target = $t.target; url = $t.url; final_url = $null; location = $null; status = $null
                        headers = @{}; server = $null; title = $null; body_sha256 = $null
                        body_len = $null; cert = $null; error = $null }
     [CtiTls]::Last = $null
@@ -91,8 +97,7 @@ function Invoke-Fetch($t, [string]$ua, [int]$timeout, [int]$maxBytes) {
         $req.Headers.Add('Accept-Language', 'en-US,en;q=0.9')
         $req.Timeout = $timeout * 1000
         $req.ReadWriteTimeout = $timeout * 1000
-        $req.AllowAutoRedirect = $true
-        $req.MaximumAutomaticRedirections = 5
+        $req.AllowAutoRedirect = $false
         # A fresh connection every time, so the certificate callback fires.
         $req.KeepAlive = $false
         $req.ConnectionGroupName = [guid]::NewGuid().ToString()
@@ -107,6 +112,7 @@ function Invoke-Fetch($t, [string]$ua, [int]$timeout, [int]$maxBytes) {
             $out.headers[$name.ToLower().Replace('-', '_')] = $resp.Headers[$name]
         }
         $out.server = $resp.Headers['Server']
+        $out.location = $resp.Headers['Location']
         $stream = $resp.GetResponseStream()
         $buffer = New-Object byte[] 65536
         $ms = New-Object System.IO.MemoryStream

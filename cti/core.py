@@ -105,12 +105,11 @@ def _is_ipv4(value: str) -> bool:
 
 
 def _is_probe_worthy(category: str, value: str) -> tuple[bool, str]:
-    """Gate applied only to what reaches the active-probing queue, right
-    before _enqueue_pending_fingerprints - not to whether a value gets
-    tracked as an observable at all, which stays exactly as permissive
-    as before (empty/skipped fingerprint results are still an expected,
-    fine outcome for infra that just isn't reachable). Returns
-    (True, "") if fine to queue, else (False, reason)."""
+    """Whether our own probe may scan this value. Applied by the netwatch
+    watchlist (and reported at filing time as `scan_skipped`) - not to
+    whether a value gets tracked as an observable at all, which stays
+    exactly as permissive as before. Returns (True, "") if fine to scan,
+    else (False, reason)."""
     if category == "ips":
         try:
             addr = ipaddress.ip_address(value)
@@ -184,13 +183,6 @@ def _path(name: str) -> Path:
     # showing up in list_clusters(), which only globs the top-level dir).
     safe = re.sub(r"[^a-z0-9._-]+", "-", safe).strip("-")
     return DATA_DIR / f"{safe}.json"
-
-
-def _pending_fingerprints_path() -> Path:
-    # A function (not a module-level constant) so it re-reads DATA_DIR
-    # each call - tests monkeypatch DATA_DIR per-test, and a precomputed
-    # path would silently keep pointing at the real data dir instead.
-    return DATA_DIR.parent / "pending_fingerprints.json"
 
 
 
@@ -844,14 +836,12 @@ def add_observable(name: str, category: str, value: str, source: str,
     filename isn't lost the way it is when only reading it off a
     display-only lookup.
 
-    A new domain/ip is still always tracked as an observable, but only
-    queued for active fingerprinting if it passes _is_probe_worthy (not
-    a private/reserved address, not a known-non-actor domain/resolver
-    IP like a public DNS resolver or a major vendor's own site) - see
-    that function's docstring. If it's skipped, the returned dict
-    carries a transient (not persisted) `fingerprint_queue_skipped`
-    list of {category, value, reason}; use requeue_fingerprint if you
-    disagree with the call and want it probed anyway.
+    A new domain/ip is always tracked as an observable, and netwatch scans
+    it on its next pass unless it fails _is_probe_worthy (a private or
+    reserved address, or a known non-actor domain/resolver such as a
+    public DNS resolver or a major vendor's own site). If it fails, the
+    returned dict carries a transient (not persisted) `scan_skipped` list
+    of {category, value, reason}.
 
     A genuinely new domain/ip also gets a live asn/ports/cert/tags
     enrichment lookup (see _apply_enrichment_snapshot) before it's filed
@@ -889,7 +879,7 @@ def _add_observable_locked(name: str, category: str, value: str, source: str,
                                     metadata=metadata, decided_by=entities.ANALYST)
     save_cluster(data)
     if skipped:
-        data = {**data, "fingerprint_queue_skipped": skipped}
+        data = {**data, "scan_skipped": skipped}
     return data
 
 
@@ -997,9 +987,6 @@ def accept_candidate(name: str, value: str, note: str = "") -> dict[str, Any]:
         entry["accepted"] = now
         _set_role_analyst(_slug(data), entry["value"], "accepted",
                           origin=(entry.get("sources") or [None])[0], reason=note or None)
-        worthy, _ = _is_probe_worthy(category, entry["value"])
-        if worthy:
-            _enqueue_pending_fingerprints(data["name"], [(category, entry["value"])])
         reason = entry.get("candidate_reason", "")
     else:
         decided = membership.decide(_slug(data), value, "accepted", reason=note or None)
@@ -1998,6 +1985,10 @@ def pivot_and_expand(value: str, cluster_name: str,
         # surfaced for review rather than auto-filed (a shared kit isn't
         # proof of the same operator).
         wm = _webamon_domain(value)
+        if isinstance(wm, dict) and wm.get("error"):
+            # Said, not swallowed: an empty pivot reads as "nothing found",
+            # and a rate-limited one is "could not look".
+            review["source_errors"] = {"webamon": wm["error"]}
         latest = wm.get("latest") if isinstance(wm, dict) and "error" not in wm else None
         if isinstance(latest, dict):
             fp = latest.get("fingerprint") or {}
@@ -2013,6 +2004,8 @@ def pivot_and_expand(value: str, cluster_name: str,
                 review["webamon_fingerprint_siblings"] = fp_siblings
     else:  # ip
         wm = _webamon_ip(value)
+        if isinstance(wm, dict) and wm.get("error"):
+            review["source_errors"] = {"webamon": wm["error"]}
         hosted = wm.get("domains", []) if isinstance(wm, dict) and "error" not in wm else []
         # Same shared-hosting guard the automatic sweep uses: a shared-
         # hosting ASN's hosted domains are every other tenant, not this
@@ -2110,6 +2103,8 @@ def _pivot_and_expand_merge(value: str, kind: str, cluster_name: str, now: str,
         n_review = sum(len(v) for v in review.values() if isinstance(v, list))
         if n_review:
             entry += f"; {n_review} left for review"
+        for source, error in (review.get("source_errors") or {}).items():
+            entry += f"; {source} unavailable ({error}) - incomplete, not a negative"
     data["hunt_log"].append({"date": now, "entry": entry})
     save_cluster(data)
 
@@ -2127,7 +2122,7 @@ _ACTIVE_SCAN_TOOLS = ("nmap", "dirsearch")
 def _opensearch_max_ts() -> float | None:
     """Best-effort snapshot of the newest `ts` indexed in the lab's Zeek/
     OpenSearch, used to bracket an active scan's captured traffic (the same
-    provenance anchor probe_pending_fingerprints uses). None if OpenSearch
+    provenance anchor the fingerprint queue used). None if OpenSearch
     isn't reachable - provenance is nice-to-have, never blocks the scan."""
     try:
         from .opensearch_client import OpenSearchClient
@@ -2354,8 +2349,7 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
     value being filed at once."""
     now = now_iso()
     counts = {}
-    newly_tracked: list[tuple[str, str]] = []  # (category, value), for the fingerprint queue
-    skipped: list[dict[str, str]] = []  # entries tracked but not queued, with why
+    skipped: list[dict[str, str]] = []  # entries tracked but never scanned, with why
     ip_ports = ip_ports or {}
     enrichment = enrichment or {}
     extracted = dict(extracted)
@@ -2411,15 +2405,12 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
                 added += 1
                 if category in _FINGERPRINTABLE_CATEGORIES:
                     ok, reason = _is_probe_worthy(category, value)
-                    if ok:
-                        newly_tracked.append((category, value))
-                    else:
+                    if not ok:
                         skipped.append({"category": category, "value": value, "reason": reason})
             # Every C2/service port a report names near this IP (see
             # report_ingest._extract_ip_ports) is stamped onto the IP's
-            # own observable entry so active fingerprinting can probe
-            # its real port(s) instead of always defaulting to 443 - see
-            # probe_pending_fingerprints.py's _lookup_ports. Appended
+            # own observable entry, which the netwatch watchlist hands the
+            # probe as known ports beside its own discovery. Appended
             # (deduped), not overwritten, since a later report might
             # name another port for the same IP (a genuinely multi-port
             # C2, or just a second report) without invalidating the
@@ -2432,85 +2423,11 @@ def _merge_observables(data: dict[str, Any], extracted: dict[str, list[str]],
         counts[category] = added
     # A candidate is not probed until it is accepted: the fingerprints the
     # probe files would otherwise export ahead of the host they belong to.
-    if newly_tracked and (metadata or {}).get("lifecycle") != "candidate":
-        _enqueue_pending_fingerprints(data["name"], newly_tracked)
     if decided_by:
         membership.mirror_seeds(
             _slug(data), [(c, v) for c in OBSERVABLE_CATEGORIES for v in extracted.get(c) or []],
             origin=source, decided_by=decided_by)
     return counts, skipped
-
-
-def _load_pending_fingerprints() -> list[dict[str, Any]]:
-    path = _pending_fingerprints_path()
-    if not path.exists():
-        return []
-    return json.loads(path.read_text())
-
-
-def _enqueue_pending_fingerprints(cluster_name: str, items: list[tuple[str, str]]) -> None:
-    # Called from inside _merge_observables, which only ever runs from a
-    # caller already holding _data_lock (add_observable/ingest_report/
-    # import_stix_bundle are all @_synchronized), so no lock of its own.
-    entries = _load_pending_fingerprints()
-    now = now_iso()
-    entries.extend({"cluster": cluster_name, "category": category, "value": value,
-                     "queued_at": now} for category, value in items)
-    atomic_write_text(_pending_fingerprints_path(), json.dumps(entries, indent=2))
-
-
-def list_pending_fingerprints() -> list[dict[str, Any]]:
-    """Peek at domains/ips newly tracked (via add_observable, ingest_report,
-    or import_stix_bundle) since the last pop_pending_fingerprints call -
-    i.e. infrastructure that hasn't been actively fingerprinted (JA4+/
-    JARM) yet. Read-only; doesn't clear the queue. Each entry is
-    {cluster, category, value, queued_at}."""
-    return _load_pending_fingerprints()
-
-
-@_synchronized
-def pop_pending_fingerprints() -> list[dict[str, Any]]:
-    """Return every queued entry and clear the queue in one step - the
-    operation a fingerprinting script (e.g. running on an isolated VM)
-    calls each cycle to claim everything waiting without racing another
-    caller or re-processing the same entries next time. Use
-    list_pending_fingerprints instead to check without consuming."""
-    entries = _load_pending_fingerprints()
-    if entries:
-        atomic_write_text(_pending_fingerprints_path(), "[]")
-    return entries
-
-
-@_synchronized
-def requeue_fingerprint(name: str, category: str, value: str) -> list[dict[str, Any]]:
-    """Force a domain/ip that's already tracked on a cluster back onto the
-    JA4+/JARM pending queue, bypassing the dedup check that normally only
-    enqueues genuinely new observables (_merge_observables only queues on
-    first sight of a value - touching an already-tracked one again via
-    add_observable does NOT re-queue it). The supported way to ask for a
-    re-probe - after a prior attempt errored, timed out, or returned a
-    null/placeholder result - without hand-editing pending_fingerprints.json
-    or re-adding the observable under a throwaway value just to trigger
-    the queue path.
-
-    category must be one of FINGERPRINTABLE_CATEGORIES ("domains", "ips").
-    Raises if the cluster doesn't exist or value isn't currently tracked
-    in that category - requeuing something never filed doesn't make
-    sense; file it with add_observable first. Returns the full pending
-    queue after the addition."""
-    if category not in _FINGERPRINTABLE_CATEGORIES:
-        raise ValueError("category must be one of " + ", ".join(_FINGERPRINTABLE_CATEGORIES))
-    if category == "ips" and not _is_ipv4(value):
-        raise ValueError(f"refusing to requeue {value!r}: IPv6 is ignored for pivoting/probing "
-                          "(no route from the probe VM)")
-    data = load_cluster(name)
-    needle = value.strip().lower()
-    bucket = data["observables"][category]
-    if not any(o["value"].lower() == needle for o in bucket):
-        raise ValueError(f"no {category} observable matching {value!r} in cluster {name!r} - "
-                          "use add_observable to file it first")
-    _enqueue_pending_fingerprints(name, [(category, value)])
-    return _load_pending_fingerprints()
 
 
 def _merge_ttps(data: dict[str, Any], technique_ids: list[str], source: str) -> list[str]:
@@ -2552,24 +2469,20 @@ def ingest_report(source: str, cluster_name: str | None = None,
     deduped by value; a repeated observable from a new source just adds
     that source to its provenance list.
 
-    Every newly-tracked domain/ip is still filed as an observable, but
-    only queued for active fingerprinting if it passes
-    _is_probe_worthy — extraction is a blind regex over report text and
-    will happily match a version string, a public DNS resolver, or a
-    vendor's own site mentioned in passing, and none of those should
-    turn into a live probe just because they matched. Anything skipped
-    is listed (with why) under `fingerprint_queue_skipped` on both the
-    return value and the persisted `report_sources` entry for this
-    ingest; use requeue_fingerprint if a skip turns out to be wrong.
+    Every newly-tracked domain/ip is filed as an observable, and netwatch
+    scans it unless it fails _is_probe_worthy — extraction is a blind
+    regex over report text and will happily match a version string, a
+    public DNS resolver, or a vendor's own site mentioned in passing, and
+    none of those should turn into a live probe just because they matched.
+    Anything skipped is listed (with why) under `scan_skipped` on both the
+    return value and the persisted `report_sources` entry for this ingest.
 
     If the report names a C2/service port near one of the extracted IPs
     (e.g. "TCP port 886 (IPs: 1.2.3.4, ...)" or a bare "1.2.3.4:8080"),
     every such port is stamped onto the IP's own observable entry
     (`ports: [...]`, see report_ingest._extract_ip_ports — usually one
     port, but a genuinely multi-port C2 can accumulate more than one).
-    Active fingerprinting checks that field first and only falls back to
-    443 if nothing was extracted — see probe_pending_fingerprints.py's
-    _lookup_ports, which probes every recorded port, not just the first.
+    netwatch scans every recorded port, beside its own port discovery.
 
     Every genuinely new domain/ip extracted also gets a live asn/ports/
     cert/tags enrichment lookup (see _apply_enrichment_snapshot), run in
@@ -2692,13 +2605,13 @@ def _ingest_report_phase2(cluster_name: str, source: str, extracted: dict[str, A
         "source": source, "ingested": now_iso(),
         "observables_found": observable_counts,
         "ttps_found": extracted["ttps"],
-        "fingerprint_queue_skipped": skipped,
+        "scan_skipped": skipped,
     })
     save_cluster(data)
     if _nothing_extracted(extracted):
         data = {**data, "warning": _EXTRACTION_EMPTY_WARNING}
     if skipped:
-        data = {**data, "fingerprint_queue_skipped": skipped}
+        data = {**data, "scan_skipped": skipped}
     return data
 
 
@@ -2760,10 +2673,9 @@ def import_stix_bundle(bundle: dict[str, Any], name: str | None = None,
     into the cluster's observables. Existing local fields not present in
     the bundle (hunt log, detections, gaps) are preserved on update.
 
-    Same fingerprint-queue gating as add_observable/ingest_report: a
-    domain/ip that fails _is_probe_worthy is still tracked but not
-    queued for active probing; see `fingerprint_queue_skipped` on the
-    return value if any were skipped."""
+    Same scan gating as add_observable/ingest_report: a domain/ip that
+    fails _is_probe_worthy is still tracked but never scanned; see
+    `scan_skipped` on the return value if any were skipped."""
     parsed = stix.from_bundle(bundle)
     cluster_name = name or parsed["name"]
     p = _path(cluster_name)
@@ -2806,7 +2718,7 @@ def import_stix_bundle(bundle: dict[str, Any], name: str | None = None,
                                         decided_by=entities.REPORT)
     save_cluster(data)
     if skipped:
-        data = {**data, "fingerprint_queue_skipped": skipped}
+        data = {**data, "scan_skipped": skipped}
     return data
 
 

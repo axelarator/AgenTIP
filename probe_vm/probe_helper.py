@@ -2,7 +2,7 @@
 ordinary port on the same mirrored bridge as the Zeek sensor - so every
 request it makes is captured to Zeek/OpenSearch/Arkime for read-back).
 The active half of the enrichment handoff: the cti host
-(cti_tools/vm_proxy.py and probe_pending_fingerprints.py) sends this one
+(cti/probe/vm_proxy.py and the netwatch jobs) sends this one
 JSON request on stdin and reads one JSON response on stdout, per the SSH
 forced-command protocol.
 
@@ -12,10 +12,8 @@ Standalone - not part of the cti_tools package. Standard library plus
 Every action names a tracked indicator and is meant to originate from
 this VM rather than the analyst's own host.
 
-Actions (selected by the request's "action" field; "jarm_probe" is the
-default for back-compat with the original single-purpose helper):
+Actions (selected by the request's "action" field, which is required):
 
-  jarm_probe   {target, port}                    -> {jarm, resolved_ip, error}
   http_fetch   {url, method, headers, data,      -> {status, body, error}
                 insecure}
   resolve_dns  {host}                            -> {status, addrs}|{status:nxdomain}|{status:error,error}
@@ -47,6 +45,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -59,7 +58,6 @@ except Exception:  # certifi optional; fall back to the system store
     _CA_FILE = None
 
 # --- adjust for your environment --------------------------------------------
-JARM_CMD = ["python3", "/opt/jarm/jarm.py"]      # salesforce/jarm CLI
 SUBFINDER_CMD = ["subfinder"]
 NMAP_CMD = ["nmap"]
 DIRSEARCH_CMD = ["dirsearch"]
@@ -72,7 +70,6 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 HTTP_TIMEOUT = 20
 TCP_PRECHECK_TIMEOUT = 3
-JARM_SUBPROCESS_TIMEOUT = 20
 HTTP_PROBE_MAX_BYTES = 512_000        # bounded body read for http_probe
 WAYBACK_TIMEOUT = 30
 NMAP_TIMEOUT = 600
@@ -112,7 +109,7 @@ def resolve_target_ip(target: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# jarm_probe (ported from win_probe_helper.py)
+# TCP pre-check and one plain handshake (used by the netwatch worker)
 # --------------------------------------------------------------------------- #
 def tcp_precheck(resolved_ip: str, port: int) -> bool:
     try:
@@ -120,15 +117,6 @@ def tcp_precheck(resolved_ip: str, port: int) -> bool:
             return True
     except OSError:
         return False
-
-
-def run_jarm(target: str, port: int) -> str | None:
-    proc = subprocess.run([*JARM_CMD, "-p", str(port), target],
-                          capture_output=True, text=True, timeout=JARM_SUBPROCESS_TIMEOUT)
-    line = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
-    if ":" not in line:
-        return None
-    return line.split(":", 1)[1].strip() or None
 
 
 def run_tls_handshake(target: str, resolved_ip: str, port: int) -> None:
@@ -145,33 +133,7 @@ def run_tls_handshake(target: str, resolved_ip: str, port: int) -> None:
             pass
 
 
-def action_jarm_probe(request: dict) -> dict:
-    target = request["target"]
-    port = int(request.get("port") or 443)
-    response: dict[str, object] = {"jarm": None, "resolved_ip": None, "error": None}
-    try:
-        resolved_ip = resolve_target_ip(target)
-        response["resolved_ip"] = resolved_ip
-    except Exception as e:
-        return {"jarm": None, "resolved_ip": None,
-                "error": f"DNS resolution failed for {target!r}: {e}"}
-    if not tcp_precheck(resolved_ip, port):
-        response["error"] = (f"port {port} on {resolved_ip} refused/unreachable during a "
-                             f"{TCP_PRECHECK_TIMEOUT}s TCP pre-check")
-        return response
-    try:
-        response["jarm"] = run_jarm(target, port)
-    except Exception as e:
-        response["error"] = f"jarm failed: {e}"
-    try:
-        run_tls_handshake(target, resolved_ip, port)
-    except Exception as e:
-        existing = response.get("error")
-        response["error"] = (f"{existing}; handshake failed: {e}" if existing
-                             else f"handshake failed: {e}")
-    return response
-
-
+# --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
 # http_fetch (ported)
 # --------------------------------------------------------------------------- #
@@ -747,7 +709,8 @@ def _observe_http(target: str, known_ports: list | None = None) -> tuple[dict, s
         # `header` is a Go map and arrives sorted by key; the raw block keeps
         # the order the server sent, which is what http.header_order reads.
         "raw_header": r.get("raw_header"),
-        "jarm": r.get("jarm"),
+        # httpx emits `jarm_hash`; `jarm` was read here and was always None.
+        "jarm": r.get("jarm_hash") or r.get("jarm"),
         "content_length": r.get("content_length"),
         "final_url": r.get("final_url") or r.get("url"),
         "cdn": r.get("cdn_name"),
@@ -866,6 +829,8 @@ def _observe_tls(target: str, known_ports: list | None = None) -> tuple[dict, st
         "serial": r.get("serial"),
         "cert_sha256": fingerprint.get("sha256"),
         "spki_sha256": _spki_sha256(r.get("certificate")),
+        # The PEM itself: the cti host computes JA4X from it (Zeek cannot).
+        "pem": r.get("certificate"),
         "not_before": r.get("not_before"),
         "not_after": r.get("not_after"),
         "self_signed": _flag("self_signed"),
@@ -1145,7 +1110,8 @@ def _httpx_by_port(target: str, ports: list[int]) -> dict[int, dict]:
             "status": r.get("status_code"), "title": r.get("title"),
             "server": r.get("webserver"), "tech": r.get("tech") or [],
             "body_sha256": hashes.get("body_sha256") or hashes.get("body-sha256"),
-            "favicon_mmh3": r.get("favicon"), "jarm": r.get("jarm"),
+            "favicon_mmh3": r.get("favicon"),
+            "jarm": r.get("jarm_hash") or r.get("jarm"),   # httpx's field is jarm_hash
             "headers": r.get("header") or {}, "raw_header": r.get("raw_header"),
             "final_url": r.get("final_url") or r.get("url"),
         }
@@ -1157,12 +1123,18 @@ def _tlsx_by_port(target: str, ports: list[int]) -> dict[int, dict]:
     locally the same way the observe pass does."""
     if not ports:
         return {}
-    records = _json_records(
-        TLSX_CMD + ["-json", "-silent", "-nc", "-serial", "-hash", "sha256",
-                    "-so", "-san", "-cn", "-tls-version", "-cipher", "-cert",
-                    "-timeout", "10", "-disable-update-check",
-                    "-p", ",".join(map(str, ports))],
-        stdin_text=target, timeout=OBSERVE_TOOL_TIMEOUT)
+    # No -san/-cn/-so: tlsx refuses to combine those display probes with any
+    # other ("san or cn flag cannot be used with other probes") and exits,
+    # so every netwatch scan recorded no certificate at all. -json returns
+    # the whole certificate without them. -cert (the PEM, for the SPKI hash)
+    # is retried without, the same way the observe pass does.
+    base = TLSX_CMD + ["-json", "-silent", "-nc", "-serial", "-hash", "sha256",
+                       "-tls-version", "-cipher", "-timeout", "10",
+                       "-disable-update-check", "-p", ",".join(map(str, ports))]
+    records, error = _run_json(base + ["-cert"], stdin_text=target,
+                               timeout=OBSERVE_TOOL_TIMEOUT)
+    if error:
+        records, _ = _run_json(base, stdin_text=target, timeout=OBSERVE_TOOL_TIMEOUT)
     out: dict[int, dict] = {}
     for r in records:
         port = r.get("port")
@@ -1176,6 +1148,7 @@ def _tlsx_by_port(target: str, ports: list[int]) -> dict[int, dict]:
             "subject_dn": r.get("subject_dn"), "sans": r.get("subject_an") or [],
             "serial": r.get("serial"), "cert_sha256": fingerprint.get("sha256"),
             "spki_sha256": _spki_sha256(r.get("certificate")),
+            "pem": r.get("certificate"),   # for JA4X, computed on the cti host
             "ja3s": r.get("ja3s_hash"), "tls_version": r.get("tls_version"),
             "self_signed": bool(r.get("self_signed")),
         }
@@ -1402,7 +1375,6 @@ def run_netwatch_worker(poll_interval: float = 5.0, once: bool = False) -> int:
 _ACTIONS = {
     "observe": action_observe,
     "fetch_and_analyze": action_fetch_and_analyze,
-    "jarm_probe": action_jarm_probe,
     "http_fetch": action_http_fetch,
     "resolve_dns": action_resolve_dns,
     "resolve_ptr": action_resolve_ptr,
@@ -1419,15 +1391,15 @@ _ACTIONS = {
 
 
 def _tool_present(cmd: list[str]) -> bool:
-    # An interpreter + script command (JARM_CMD) needs the script on disk
-    # too - `which python3` alone would report jarm present when it isn't.
+    # An interpreter + script command needs the script on disk too -
+    # `which python3` alone would report the tool present when it isn't.
     return bool(shutil.which(cmd[0])) and all(
         os.path.exists(a) for a in cmd[1:] if a.startswith("/"))
 
 
 def check_access() -> dict:
     tools = {name: _tool_present(cmd) for name, cmd in {
-        "jarm": JARM_CMD, "subfinder": SUBFINDER_CMD, "nmap": NMAP_CMD,
+        "subfinder": SUBFINDER_CMD, "nmap": NMAP_CMD,
         "dirsearch": DIRSEARCH_CMD, "openssl": OPENSSL_CMD, "dig": DIG_CMD,
         # the observe pass - each optional, each reported so a half-provisioned
         # VM says so instead of quietly returning less
@@ -1445,7 +1417,7 @@ def main() -> int:
         return run_netwatch_worker(once="--once" in sys.argv[1:])
     try:
         request = json.loads(sys.stdin.read() or "{}")
-        action = request.get("action", "jarm_probe")
+        action = request.get("action")
     except Exception as e:
         json.dump({"error": f"bad request: {e}"}, sys.stdout)
         return 1

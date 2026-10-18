@@ -660,6 +660,11 @@ def normalize(selector_type: str, value: Any) -> str | None:
 
     if selector_type == "http.body_sha256" and text in _EMPTY_BODY_SHA256:
         return None
+    # One serial, one spelling. tlsx and openssl write 6c:86:9e:..., .NET
+    # writes 6c869e...; the same certificate seen from the probe and from
+    # win116 read as two serials and as a "change" in the digest.
+    if selector_type == "tls.serial":
+        text = text.replace(":", "").replace(" ", "")
     # An all-zero JARM is what the tool prints when nothing answered the
     # handshake. 33 tracked hosts "shared" it, linking every dead endpoint
     # to every other.

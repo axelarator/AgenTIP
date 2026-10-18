@@ -145,3 +145,20 @@ def test_it_only_runs_on_the_expansion_day(monkeypatch):
     assert "skipped" in X.run(date(2026, 10, 6), clusters=[])     # a Tuesday
     assert "skipped" not in X.run(date(2026, 10, 5), clusters=[])  # a Monday
     assert "skipped" not in X.run(date(2026, 10, 6), forced=True, clusters=[])
+
+
+def test_a_pdns_neighbour_is_scored_on_its_dated_link(cluster, monkeypatch):
+    """The link that surfaced a host is recorded before it is scored, so a
+    name that sat on our address two years ago scores on that gap - not on
+    nothing at all."""
+    from cti.netwatch.candidates import Candidate
+    _select("known.example", "net.resolved_ip", "198.51.100.40")
+    monkeypatch.setattr(X, "_live_indicators", lambda data: ["198.51.100.40"])
+    monkeypatch.setattr(X.pdns_source, "host_candidates", lambda ind, kind: [
+        Candidate("old-tenant.example", "domain", "net.cohosted_domain:198.51.100.40",
+                  "198.51.100.40", "pdns", first_seen=1680000000, last_seen=1680500000)])
+    monkeypatch.setattr(X.webamon, "reverse_selector", lambda *a, **k: {"indicators": []})
+    X.expand_cluster("Kit")
+    score = membership.score("kit", "old-tenant.example", members=["known.example"])
+    [pair] = [e for e in score["evidence"] if e["type"] == "net.historical_ip"]
+    assert pair["gap_days"] > 900 and score["band"] == "noise"

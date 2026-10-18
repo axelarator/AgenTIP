@@ -7,8 +7,12 @@ Three kinds of movement, all read from what the store already keeps:
   append-only). New evidence lifting a `weak` host to `probable` is the
   signal the score exists to deliver; a fall is worth seeing too.
 * **Value changes** - on a tracked or candidate host, a selector span that
-  opened in the window replacing an earlier value of the same type: a new
-  JARM, a re-keyed TLS stack, a changed header order, a new registrant.
+  opened in the window replacing an earlier value of the same type FROM THE
+  SAME SOURCE AND VANTAGE: a new JARM, a re-keyed TLS stack, a changed
+  header order, a new registrant. Comparing across tools read every
+  difference between scanners as a change - each client's hello draws a
+  different JA4S, and two JARM implementations disagree - so it is not
+  done. A value the host has shown before is alternation, not change.
   Types the attribute change-detectors already report (certificate hash,
   resolved IP, PTR, title, server, ports, Webamon fingerprints) are left to
   them, and body hashes are left out - dynamic pages change on every load.
@@ -137,12 +141,22 @@ def value_changes(con: duckdb.DuckDBPyConnection, *, since: datetime, until: dat
                  WHERE o.indicator_value = n.indicator_value
                    AND o.selector_type = n.selector_type
                    AND o.selector_value <> n.selector_value
+                   AND o.source = n.source
+                   AND coalesce(o.vantage, '') = coalesce(n.vantage, '')
                    AND o.start_at < n.start_at
                  ORDER BY o.end_at DESC LIMIT 1) AS previous
         FROM selector_spans n
         WHERE n.start_at >= ? AND n.start_at <= ?
           AND n.selector_type IN ({types})
-          AND n.source NOT IN ({passive})""",
+          AND n.source NOT IN ({passive})
+          -- A value this host has shown before, from anywhere, is a host
+          -- alternating between values (two certificates behind a balancer),
+          -- not a change.
+          AND NOT EXISTS (SELECT 1 FROM selector_spans r
+                          WHERE r.indicator_value = n.indicator_value
+                            AND r.selector_type = n.selector_type
+                            AND r.selector_value = n.selector_value
+                            AND r.start_at < n.start_at)""",
         [since, until, *TIMELINE_TYPES, *sorted(PASSIVE_SOURCES)])
     out = []
     fronted: dict[str, bool] = {}

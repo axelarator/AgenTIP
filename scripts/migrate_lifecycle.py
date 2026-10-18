@@ -19,6 +19,8 @@ Three things, all from data already on disk - nothing is probed:
 """
 from __future__ import annotations
 
+import re
+
 import argparse
 import sys
 from collections import defaultdict
@@ -32,7 +34,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cti import core  # noqa: E402
 from cti.store.connection import db_path  # noqa: E402
 from cti.util import now_iso  # noqa: E402
-from probe_pending_fingerprints import ja4l_target  # noqa: E402
 
 LIVE_SQL = """
 SELECT indicator_value, max(observed_at) AS last_live
@@ -43,6 +44,23 @@ WHERE (source IN ('observe_tls', 'tls_live') AND tls_sha256 IS NOT NULL)
        AND resolved_ip IS NOT NULL AND CAST(resolved_ip AS VARCHAR) NOT IN ('[]', ''))
 GROUP BY indicator_value
 """
+
+
+# Inlined from the retired probe_pending_fingerprints.py (2026-10-17).
+_AGAINST = re.compile(r"handshake against (\S+:\d+)")
+
+
+def ja4l_target(entry: dict) -> str | None:
+    """The target:port a JA4L entry was measured against - from its
+    `measured_for` field, or read out of the source text on entries filed
+    before that field existed."""
+    if entry.get("measured_for"):
+        return entry["measured_for"]
+    for source in entry.get("sources") or []:
+        m = _AGAINST.search(source)
+        if m:
+            return m.group(1)
+    return None
 
 
 def last_live_index(path: Path) -> dict[str, str]:

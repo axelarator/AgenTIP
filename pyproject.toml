@@ -9,6 +9,7 @@ dependencies = [
     # is its own change, not part of the LangGraph rewrite.
     "mcp>=1.2.0,<2",
     "duckdb>=1.0",
+    "cryptography>=42",   # JA4X from certificates (cti/sources/ja4x.py)
     "langgraph>=0.2",
     "langchain-core>=0.3",
     "claude-agent-sdk>=0.1",

@@ -31,8 +31,6 @@ Protocol: one JSON object on stdin, one JSON object on stdout, handled
 by probe_helper.py on the VM (see that module for the full request/
 response shapes per action). Actions:
 
-- "jarm_probe" (default, back-compat with requests that omit "action"):
-  active TLS/JARM fingerprinting - see probe_jarm().
 - "http_fetch": fetch a URL from the VM, return status/body - what
   pivot.py's RDAP/RIPEstat/ThreatFox lookups run through instead of
   calling urllib directly from this host. Accepts an optional "data"
@@ -211,11 +209,6 @@ def _ssh_json_rpc(request: dict[str, object], timeout: int | None = None) -> dic
         return json.loads(proc.stdout)
     except json.JSONDecodeError as e:
         raise VMProxyError(f"non-JSON response from {PROBE_HOST!r}: {proc.stdout!r}") from e
-
-
-def probe_jarm(target: str, port: int) -> dict[str, object]:
-    return _ssh_json_rpc({"action": "jarm_probe", "target": target, "port": port})
-
 
 
 def http_fetch(url: str, headers: dict[str, str] | None = None, method: str = "GET",

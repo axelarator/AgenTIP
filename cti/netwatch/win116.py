@@ -21,15 +21,17 @@ for every seed is built up over runs rather than in one burst.
   certificate - as spans with vantage `win116`;
 * `http.client_divergence` when the answer differs from the probe's latest
   snapshot of the same host and port: a different status class, title,
-  certificate or landing host - or a TLS session the scanner negotiated and
-  Schannel could not (legacy-only ciphers, or a filter on the client
-  hello). The value names what diverged ("status:404>200", "title", "cert",
-  "redirect", "tls"), so hosts that gate the same way share it. A timeout
+  certificate - or a TLS session the scanner negotiated and Schannel could
+  not (legacy-only ciphers, or a filter on the client hello). Neither side
+  follows redirects, so a Windows-only redirect is a status-class
+  difference. The value names what diverged ("status:404>302", "title",
+  "cert", "tls"), so hosts that gate the same way share it. A timeout
   is not divergence: it could be anything. Body hashes alone are not compared: a dynamic page
   differs on every load, and that is not gating.
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -37,10 +39,10 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlsplit
 
 from .. import membership, store
 from ..probe import win_proxy
+from ..sources import ja4x as ja4x_mod
 from ..sources import observe as observe_source
 from ..store import entities
 from . import watchlist
@@ -125,14 +127,30 @@ def _baseline(con, target: str, port: int, now: datetime) -> dict[str, Any] | No
     return {"status": status, "title": title, "cert": cert, "final_url": final}
 
 
-def _host(url: str | None) -> str | None:
-    if not url:
-        return None
-    return (urlsplit(url).hostname or "").lower().rstrip(".") or None
+# The runner keeps the first 200 characters of the RAW title (entities and
+# all); httpx keeps the whole decoded title. Two titles are the same when
+# one is a prefix of the other, once that prefix is long enough to mean it.
+MIN_TITLE_PREFIX = 40
+
+
+def _title(value: str | None) -> str:
+    return " ".join(html.unescape(value or "").split()).lower()
+
+
+def _same_title(a: str, b: str) -> bool:
+    n = min(len(a), len(b))
+    return a == b or (n >= MIN_TITLE_PREFIX and a[:n] == b[:n])
 
 
 def divergence(base: dict[str, Any] | None, seen: dict[str, Any], target: str) -> str | None:
-    """What a Windows client was served differently, as a shareable value."""
+    """What a Windows client was served differently, as a shareable value.
+
+    Both sides report the FIRST response - neither follows redirects - so a
+    status class, a title or a certificate can be compared directly. Titles
+    are compared only between two pages that were actually served (2xx):
+    a redirect's body is boilerplate, and two of them differing says
+    nothing. A Windows-only redirect shows as a status-class difference.
+    """
     if not base:
         return None
     http, tls = seen.get("http") or {}, seen.get("tls") or {}
@@ -144,16 +162,14 @@ def divergence(base: dict[str, Any] | None, seen: dict[str, Any], target: str) -
     ws, ps = http.get("status"), base.get("status")
     if isinstance(ws, int) and isinstance(ps, int) and ws // 100 != ps // 100:
         parts.append(f"status:{ps}>{ws}")
-    wt, pt = (http.get("title") or "").strip().lower(), (base.get("title") or "").strip().lower()
-    if wt and pt and wt != pt:
+    both_served = (isinstance(ws, int) and isinstance(ps, int)
+                   and ws // 100 == 2 and ps // 100 == 2)
+    wt, pt = _title(http.get("title")), _title(base.get("title"))
+    if both_served and wt and pt and not _same_title(wt, pt):
         parts.append("title")
     wc, pc = tls.get("cert_sha256"), base.get("cert")
     if wc and pc and wc.lower() != pc.lower():
         parts.append("cert")
-    landed, probe_landed = _host(http.get("final_url")), _host(base.get("final_url"))
-    target_host = target.lower().rstrip(".")
-    if landed and landed != target_host and landed != (probe_landed or target_host):
-        parts.append("redirect")
     return ",".join(sorted(parts)) or None
 
 
@@ -186,6 +202,9 @@ def run(*, targets: list[dict[str, Any]] | None = None,
             answered += is_open
             kind = "ip" if t["kind"] == "ip" else "domain"
             diverged = divergence(_baseline(con, t["value"], port, now), seen, t["value"])
+            ja4x = ja4x_mod.for_tls(tls)
+            stored = ({**seen, "tls": {k: v for k, v in tls.items() if k != "der_b64"}}
+                      if tls.get("der_b64") else seen)
             store.upsert_service_snapshot(con, row={
                 "scan_id": scan_id, "scanned_at": now, "vantage": win_proxy.VANTAGE,
                 "profile": "client", "target": t["value"], "ip": None, "port": port,
@@ -193,7 +212,7 @@ def run(*, targets: list[dict[str, Any]] | None = None,
                 "cert_sha256": tls.get("cert_sha256"), "tls_issuer": tls.get("issuer"),
                 "http_status": http.get("status"), "http_title": http.get("title"),
                 "http_server": http.get("server"), "body_sha256": http.get("body_sha256"),
-                "record": seen})
+                "ja4x": ja4x, "record": stored})
             if is_open:
                 selectors_written += len(store.selectors.record_many(
                     con, indicator_value=t["value"],

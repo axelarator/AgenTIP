@@ -273,8 +273,8 @@ class OpenSearchClient:
     def sources(self, query: dict[str, Any], *, size: int = 50) -> list[dict[str, Any]]:
         """The newest-first list of `_source` documents for a query.
 
-        The shape scripts/probe_pending_fingerprints.py needs. It had its
-        own copy of this whole client returning exactly this; search()
+        The shape the netwatch passive join needs. The retired fingerprint
+        queue script once had its own copy of this whole client; search()
         returns the full body instead because the daily Zeek cross-
         reference needs aggregations. One client, two accessors.
         """

@@ -25,7 +25,15 @@ from ..state import CTIState, Family, Finding, Item
 # single-writer design avoids.
 SPECIALIST_TOOLS = ["query_duckdb", "get_actor_summary"]
 
-MAX_TURNS = 4
+# A turn is one model response; each tool call costs one. At 4 a specialist
+# had three lookups and its answer, and the fourth lookup aborted it with
+# nothing kept - 5 of 112 runs before 2026-10-17, two of four that day.
+MAX_TURNS = 6
+_TURN_LIMIT = "maximum number of turns"
+_NO_TOOLS_RETRY = (
+    "\n\nYou have no tools for this answer and cannot look anything up. Report "
+    "your findings from the items above alone, in the required JSON, and say in "
+    "a finding's detail when it would need a lookup to confirm.")
 
 
 def _render_items(items: list[Item]) -> str:
@@ -65,16 +73,21 @@ def make_specialist(family: Family):
         if not items:
             return {}
 
-        result = await run_turn(
-            system=load_prompt(family),
-            prompt=(f"Day: {state.get('day')}\n\n"
-                    f"Items for you ({len(items)}):\n\n{_render_items(items)}"),
-            allowed_tools=SPECIALIST_TOOLS,
-            max_turns=MAX_TURNS,
-        )
+        prompt = (f"Day: {state.get('day')}\n\n"
+                  f"Items for you ({len(items)}):\n\n{_render_items(items)}")
+        result = await run_turn(system=load_prompt(family), prompt=prompt,
+                                allowed_tools=SPECIALIST_TOOLS, max_turns=MAX_TURNS)
+        notes: list[str] = []
+        if result.error and _TURN_LIMIT in result.error:
+            # Running out of lookups used to discard everything the
+            # specialist had. One more call, with no tools, gets its answer.
+            result = await run_turn(system=load_prompt(family),
+                                    prompt=prompt + _NO_TOOLS_RETRY,
+                                    allowed_tools=[], max_turns=1, mcp=False)
+            notes.append(f"{family}: hit the {MAX_TURNS}-turn limit; answered "
+                         "without further lookups")
         if result.error:
-            return {"errors": [f"{family}: {result.error}"]}
-
+            return {"errors": notes + [f"{family}: {result.error}"]}
         parsed, parse_error = parse_findings(result.text)
         if parse_error:
             return {"errors": [f"{family}: {parse_error}"]}
@@ -100,7 +113,10 @@ def make_specialist(family: Family):
                 correlation_type=correlation_type,
                 confidence=str(raw.get("confidence") or "medium"),
             ))
-        return {"findings": [f for f in findings if f.headline]}
+        out: dict[str, Any] = {"findings": [f for f in findings if f.headline]}
+        if notes:
+            out["errors"] = notes
+        return out
 
     node.__name__ = family
     return node

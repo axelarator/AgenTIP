@@ -1137,112 +1137,79 @@ def test_add_observable_ja4_and_jarm_categories():
     assert data["observables"]["jarm"][0]["sources"] == ["JARM via isolated VM"]
 
 
-# --- pending fingerprint queue -----------------------------------------------
+# --- scan gate (netwatch) ----------------------------------------------------
+# The gate used to sit on the fingerprint queue, retired 2026-10-17. Filing
+# reports what will never be scanned as `scan_skipped`, and the netwatch
+# watchlist is what enforces it.
 
-def test_new_domain_or_ip_is_queued_for_fingerprinting():
-    core.create_cluster("Queue Test")
-    core.add_observable("Queue Test", "domains", "evil.example", "report X")
-    core.add_observable("Queue Test", "ips", "185.220.101.47", "report X")
-    core.add_observable("Queue Test", "hashes", "md5:098f6bcd4621d373cade4e832627b4f6", "report X")
-    pending = core.list_pending_fingerprints()
-    queued = {(e["cluster"], e["category"], e["value"]) for e in pending}
-    assert ("Queue Test", "domains", "evil.example") in queued
-    assert ("Queue Test", "ips", "185.220.101.47") in queued
-    assert not any(e["category"] == "hashes" for e in pending)
+def _watchlist_values(monkeypatch, name):
+    from cti.netwatch import watchlist
+    monkeypatch.setattr(watchlist.cdn, "available", lambda: False)
+    return {t["value"] for t in watchlist.build(clusters=[name])}
 
 
-def test_already_tracked_value_is_not_requeued():
-    core.create_cluster("Requeue Test")
-    core.add_observable("Requeue Test", "domains", "evil.example", "report X")
-    core.pop_pending_fingerprints()
-    core.add_observable("Requeue Test", "domains", "evil.example", "report Y")
-    assert core.list_pending_fingerprints() == []
+def test_filing_queues_nothing(isolated_data_dir):
+    core.create_cluster("No Queue")
+    core.add_observable("No Queue", "domains", "evil.example", "report X")
+    assert not (isolated_data_dir.parent / "pending_fingerprints.json").exists()
+    assert not hasattr(core, "list_pending_fingerprints")
 
 
-def test_pop_pending_fingerprints_clears_the_queue():
-    core.create_cluster("Pop Test")
-    core.add_observable("Pop Test", "domains", "evil.example", "report X")
-    popped = core.pop_pending_fingerprints()
-    assert any(e["value"] == "evil.example" for e in popped)
-    assert core.list_pending_fingerprints() == []
-    assert core.pop_pending_fingerprints() == []
-
-
-def test_pending_fingerprints_respect_isolated_data_dir(isolated_data_dir):
-    """Regression test: the queue file must follow a monkeypatched
-    DATA_DIR like cluster files do, not a path computed once at import
-    time - otherwise tests (or any DATA_DIR override) would leak into
-    the real data dir instead of the isolated one."""
-    core.create_cluster("Isolation Test")
-    core.add_observable("Isolation Test", "domains", "evil.example", "report X")
-    assert (isolated_data_dir.parent / "pending_fingerprints.json").exists()
-
-
-# --- fingerprint queue validation gate ---------------------------------------
-
-def test_private_ip_is_tracked_but_not_queued():
-    # pending_fingerprints.json lives one level above the (monkeypatched)
-    # per-test DATA_DIR, which pytest's tmp_path makes a shared sibling
-    # dir across tests in the same session - so assert this value isn't
-    # queued, not that the whole (possibly session-shared) queue is empty.
+def test_private_ip_is_tracked_but_never_scanned(monkeypatch):
     core.create_cluster("Gate Test IP")
     data = core.add_observable("Gate Test IP", "ips", "10.99.0.9", "report X")
     assert any(o["value"] == "10.99.0.9" for o in data["observables"]["ips"])
-    assert not any(e["value"] == "10.99.0.9" for e in core.list_pending_fingerprints())
-    assert data["fingerprint_queue_skipped"] == [
+    assert data["scan_skipped"] == [
         {"category": "ips", "value": "10.99.0.9",
          "reason": "private/reserved/loopback/link-local address, not routable adversary infra"}
     ]
+    assert "10.99.0.9" not in _watchlist_values(monkeypatch, "Gate Test IP")
 
 
-def test_public_dns_resolver_is_tracked_but_not_queued():
+def test_public_dns_resolver_is_tracked_but_never_scanned(monkeypatch):
     core.create_cluster("Gate Test Resolver")
     data = core.add_observable("Gate Test Resolver", "ips", "8.8.8.8", "report X")
     assert any(o["value"] == "8.8.8.8" for o in data["observables"]["ips"])
-    assert not any(e["value"] == "8.8.8.8" for e in core.list_pending_fingerprints())
-    assert data["fingerprint_queue_skipped"][0]["reason"] == "known non-actor infrastructure (public DNS resolver)"
+    assert data["scan_skipped"][0]["reason"] == "known non-actor infrastructure (public DNS resolver)"
+    assert "8.8.8.8" not in _watchlist_values(monkeypatch, "Gate Test Resolver")
 
 
-def test_known_non_actor_domain_is_tracked_but_not_queued():
+def test_known_non_actor_domain_is_tracked_but_never_scanned(monkeypatch):
     core.create_cluster("Gate Test Domain")
     data = core.add_observable("Gate Test Domain", "domains", "microsoft.com", "report X")
     assert any(o["value"] == "microsoft.com" for o in data["observables"]["domains"])
-    assert not any(e["value"] == "microsoft.com" for e in core.list_pending_fingerprints())
-    assert data["fingerprint_queue_skipped"][0]["reason"] == \
+    assert data["scan_skipped"][0]["reason"] == \
         "known non-actor infrastructure (major vendor/CDN/sinkhole domain)"
+    assert "microsoft.com" not in _watchlist_values(monkeypatch, "Gate Test Domain")
 
 
-def test_subdomain_of_known_non_actor_domain_is_not_skipped():
+def test_subdomain_of_known_non_actor_domain_is_scanned(monkeypatch):
     """Deliberately exact-match only: a subdomain of hosting-platform-style
     apex domains (github.io, amazonaws.com, ...) is routine attacker-
     controlled shared hosting, not a false positive, so only the bare
-    apex is gated - a subdomain must still queue normally."""
+    apex is gated."""
     core.create_cluster("Gate Test Subdomain")
     data = core.add_observable("Gate Test Subdomain", "domains", "evil.github.com", "report X")
-    assert any(e["value"] == "evil.github.com" for e in core.list_pending_fingerprints())
-    assert "fingerprint_queue_skipped" not in data
+    assert "scan_skipped" not in data
+    assert "evil.github.com" in _watchlist_values(monkeypatch, "Gate Test Subdomain")
 
 
-def test_ipv6_ip_is_tracked_but_not_queued():
-    """Functional rule: ignore IPv6 for pivoting and probing - the probe
-    VM has no IPv6 route, so an IPv6 literal in the queue would only ever
-    time out."""
+def test_ipv6_ip_is_tracked_but_never_scanned(monkeypatch):
+    """The probe VM has no IPv6 route, so a scan would only ever time out."""
     core.create_cluster("Gate Test IPv6")
     data = core.add_observable("Gate Test IPv6", "ips", "2a10:1fc0:6::de96:9634", "report X")
     assert any(o["value"] == "2a10:1fc0:6::de96:9634" for o in data["observables"]["ips"])
-    assert not any(e["value"] == "2a10:1fc0:6::de96:9634" for e in core.list_pending_fingerprints())
-    assert data["fingerprint_queue_skipped"][0]["reason"] == \
+    assert data["scan_skipped"][0]["reason"] == \
         "IPv6 - the probe VM has no IPv6 route, active fingerprinting would only ever time out"
+    assert "2a10:1fc0:6::de96:9634" not in _watchlist_values(monkeypatch, "Gate Test IPv6")
 
 
-def test_ordinary_domain_and_ip_are_unaffected_by_the_gate():
+def test_ordinary_domain_and_ip_are_scanned(monkeypatch):
     core.create_cluster("Gate Test Normal")
-    data = core.add_observable("Gate Test Normal", "domains", "evil.example", "report X")
+    core.add_observable("Gate Test Normal", "domains", "evil.example", "report X")
     data = core.add_observable("Gate Test Normal", "ips", "185.220.101.47", "report X")
-    assert "fingerprint_queue_skipped" not in data
-    queued = {(e["category"], e["value"]) for e in core.list_pending_fingerprints()}
-    assert ("domains", "evil.example") in queued
-    assert ("ips", "185.220.101.47") in queued
+    assert "scan_skipped" not in data
+    assert {"evil.example", "185.220.101.47"} <= _watchlist_values(monkeypatch, "Gate Test Normal")
 
 
 def test_ingest_report_records_skipped_entries_in_report_sources(tmp_path):
@@ -1251,11 +1218,9 @@ def test_ingest_report_records_skipped_entries_in_report_sources(tmp_path):
     report.write_text("Fancy Bear infrastructure includes evil.example and "
                        "microsoft.com (mentioned only in passing).")
     data = core.ingest_report(str(report), cluster_name="Gate Test Ingest")
-    skipped = data["report_sources"][-1]["fingerprint_queue_skipped"]
+    skipped = data["report_sources"][-1]["scan_skipped"]
     assert any(s["value"] == "microsoft.com" for s in skipped)
-    queued = {e["value"] for e in core.list_pending_fingerprints()}
-    assert "evil.example" in queued
-    assert "microsoft.com" not in queued
+    assert not any(s["value"] == "evil.example" for s in skipped)
 
 
 # --- observables in STIX export/import --------------------------------------
@@ -1704,6 +1669,21 @@ def test_pivot_and_expand_suppresses_cohosted_domains_for_shared_hosting_ip(monk
     assert str(shared_asn) in result["review"]["cohosted_domains_suppressed"]
 
 
+def test_a_rate_limited_pivot_says_so_instead_of_finding_nothing(monkeypatch):
+    """Webamon's 429 was dropped, so a pivot that could not look reported
+    the same empty result as one that looked and found nothing."""
+    monkeypatch.setattr(core.webamon, "search_ip",
+                        lambda ip, size=50: {"error": "webamon rate limited"})
+    monkeypatch.setattr(core.pivot, "ripestat_lookup", lambda ip: {"asn": [64500]})
+    core.create_cluster("Expand Limited")
+    core.add_observable("Expand Limited", "ips", "185.10.10.11", "seed")
+    result = core.pivot_and_expand("185.10.10.11", "Expand Limited", include_cohosted=True)
+    assert result["filed"] == {}
+    assert result["review"]["source_errors"] == {"webamon": "webamon rate limited"}
+    entry = core.get_cluster("Expand Limited")["hunt_log"][-1]["entry"]
+    assert "incomplete, not a negative" in entry
+
+
 def test_pivot_and_expand_rejects_hash(monkeypatch):
     core.create_cluster("Expand Hash")
     with pytest.raises(ValueError):
@@ -1720,13 +1700,6 @@ def test_pivot_and_expand_skips_ipv6_target():
     assert result["filed"] == {}
     data = core.get_cluster("Expand IPv6 Target")
     assert any("skipped (IPv6" in h["entry"] for h in data["hunt_log"])
-
-
-def test_requeue_fingerprint_rejects_ipv6():
-    core.create_cluster("Requeue IPv6")
-    core.add_observable("Requeue IPv6", "ips", "2a10:1fc0:6::de96:9634", "seed")
-    with pytest.raises(ValueError):
-        core.requeue_fingerprint("Requeue IPv6", "ips", "2a10:1fc0:6::de96:9634")
 
 
 # --------------------------------------------------------------------------- #
@@ -2313,25 +2286,27 @@ def _candidate_cluster(name="Cand"):
     return name
 
 
-def _queued(name):
-    # The queue lives beside DATA_DIR, which every test in this file shares,
-    # so it is filtered to this test's own cluster.
-    return [p["value"] for p in core.list_pending_fingerprints() if p["cluster"] == name]
+def _scanned(name, monkeypatch):
+    """What netwatch would scan for this cluster: members, and candidates
+    at the scan band or better."""
+    from cti.netwatch import watchlist
+    monkeypatch.setattr(watchlist.cdn, "available", lambda: False)
+    return sorted(t["value"] for t in watchlist.build(clusters=[name]))
 
 
 def _slug(name):
     return core._slug(name)
 
 
-def test_a_filed_candidate_is_scored_in_the_store_not_the_json():
+def test_a_filed_candidate_is_scored_in_the_store_not_the_json(monkeypatch):
     name = _candidate_cluster("Cand Unqueued")
     assert core.load_cluster(name)["observables"]["domains"] == []
     [cand] = membership.candidates(_slug(name))
     assert cand["entity"] == "new.example" and cand["band"] == "noise"
-    assert _queued(name) == []
+    assert _scanned(name, monkeypatch) == []        # noise is below the scan band
 
 
-def test_accepting_a_candidate_makes_it_a_member_and_queues_it():
+def test_accepting_a_candidate_makes_it_a_member_and_scanned(monkeypatch):
     name = _candidate_cluster("Cand Accepted")
     core.accept_candidate(name, "NEW.example", "same kit as known.example")
     data = core.load_cluster(name)
@@ -2339,7 +2314,7 @@ def test_accepting_a_candidate_makes_it_a_member_and_queues_it():
     assert core.lifecycle_of(data["observables"]["domains"][0]) == "active"
     assert membership.role(_slug(name), "new.example") == "accepted"
     assert "same kit" in data["hunt_log"][-1]["entry"]
-    assert _queued(name) == ["new.example"]
+    assert _scanned(name, monkeypatch) == ["new.example"]
 
 
 def test_a_rejected_candidate_is_denied_for_good():

@@ -19,7 +19,8 @@ export function groupReportSources(reports) {
     const ttps = [...new Set(attempts.flatMap((a) => a.ttps_found || []))];
     const skippedByKey = new Map();
     for (const a of attempts) {
-      for (const s of a.fingerprint_queue_skipped || []) skippedByKey.set(`${s.category}:${s.value}`, s);
+      // scan_skipped since 2026-10-17; fingerprint_queue_skipped before it.
+      for (const s of a.scan_skipped || a.fingerprint_queue_skipped || []) skippedByKey.set(`${s.category}:${s.value}`, s);
     }
     return {
       source: attempts[0].source, attempts, observableCounts: counts, ttps,

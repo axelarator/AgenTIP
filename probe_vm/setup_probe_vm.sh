@@ -67,12 +67,10 @@ if ! command -v dirsearch >/dev/null; then
   PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install dirsearch
 fi
 
-echo "== jarm (salesforce/jarm -> /opt/jarm, probe_helper.JARM_CMD)"
-if [[ -d /opt/jarm/.git ]]; then
-  git -C /opt/jarm pull -q --ff-only || echo "   (jarm update skipped)"
-else
-  git clone -q https://github.com/salesforce/jarm /opt/jarm
-fi
+# salesforce/jarm (/opt/jarm) is no longer installed: since 2026-10-17 JARM
+# comes from httpx -jarm in every netwatch scan, which gave the same value
+# on every host both measured at the same time. An existing /opt/jarm is
+# left alone and unused; remove it by hand if you like.
 
 echo "== cti-provision (the bounded provisioning command)"
 # A SECOND key, pinned to its own forced command, lets the tooling install
@@ -238,6 +236,12 @@ systemctl daemon-reload
 systemctl enable --now netwatch-worker.service >/dev/null 2>&1 \
   && echo "   netwatch-worker.service enabled" \
   || echo "   WARNING: could not enable netwatch-worker.service"
+# `enable --now` leaves an already-running worker on the OLD helper: the
+# worker imports probe_helper.py once at start. It used to crash every idle
+# cycle and so restart onto new code by accident; it no longer does.
+systemctl restart netwatch-worker.service \
+  && echo "   netwatch-worker.service restarted onto this helper" \
+  || echo "   WARNING: could not restart netwatch-worker.service"
 
 echo "== user $PROBE_USER"
 if ! id "$PROBE_USER" >/dev/null 2>&1; then
@@ -280,7 +284,9 @@ runuser -u "$PROBE_USER" -- docker info >/dev/null 2>&1 \
 # collects less is worse than one that says what is missing.
 echo "   observe toolchain:"
 for tool in httpx tlsx dnsx naabu cdncheck whois; do
-  if runuser -u "$PROBE_USER" -- command -v "$tool" >/dev/null 2>&1; then
+  # `command` is a shell builtin, so it needs a shell: run directly under
+  # runuser it never executes, and every tool read as MISSING.
+  if runuser -u "$PROBE_USER" -- sh -c 'command -v "$1"' _ "$tool" >/dev/null 2>&1; then
     printf "     %-10s ok\n" "$tool"
   else
     printf "     %-10s MISSING - observe will skip it and say so\n" "$tool"
@@ -298,6 +304,6 @@ Done. On the cti host:
        export CTI_PROBE_USER=$PROBE_USER
        export CTI_PROBE_SSH_KEY=~/.ssh/id_ed25519_probe
        export CTI_PROBE_KNOWN_HOSTS=~/.ssh/known_hosts_probe
-  3. Re-run ./setup.sh, restart the harness, then:
-       .venv/bin/python scripts/probe_pending_fingerprints.py --check-access
+  3. Re-run ./setup.sh, restart the harness, then check a scan round-trips:
+       .venv/bin/python -m graph netwatch --tiers hot
 EOF

@@ -325,9 +325,8 @@ except HoneyLabs is proxied through the probe VM via `vm_proxy`):
   totals move slowly, so a longer `CTI_PIVOT_CACHE_TTL` (e.g. 86400) is
   sensible if HoneyLabs becomes the dominant source. Skipped with a
   note if the key isn't set; deliberately no keyless fallback. The same
-  lookup also backs `core.honeylabs_context`/`core.summarize_honeylabs`,
-  which `scripts/probe_pending_fingerprints.py` uses to stamp a one-line
-  telemetry summary onto queued IPs as provenance. For interactive
+  lookup also backs `core.honeylabs_context`/`core.summarize_honeylabs`
+  (the daily enrichment's per-IP telemetry). For interactive
   queries beyond per-IP lookups, the `honeylabs` remote MCP server in
   `.mcp.json` exposes HoneyLabs' own tools directly.
 
@@ -442,8 +441,8 @@ step 5.
    through.
 6. **Verify:** on the VM, `python3 /opt/cti/probe_helper.py
    --check-access` reports tool availability; from the cti host,
-   `python3 mcp-server/scripts/probe_pending_fingerprints.py
-   --check-access` round-trips the SSH hop and OpenSearch. Then run a
+   `python -m graph netwatch --tiers hot` round-trips a scan through the
+   SSH hop and joins Zeek back from the SIEM. Then run a
    `pivot_observable` on a domain you control and confirm the TLS/HTTP
    request appears in OpenSearch `zeek-*`.
 

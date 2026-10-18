@@ -203,9 +203,9 @@ def remove_observable(name: str, category: str, value: str) -> dict:
 @mcp.tool()
 def accept_candidate(name: str, value: str, note: str = "") -> dict:
     """Accept a scored candidate (see list_candidates): it becomes a cluster
-    member, joins the cluster JSON, starts exporting, and is queued for
-    fingerprinting. `note` goes in the hunt log with the link that
-    justified it."""
+    member, joins the cluster JSON, starts exporting, and is scanned by
+    netwatch from its next pass. `note` goes in the hunt log with the link
+    that justified it."""
     return core.accept_candidate(name, value, note)
 
 
@@ -301,41 +301,6 @@ def rescore_candidates(name: str) -> list[dict]:
     record the results (score history grows by one row each)."""
     return [{"entity": r["entity"], "score": r["score"], "band": r["band"]}
             for r in membership.rescore(core._slug(name))]
-
-
-@mcp.tool()
-def list_pending_fingerprints() -> list[dict]:
-    """Peek at domains/ips newly tracked (via add_observable,
-    ingest_report, or import_stix_bundle) since the last
-    pop_pending_fingerprints call - infrastructure that hasn't been
-    actively fingerprinted (JA4+/JARM) yet. Read-only, doesn't clear the
-    queue. Each entry is {cluster, category, value, queued_at}."""
-    return core.list_pending_fingerprints()
-
-
-@mcp.tool()
-def pop_pending_fingerprints() -> list[dict]:
-    """Return every queued pending-fingerprint entry and clear the queue
-    in one step - call this from wherever you actively collect JA4+/JARM
-    fingerprints (e.g. an isolated VM) each cycle to claim everything
-    waiting without re-processing it next time. File results back with
-    add_observable. Use list_pending_fingerprints instead to check
-    without consuming."""
-    return core.pop_pending_fingerprints()
-
-
-@mcp.tool()
-def requeue_fingerprint(name: str, category: str, value: str) -> list[dict]:
-    """Put an already-tracked domain/ip back on the JA4+/JARM pending
-    queue for re-probing - use this after a prior fingerprint attempt
-    errored, timed out, or came back as a null/placeholder result (e.g.
-    JARM's all-zero no-response sentinel). add_observable/ingest_report
-    only enqueue a value the first time it's seen, so touching an
-    existing observable again does NOT requeue it on its own - this is
-    the supported way to force that instead of hand-editing the queue
-    file. category must be "domains" or "ips". Raises if the cluster or
-    the observable isn't found."""
-    return core.requeue_fingerprint(name, category, value)
 
 
 @mcp.tool()
@@ -482,7 +447,7 @@ def export_stix_bundle(name: str, include_inactive: bool = False) -> dict:
 
 
 @mcp.tool()
-def export_stix_ecosystem(name: str) -> dict:
+def export_stix_ecosystem(name: str, include_inactive: bool = False) -> dict:
     """Export this cluster and every cluster it's transitively related
     to (via add_relationship) as one self-contained STIX 2.1 bundle -
     unlike export_stix_bundle, every cross-cluster Relationship's

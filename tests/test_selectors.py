@@ -1021,3 +1021,9 @@ def test_ja4x_is_part_of_the_certificate():
     "http.header_order", "flow.app_proto"])
 def test_new_fingerprints_cannot_promote_alone(selector_type):
     assert not S.can_promote(selector_type)
+
+
+def test_one_serial_one_spelling():
+    """tlsx/openssl write colons, .NET does not; one certificate."""
+    assert (S.normalize("tls.serial", "6C:86:9E:E9:08:6B")
+            == S.normalize("tls.serial", "6c869ee9086b") == "6c869ee9086b")

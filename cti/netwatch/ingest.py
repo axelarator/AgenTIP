@@ -19,11 +19,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .. import store
+from ..sources import ja4x as ja4x_mod
 from ..sources import observe as observe_source
 from ..sources.opensearch import OpenSearchClient, OpenSearchError
 from .jobs import spool_dir
@@ -40,6 +42,47 @@ _VANTAGE_IP = {
 # Zeek -> Wazuh ingest lags capture; widen the window on both sides.
 _JOIN_LOOKBACK = 120.0
 _JOIN_LOOKAHEAD = 900.0
+
+
+def _join_all(client, by_target: dict) -> dict[tuple, dict[int, dict]]:
+    """The passive fingerprints for every open (scan, target, port), retrying
+    the ones Zeek should have but has not indexed yet.
+
+    Ingest runs seconds after a scan, and tlsx's session - the one the
+    fingerprints are pinned to - is the last a scan opens, so it was often
+    not indexed yet (2026-10-17). A port where tlsx returned a certificate
+    must have that session, so only those are retried: every 10 seconds,
+    for at most CTI_ZEEK_WAIT seconds (default 120). Waiting on the index's
+    overall freshness instead failed in a quiet lab, where nothing newer
+    than the scan itself ever arrives.
+    """
+    out: dict[tuple, dict[int, dict]] = {}
+    pending: list[tuple] = []
+    for key, records in by_target.items():
+        out[key] = {}
+        for rec in records:
+            if not rec.get("open") or not rec.get("ip"):
+                continue
+            args = (client, rec.get("vantage") or "probe", rec["ip"], rec["port"],
+                    _parse_ts(rec.get("ts")).replace(tzinfo=timezone.utc).timestamp())
+            out[key][rec["port"]] = _passive_fingerprints(*args)
+            if rec.get("tls") and not out[key][rec["port"]].get("ja4s"):
+                pending.append((key, rec["port"], args))
+    deadline = time.monotonic() + float(os.environ.get("CTI_ZEEK_WAIT", "120"))
+    while pending and time.monotonic() < deadline:
+        time.sleep(10)
+        still = []
+        for key, port, args in pending:
+            found = _passive_fingerprints(*args)
+            if found.get("ja4s"):
+                out[key][port] = found
+            else:
+                still.append((key, port, args))
+        pending = still
+    if pending:
+        log.warning("Zeek had no pinned session for %d TLS port(s) after the wait: %s",
+                    len(pending), ", ".join(f"{k[1]}:{p}" for k, p, _ in pending[:5]))
+    return out
 
 # (field on the snapshot) -> change_type when it differs from the baseline.
 _DIFF_FIELDS = {
@@ -61,10 +104,33 @@ def _parse_ts(value: Any) -> datetime:
     return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
 
 
+# Which of our clients' sessions the server-side fingerprints are read from.
+# A server answers each client hello differently - measured 2026-10-17, 74 of
+# 130 servers gave httpx and tlsx different JA4S, while every client got a
+# stable answer of its own - so a JA4S only means something per client.
+# Pinned to tlsx: the dedicated TLS client, used by both the sweep and
+# netwatch, stable on all 88 servers it reached. The value is the cipher-hash
+# part of tlsx's own JA4 (the middle field), which holds across SNI/no-SNI.
+DEFAULT_JA4S_CLIENT_HASH = "e8f1e7e78f70"
+
+
+def ja4s_client_hash() -> str:
+    return os.environ.get("CTI_JA4S_CLIENT_HASH", DEFAULT_JA4S_CLIENT_HASH)
+
+
+def _pinned_client(ja4: str | None) -> bool:
+    parts = (ja4 or "").split("_")
+    return len(parts) == 3 and parts[1] == ja4s_client_hash()
+
+
 def _passive_fingerprints(client: OpenSearchClient | None, vantage: str,
                           ip: str, port: int, scan_epoch: float) -> dict[str, Any]:
-    """ja4s (ssl.log) and ja4ts/ja4l (conn.log) for the session our probe
-    opened to ip:port around scan time. Unreachable Zeek is a skip."""
+    """ja4s/ja4x (ssl.log) and ja4ts/ja4l (conn.log) for the pinned client's
+    session to ip:port around scan time. Unreachable Zeek is a skip.
+
+    The TCP fingerprints come from the same session (joined on Zeek's uid):
+    a server's SYN-ACK also depends on the client's SYN.
+    """
     probe_ip = _VANTAGE_IP.get(vantage)
     if client is None or not probe_ip or not ip:
         return {}
@@ -75,26 +141,59 @@ def _passive_fingerprints(client: OpenSearchClient | None, vantage: str,
             client.ts_range(gte=scan_epoch - _JOIN_LOOKBACK,
                             lt=scan_epoch + _JOIN_LOOKAHEAD)]
     try:
-        for hit in client.sources({"bool": {"filter": base}}, size=50):
-            lf = hit.get("log_file", "")
-            if lf.endswith("ssl.log"):
-                if hit.get("ja4s") and not out.get("ja4s"):
-                    out["ja4s"] = hit["ja4s"]
-                if hit.get("ja4x") and not out.get("ja4x"):
-                    out["ja4x"] = hit["ja4x"]
-            elif lf.endswith("conn.log"):
-                for f in ("ja4ts", "ja4l"):
-                    if hit.get(f) and not out.get(f):
-                        out[f] = hit[f]
+        hits = client.sources({"bool": {"filter": base}}, size=200)
     except OpenSearchError as e:
         log.warning("passive join unavailable: %s", e)
+        return out
+    ssl = [h for h in hits if h.get("log_file", "").endswith("ssl.log")]
+    pinned = [h for h in ssl if _pinned_client(h.get("ja4"))]
+    if ssl and not pinned:
+        log.info("no session from the pinned TLS client (JA4 cipher hash %s) to %s:%s "
+                    "among %d - if tlsx was upgraded, set CTI_JA4S_CLIENT_HASH",
+                    ja4s_client_hash(), ip, port, len(ssl))
+    for hit in pinned:
+        for f in ("ja4s", "ja4x"):
+            if hit.get(f) and not out.get(f):
+                out[f] = hit[f]
+    uids = {h.get("uid") for h in pinned if h.get("uid")}
+    for hit in hits:
+        if hit.get("log_file", "").endswith("conn.log") and hit.get("uid") in uids:
+            for f in ("ja4ts", "ja4l"):
+                if hit.get(f) and not out.get(f):
+                    out[f] = hit[f]
     return out
 
 
+def intercepted_ports() -> set[int]:
+    """Ports something on the probe's egress path answers for every target.
+
+    Measured 2026-10-16: TCP/53 to five unrelated hosts on four providers
+    completed the handshake, sent 0 bytes and closed at an identical 0.48 s
+    or 2.47 s, while real resolvers on the same path answered with 48-300
+    bytes. naabu reports that as open on every host it touches. A port in
+    this set counts as open only with an application answer behind it.
+    """
+    raw = os.environ.get("CTI_NETWATCH_INTERCEPTED_PORTS", "53")
+    return {int(p) for p in raw.split(",") if p.strip().isdigit()}
+
+
+def _intercepted(rec: dict[str, Any]) -> bool:
+    return (bool(rec.get("open")) and int(rec.get("port") or 0) in intercepted_ports()
+            and not (rec.get("http") or rec.get("tls") or rec.get("banner_sha256")
+                     or rec.get("app_proto")))
+
+
 def _flatten(rec: dict[str, Any], passive: dict[str, Any]) -> dict[str, Any]:
-    """A scan record (+ passive fingerprints) -> a service_snapshots row."""
+    """A scan record (+ passive fingerprints) -> a service_snapshots row.
+
+    JA4X is computed here from the certificate's PEM, which is then dropped
+    from the stored record: it is ~2 KB per port per scan, and the digest it
+    yields (with cert_sha256 beside it) is what anything reads back."""
     http = rec.get("http") or {}
     tls = rec.get("tls") or {}
+    ja4x = passive.get("ja4x") or ja4x_mod.for_tls(tls)
+    if tls.get("pem"):
+        rec = {**rec, "tls": {k: v for k, v in tls.items() if k != "pem"}}
     return {
         "scan_id": rec["scan_id"], "scanned_at": _parse_ts(rec.get("ts")),
         "vantage": rec.get("vantage") or "probe", "profile": rec.get("profile"),
@@ -104,7 +203,7 @@ def _flatten(rec: dict[str, Any], passive: dict[str, Any]) -> dict[str, Any]:
         "cert_sha256": tls.get("cert_sha256"), "spki_sha256": tls.get("spki_sha256"),
         "tls_issuer": tls.get("issuer"), "ja3s": tls.get("ja3s"),
         "ja4s": passive.get("ja4s"), "ja4ts": passive.get("ja4ts"),
-        "ja4x": passive.get("ja4x"),
+        "ja4x": ja4x,
         "jarm": http.get("jarm"), "http_status": http.get("status"),
         "http_title": http.get("title"), "http_server": http.get("server"),
         "header_order": observe_source.header_order(http.get("raw_header")),
@@ -159,11 +258,15 @@ def _observe_result(records: list[dict[str, Any]], passive_by_port: dict[int, di
                 open_ports.append(rec["port"])
         if rec.get("http") and not http:
             http = dict(rec["http"])
-        if rec.get("tls") and not tls:
-            tls = dict(rec["tls"])
-            passive = passive_by_port.get(rec["port"], {})
-            if passive.get("ja4s"):
-                tls["ja4s"] = passive["ja4s"]
+        if rec.get("tls") and not tls.get("cert_sha256"):
+            tls = {**dict(rec["tls"]), **({"ja4s": tls["ja4s"]} if tls.get("ja4s") else {})}
+        # Zeek's JA4S is the server's own answer, recorded whether or not the
+        # active TLS grab produced a certificate - it was only ever attached
+        # beside one, so while tlsx failed no JA4S became a selector at all.
+        passive = passive_by_port.get(rec.get("port"), {})
+        for field in ("ja4s", "ja4ts", "ja4x"):
+            if passive.get(field) and field not in tls:
+                tls[field] = passive[field]
     return {"http": http, "tls": tls, "dns": {}, "whois": {},
             "cdn": {}, "ports": open_ports or None, "errors": {}}
 
@@ -202,15 +305,13 @@ def ingest(*, client: Any = _UNSET, purge: bool = True) -> dict[str, Any]:
 
     snapshots = changes = selectors = 0
     with store.connect_retry(read_only=False) as con:
+        # Before anything reads `open`: the join, the snapshot, the diff and
+        # the port-set selector must all see an intercepted port as closed.
+        by_target = {key: [{**r, "open": False, "intercepted": True} if _intercepted(r) else r
+                           for r in records] for key, records in by_target.items()}
+        joined = _join_all(client, by_target) if client is not None else {}
         for (scan_id, target), records in by_target.items():
-            passive_by_port: dict[int, dict] = {}
-            for rec in records:
-                if not rec.get("open") or not rec.get("ip"):
-                    continue
-                passive_by_port[rec["port"]] = _passive_fingerprints(
-                    client, rec.get("vantage") or "probe", rec["ip"],
-                    rec["port"], _parse_ts(rec.get("ts")).replace(
-                        tzinfo=timezone.utc).timestamp())
+            passive_by_port = joined.get((scan_id, target), {})
             actor = next((r.get("actor") for r in records if r.get("actor")), None)
             kind = "ip" if records and records[0].get("ip") == target else "domain"
             observed_at = _parse_ts(records[0].get("ts"))

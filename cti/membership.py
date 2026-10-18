@@ -113,6 +113,26 @@ def _score_against(con, cluster: str, value: str, extra_members: Iterable[str]):
     return R.score_against(con, value, members)
 
 
+def record_links(value: str, links: Iterable[dict[str, Any]], *, origin: str) -> int:
+    """Record the dated selectors that surfaced a host, on that host, before
+    anything scores it - otherwise a passive-DNS neighbour is scored without
+    the one link that found it, and "shared an address two years apart"
+    reads the same as "shares nothing"."""
+    from .store import selectors as S
+
+    links = list(links)
+    if not links:
+        return 0
+    with store.connect_retry(read_only=False) as con:
+        for link in links:
+            S.record(con, indicator_value=E.canonical(value),
+                     selector_type=link["selector_type"], selector_value=link["value"],
+                     observed_at=link.get("last") or link.get("first") or _now(),
+                     first_seen=link.get("first"), last_seen=link.get("last"),
+                     indicator_type=E.entity_type(value), source=link.get("source") or origin)
+    return len(links)
+
+
 def file_candidate(cluster: str, value: str, *, origin: str, decided_by: str,
                    reason: str | None = None,
                    links: Iterable[dict[str, Any]] = (),
@@ -230,6 +250,7 @@ def _now() -> datetime:
 
 
 __all__ = ["MEMBER_CATEGORIES", "BAND_ORDER", "SERVER_FINGERPRINTS", "band_at_least",
-           "fingerprint_selector", "record_fingerprints", "member_value", "mirror_seeds",
+           "fingerprint_selector", "record_fingerprints", "record_links", "member_value",
+           "mirror_seeds",
            "file_candidate", "role", "decide", "forget", "values_with_role", "candidates",
            "score", "rescore", "expire"]

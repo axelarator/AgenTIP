@@ -104,18 +104,6 @@ def test_resolve_dns_inconclusive_error(monkeypatch):
     assert vm_proxy.resolve_dns("nope.invalid") is None
 
 
-def test_probe_jarm_sends_jarm_probe_action(monkeypatch):
-    captured = {}
-
-    def fake_rpc(request):
-        captured.update(request)
-        return {"jarm": "abc", "resolved_ip": "1.2.3.4", "error": None}
-    monkeypatch.setattr(vm_proxy, "_ssh_json_rpc", fake_rpc)
-    result = vm_proxy.probe_jarm("example.com", 443)
-    assert captured == {"action": "jarm_probe", "target": "example.com", "port": 443}
-    assert result["jarm"] == "abc"
-
-
 def test_ssh_json_rpc_uses_default_timeout(monkeypatch):
     captured = {}
 

@@ -20,8 +20,10 @@ export function parseHash(raw) {
       return rest[0]
         ? { name: "technique", id: rest[0] }
         : { name: "techniques" };
+    // The fingerprint queue was retired 2026-10-17 (netwatch scans members
+    // directly); an old bookmark lands on the overview rather than breaking.
     case "queue":
-      return { name: "queue" };
+      return { name: "overview" };
     case "indicators":
       return { name: "indicators" };
     case "indicator":
