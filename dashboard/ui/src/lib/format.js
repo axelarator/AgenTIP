@@ -28,12 +28,6 @@ export function dayOf(value) {
   return value ? String(value).slice(0, 10) : "—";
 }
 
-// Prose only. NEVER an indicator value - see IndicatorChip.
-export function truncate(text, n) {
-  if (!text) return "";
-  return text.length > n ? text.slice(0, n).trimEnd() + "…" : text;
-}
-
 export function humanBytes(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return value ?? "—";

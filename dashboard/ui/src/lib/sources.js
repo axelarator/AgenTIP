@@ -4,7 +4,6 @@
 // have no relationship to this lab's own captured traffic, and an earlier
 // version that linked them produced a link that (correctly) usually showed
 // nothing.
-import { truncate } from "./format.js";
 
 const JARM_SOURCE_RE = /^JARM against (.+):(\d+) via .+, (\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}Z)?)$/;
 // Any sensor name: it comes from CTI_ZEEK_SENSOR when the pipeline writes it.
@@ -63,5 +62,5 @@ export function describeSource(source, category, value) {
   }
   const pivot = pivotSourceUrl(source, category, value);
   if (pivot) return { kind: "link", url: pivot.url, label: pivot.label, title: source };
-  return { kind: "note", text: truncate(source, 42), title: source };
+  return { kind: "note", text: source, title: source };
 }

@@ -110,6 +110,11 @@ def _get(path: str, params: dict[str, Any]) -> Any:
         if e.status == 403:
             return {"error": "webamon forbidden (plan/quota)"}
         if e.status == 429:
+            # Webamon answers 429 both for a burst and for a spent plan
+            # quota ({"error": "Quota exceeded", ...}); only the first one
+            # clears by waiting a minute.
+            if "quota" in (e.body or "").lower():
+                return {"error": "webamon quota exceeded"}
             return {"error": "webamon rate limited"}
         if e.status is not None:
             return {"error": f"webamon HTTP {e.status}"}

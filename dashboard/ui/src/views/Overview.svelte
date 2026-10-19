@@ -2,7 +2,7 @@
   import { api } from "../lib/api.js";
   import { resource } from "../lib/resource.svelte.js";
   import { href } from "../lib/router.js";
-  import { formatDate, truncate } from "../lib/format.js";
+  import { formatDate } from "../lib/format.js";
   import Async from "../components/Async.svelte";
   import PageHeader from "../components/PageHeader.svelte";
   import StatTile from "../components/StatTile.svelte";
@@ -63,7 +63,7 @@
             <span class="timeline-item__date">{formatDate(e.date)}</span>
             <a class="timeline-item__cluster-link" href={href.cluster(e.slug, "hunt_log")}>{e.cluster}</a>
           </div>
-          <div class="timeline-item__body">{truncate(e.entry, 320)}</div>
+          <div class="timeline-item__body">{e.entry}</div>
         </div>
       {:else}
         <div class="empty-state">No hunt log entries yet.</div>
