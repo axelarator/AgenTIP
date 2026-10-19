@@ -1,5 +1,5 @@
 <script>
-  import { formatDate, truncate } from "../../lib/format.js";
+  import { formatDate } from "../../lib/format.js";
   import CoverageChip from "../../components/CoverageChip.svelte";
   import TechniqueChip from "../../components/TechniqueChip.svelte";
 
@@ -27,7 +27,7 @@
             <td><TechniqueChip id={t.id} /></td>
             <td>{t.name}</td>
             <td><CoverageChip status={t.status} /></td>
-            <td>{truncate(t.notes, 140)}</td>
+            <td class="notes">{t.notes || ""}</td>
             <td class="mono">{formatDate(t.updated)}</td>
           </tr>
         {/each}
@@ -35,3 +35,7 @@
     </table>
   {/if}
 </div>
+
+<style>
+  .notes { white-space: pre-wrap; overflow-wrap: anywhere; }
+</style>
