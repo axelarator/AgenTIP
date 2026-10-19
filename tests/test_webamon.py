@@ -167,3 +167,21 @@ def test_get_bumps_quota_and_maps_http_errors(monkeypatch):
     monkeypatch.setattr(http.urllib.request, "urlopen", raise_403)
     assert webamon._get("/search", {"search": "x"}) == {"error": "webamon forbidden (plan/quota)"}
     assert webamon.quota_used_today() == 2  # a rejected call still counts against the wire attempt
+
+
+def test_get_tells_quota_exceeded_from_rate_limit(monkeypatch):
+    import io
+    import urllib.error
+
+    def raise_429(body):
+        def _raise(*a, **k):
+            raise urllib.error.HTTPError("u", 429, "Too Many Requests", {},
+                                         io.BytesIO(body.encode()))
+        return _raise
+
+    monkeypatch.setattr(http.urllib.request, "urlopen", raise_429(
+        '{"error": "Quota exceeded", "message": "searches quota exceeded"}'))
+    assert webamon._get("/search", {"search": "x"}) == {"error": "webamon quota exceeded"}
+
+    monkeypatch.setattr(http.urllib.request, "urlopen", raise_429("slow down"))
+    assert webamon._get("/search", {"search": "x"}) == {"error": "webamon rate limited"}
