@@ -22,7 +22,8 @@ Actions (selected by the request's "action" field, which is required):
   http_probe   {url, insecure}                   -> {status, final_url, title, server, content_type, body_sha256, autoindex, error}
   subfinder    {domain}                          -> {subdomains:[...], error}
   wayback_cdx  {domain}                          -> {urls:[...], subdomains:[...], error}
-  nmap         {target, top, sv}                 -> {ports:[{port,proto,service,product,version}], resolved_ip, error}
+  nmap         {target, top, sv, ports?}         -> {ports:[{port,proto,service,product,version}], resolved_ip, error, top, extra_ports}
+                                                    (ports: extra TCP ports scanned alongside the top list, max 64)
   dirsearch    {url, extensions, rate,           -> {hits:[{path,status,size}], opendirs:[{url,files:[...]}], baseline_404, error}
                 max_depth, max_files}
 
@@ -347,15 +348,65 @@ def action_wayback_cdx(request: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # nmap (new, on-demand)
 # --------------------------------------------------------------------------- #
+NMAP_SERVICES = Path("/usr/share/nmap/nmap-services")
+MAX_EXTRA_PORTS = 64
+
+
+def _top_tcp_ports(n: int, services: Path | None = None) -> list[int]:
+    """The n most frequently open TCP ports, ranked by nmap-services' open
+    frequency - the same list `--top-ports n` scans. Read directly because
+    nmap ignores --top-ports when -p is also given, and extra ports have to
+    be scanned ALONGSIDE the top list, not instead of it: a scan that only
+    covered the extras would report every top port as closed."""
+    ranked: list[tuple[float, int]] = []
+    for line in (services or NMAP_SERVICES).read_text(errors="replace").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split()
+        if len(fields) < 3 or not fields[1].endswith("/tcp"):
+            continue
+        try:
+            ranked.append((float(fields[2]), int(fields[1].split("/")[0])))
+        except ValueError:
+            continue
+    ranked.sort(key=lambda pair: (-pair[0], pair[1]))
+    return [port for _, port in ranked[:n]]
+
+
+def _extra_ports(raw) -> list[int]:
+    """Validate the caller's extra ports: TCP 1-65535, deduplicated, capped."""
+    if not raw:
+        return []
+    ports = sorted({int(p) for p in raw})
+    bad = [p for p in ports if not 1 <= p <= 65535]
+    if bad:
+        raise ValueError(f"ports out of range: {bad}")
+    if len(ports) > MAX_EXTRA_PORTS:
+        raise ValueError(f"at most {MAX_EXTRA_PORTS} extra ports, got {len(ports)}")
+    return ports
+
+
 def action_nmap(request: dict) -> dict:
     target = request["target"]
     top = int(request.get("top") or 100)
     sv = bool(request.get("sv", True))
     try:
+        extra = _extra_ports(request.get("ports"))
+    except (TypeError, ValueError) as e:
+        return {"ports": [], "resolved_ip": None, "error": f"bad ports: {e}"}
+    try:
         resolved_ip = resolve_target_ip(target)
     except Exception as e:
         return {"ports": [], "resolved_ip": None, "error": f"DNS resolution failed: {e}"}
-    cmd = [*NMAP_CMD, "--top-ports", str(top), "-Pn", "-oX", "-"]
+    if extra:
+        try:
+            scan = sorted(set(_top_tcp_ports(top)) | set(extra))
+        except OSError as e:
+            return {"ports": [], "resolved_ip": resolved_ip,
+                    "error": f"cannot read {NMAP_SERVICES} to build the top-{top} list: {e}"}
+        cmd = [*NMAP_CMD, "-p", ",".join(map(str, scan)), "-Pn", "-oX", "-"]
+    else:
+        cmd = [*NMAP_CMD, "--top-ports", str(top), "-Pn", "-oX", "-"]
     if sv:
         cmd.append("-sV")
     cmd.append(target)
@@ -382,7 +433,10 @@ def action_nmap(request: dict) -> dict:
             })
     except Exception as e:
         return {"ports": [], "resolved_ip": resolved_ip, "error": f"nmap XML parse failed: {e}"}
-    return {"ports": ports, "resolved_ip": resolved_ip, "error": None}
+    # `extra_ports` is echoed back so the caller can tell a helper that
+    # scanned them from an older one that silently ignored the key.
+    return {"ports": ports, "resolved_ip": resolved_ip, "error": None,
+            "top": top, "extra_ports": extra}
 
 
 # --------------------------------------------------------------------------- #

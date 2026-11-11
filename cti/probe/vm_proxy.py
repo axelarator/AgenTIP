@@ -283,13 +283,19 @@ def wayback_cdx(domain: str) -> dict[str, object]:
     return _ssh_json_rpc({"action": "wayback_cdx", "domain": domain})
 
 
-def nmap(target: str, top_ports: int = 100, service_detection: bool = True) -> dict[str, object]:
-    """Top-ports service scan from the VM (on-demand, long):
+def nmap(target: str, top_ports: int = 100, service_detection: bool = True,
+         ports: list[int] | None = None) -> dict[str, object]:
+    """Top-ports service scan from the VM (on-demand, long), plus any extra
+    `ports` scanned alongside the top list:
     {"ports": [{"port","proto","service","product","version"}],
-    "resolved_ip": str, "error": str|None}."""
-    return _ssh_json_rpc(
-        {"action": "nmap", "target": target, "top": top_ports, "sv": service_detection},
-        timeout=LONG_TIMEOUT)
+    "resolved_ip": str, "error": str|None, "extra_ports": [...]}.
+    A helper that predates the `ports` key ignores it and returns no
+    `extra_ports` - callers must check before claiming the extras were scanned."""
+    request: dict[str, object] = {"action": "nmap", "target": target,
+                                  "top": top_ports, "sv": service_detection}
+    if ports:
+        request["ports"] = sorted({int(p) for p in ports})
+    return _ssh_json_rpc(request, timeout=LONG_TIMEOUT)
 
 
 def dirsearch(url: str, extensions: list[str] | None = None, rate: int = 20,

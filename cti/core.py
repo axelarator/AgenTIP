@@ -2137,8 +2137,13 @@ def _ts_to_dt(ts: float | None) -> datetime | None:
     return datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
 
 
+_MAX_EXTRA_DIRSEARCH = 8
+_TLS_SERVICES = {"https", "https-alt", "ssl/http", "ssl/https"}
+
+
 def active_scan(target: str, cluster: str | None = None,
-                tools: list[str] | None = None) -> dict[str, Any]:
+                tools: list[str] | None = None,
+                ports: list[int] | None = None) -> dict[str, Any]:
     """On-demand, LOUD active scan of a domain/ip - explicitly separate
     from the automatic light-touch enrichment sweep. Runs nmap (top-ports
     -sV) and/or dirsearch (web path map + recursive open-directory file
@@ -2149,10 +2154,20 @@ def active_scan(target: str, cluster: str | None = None,
     if `cluster` is given and the target is tracked there, stamped onto its
     observable), and the run is audited in active_scans with the Zeek
     timestamp window its traffic falls in, so the captured packets can be
-    found later in OpenSearch/Arkime."""
+    found later in OpenSearch/Arkime.
+
+    `ports` adds specific TCP ports - a report's console or open-directory
+    ports, say - to nmap's top-100 list rather than replacing it, so the
+    recorded port set stays comparable with earlier scans. With dirsearch,
+    each extra port nmap found open (every extra port, if nmap is not run)
+    is also mapped, up to eight."""
     kind = pivot.classify(target)
     if kind not in ("domain", "ip"):
         raise ValueError(f"active_scan supports domain/ip; got kind={kind!r} for {target!r}")
+    extra = sorted({int(p) for p in ports}) if ports else []
+    bad = [p for p in extra if not 1 <= p <= 65535]
+    if bad:
+        raise ValueError(f"active_scan ports out of range: {bad}")
     if kind == "ip" and ipaddress.ip_address(target).version == 6:
         return {"target": target, "kind": kind, "skipped": "IPv6 (no route from the probe VM)"}
     requested = list(tools) if tools else list(_ACTIVE_SCAN_TOOLS)
@@ -2167,32 +2182,60 @@ def active_scan(target: str, cluster: str | None = None,
     # Network phase - unlocked (nmap/dirsearch take minutes).
     summary: dict[str, Any] = {"target": target, "kind": kind, "cluster": cluster,
                                "tools": requested, "ran_at": ran_at}
+    if extra:
+        summary["extra_ports"] = extra
     nmap_ports: list[int] = []
+    open_services: dict[int, str | None] = {}
     if "nmap" in requested:
         try:
-            nres = vm_proxy.nmap(target)
+            nres = (vm_proxy.nmap(target, ports=extra) if extra else vm_proxy.nmap(target))
         except vm_proxy.VMProxyError as e:
             nres = {"error": str(e)}
         if isinstance(nres, dict) and not nres.get("error"):
             nmap_ports = sorted({p["port"] for p in (nres.get("ports") or []) if p.get("port")})
+            open_services = {p["port"]: p.get("service") for p in (nres.get("ports") or [])
+                             if p.get("port")}
             summary["nmap"] = {"ports": nres.get("ports") or [], "resolved_ip": nres.get("resolved_ip")}
+            if extra and nres.get("extra_ports") is None:
+                # An older helper ignores the key and scans the top list only.
+                # Say so rather than let "8787 not open" read as a finding.
+                summary["nmap"]["warning"] = (
+                    "the probe helper predates the ports option: only the top-100 "
+                    "ports were scanned, NOT the extra ports - redeploy it with "
+                    "setup_probe_vm.sh")
         else:
             summary["nmap"] = {"error": nres.get("error")}
 
     opendirs: list[dict[str, Any]] = []
     if "dirsearch" in requested:
-        url = target if target.startswith(("http://", "https://")) else f"http://{target}/"
-        try:
-            dres = vm_proxy.dirsearch(url)
-        except vm_proxy.VMProxyError as e:
-            dres = {"error": str(e)}
-        if isinstance(dres, dict) and not dres.get("error"):
-            opendirs = dres.get("opendirs") or []
-            summary["dirsearch"] = {"hits": len(dres.get("hits") or []),
-                                    "opendirs": len(opendirs),
-                                    "baseline_404": dres.get("baseline_404")}
+        base = target if target.startswith(("http://", "https://")) else f"http://{target}/"
+        urls = [base]
+        if extra and not target.startswith(("http://", "https://")):
+            mapped = [p for p in extra if p in open_services] if "nmap" in requested else extra
+            for p in mapped[:_MAX_EXTRA_DIRSEARCH]:
+                scheme = "https" if (open_services.get(p) or "") in _TLS_SERVICES else "http"
+                urls.append(f"{scheme}://{target}:{p}/")
+        runs: list[dict[str, Any]] = []
+        for url in urls:
+            try:
+                dres = vm_proxy.dirsearch(url)
+            except vm_proxy.VMProxyError as e:
+                dres = {"error": str(e)}
+            if isinstance(dres, dict) and not dres.get("error"):
+                found = dres.get("opendirs") or []
+                opendirs.extend(found)
+                runs.append({"url": url, "hits": len(dres.get("hits") or []),
+                             "opendirs": len(found),
+                             "baseline_404": dres.get("baseline_404")})
+            else:
+                runs.append({"url": url, "error": dres.get("error")})
+        if len(runs) == 1:
+            run = dict(runs[0])
+            run.pop("url")
+            summary["dirsearch"] = run
         else:
-            summary["dirsearch"] = {"error": dres.get("error")}
+            summary["dirsearch"] = {"hits": sum(r.get("hits", 0) for r in runs),
+                                    "opendirs": len(opendirs), "urls": runs}
 
     after_ts = _opensearch_max_ts()
 

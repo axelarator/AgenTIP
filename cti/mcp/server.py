@@ -358,7 +358,8 @@ def pivot_and_expand(value: str, cluster_name: str,
 
 @mcp.tool()
 def active_scan(target: str, cluster: str | None = None,
-                tools: list[str] | None = None) -> dict:
+                tools: list[str] | None = None,
+                ports: list[int] | None = None) -> dict:
     """On-demand LOUD active scan of a domain/ip from the probe VM - nmap
     (top-ports service scan) and/or dirsearch (web path map + recursive
     open-directory file listing). Distinct from the automatic light-touch
@@ -368,8 +369,14 @@ def active_scan(target: str, cluster: str | None = None,
     `cluster` is given and the target is tracked there, results are stamped
     onto its observable. The run is audited with the Zeek timestamp window
     its traffic falls in, so the captured packets can be found in
-    OpenSearch/Arkime. `tools` defaults to both nmap and dirsearch."""
-    return core.active_scan(target, cluster, tools)
+    OpenSearch/Arkime. `tools` defaults to both nmap and dirsearch.
+
+    `ports` adds specific TCP ports (max 64) to nmap's top-100 list - use
+    it for a report's non-standard ports, which top-100 never reaches.
+    dirsearch then also maps each extra port nmap found open (up to 8).
+    If the result's nmap block carries a `warning`, the probe helper is
+    too old to scan extra ports and they were NOT checked."""
+    return core.active_scan(target, cluster, tools, ports)
 
 
 @mcp.tool()

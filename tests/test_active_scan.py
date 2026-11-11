@@ -211,3 +211,54 @@ def test_a_page_with_no_listing_files_nothing():
 def test_a_failed_probe_files_nothing():
     _log({"error": "connection reset"})
     assert _opendir_rows("evil.example") == []
+
+
+# --------------------------------------------------------------------------- #
+# extra ports: scanned alongside top-100, never instead of it
+# --------------------------------------------------------------------------- #
+
+def test_extra_ports_reach_nmap_and_dirsearch_maps_the_open_ones(monkeypatch):
+    seen = {}
+
+    def nmap(target, top_ports=100, service_detection=True, ports=None):
+        seen["ports"] = ports
+        return {"ports": [{"port": 22, "proto": "tcp", "service": "ssh"},
+                          {"port": 8787, "proto": "tcp", "service": "http"},
+                          {"port": 18080, "proto": "tcp", "service": "https"}],
+                "resolved_ip": "203.0.113.7", "error": None,
+                "top": 100, "extra_ports": ports}
+
+    urls = []
+    monkeypatch.setattr(core.vm_proxy, "nmap", nmap)
+    monkeypatch.setattr(core.vm_proxy, "dirsearch", lambda url, **kw: urls.append(url) or {
+        "hits": [], "opendirs": [], "baseline_404": {}, "error": None})
+    r = core.active_scan("203.0.113.7", ports=[18080, 8787, 50050, 8787])
+    assert seen["ports"] == [8787, 18080, 50050]
+    assert r["extra_ports"] == [8787, 18080, 50050]
+    assert "warning" not in r["nmap"]
+    # base URL, then only the extras nmap saw open, TLS ones over https
+    assert urls == ["http://203.0.113.7/", "http://203.0.113.7:8787/",
+                    "https://203.0.113.7:18080/"]
+    assert len(r["dirsearch"]["urls"]) == 3
+
+
+def test_an_old_helper_that_ignores_extra_ports_is_flagged(monkeypatch):
+    monkeypatch.setattr(core.vm_proxy, "nmap",
+                        lambda target, top_ports=100, service_detection=True, ports=None: {
+                            "ports": [{"port": 22, "proto": "tcp"}],
+                            "resolved_ip": "203.0.113.7", "error": None})
+    r = core.active_scan("203.0.113.7", tools=["nmap"], ports=[8787])
+    assert "NOT the extra ports" in r["nmap"]["warning"]
+
+
+def test_no_extra_ports_keeps_the_old_call_and_summary_shape(monkeypatch):
+    _stub_nmap(monkeypatch, [80])   # the stub takes no `ports` argument
+    _stub_dirsearch(monkeypatch, [])
+    r = core.active_scan("203.0.113.7")
+    assert "extra_ports" not in r
+    assert set(r["dirsearch"]) == {"hits", "opendirs", "baseline_404"}
+
+
+def test_out_of_range_extra_ports_are_rejected():
+    with pytest.raises(ValueError, match="out of range"):
+        core.active_scan("203.0.113.7", tools=["nmap"], ports=[0, 70000])
