@@ -302,7 +302,7 @@ def test_ingest_report_merges_into_existing_cluster_without_clobbering_status():
     core.update_ttp("Fox Tempest", "T1059.001", "PowerShell", 3, notes="validated")
 
     import tempfile, os
-    fd, path = tempfile.mkstemp(suffix=".txt")
+    fd, path = tempfile.mkstemp(suffix=".txt", dir=os.environ["CTI_REPORT_DIRS"])
     os.write(fd, b"Fox Tempest seen again using T1059.001 and T1053.005, "
                   b"C2 at second-c2[.]xyz")
     os.close(fd)

@@ -47,6 +47,9 @@ def isolated_data(monkeypatch, tmp_path):
     # collect graph wrote its 8 stub clusters into the live data/runs/ as if
     # they were today's collect run; the dashboard showed them as real.
     monkeypatch.setenv("CTI_RUNS_DIR", str(tmp_path / "runs"))
+    # Local reports are only read from a report directory; tests write
+    # theirs under tmp_path.
+    monkeypatch.setenv("CTI_REPORT_DIRS", str(tmp_path))
     for var in ("CTI_TRACKING_INBOX", "CTI_TRACKING_ARCHIVE",
                 "CTI_TRACKING_DIGESTS", "CTI_TRACKING_NARRATIVES"):
         monkeypatch.setenv(var, str(tmp_path / var.lower()))

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from cti.report import ingest as report_ingest
 
 
@@ -152,10 +154,10 @@ def test_fetch_text_local_file(tmp_path):
     assert report_ingest.fetch_text(str(p)) == "hello world"
 
 
-def test_fetch_text_missing_file():
+def test_fetch_text_missing_file(tmp_path):
     import pytest
     with pytest.raises(FileNotFoundError):
-        report_ingest.fetch_text("/no/such/file.txt")
+        report_ingest.fetch_text(str(tmp_path / "no-such-file.txt"))
 
 
 def test_fetch_text_pdf_without_poppler(tmp_path, monkeypatch):
@@ -238,3 +240,51 @@ def test_ordinary_tags_still_separate_words():
     assert report_ingest._strip_html("<td>one</td><td>two</td>").split() == ["one", "two"]
     assert report_ingest._strip_html("a<br>b").split() == ["a", "b"]
     assert report_ingest._strip_html("<b>x</b><i>y</i>").split() == ["x", "y"]
+
+
+# --------------------------------------------------------------------------- #
+# Where a report may come from
+# --------------------------------------------------------------------------- #
+
+def test_a_local_file_outside_the_report_directories_is_refused(tmp_path, monkeypatch):
+    """The source is an MCP tool argument. A hex API key in a dotfile would
+    otherwise come back as a "hash"."""
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    monkeypatch.setenv("CTI_REPORT_DIRS", str(inbox))
+    secret = tmp_path / ".env"
+    secret.write_text("API_KEY=" + "ab" * 32)
+    with pytest.raises(report_ingest.UnsupportedSource, match="outside the report"):
+        report_ingest.fetch_text(str(secret))
+    with pytest.raises(report_ingest.UnsupportedSource):
+        report_ingest.fetch_text(str(inbox / ".." / ".env"))       # traversal
+    link = inbox / "report.txt"
+    link.symlink_to(secret)
+    with pytest.raises(report_ingest.UnsupportedSource):
+        report_ingest.fetch_text(str(link))                        # symlink out
+    (inbox / "real.txt").write_text("fine")
+    assert report_ingest.fetch_text(str(inbox / "real.txt")) == "fine"
+
+
+@pytest.mark.parametrize("address", ["127.0.0.1", "172.16.0.1", "169.254.169.254",
+                                     "192.168.1.1", "::1"])
+def test_a_report_url_on_an_internal_address_is_refused(monkeypatch, address):
+    monkeypatch.setattr(report_ingest.socket, "getaddrinfo",
+                        lambda host, port: [(None, None, None, "", (address, 0))])
+    monkeypatch.setattr(report_ingest, "_open_url",
+                        lambda req: pytest.fail("fetched an internal address"))
+    with pytest.raises(report_ingest.UnsupportedSource, match="not a public address"):
+        report_ingest.fetch_text("https://reports.example/apt.html")
+
+
+def test_a_redirect_to_an_internal_address_is_refused(monkeypatch):
+    monkeypatch.setattr(report_ingest.socket, "getaddrinfo",
+                        lambda host, port: [(None, None, None, "", ("10.0.0.5", 0))])
+    handler = report_ingest._PublicRedirects()
+    with pytest.raises(report_ingest.UnsupportedSource):
+        handler.redirect_request(None, None, 302, "Found", {}, "http://fw.lab/")
+
+
+def test_only_http_urls_are_fetched():
+    with pytest.raises(report_ingest.UnsupportedSource, match="only http"):
+        report_ingest._refuse_internal("file:///etc/passwd")

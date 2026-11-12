@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import html
 import ipaddress
+import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
+import urllib.parse
 import urllib.request
 from collections import Counter
 from pathlib import Path
@@ -197,8 +200,78 @@ def _pdftotext(path: str) -> str:
     return out.stdout.decode("utf-8", errors="replace")
 
 
+# --------------------------------------------------------------------------- #
+# Where a report may come from
+#
+# `source` reaches this module from an MCP tool argument, so it is whatever
+# a model was told to pass. Unrestricted, that meant two things: any local
+# path was read (and every 32/40/64-character hex string in it came back as
+# a "hash", which is the shape of most API keys), and any URL was fetched
+# from this host, including the firewall's and the sensor tunnel's.
+# --------------------------------------------------------------------------- #
+
+def report_dirs() -> list[Path]:
+    """The directories a local report may be read from: data/reports/ in
+    the repo, plus anything listed in CTI_REPORT_DIRS (os.pathsep-separated).
+    """
+    roots = [Path(__file__).resolve().parents[2] / "data" / "reports"]
+    extra = os.environ.get("CTI_REPORT_DIRS", "")
+    roots += [Path(p).expanduser() for p in extra.split(os.pathsep) if p.strip()]
+    return [r.resolve() for r in roots]
+
+
+def _local_report(source: str) -> Path:
+    """`source` as a path inside a report directory, or UnsupportedSource.
+
+    Resolved first, so neither `..` nor a symlink can step outside."""
+    path = Path(source).expanduser().resolve()
+    roots = report_dirs()
+    if not any(path == root or root in path.parents for root in roots):
+        raise UnsupportedSource(
+            f"{source!r} is outside the report directories - copy the file into "
+            f"{roots[0]} (or add its directory to CTI_REPORT_DIRS) and pass that path")
+    return path
+
+
+def _refuse_internal(url: str) -> None:
+    """Raise UnsupportedSource if `url` is not plain http(s) to a public host.
+
+    A name that does not resolve is let through: the fetch itself will fail
+    with the resolver's own error, which is the more useful message."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise UnsupportedSource(f"only http(s) report URLs are fetched, not {url!r}")
+    if os.environ.get("CTI_REPORT_ALLOW_PRIVATE") == "1":
+        return
+    try:
+        infos = socket.getaddrinfo(parts.hostname, None)
+    except OSError:
+        return
+    for info in infos:
+        addr = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            raise UnsupportedSource(
+                f"{parts.hostname} resolves to {addr}, which is not a public address - "
+                "a report URL is fetched from this host, so internal addresses are "
+                "refused (set CTI_REPORT_ALLOW_PRIVATE=1 to allow one deliberately)")
+
+
+class _PublicRedirects(urllib.request.HTTPRedirectHandler):
+    """A redirect is a second URL the caller never saw; hold it to the same rule."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _refuse_internal(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_url(req: urllib.request.Request):
+    return urllib.request.build_opener(_PublicRedirects).open(req, timeout=FETCH_TIMEOUT)
+
+
 def fetch_text(source: str) -> str:
-    """Return plain text for a URL or local file path. HTML is stripped
+    """Return plain text for a public http(s) URL, or for a local file
+    inside one of `report_dirs()`. HTML is stripped
     to text; PDFs are extracted via `pdftotext` if poppler-utils is
     installed (otherwise a clear error asks you to extract the text
     first). Other binary formats are unsupported.
@@ -221,8 +294,9 @@ def fetch_text(source: str) -> str:
     is_pdf = source.lower().endswith(".pdf")
 
     if source.startswith(("http://", "https://")):
+        _refuse_internal(source)
         req = urllib.request.Request(source, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
+        with _open_url(req) as resp:
             content_type = resp.headers.get_content_type()
             body = resp.read()
         if is_pdf or content_type == "application/pdf":
@@ -239,7 +313,7 @@ def fetch_text(source: str) -> str:
             return _strip_html(raw)
         return raw
 
-    p = Path(source)
+    p = _local_report(source)
     if not p.exists():
         raise FileNotFoundError(f"no such file: {source}")
     if is_pdf:
