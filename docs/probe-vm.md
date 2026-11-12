@@ -44,6 +44,7 @@ its absence dates the deployed helper:
 | `responded` | "Record a probed-but-silent host instead of losing it to an empty dict" |
 | `ports: null` when nothing scanned | "Stop reporting an unscanned host as having no open ports" |
 | `extra_ports` in an `nmap` result | "Let active_scan add specific ports to nmap's top-100 list" |
+| `fetch_and_analyze` returns `analyzed` > 0 (or an `error`) instead of a silent `analyzed: 0` | "Let the sandbox container read its staged samples" |
 
 The `nmap` check is its own call (`vm_proxy.nmap(target, ports=[...])`):
 a helper that predates it ignores `ports` and returns no `extra_ports`,

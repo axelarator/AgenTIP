@@ -206,6 +206,13 @@ def main() -> int:
             print(json.dumps({"error": f"yara rules failed to compile: {e}"}))
             return 1
 
+    # rglob silently yields nothing for a directory it cannot read, which
+    # would look exactly like an empty one.
+    if not os.access(root, os.R_OK | os.X_OK):
+        print(f"input directory {root} is not readable by uid {os.getuid()}",
+              file=sys.stderr)
+        return 1
+
     results, errors = [], []
     for path in sorted(root.rglob("*")):
         if not path.is_file():

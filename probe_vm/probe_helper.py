@@ -605,6 +605,10 @@ def action_fetch_and_analyze(request: dict) -> dict:
     budget = min(int(request.get("max_total_bytes") or SAMPLE_MAX_TOTAL),
                  SAMPLE_MAX_TOTAL)
     staging = Path(tempfile.mkdtemp(prefix="cti-sbx-"))
+    # mkdtemp makes the directory 0700, but the image runs as `nobody`, which
+    # then cannot list /in - and rglob swallows the PermissionError, so the
+    # container used to report "0 analyzed" and exit 0 on every run.
+    staging.chmod(0o755)
     fetched, errors, name_to_url = 0, [], {}
     try:
         for index, url in enumerate(urls):
@@ -616,6 +620,7 @@ def action_fetch_and_analyze(request: dict) -> dict:
             if "error" in outcome:
                 errors.append({"url": url, "error": outcome["error"]})
                 continue
+            (staging / name).chmod(0o644)
             budget -= outcome["bytes"]
             fetched += 1
             name_to_url[name] = url
@@ -659,10 +664,17 @@ def action_fetch_and_analyze(request: dict) -> dict:
         record["url"] = name_to_url.get(staged)
         record["path"] = staged.split("_", 1)[-1]
 
+    analyzed = payload.get("analyzed", 0)
+    sandbox_errors = payload.get("errors", [])
+    # Files went in and nothing came out, with nothing said about why: the
+    # container could not see them. Never report that as a clean run.
+    silent = fetched and not analyzed and not sandbox_errors
     return {"results": payload.get("results", []),
-            "errors": errors + payload.get("errors", []),
-            "fetched": fetched, "analyzed": payload.get("analyzed", 0),
-            "error": None}
+            "errors": errors + sandbox_errors,
+            "fetched": fetched, "analyzed": analyzed,
+            "error": (f"sandbox analyzed none of {fetched} fetched file(s) "
+                      "and reported no error - is the staging directory "
+                      "readable by the container user?") if silent else None}
 # --------------------------------------------------------------------------- #
 # observe - one CLI pass that yields selectors
 #

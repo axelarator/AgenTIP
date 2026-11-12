@@ -808,3 +808,55 @@ def test_the_helper_no_longer_offers_the_openssl_tls_grab():
     assert "action_tls_grab" not in helper
     assert "tls_grab" not in helper["_ACTIONS"]
     assert "TLS_TIMEOUT" not in helper, "an orphaned constant is dead config"
+
+
+# --------------------------------------------------------------------------- #
+# Staging permissions - the container runs as `nobody`
+# --------------------------------------------------------------------------- #
+
+def _staged_run(monkeypatch, tmp_path, container):
+    """Run action_fetch_and_analyze with downloads and docker stubbed.
+    `container(staging)` returns (returncode, stdout) for the docker run."""
+    import subprocess
+    import types
+    ns = _helper()
+    monkeypatch.setattr(ns["tempfile"], "tempdir", str(tmp_path))
+
+    def fake_download(url, dest, budget):
+        dest.write_bytes(b"payload")
+        dest.chmod(0o600)              # whatever the umask, staging must fix it
+        return {"bytes": 7}
+    ns["_download"] = fake_download
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        staging = Path(cmd[cmd.index("-v") + 1].split(":")[0])
+        seen["dir_mode"] = staging.stat().st_mode & 0o777
+        seen["file_modes"] = {p.stat().st_mode & 0o777 for p in staging.iterdir()}
+        rc, out = container(staging)
+        return types.SimpleNamespace(returncode=rc, stdout=out, stderr="")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    out = ns["action_fetch_and_analyze"]({"urls": ["http://h/a", "http://h/b"]})
+    return out, seen
+
+
+def test_staging_is_readable_by_the_container_user(tmp_path, monkeypatch):
+    ok = json.dumps({"results": [], "errors": [], "analyzed": 2})
+    out, seen = _staged_run(monkeypatch, tmp_path, lambda s: (0, ok))
+    assert seen["dir_mode"] & 0o005 == 0o005          # others can list it
+    assert seen["file_modes"] == {0o644}
+    assert out["error"] is None
+
+
+def test_files_in_and_nothing_out_is_an_error_not_a_clean_run(tmp_path, monkeypatch):
+    empty = json.dumps({"results": [], "errors": [], "analyzed": 0})
+    out, _ = _staged_run(monkeypatch, tmp_path, lambda s: (0, empty))
+    assert out["fetched"] == 2 and out["analyzed"] == 0
+    assert "analyzed none of 2" in out["error"]
+
+
+def test_analyzer_refuses_an_unreadable_input_directory(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(analyze_mod.os, "access", lambda p, mode: False)
+    monkeypatch.setattr("sys.argv", ["analyze", str(tmp_path)])
+    assert analyze_mod.main() == 1
+    assert "not readable" in capsys.readouterr().err
