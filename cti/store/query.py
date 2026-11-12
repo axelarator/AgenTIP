@@ -39,9 +39,18 @@ def run_readonly_query(sql: str, max_rows: int = QUERY_MAX_ROWS) -> dict[str, An
     Read-only enforcement is DuckDB's own read_only flag (writes
     raise), not SQL parsing. Output is capped at max_rows and
     QUERY_MAX_BYTES serialized so agent contexts can't be flooded.
+
+    read_only protects the database, not the host: a read-only
+    connection still runs read_text('/etc/...'), COPY ... TO, ATTACH and
+    INSTALL. The SQL here is written by a model that has just read
+    adversary-controlled text (page titles, banners, file names), so the
+    connection is cut off from the filesystem and the network first, and
+    the setting is locked so the query cannot turn it back on.
     """
     try:
         with connect_retry(read_only=True) as con:
+            con.execute("SET enable_external_access = false")
+            con.execute("SET lock_configuration = true")
             cur = con.execute(sql)
             columns = [d[0] for d in cur.description]
             raw = cur.fetchmany(max_rows + 1)

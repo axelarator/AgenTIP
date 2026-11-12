@@ -913,6 +913,28 @@ def test_query_duckdb_read_only_and_truncation():
     assert "error" in denied
 
 
+@pytest.mark.parametrize("sql", [
+    "SELECT content FROM read_text('{secret}')",
+    "SELECT * FROM read_csv('{secret}')",
+    "COPY (SELECT 1) TO '{out}'",
+    "ATTACH '{other}' AS other (READ_ONLY)",
+])
+def test_query_duckdb_cannot_touch_the_filesystem(tmp_path, sql):
+    """read_only guards the database file, not the host it runs on."""
+    with store.connect() as con:
+        _obs(con, "10.0.0.1", TODAY)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("api-key")
+    out = tmp_path / "out.csv"
+    other = tmp_path / "other.duckdb"
+    duckdb.connect(str(other)).close()
+    result = store.run_readonly_query(sql.format(secret=secret, out=out, other=other))
+    assert "error" in result, result
+    assert not out.exists()
+    # ...and the lockdown does not outlive the query's own connection.
+    assert "error" not in store.run_readonly_query("SELECT count(*) FROM observations")
+
+
 def test_query_duckdb_uninitialized_db_fails_fast():
     result = store.run_readonly_query("SELECT 1")
     assert "not initialized" in result["error"]
