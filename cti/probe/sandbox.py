@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..errors import VMProxyError
-from ..store import connect, upsert_opendir_samples
+from ..store import connect_retry, upsert_opendir_samples
 from . import vm_proxy
 
 log = logging.getLogger("cti.probe.sandbox")
@@ -60,7 +60,7 @@ def analyze_urls(urls: list[str], *, indicator: str, actor: str | None = None,
     if persist and results:
         analyzed_at = datetime.now(timezone.utc).replace(tzinfo=None)
         try:
-            with connect(read_only=False) as con:
+            with connect_retry(read_only=False) as con:
                 upsert_opendir_samples(
                     con, indicator_value=indicator,
                     url=url_base or (results[0].get("url") or ""),

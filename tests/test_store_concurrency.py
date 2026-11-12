@@ -136,7 +136,7 @@ def test_history_failures_become_a_note_not_a_failed_sweep(monkeypatch, exc):
     unswept whose cluster JSON had in fact been written."""
     def boom(*a, **k):
         raise exc
-    monkeypatch.setattr(core.tracking_store, "connect", boom)
+    monkeypatch.setattr(core.tracking_store, "connect_retry", boom)
     note = core._log_cluster_enrichment_history("A", datetime(2026, 9, 19), {})
     assert note and note.startswith("enrichment history not recorded:")
     assert type(exc).__name__ in note
@@ -147,3 +147,21 @@ def test_active_scan_history_failures_are_also_a_note(monkeypatch):
     import inspect
     source = inspect.getsource(core.active_scan)
     assert "duckdb.Error" in source and "duckdb.IOException" not in source
+
+
+def test_history_write_waits_for_a_busy_database_instead_of_giving_up(monkeypatch):
+    """The hourly netwatch ingest and the daily sweep overlap every morning.
+    A plain connect() gave up on the first lock conflict and the day's
+    history for that cluster was dropped (audit T2)."""
+    attempts = []
+    real = duckdb.connect
+
+    def flaky(path, read_only=False):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise duckdb.IOException("Could not set lock on file")
+        return real(path, read_only=read_only)
+    monkeypatch.setattr(duckdb, "connect", flaky)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    assert core._log_cluster_enrichment_history("A", datetime(2026, 9, 19), {}) is None
+    assert len(attempts) == 3

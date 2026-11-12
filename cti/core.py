@@ -2253,7 +2253,7 @@ def active_scan(target: str, cluster: str | None = None,
     new_files: list[dict[str, Any]] = []
     indicator_type = "domain" if kind == "domain" else ("ipv6" if ":" in target else "ipv4")
     try:
-        with tracking_store.connect(read_only=False) as con:
+        with tracking_store.connect_retry(read_only=False) as con:
             if nmap_ports:
                 tracking_store.upsert_observation(
                     con, observed_at=observed_at, indicator_value=target,

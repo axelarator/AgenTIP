@@ -944,3 +944,23 @@ def observable_history(ip: str) -> dict[str, Any]:
 
     return {"ip": ip, "status": status, "observations": observations,
             "asn_changes": asn_changes, "zeek_matches": zeek_matches}
+
+
+def opendir_samples(indicator: str) -> dict[str, Any]:
+    """Sandbox verdicts recorded for one indicator's open-directory files,
+    newest first, in the same {columns, rows} shape run_readonly_query
+    returns."""
+    columns = ["path", "url", "sha256", "size", "magic", "mime", "verdict",
+               "yara_hits", "analyzed_at"]
+    try:
+        with connect_retry(read_only=True) as con:
+            raw = con.execute(
+                f"SELECT {', '.join(columns)} FROM opendir_samples "
+                "WHERE indicator_value = ? ORDER BY analyzed_at DESC, path",
+                [indicator]).fetchall()
+    except TrackingBusy:
+        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
+    except duckdb.IOException as e:
+        return {"error": f"tracking DB unavailable: {e}"}
+    return {"columns": columns, "rows": [[_cell(v) for v in row] for row in raw],
+            "truncated": False}

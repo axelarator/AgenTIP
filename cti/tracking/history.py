@@ -217,7 +217,7 @@ def _log_cluster_enrichment_history(
     hiccup - pivot_cluster's cluster-JSON write already happened and a
     separate store's outage shouldn't undo or block reporting that success."""
     try:
-        with tracking_store.connect(read_only=False) as con:
+        with tracking_store.connect_retry(read_only=False) as con:
             for (category, value), (_status, detail, enrichment) in results.items():
                 if category == "domains":
                     indicator_type = "domain"

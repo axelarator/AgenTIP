@@ -20,6 +20,7 @@ from .observations import upsert_observation
 from .query import (finding_days, findings_for,
                     QUERY_MAX_BYTES, QUERY_MAX_ROWS, actor_summary,
                     indicator_index, indicator_profile, observable_history,
+                    opendir_samples,
                     selector_detail, selector_types_for, run_readonly_query,
                     save_correlation,
                     tracked_observables)
@@ -46,5 +47,5 @@ __all__ = [
     "tracked_observables", "upsert_actor", "upsert_observation",
     "upsert_opendir_files", "upsert_opendir_samples", "upsert_zeek_match",
     "upsert_service_snapshot", "record_service_change", "latest_service_snapshot",
-    "update_service_flow",
+    "update_service_flow", "opendir_samples",
 ]

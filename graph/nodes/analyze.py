@@ -174,9 +174,9 @@ def persist(state: CTIState) -> dict:
         try:
             from datetime import date as _date
 
-            from cti.store import connect, record_findings
+            from cti.store import connect_retry, record_findings
             day = state.get("day")
-            with connect(read_only=False) as con:
+            with connect_retry(read_only=False) as con:
                 record_findings(con,
                                 day=_date.fromisoformat(day) if isinstance(day, str) else day,
                                 findings=[f.to_dict() for f in findings])

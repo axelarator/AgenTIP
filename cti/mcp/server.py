@@ -405,13 +405,7 @@ def analyze_opendir_samples(indicator: str, urls: list[str],
 def get_opendir_samples(indicator: str) -> dict:
     """Sandbox verdicts already recorded for an indicator's open-directory
     files. Read-only - it never fetches anything."""
-    from ..store import run_readonly_query
-
-    return run_readonly_query(
-        "SELECT path, url, sha256, size, magic, mime, verdict, yara_hits, "
-        "analyzed_at FROM opendir_samples "
-        f"WHERE indicator_value = '{indicator.replace(chr(39), chr(39) * 2)}' "
-        "ORDER BY analyzed_at DESC")
+    return tracking.opendir_samples(indicator)
 
 
 @mcp.tool()
