@@ -8,6 +8,7 @@ from __future__ import annotations
 import concurrent.futures
 import ipaddress
 import json
+import logging
 import os
 import re
 import threading
@@ -49,6 +50,8 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 # across every harness surface (MCP server, CLI, any future UI) rather
 # than nested inside mcp-server/. Override with CTI_DATA_DIR for tests
 # or alternate deployments (e.g. a separate private data repo).
+log = logging.getLogger(__name__)
+
 _REPO_ROOT = repo_root()
 DATA_DIR = Path(os.environ.get("CTI_DATA_DIR", _REPO_ROOT / "data" / "clusters"))
 
@@ -2123,11 +2126,17 @@ def _opensearch_max_ts() -> float | None:
     """Best-effort snapshot of the newest `ts` indexed in the lab's Zeek/
     OpenSearch, used to bracket an active scan's captured traffic (the same
     provenance anchor the fingerprint queue used). None if OpenSearch
-    isn't reachable - provenance is nice-to-have, never blocks the scan."""
+    isn't reachable - provenance is nice-to-have, never blocks the scan.
+
+    Only the sensor being unreachable is swallowed. This used to catch
+    Exception, and when the client module moved to cti/sources/ the
+    resulting ImportError was swallowed with it: 51 of 52 recorded scans
+    have no window."""
+    from .sources.opensearch import OpenSearchClient, OpenSearchError
     try:
-        from .opensearch_client import OpenSearchClient
         return OpenSearchClient().current_max_ts()
-    except Exception:
+    except (OpenSearchError, OSError, ValueError, KeyError) as e:
+        log.info("no Zeek window for this scan: %s", e)
         return None
 
 

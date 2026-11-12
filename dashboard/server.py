@@ -401,9 +401,21 @@ routes = [
 app = Starlette(routes=routes)
 
 
+def bind_host() -> str:
+    """Loopback unless CTI_DASHBOARD_HOST says otherwise.
+
+    There is no login, and the pages include every hunt log - which by now
+    describe the lab's own firewall and VPN layout. Reaching it from another
+    machine is a decision (set the variable to the LAN address, or tunnel
+    with `ssh -L 8420:127.0.0.1:8420`), not the default.
+    """
+    return os.environ.get("CTI_DASHBOARD_HOST") or "127.0.0.1"
+
+
 if __name__ == "__main__":
     import uvicorn
-    # Headless lab VM — bind all interfaces so the dashboard is reachable by
-    # the VM's LAN IP, not just from a shell on the box itself.
-    uvicorn.run(app, host=os.environ.get("CTI_DASHBOARD_HOST", "0.0.0.0"),
-                port=int(os.environ.get("CTI_DASHBOARD_PORT", "8420")))
+    host = bind_host()
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print(f"dashboard: listening on {host} with NO authentication "
+              "(CTI_DASHBOARD_HOST)", flush=True)
+    uvicorn.run(app, host=host, port=int(os.environ.get("CTI_DASHBOARD_PORT", "8420")))

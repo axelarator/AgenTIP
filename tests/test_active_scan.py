@@ -8,6 +8,9 @@ import pytest
 from cti import core
 from cti import store as tracking_store
 
+# The fixture below stubs this out for every test; keep the real one to test it.
+_REAL_MAX_TS = core._opensearch_max_ts
+
 
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
@@ -262,3 +265,26 @@ def test_no_extra_ports_keeps_the_old_call_and_summary_shape(monkeypatch):
 def test_out_of_range_extra_ports_are_rejected():
     with pytest.raises(ValueError, match="out of range"):
         core.active_scan("203.0.113.7", tools=["nmap"], ports=[0, 70000])
+
+
+def test_zeek_window_comes_from_the_real_client(monkeypatch):
+    """The import inside _opensearch_max_ts named a module that had moved,
+    and `except Exception` hid it for every scan."""
+    from cti.sources import opensearch
+    monkeypatch.setattr(opensearch.OpenSearchClient, "current_max_ts", lambda self: 1234.5)
+    assert _REAL_MAX_TS() == 1234.5
+
+
+def test_zeek_window_is_none_only_when_the_sensor_is_down(monkeypatch):
+    from cti.sources import opensearch
+
+    def down(self):
+        raise opensearch.OpenSearchError("connection refused")
+    monkeypatch.setattr(opensearch.OpenSearchClient, "current_max_ts", down)
+    assert _REAL_MAX_TS() is None
+
+    def bug(self):
+        raise AttributeError("a programming error must not look like 'sensor down'")
+    monkeypatch.setattr(opensearch.OpenSearchClient, "current_max_ts", bug)
+    with pytest.raises(AttributeError):
+        _REAL_MAX_TS()

@@ -403,3 +403,11 @@ def test_markup_in_narrative_text_stays_text():
     """)
     assert all(t["t"] in ("text", "code", "indicator", "hash") for t in got)
     assert "<img src=x onerror=alert(1)>" in "".join(t["v"] for t in got)
+
+
+def test_dashboard_binds_loopback_unless_told_otherwise(monkeypatch):
+    from dashboard import server
+    monkeypatch.delenv("CTI_DASHBOARD_HOST", raising=False)
+    assert server.bind_host() == "127.0.0.1"
+    monkeypatch.setenv("CTI_DASHBOARD_HOST", "192.168.1.10")
+    assert server.bind_host() == "192.168.1.10"
