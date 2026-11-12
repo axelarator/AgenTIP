@@ -320,13 +320,29 @@ def update_service_flow(con: duckdb.DuckDBPyConnection, *, scan_id: str,
 
 
 def latest_service_snapshot(con: duckdb.DuckDBPyConnection, target: str,
-                            port: int, *, before_scan_id: str) -> dict[str, Any] | None:
+                            port: int, *, before_scan_id: str,
+                            vantage: str | None = None,
+                            before: Any = None) -> dict[str, Any] | None:
     """The most recent snapshot of this (target, port) from an earlier scan,
-    the baseline a new scan is diffed against."""
+    the baseline a new scan is diffed against.
+
+    `vantage` keeps the comparison like-for-like. win116 writes rows to this
+    table too, with `open` meaning "a Windows client got an answer" and no
+    JARM or JA4S at all; a probe scan diffed against one of those reported
+    ports opening and certificates changing that had done neither. `before`
+    keeps the baseline in the past, so re-ingesting an old scan is not
+    compared with a newer one.
+    """
     cols = list(_SNAPSHOT_COLUMNS) + ["c2_hits", "record"]
+    where, params = ["target = ?", "port = ?", "scan_id <> ?"], [target, port, before_scan_id]
+    if vantage is not None:
+        where.append("vantage = ?")
+        params.append(vantage)
+    if before is not None:
+        where.append("scanned_at < ?")
+        params.append(before)
     rows = con.execute(
         f"""SELECT {', '.join(cols)} FROM service_snapshots
-            WHERE target = ? AND port = ? AND scan_id <> ?
-            ORDER BY scanned_at DESC LIMIT 1""",
-        [target, port, before_scan_id]).fetchall()
+            WHERE {' AND '.join(where)}
+            ORDER BY scanned_at DESC LIMIT 1""", params).fetchall()
     return dict(zip(cols, rows[0])) if rows else None

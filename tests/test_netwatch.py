@@ -214,8 +214,9 @@ def test_ingest_diffs_against_the_previous_scan():
     # and would hide that old/new are written to a JSON column.
     _spool([_record("scan1", "203.0.113.8", 443, tls={"cert_sha256": "ab" * 32})])
     ingest.ingest(client=None)
-    _spool([_record("scan2", "203.0.113.8", 443, tls={"cert_sha256": "cd" * 32}),
-            _record("scan2", "203.0.113.8", 8443, open=True,
+    later = "2026-10-14T21:00:00+00:00"
+    _spool([_record("scan2", "203.0.113.8", 443, ts=later, tls={"cert_sha256": "cd" * 32}),
+            _record("scan2", "203.0.113.8", 8443, ts=later, open=True,
                     tls={"cert_sha256": "ef" * 32})])
     ingest.ingest(client=None)
     with store.connect(read_only=True) as con:
@@ -400,3 +401,64 @@ def test_ingest_gives_up_waiting_and_still_ingests(monkeypatch):
     monkeypatch.setenv("CTI_PROBE_HOST", "10.99.0.74")
     _spool([_record("scanV", "203.0.113.51", 443, tls={"cert_sha256": "c" * 64})])
     assert ingest.ingest(client=Never())["snapshots"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# The baseline a scan is diffed against (audit S1), and the lock (audit N1)
+# --------------------------------------------------------------------------- #
+
+def test_a_probe_scan_is_not_diffed_against_the_windows_view():
+    """win116 writes to the same table. Its row for 443 says `open` false
+    (Schannel could not negotiate) and carries a different certificate hash
+    spelling; neither is something the probe saw change."""
+    _spool([_record("scan1", "203.0.113.9", 443, tls={"cert_sha256": "ab" * 32})])
+    ingest.ingest(client=None)
+    with store.connect() as con:
+        store.upsert_service_snapshot(con, row={
+            "scan_id": "win116-1", "scanned_at": datetime(2026, 10, 14, 21, 0),
+            "vantage": "win116", "profile": "client", "target": "203.0.113.9",
+            "port": 443, "open": False, "cert_sha256": "ff" * 32})
+    _spool([_record("scan2", "203.0.113.9", 443, ts="2026-10-14T22:00:00+00:00",
+                    tls={"cert_sha256": "ab" * 32})])
+    ingest.ingest(client=None)
+    with store.connect(read_only=True) as con:
+        assert con.execute("SELECT change_type FROM service_changes").fetchall() == []
+
+
+def test_the_baseline_is_an_earlier_scan_not_a_later_one():
+    _spool([_record("late", "203.0.113.10", 443, ts="2026-10-15T20:00:00+00:00",
+                    tls={"cert_sha256": "cd" * 32})])
+    ingest.ingest(client=None)
+    # An older spool file turns up afterwards (a job collected late).
+    _spool([_record("early", "203.0.113.10", 443, ts="2026-10-14T20:00:00+00:00",
+                    tls={"cert_sha256": "ab" * 32})])
+    ingest.ingest(client=None)
+    with store.connect(read_only=True) as con:
+        rows = con.execute("SELECT scan_id FROM service_changes").fetchall()
+    assert ("early",) not in rows
+
+
+def test_the_zeek_join_runs_with_no_database_connection_open(monkeypatch):
+    """The join is network calls and sleeps; holding the write lock through
+    it is what showed as 'database is busy' every hour."""
+    monkeypatch.setenv("CTI_PROBE_HOST", "10.99.0.74")
+    with store.connect():
+        pass                                  # create the file
+    seen = {}
+
+    class Watching(_FakeZeek):
+        def sources(self, query, size=50):
+            try:
+                # A second process could open the file only if we hold no lock.
+                import subprocess, sys, os
+                probe = subprocess.run(
+                    [sys.executable, "-c",
+                     "import duckdb,os;duckdb.connect(os.environ['CTI_DUCKDB_PATH']).close()"],
+                    capture_output=True, text=True, env=dict(os.environ))
+                seen["free"] = probe.returncode == 0
+            finally:
+                return super().sources(query, size)
+
+    _spool([_record("scanA", "203.0.113.12", 443, tls={"cert_sha256": "c" * 64})])
+    ingest.ingest(client=Watching())
+    assert seen == {"free": True}

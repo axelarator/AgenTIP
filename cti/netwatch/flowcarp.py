@@ -297,7 +297,8 @@ def _apply(con, target: dict[str, Any], verdict: dict[str, Any]) -> int:
     if prior is None:
         return 0
     base = store.latest_service_snapshot(
-        con, target["target"], target["port"], before_scan_id=target["scan_id"])
+        con, target["target"], target["port"], before_scan_id=target["scan_id"],
+        vantage=target.get("vantage"), before=target.get("scanned_at"))
     changes = 0
     new_proto = verdict["app_proto"]
     old_proto = (base or {}).get("app_proto")

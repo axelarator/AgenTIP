@@ -219,7 +219,8 @@ def _flatten(rec: dict[str, Any], passive: dict[str, Any]) -> dict[str, Any]:
 def _diff(con, row: dict[str, Any]) -> int:
     """Record what moved on this (target, port) since the last scan."""
     base = store.latest_service_snapshot(
-        con, row["target"], row["port"], before_scan_id=row["scan_id"])
+        con, row["target"], row["port"], before_scan_id=row["scan_id"],
+        vantage=row["vantage"], before=row["scanned_at"])
     changes: list[tuple[str, str, Any, Any]] = []
 
     if base is not None and bool(base.get("open")) != row["open"]:
@@ -232,8 +233,8 @@ def _diff(con, row: dict[str, Any]) -> int:
             if new and old and new != old:
                 changes.append((field, change_type, old, new))
     new_hits = set(row.get("c2_hits") or [])
-    old_hits = set((base or {}).get("c2_hits") and
-                   json.loads(base["c2_hits"]) if base and base.get("c2_hits") else [])
+    old_hits_json = base.get("c2_hits") if base else None
+    old_hits = set(json.loads(old_hits_json)) if old_hits_json else set()
     if new_hits - old_hits:
         changes.append(("c2_hits", "c2_signature_hit",
                         sorted(old_hits) or None, sorted(new_hits)))
@@ -303,13 +304,18 @@ def ingest(*, client: Any = _UNSET, purge: bool = True) -> dict[str, Any]:
                 continue
             by_target.setdefault((rec.get("scan_id"), rec.get("target")), []).append(rec)
 
+    # Before anything reads `open`: the join, the snapshot, the diff and
+    # the port-set selector must all see an intercepted port as closed.
+    by_target = {key: [{**r, "open": False, "intercepted": True} if _intercepted(r) else r
+                       for r in records] for key, records in by_target.items()}
+    # The join is one OpenSearch query per open port plus up to CTI_ZEEK_WAIT
+    # seconds of waiting for late sessions. It ran inside the write
+    # connection, which locked every other reader and writer out for minutes
+    # each hour; it needs no database, so it runs before one is opened.
+    joined = _join_all(client, by_target) if client is not None else {}
+
     snapshots = changes = selectors = 0
     with store.connect_retry(read_only=False) as con:
-        # Before anything reads `open`: the join, the snapshot, the diff and
-        # the port-set selector must all see an intercepted port as closed.
-        by_target = {key: [{**r, "open": False, "intercepted": True} if _intercepted(r) else r
-                           for r in records] for key, records in by_target.items()}
-        joined = _join_all(client, by_target) if client is not None else {}
         for (scan_id, target), records in by_target.items():
             passive_by_port = joined.get((scan_id, target), {})
             actor = next((r.get("actor") for r in records if r.get("actor")), None)
