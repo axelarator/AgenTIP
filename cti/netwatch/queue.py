@@ -19,15 +19,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from ..util import data_dir
+from ..util import state_subdir
 
 log = logging.getLogger(__name__)
 
 
 def queue_dir() -> Path:
-    d = data_dir() / "netwatch" / "queue"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return state_subdir("netwatch", "queue")
 
 
 def enqueue(targets: list[dict[str, Any]], *, source: str) -> int:

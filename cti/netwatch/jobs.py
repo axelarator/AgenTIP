@@ -18,7 +18,7 @@ from typing import Any
 
 from ..probe import vm_proxy
 from ..sources import budget
-from ..util import data_dir
+from ..util import state_subdir
 from . import queue, watchlist
 
 log = logging.getLogger(__name__)
@@ -31,9 +31,7 @@ POLL_TIMEOUT = 1800.0
 
 
 def spool_dir() -> Path:
-    d = data_dir() / "netwatch" / "spool"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return state_subdir("netwatch", "spool")
 
 
 def plan(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:

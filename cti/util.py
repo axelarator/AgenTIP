@@ -63,6 +63,46 @@ def data_dir() -> Path:
     return Path(base) if base else repo_root() / "data" / "clusters"
 
 
+def state_dir() -> Path:
+    """Where everything that is NOT a cluster file lives: hunt rules, the
+    netwatch spool and queue, FlowCarp models. `data/` in the repo.
+
+    These used to be built on data_dir(), which is the cluster directory, so
+    they landed in data/clusters/ - while the README, the rules folder's own
+    README and two MCP tool descriptions all say data/hunt_rules/ and
+    data/flowcarp/models/. A rule saved where documented was never loaded.
+
+    CTI_STATE_DIR overrides it. With only CTI_DATA_DIR set (every test, and
+    any deployment that relocated its data) state stays beside the clusters
+    as before, so an override keeps meaning what it meant.
+    """
+    explicit = os.environ.get("CTI_STATE_DIR")
+    if explicit:
+        return Path(explicit)
+    relocated = os.environ.get("CTI_DATA_DIR")
+    return Path(relocated) if relocated else repo_root() / "data"
+
+
+def state_subdir(*parts: str) -> Path:
+    """A directory under state_dir(), created on demand.
+
+    Anything still sitting in the old location (the same path under the
+    cluster directory) is moved across first, so a spool file written by a
+    run that started before the change is ingested rather than orphaned."""
+    target = state_dir().joinpath(*parts)
+    target.mkdir(parents=True, exist_ok=True)
+    legacy = data_dir().joinpath(*parts)
+    if legacy != target and legacy.is_dir():
+        for entry in legacy.iterdir():
+            if not (target / entry.name).exists():
+                entry.rename(target / entry.name)
+        try:
+            legacy.rmdir()
+        except OSError:
+            pass                      # something stayed behind; leave it visible
+    return target
+
+
 # --------------------------------------------------------------------------- #
 # Files
 # --------------------------------------------------------------------------- #

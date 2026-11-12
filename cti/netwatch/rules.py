@@ -43,7 +43,7 @@ import yaml
 
 from ..store import rarity
 from ..store.selectors import (TYPES, canonical_dn, normalize, selector_class)
-from ..util import data_dir
+from ..util import state_subdir
 
 log = logging.getLogger(__name__)
 
@@ -129,9 +129,7 @@ def _coerce(raw: dict[str, Any], source: str | None) -> Rule | None:
 
 
 def rules_dir() -> Path:
-    d = data_dir() / "hunt_rules"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return state_subdir("hunt_rules")
 
 
 def load(*, directory: Path | None = None, enabled_only: bool = True

@@ -60,3 +60,10 @@ dashboard/ui/.vite/
 # Stale nested copy left by the 2026-09-19 migration - holds the same
 # sensitive cluster/tracking data as above, just one level deeper.
 data/data/
+
+# Runtime state that moved out of data/clusters/ (see cti/util.py state_dir):
+# netwatch's scan spool and queue, built FlowCarp models, and the reports
+# an analyst drops in to be ingested.
+data/netwatch/
+data/flowcarp/models/
+data/reports/

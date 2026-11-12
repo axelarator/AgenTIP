@@ -53,7 +53,7 @@ from typing import Any, Callable, Iterable
 
 from .. import store
 from ..sources import budget
-from ..util import data_dir
+from ..util import state_subdir
 
 log = logging.getLogger(__name__)
 
@@ -77,9 +77,7 @@ DEFAULT_LIMIT = 200
 
 
 def models_dir() -> Path:
-    d = data_dir() / "flowcarp" / "models"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return state_subdir("flowcarp", "models")
 
 
 # --------------------------------------------------------------------------- #

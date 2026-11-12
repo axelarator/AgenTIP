@@ -209,3 +209,30 @@ def test_neighbourhood_range_narrows_to_a_slash24():
     assert net == ipaddress.ip_network("185.100.87.128/25")
     # ipv6 is not swept
     assert neighbourhood._range_for("2001:db8::1", "2001:db8::/48") is None
+
+
+# --------------------------------------------------------------------------- #
+# Where rules are read from (audit U1)
+# --------------------------------------------------------------------------- #
+
+def test_rules_are_read_from_the_documented_directory(tmp_path, monkeypatch):
+    """data/hunt_rules/, not data/clusters/hunt_rules/."""
+    from cti import util
+    monkeypatch.delenv("CTI_DATA_DIR")
+    monkeypatch.delenv("CTI_STATE_DIR", raising=False)
+    monkeypatch.setattr(util, "repo_root", lambda: tmp_path)
+    assert rules.rules_dir() == tmp_path / "data" / "hunt_rules"
+    assert util.data_dir() == tmp_path / "data" / "clusters"
+
+
+def test_files_left_in_the_old_location_are_adopted(tmp_path, monkeypatch):
+    from cti import util
+    from cti.netwatch import jobs
+    monkeypatch.delenv("CTI_DATA_DIR")
+    monkeypatch.setattr(util, "repo_root", lambda: tmp_path)
+    old = tmp_path / "data" / "clusters" / "netwatch" / "spool"
+    old.mkdir(parents=True)
+    (old / "hot-1.jsonl").write_text("{}")
+    new = jobs.spool_dir()
+    assert new == tmp_path / "data" / "netwatch" / "spool"
+    assert (new / "hot-1.jsonl").read_text() == "{}" and not old.exists()
