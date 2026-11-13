@@ -23,6 +23,7 @@ from cti import core
 from cti.tracking import digest
 from graph import trace
 from graph.nodes import collect
+from cluster_patching import patch_clusters
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -40,7 +41,7 @@ def test_sweep_lifts_the_history_note_out_of_pivot_cluster(monkeypatch):
     raising. If the sweep does not carry it, it vanishes: the cluster JSON
     is current, the DuckDB history change detection depends on is not, and
     nothing says so."""
-    monkeypatch.setattr(core, "pivot_cluster",
+    patch_clusters(monkeypatch, "pivot_cluster",
                         lambda slug: {"history_note": "enrichment history not recorded: X"})
     out = collect.sweep({"cluster": "fox-tempest", "day": "2026-09-19"})
     entry = out["sweep_results"][0]
@@ -50,7 +51,7 @@ def test_sweep_lifts_the_history_note_out_of_pivot_cluster(monkeypatch):
 def test_a_failed_sweep_is_recorded_with_its_error(monkeypatch):
     def boom(slug):
         raise RuntimeError("probe VM down")
-    monkeypatch.setattr(core, "pivot_cluster", boom)
+    patch_clusters(monkeypatch, "pivot_cluster", boom)
     entry = collect.sweep({"cluster": "x", "day": "2026-09-19"})["sweep_results"][0]
     assert not entry["ok"] and "probe VM down" in entry["error"]
 
@@ -299,7 +300,7 @@ async def test_eight_clusters_fanned_out_all_record_their_history(monkeypatch, t
     for name in (*collect.PROBE_ENV, *collect.KEY_ENV):
         monkeypatch.setenv(name, "x")   # the sweep is gated on preflight
     slugs = [f"cluster-{n}" for n in range(8)]
-    monkeypatch.setattr(core, "list_clusters", lambda: slugs)
+    patch_clusters(monkeypatch, "list_clusters", lambda: slugs)
     monkeypatch.setattr(collect.ingest, "register_new_clusters", lambda con: {})
     monkeypatch.setattr(collect.enrich, "build_worklist", lambda con: ([], set()))
 
@@ -317,7 +318,7 @@ async def test_eight_clusters_fanned_out_all_record_their_history(monkeypatch, t
         note = core._log_cluster_enrichment_history(slug, observed_at, results)
         return {"history_note": note} if note else {}
 
-    monkeypatch.setattr(core, "pivot_cluster", fake_pivot_cluster)
+    patch_clusters(monkeypatch, "pivot_cluster", fake_pivot_cluster)
 
     final, _ = await trace.run_traced(build_collect(), {"day": "2026-09-19"},
                                       day="2026-09-19", stage="collect")
@@ -500,7 +501,7 @@ def test_a_slow_optional_lookup_does_not_cost_a_domain_its_status(monkeypatch):
     def ssh_that_times_out(cmd, **kw):
         raise subprocess.TimeoutExpired(cmd, 60)
     monkeypatch.setattr(real.subprocess, "run", ssh_that_times_out)
-    monkeypatch.setattr(core, "_cached_pivot", lambda source, value, fetch: fetch())   # no cache here
+    patch_clusters(monkeypatch, "_cached_pivot", lambda source, value, fetch: fetch())   # no cache here
 
     status, detail, enrichment = core._domain_lifecycle("example.com")
     assert status != "unknown", "the domain lost its status to one slow optional lookup"

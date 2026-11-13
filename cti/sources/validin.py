@@ -93,7 +93,7 @@ _AUTOMATIC_DIRS = tuple(str(_REPO_ROOT / name) + os.sep
 # test has to differ: a function called `_sweep_lifecycle` anywhere is ours,
 # while `collect` or `run` is a name any library might use, so the generic
 # ones only count inside this repo.
-# Checked against cti/core.py by a test, because a list that has drifted
+# Checked against cti/clusters/ by a test, because a list that has drifted
 # from the code guards nothing: the first version of this named four
 # functions that do not exist.
 _AUTOMATIC_FUNCTIONS = frozenset({

@@ -12,6 +12,7 @@ import pytest
 from cti import core, store
 from cti.store import entities
 from cti.netwatch import ingest, jobs, watchlist
+from cluster_patching import patch_clusters
 
 REPO = Path(__file__).resolve().parents[1]
 NOW = datetime.now(timezone.utc)
@@ -40,14 +41,14 @@ def _ip(value, lifecycle, since=None, ports=(443,)):
 def _gate_open(monkeypatch):
     """These fixtures use the documentation ranges, which the scan gate
     (rightly) refuses; tiering is what is under test here."""
-    monkeypatch.setattr(core, "_is_probe_worthy", lambda category, value: (True, ""))
+    patch_clusters(monkeypatch, "_is_probe_worthy", lambda category, value: (True, ""))
 
 
 def test_the_watchlist_applies_the_scan_gate(monkeypatch):
     cl = _cluster(ips=[_ip("10.1.2.3", "active"), _ip("8.8.8.8", "active"),
                        _ip("185.220.101.47", "active")])
-    monkeypatch.setattr(core, "list_clusters", lambda: ["c"])
-    monkeypatch.setattr(core, "load_cluster", lambda n: cl)
+    patch_clusters(monkeypatch, "list_clusters", lambda: ["c"])
+    patch_clusters(monkeypatch, "load_cluster", lambda n: cl)
     monkeypatch.setattr(watchlist.cdn, "available", lambda: False)
     assert [t["value"] for t in watchlist.build()] == ["185.220.101.47"]
 
@@ -61,8 +62,8 @@ def test_tiers_follow_lifecycle(monkeypatch):
         _ip("203.0.113.4", "candidate"),                                      # hot
         _ip("203.0.113.5", "retired"),                                        # dropped
     ])
-    monkeypatch.setattr(core, "list_clusters", lambda: ["c"])
-    monkeypatch.setattr(core, "load_cluster", lambda n: cl)
+    patch_clusters(monkeypatch, "list_clusters", lambda: ["c"])
+    patch_clusters(monkeypatch, "load_cluster", lambda n: cl)
     monkeypatch.setattr(watchlist.cdn, "available", lambda: False)
     tiers = {t["value"]: t["tier"] for t in watchlist.build()}
     assert tiers == {"203.0.113.1": "full", "203.0.113.2": "hot",
@@ -73,8 +74,8 @@ def test_tiers_follow_lifecycle(monkeypatch):
 def test_cdn_ips_are_dropped(monkeypatch):
     _gate_open(monkeypatch)
     cl = _cluster(ips=[_ip("1.1.1.1", "active")])
-    monkeypatch.setattr(core, "list_clusters", lambda: ["c"])
-    monkeypatch.setattr(core, "load_cluster", lambda n: cl)
+    patch_clusters(monkeypatch, "list_clusters", lambda: ["c"])
+    patch_clusters(monkeypatch, "load_cluster", lambda n: cl)
     monkeypatch.setattr(watchlist.cdn, "available", lambda: True)
     monkeypatch.setattr(watchlist.cdn, "is_cdn", lambda ip: ip == "1.1.1.1")
     assert watchlist.build() == []
@@ -85,8 +86,8 @@ def test_strongest_tier_and_port_union_win(monkeypatch):
     a = _cluster(ips=[_ip("203.0.113.9", "dormant", ports=[443])])          # hot
     b = _cluster(ips=[_ip("203.0.113.9", "active",
                           since=_iso(NOW - timedelta(days=90)), ports=[8443])])  # full
-    monkeypatch.setattr(core, "list_clusters", lambda: ["a", "b"])
-    monkeypatch.setattr(core, "load_cluster", lambda n: a if n == "a" else b)
+    patch_clusters(monkeypatch, "list_clusters", lambda: ["a", "b"])
+    patch_clusters(monkeypatch, "load_cluster", lambda n: a if n == "a" else b)
     monkeypatch.setattr(watchlist.cdn, "available", lambda: False)
     got = watchlist.build()
     assert len(got) == 1
@@ -97,8 +98,8 @@ def test_strongest_tier_and_port_union_win(monkeypatch):
 def test_scored_candidates_join_the_hot_tier_above_the_floor(monkeypatch):
     _gate_open(monkeypatch)
     cl = _cluster(ips=[_ip("203.0.113.1", "active", since=_iso(NOW - timedelta(days=60)))])
-    monkeypatch.setattr(core, "list_clusters", lambda: ["apt-w"])
-    monkeypatch.setattr(core, "load_cluster", lambda n: cl)
+    patch_clusters(monkeypatch, "list_clusters", lambda: ["apt-w"])
+    patch_clusters(monkeypatch, "load_cluster", lambda n: cl)
     monkeypatch.setattr(watchlist.cdn, "available", lambda: False)
     with store.connect() as con:
         for value, score, band in (("lead.example", 0.6, "probable"),

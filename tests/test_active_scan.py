@@ -7,6 +7,7 @@ import pytest
 
 from cti import core
 from cti import store as tracking_store
+from cluster_patching import patch_clusters
 
 # The fixture below stubs this out for every test; keep the real one to test it.
 _REAL_MAX_TS = core._opensearch_max_ts
@@ -14,10 +15,10 @@ _REAL_MAX_TS = core._opensearch_max_ts
 
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
-    monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+    patch_clusters(monkeypatch, "DATA_DIR", tmp_path)
     monkeypatch.setenv("CTI_DUCKDB_PATH", str(tmp_path / "tracking.duckdb"))
     # No OpenSearch in tests - provenance snapshot returns None (best-effort).
-    monkeypatch.setattr(core, "_opensearch_max_ts", lambda: None)
+    patch_clusters(monkeypatch, "_opensearch_max_ts", lambda: None)
     yield
 
 
@@ -39,13 +40,13 @@ def test_active_scan_nmap_records_ports_and_change(monkeypatch):
                                                                        "baseline_404": {}, "error": None})
     # Two scans must land on distinct days so the second diffs against the
     # first's baseline (real runs are days apart; now_iso() is second-granular).
-    monkeypatch.setattr(core, "now_iso", lambda: "2026-09-10T00:00:00+00:00")
+    patch_clusters(monkeypatch, "now_iso", lambda: "2026-09-10T00:00:00+00:00")
     r1 = core.active_scan("203.0.113.7", tools=["nmap"])
     assert r1["nmap"]["ports"][0]["port"] == 80
 
     # a later scan with a different port set is a recorded port change
     _stub_nmap(monkeypatch, [8080])
-    monkeypatch.setattr(core, "now_iso", lambda: "2026-09-11T00:00:00+00:00")
+    patch_clusters(monkeypatch, "now_iso", lambda: "2026-09-11T00:00:00+00:00")
     core.active_scan("203.0.113.7", tools=["nmap"])
     with tracking_store.connect(read_only=True) as con:
         row = con.execute(

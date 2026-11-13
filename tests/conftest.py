@@ -15,15 +15,29 @@ what happens when nothing stubbed it.
 """
 from __future__ import annotations
 
+import os
 import socket
+import tempfile
 
 import pytest
 
-from cti.errors import VMProxyError
-from cti.probe import vm_proxy
-from cti.sources import passive
+# Before anything from cti is imported. cti.clusters.storage reads
+# CTI_DATA_DIR once, at import, and data/clusters/ in this repo is live
+# tracked intelligence. Twice a test run wrote into it because the per-test
+# fixture below patched a name that no longer decided where files went
+# (2026-11-13: test clusters created beside the real ones, and three real
+# clusters modified). With this set first, the worst an unpatched test can
+# reach is a throwaway directory.
+os.environ["CTI_DATA_DIR"] = tempfile.mkdtemp(prefix="cti-test-clusters-")
+os.environ["CTI_DUCKDB_PATH"] = os.path.join(
+    tempfile.mkdtemp(prefix="cti-test-db-"), "tracking.duckdb")
+
+from cti.errors import VMProxyError  # noqa: E402
+from cti.probe import vm_proxy  # noqa: E402
+from cti.sources import passive  # noqa: E402
 
 _REAL_CONNECT = socket.socket.connect
+_REPO = __import__("pathlib").Path(__file__).resolve().parents[1]
 
 # Keys the enrichment layer reads straight from the environment. Left set,
 # a forgotten stub turns into a real, metered API call (and, for Webamon,
@@ -42,11 +56,14 @@ def isolated_data(monkeypatch, tmp_path):
     test, not just the ones that remember to.
     """
     monkeypatch.setenv("CTI_DATA_DIR", str(tmp_path / "clusters"))
-    # cti.core reads CTI_DATA_DIR once, at import, into core.DATA_DIR, so the
-    # variable alone does not move it. A test that called core.create_cluster
-    # without patching this itself wrote the cluster into the live store.
+    # The cluster store reads CTI_DATA_DIR once, at import, so the variable
+    # alone does not move it for a test. This does.
     from cti import core
-    monkeypatch.setattr(core, "DATA_DIR", tmp_path / "clusters")
+    from cti.clusters import storage
+    monkeypatch.setattr(storage, "DATA_DIR", tmp_path / "clusters")
+    monkeypatch.setattr(core, "DATA_DIR", tmp_path / "clusters")   # the view tests read
+    live = (_REPO / "data").resolve()
+    assert live not in storage.DATA_DIR.resolve().parents, "tests must never see live data"
     monkeypatch.setenv("CTI_DUCKDB_PATH", str(tmp_path / "tracking.duckdb"))
     # Pipeline traces too. This was missing, and a test that ran the real
     # collect graph wrote its 8 stub clusters into the live data/runs/ as if
@@ -97,3 +114,4 @@ def no_network(monkeypatch, request):
     monkeypatch.setattr(socket.socket, "connect", _blocked_connect)
     yield
     monkeypatch.setattr(socket.socket, "connect", _REAL_CONNECT)
+

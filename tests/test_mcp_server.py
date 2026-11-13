@@ -7,6 +7,7 @@ import pytest
 
 from cti import core, store
 from cti.mcp import server
+from cluster_patching import patch_clusters
 
 SMALL = 1500          # bytes; the fixture cluster is several times this
 N = 25
@@ -69,10 +70,10 @@ def test_a_core_warning_survives_the_acknowledgement(big):
 
 def test_pivot_and_scan_results_carry_counts_not_the_cluster(big, monkeypatch):
     state = core.load_cluster(big)
-    monkeypatch.setattr(core, "pivot_and_expand",
+    patch_clusters(monkeypatch, "pivot_and_expand",
                         lambda *a: {"filed": {"ips": ["203.0.113.200"]},
                                     "cluster_state": state})
-    monkeypatch.setattr(core, "active_scan",
+    patch_clusters(monkeypatch, "active_scan",
                         lambda *a: {"target": "203.0.113.1", "cluster_state": state})
 
     for reply in (server.pivot_and_expand("203.0.113.1", big),

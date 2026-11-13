@@ -149,9 +149,9 @@ def test_the_sweep_function_names_are_real():
     run_daily and daily_digest. None of them exist; the gate they were
     supposed to provide was four dead strings.
     """
-    core = (REPO / "cti" / "core.py").read_text()
+    code = "".join(p.read_text() for p in (REPO / "cti" / "clusters").glob("*.py"))
     for name in validin._AUTOMATIC_FUNCTIONS:
-        assert f"def {name}(" in core, f"{name} is no longer a function in core.py"
+        assert f"def {name}(" in code, f"{name} is no longer a function in cti/clusters/"
 
 
 def test_an_unreadable_stack_is_treated_as_automatic(monkeypatch):

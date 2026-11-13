@@ -20,6 +20,7 @@ from cti.sources import pivot
 from cti import store
 from cti.tracking import analytics, digest, enrich, hl_mcp, ingest
 from cti.tracking import opensearch_xref
+from cluster_patching import patch_clusters
 
 
 # Anchored to the real clock, not a hardcoded date: several tests below
@@ -150,7 +151,7 @@ def test_ingest_json_and_rerun_is_idempotent(tmp_path):
 
 
 def test_register_new_clusters_adds_only_untracked(tmp_path, monkeypatch):
-    monkeypatch.setattr(core, "DATA_DIR", tmp_path / "clusters")
+    patch_clusters(monkeypatch, "DATA_DIR", tmp_path / "clusters")
     core.DATA_DIR.mkdir()
     core.create_cluster("Existing Actor")
     core.add_observable("Existing Actor", "ips", "203.0.113.9", "test")
@@ -174,7 +175,7 @@ def test_register_new_clusters_adds_only_untracked(tmp_path, monkeypatch):
 
 
 def test_register_new_clusters_is_idempotent(tmp_path, monkeypatch):
-    monkeypatch.setattr(core, "DATA_DIR", tmp_path / "clusters")
+    patch_clusters(monkeypatch, "DATA_DIR", tmp_path / "clusters")
     core.DATA_DIR.mkdir()
     core.create_cluster("Solo Actor")
     core.add_observable("Solo Actor", "ips", "203.0.113.20", "test")

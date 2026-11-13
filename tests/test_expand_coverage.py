@@ -13,13 +13,14 @@ import pytest
 from cti import core, membership, store
 from cti.store import selectors
 from cti.tracking import expand_coverage as X
+from cluster_patching import patch_clusters
 
 DAY = datetime(2026, 10, 5)
 
 
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
-    monkeypatch.setattr(core, "DATA_DIR", tmp_path / "clusters")
+    patch_clusters(monkeypatch, "DATA_DIR", tmp_path / "clusters")
     monkeypatch.setenv("CTI_DUCKDB_PATH", str(tmp_path / "t.duckdb"))
 
 
@@ -66,8 +67,8 @@ def cluster(monkeypatch):
         return None
 
     monkeypatch.setattr(X.webamon, "reverse_selector", reverse)
-    monkeypatch.setattr(core, "_sweep_lifecycle", sweep)
-    monkeypatch.setattr(core, "_record_enrichment", record)
+    patch_clusters(monkeypatch, "_sweep_lifecycle", sweep)
+    patch_clusters(monkeypatch, "_record_enrichment", record)
     return reversed_
 
 
@@ -107,7 +108,7 @@ def test_a_filed_candidate_is_not_swept_again(cluster, monkeypatch):
     X.expand_cluster("Kit")
     swept = []
     real = core._sweep_lifecycle
-    monkeypatch.setattr(core, "_sweep_lifecycle",
+    patch_clusters(monkeypatch, "_sweep_lifecycle",
                         lambda d, i, *a, **k: swept.extend(d) or real(d, i))
     X.expand_cluster("Kit")
     assert swept == []
@@ -116,7 +117,7 @@ def test_a_filed_candidate_is_not_swept_again(cluster, monkeypatch):
 def test_denied_and_tracked_hosts_are_never_swept(cluster, monkeypatch):
     swept = []
     real = core._sweep_lifecycle
-    monkeypatch.setattr(core, "_sweep_lifecycle",
+    patch_clusters(monkeypatch, "_sweep_lifecycle",
                         lambda d, i, *a, **k: swept.extend(d) or real(d, i))
     X.expand_cluster("Kit")
     assert sorted(swept) == ["new.example", "weak.example"]

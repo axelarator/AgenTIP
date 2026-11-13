@@ -10,6 +10,7 @@ import json
 import pytest
 
 from cti import core, membership
+from cluster_patching import patch_clusters
 
 
 def stub_cert(monkeypatch, grab):
@@ -44,7 +45,7 @@ def stub_cert(monkeypatch, grab):
 @pytest.fixture(autouse=True)
 def isolated_data_dir(tmp_path, monkeypatch):
     """Never touch the real data/clusters/ directory from tests."""
-    monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+    patch_clusters(monkeypatch, "DATA_DIR", tmp_path)
     yield tmp_path
 
 
@@ -1019,7 +1020,7 @@ def test_ingest_report_network_phase_does_not_hold_data_lock(tmp_path, monkeypat
             f.close()
         return real_sweep(domains, ips)
 
-    monkeypatch.setattr(core, "_sweep_lifecycle", probing_sweep)
+    patch_clusters(monkeypatch, "_sweep_lifecycle", probing_sweep)
     report = tmp_path / "report.txt"
     report.write_text("New actor infra at c2-lock-test.xyz. T1059.001.")
     core.ingest_report(str(report), cluster_name="Lock Test", create_if_missing=False)
@@ -1586,7 +1587,7 @@ def test_pivot_cluster_survives_tracking_store_failure(stub_cluster_sweep_net, m
 
     def boom(actor, observed_at, results):
         return "enrichment history not recorded: simulated failure"
-    monkeypatch.setattr(core, "_log_cluster_enrichment_history", boom)
+    patch_clusters(monkeypatch, "_log_cluster_enrichment_history", boom)
 
     summary = core.pivot_cluster("Busy Sweep")
     # the cluster-JSON write still succeeded despite the tracking-store note
@@ -1750,7 +1751,7 @@ def seen_by_enrichment(monkeypatch):
     def fake(domains, ips):
         seen["domains"], seen["ips"] = list(domains), list(ips)
         return {}
-    monkeypatch.setattr(core, "_sweep_lifecycle", fake)
+    patch_clusters(monkeypatch, "_sweep_lifecycle", fake)
     return seen
 
 
@@ -1838,7 +1839,7 @@ def _selector_rows(indicator: str) -> list[str]:
 
 def _stub_observe(monkeypatch, host="new.example"):
     """A realistic observe result for the add-time sweep."""
-    monkeypatch.setattr(core, "_observe", lambda value, kind, ports=None: {
+    patch_clusters(monkeypatch, "_observe", lambda value, kind, ports=None: {
         "target": value, "kind": kind,
         "http": {"status": 200, "body_sha256": "b" * 64, "server": "nginx/1.18.0"},
         "tls": {"cert_sha256": "c" * 64, "serial": "0A:1B",
@@ -1846,11 +1847,11 @@ def _stub_observe(monkeypatch, host="new.example"):
         "dns": {"a": ["203.0.113.9"]}, "whois": {}, "cdn": {"is_cdn": False},
         "ports": None, "responded": {"http": True, "tls": True},
         "errors": {}, "tools_missing": []})
-    monkeypatch.setattr(core, "_live_http", lambda host: {"error": "stubbed"})
-    monkeypatch.setattr(core, "_webamon_domain", lambda d: {"error": "stubbed"})
-    monkeypatch.setattr(core, "_webamon_infostealers", lambda d: {"error": "stubbed"})
-    monkeypatch.setattr(core, "_subdomains_for", lambda d: {"error": "stubbed"})
-    monkeypatch.setattr(core, "_threatfox_enrichment", lambda v: None)
+    patch_clusters(monkeypatch, "_live_http", lambda host: {"error": "stubbed"})
+    patch_clusters(monkeypatch, "_webamon_domain", lambda d: {"error": "stubbed"})
+    patch_clusters(monkeypatch, "_webamon_infostealers", lambda d: {"error": "stubbed"})
+    patch_clusters(monkeypatch, "_subdomains_for", lambda d: {"error": "stubbed"})
+    patch_clusters(monkeypatch, "_threatfox_enrichment", lambda v: None)
     monkeypatch.setattr(core.pivot, "classify_domain_lifecycle",
                         lambda *a, **k: ("active", {}))
 
@@ -1891,7 +1892,7 @@ def test_a_tracking_store_failure_does_not_lose_the_cluster_write(monkeypatch):
     not undo it or raise. The note is reported instead."""
     core.create_cluster("Add Time Degraded")
     _stub_observe(monkeypatch)
-    monkeypatch.setattr(core, "_log_cluster_enrichment_history",
+    patch_clusters(monkeypatch, "_log_cluster_enrichment_history",
                         lambda *a, **k: "tracking DB busy")
 
     result = core.add_observable("Add Time Degraded", "domains", "new.example", "r")
@@ -1904,7 +1905,7 @@ def test_an_empty_enrichment_writes_nothing(monkeypatch):
     """Re-adding a tracked value skips the sweep entirely, so there is no
     result to record and no reason to open the store."""
     opened = []
-    monkeypatch.setattr(core, "_log_cluster_enrichment_history",
+    patch_clusters(monkeypatch, "_log_cluster_enrichment_history",
                         lambda *a, **k: opened.append(1))
     assert core._record_enrichment("Any", {}) is None
     assert opened == []
@@ -1955,7 +1956,7 @@ def test_patching_the_history_writer_on_core_still_takes_effect(monkeypatch):
     every test that relies on it goes green for the wrong reason.
     """
     seen = []
-    monkeypatch.setattr(core, "_log_cluster_enrichment_history",
+    patch_clusters(monkeypatch, "_log_cluster_enrichment_history",
                         lambda *a, **k: seen.append(a) or None)
     core._record_enrichment("Any", {("domains", "x.example"): ("active", {}, {})})
     assert seen, "the patch did not reach the call"
@@ -2224,7 +2225,7 @@ def test_the_sweep_skips_retired_and_ages_the_rest(stub_cluster_sweep_net, monke
 
     swept = []
     real = core._sweep_lifecycle
-    monkeypatch.setattr(core, "_sweep_lifecycle",
+    patch_clusters(monkeypatch, "_sweep_lifecycle",
                         lambda d, i, *a, **k: swept.extend(d) or real(d, i, *a, **k))
     summary = core.pivot_cluster("Aging")
     assert swept == ["old.example"]
@@ -2378,3 +2379,20 @@ def test_quiet_candidates_expire():
         row = con.execute("SELECT role, decided_by, reason FROM memberships "
                           "WHERE entity = 'new.example'").fetchone()
     assert row[0] == "rejected" and row[1] == "expiry" and "never observed" in row[2]
+
+
+def test_no_cluster_module_has_a_relative_import_that_points_nowhere():
+    """A relative import inside a function is only resolved when the
+    function runs. When the active-scan code first moved, one such import
+    kept its old depth and failed on every call, and a broad except hid it
+    for weeks (51 of 52 scans lost their Zeek window). Resolve them all."""
+    import ast
+    import importlib.util
+    from pathlib import Path
+    pkg = Path(core.__file__).parent / "clusters"
+    for path in sorted(pkg.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom) and node.level:
+                target = "." * node.level + (node.module or "")
+                spec = importlib.util.find_spec(target, package="cti.clusters")
+                assert spec is not None, f"{path.name}:{node.lineno} imports {target}"
