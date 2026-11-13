@@ -411,3 +411,17 @@ def test_dashboard_binds_loopback_unless_told_otherwise(monkeypatch):
     assert server.bind_host() == "127.0.0.1"
     monkeypatch.setenv("CTI_DASHBOARD_HOST", "192.168.1.10")
     assert server.bind_host() == "192.168.1.10"
+
+
+def test_no_handler_blocks_the_event_loop():
+    """Every handler reads cluster files or queries DuckDB, and a busy
+    database means back-off sleeps of several seconds. Declared `async def`
+    they ran on the event loop, so one slow request stalled all the others.
+    A plain function is run in Starlette's thread pool."""
+    import inspect
+    from starlette.routing import Route
+    from dashboard import server
+
+    handlers = [r.endpoint for r in server.routes if isinstance(r, Route)]
+    assert len(handlers) >= 20
+    assert [h.__name__ for h in handlers if inspect.iscoroutinefunction(h)] == []

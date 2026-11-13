@@ -2540,8 +2540,7 @@ def ingest_report(source: str, cluster_name: str | None = None,
     cert/tags enrichment lookup (see _apply_enrichment_snapshot), run in
     an unlocked phase between the report fetch/extraction and the final
     write - see _sweep_lifecycle's docstring for why that has to happen
-    outside _data_lock. The single report-URL fetch itself still runs
-    under the lock, unchanged from before.
+    outside _data_lock. The report fetch runs before the lock is taken.
 
     `exclude` drops extracted values BEFORE anything else happens to them,
     which matters more than it sounds. Extraction over-matches - a vendor's
@@ -2556,8 +2555,12 @@ def ingest_report(source: str, cluster_name: str | None = None,
     be given with or without its algorithm prefix. What was dropped comes
     back under `excluded` so the exclusion can be recorded in the hunt log.
     """
+    # Unlocked, like analyze_report's fetch: the cluster lock is global, and
+    # held through this it made every other cluster write wait on a third
+    # party's web server.
+    text = report_ingest.defang_normalize(_fetch_report_text(source))
     cluster_name, extracted, new_domains, new_ips, excluded = _ingest_report_phase1(
-        source, cluster_name, create_if_missing, exclude)
+        source, cluster_name, create_if_missing, exclude, text)
     enrichment = _sweep_lifecycle(new_domains, new_ips)  # unlocked
     result = _ingest_report_phase2(cluster_name, source, extracted, enrichment, create_if_missing)
     result["excluded"] = excluded   # the returned dict only; it is not re-saved
@@ -2599,15 +2602,12 @@ def _apply_exclusions(extracted: dict[str, Any], exclude: list[str] | None
 
 @_synchronized
 def _ingest_report_phase1(source: str, cluster_name: str | None, create_if_missing: bool,
-                          exclude: list[str] | None = None
+                          exclude: list[str] | None, text: str
                           ) -> tuple[str, dict[str, Any], list[str], list[str], list[str]]:
-    """Locked: fetch the report (one bounded URL fetch, as before) and
-    extract/resolve the cluster name - no per-indicator network calls
-    happen in this phase. Returns what phase 2 needs to finish the write,
-    plus the genuinely-new domains/ips for the unlocked enrichment sweep
-    that runs between the two phases."""
-    text = _fetch_report_text(source)
-    text = report_ingest.defang_normalize(text)
+    """Locked: extract from the already-fetched report `text` and resolve
+    the cluster name - no network calls happen in this phase. Returns what
+    phase 2 needs to finish the write, plus the genuinely-new domains/ips
+    for the unlocked enrichment sweep that runs between the two phases."""
     extracted, excluded = _apply_exclusions(report_ingest.extract_observables(text), exclude)
 
     if cluster_name is None:

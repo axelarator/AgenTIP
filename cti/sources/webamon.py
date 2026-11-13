@@ -187,7 +187,7 @@ def normalize_scan(doc: dict[str, Any]) -> dict[str, Any]:
 def search_domain(domain: str, size: int = 5) -> dict[str, Any]:
     """Latest Webamon scan(s) for a domain (scans index). Returns
     {"total_hits", "results": [normalized...], "latest": normalized|None}."""
-    resp = _search({"lucene_query": f'domain.name:"{domain}"', "index": "scans",
+    resp = _search({"lucene_query": f"domain.name:{_lucene_literal(domain)}", "index": "scans",
                     "fields": _SCAN_FIELDS, "size": size})
     if "error" in resp:
         return resp
@@ -206,7 +206,7 @@ def search_ip(ip: str, size: int = 50) -> dict[str, Any]:
     """Domains Webamon has scanned resolving to this IP (server.ip on the
     scans index) - the reverse-IP / passive-hostname replacement. Returns
     {"total_hits", "domains": [...], "results": [{resolved_domain,date,page_title}]}."""
-    resp = _search({"lucene_query": f'server.ip:"{ip}"', "index": "scans",
+    resp = _search({"lucene_query": f"server.ip:{_lucene_literal(ip)}", "index": "scans",
                     "fields": "resolved_domain,date,page_title", "size": size})
     if "error" in resp:
         return resp
@@ -231,8 +231,8 @@ def infostealers(term: str, size: int = 25) -> dict[str, Any]:
     is what the index claimed for the query, and `capped` means the page
     came back full, so the real total may be higher than what was counted.
     """
-    quoted = f'"{term}"'
-    resp = _search({"lucene_query": f'domain:{quoted} OR username:"@{term}"',
+    resp = _search({"lucene_query": f"domain:{_lucene_literal(term)} OR "
+                                    f"username:{_lucene_literal('@' + term)}",
                     "index": "infostealers", "size": size})
     if "error" in resp:
         return resp
@@ -257,7 +257,7 @@ def fingerprint_siblings(fp_hash: str, kind: str = "dom", size: int = 25) -> dic
     (fingerprint.dom / fingerprint.ssl) - the campaign-cluster signal that
     stands in for the plan-gated /clusters endpoint. Returns
     {"total_hits", "domains": [...]}."""
-    resp = _search({"lucene_query": f'fingerprint.{kind}:"{fp_hash}"', "index": "scans",
+    resp = _search({"lucene_query": f"fingerprint.{kind}:{_lucene_literal(fp_hash)}", "index": "scans",
                     "fields": "resolved_domain,date", "size": size})
     if "error" in resp:
         return resp
@@ -522,7 +522,7 @@ def submit_scan(submission_url: str) -> dict[str, Any]:
 def poll_scan(report_id: str) -> dict[str, Any] | None:
     """Fetch a submitted scan's result by polling the scans index for its
     report_id. Returns the normalized scan, or None if not indexed yet."""
-    resp = _search({"lucene_query": f'report_id:"{report_id}"', "index": "scans",
+    resp = _search({"lucene_query": f"report_id:{_lucene_literal(report_id)}", "index": "scans",
                     "fields": _SCAN_FIELDS, "size": 1})
     if "error" in resp:
         return None

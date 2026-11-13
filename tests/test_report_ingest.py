@@ -288,3 +288,26 @@ def test_a_redirect_to_an_internal_address_is_refused(monkeypatch):
 def test_only_http_urls_are_fetched():
     with pytest.raises(report_ingest.UnsupportedSource, match="only http"):
         report_ingest._refuse_internal("file:///etc/passwd")
+
+
+@pytest.mark.parametrize("domain", [
+    "panel.evil.ai", "c2.example.eu", "update.example.ca", "cdn.example.au",
+    "login.example.gg", "short.example.ly", "x.example.st", "relay.example.ac",
+    "drop.example.sbs", "gate.example.cfd", "mail.example.tech",
+])
+def test_domains_on_common_tlds_are_not_dropped(domain):
+    """The TLD list was about 70 entries and left these out, so indicators
+    on them vanished from every report without a word."""
+    out = report_ingest.extract_observables(f"The loader calls back to {domain} daily.")
+    assert out["domains"] == [domain]
+
+
+@pytest.mark.parametrize("name", [
+    "config.py", "loader.rs", "invoice.one", "README.md", "payload.zip",
+    "libcrypto.so", "user.id",
+])
+def test_filenames_and_identifiers_are_still_not_domains(name):
+    """Every extracted domain gets a live lookup from the probe, so a file
+    name read as a domain is traffic sent somewhere it should not go."""
+    out = report_ingest.extract_observables(f"The dropper writes {name} to disk.")
+    assert out["domains"] == []

@@ -44,7 +44,11 @@ def shared_asns() -> tuple[int, ...]:
 
 
 def is_shared_asn(asn: Any) -> bool:
-    return asn is not None and asn in shared_asns()
+    """Coerced here, not left to each caller: sources report an ASN as an
+    int, a string or "AS16509", and only the int ever matched the list."""
+    from ..util import asn_int
+    number = asn_int(asn)
+    return number is not None and number in shared_asns()
 
 
 def is_shared(*, asn: Any = None, ptr: str | None = None) -> tuple[bool, str | None]:

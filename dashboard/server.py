@@ -55,13 +55,13 @@ def _cluster_summary(name: str) -> dict:
     }
 
 
-async def list_clusters(request):
+def list_clusters(request):
     summaries = [_cluster_summary(n) for n in core.list_clusters()]
     summaries.sort(key=lambda c: c["last_seen"] or "", reverse=True)
     return JSONResponse(summaries)
 
 
-async def get_cluster(request):
+def get_cluster(request):
     name = request.path_params["name"]
     try:
         data = core.get_cluster(name)
@@ -70,7 +70,7 @@ async def get_cluster(request):
     return JSONResponse(data)
 
 
-async def stats(request):
+def stats(request):
     names = core.list_clusters()
     totals = {"observable_count": 0, "ttp_count": 0, "gap_count": 0, "detection_count": 0}
     activity = []
@@ -91,15 +91,15 @@ async def stats(request):
     })
 
 
-async def techniques(request):
+def techniques(request):
     return JSONResponse(core.get_technique_usage())
 
 
-async def technique_detail(request):
+def technique_detail(request):
     return JSONResponse(core.get_technique_usage(request.path_params["technique_id"]))
 
 
-async def observable_search(request):
+def observable_search(request):
     q = request.query_params.get("q", "").strip()
     if not q:
         return JSONResponse({"query": q, "exact": [], "partial": []})
@@ -134,21 +134,21 @@ def _open_candidates() -> int | None:
         return None
 
 
-async def tracking_observables(request):
+def tracking_observables(request):
     result = tracking_store.tracked_observables()
     if "error" in result:
         return JSONResponse(result, status_code=503)
     return JSONResponse(result)
 
 
-async def tracking_observable_detail(request):
+def tracking_observable_detail(request):
     result = tracking_store.observable_history(request.path_params["ip"])
     if "error" in result:
         return JSONResponse(result, status_code=503)
     return JSONResponse(result)
 
 
-async def indicator_index(request):
+def indicator_index(request):
     """Every indicator with observations, for the index page.
 
     tracked_observables() is scoped to indicators whose actor is tracked;
@@ -162,14 +162,14 @@ async def indicator_index(request):
     return JSONResponse(result)
 
 
-async def indicator_detail(request):
+def indicator_detail(request):
     result = tracking_store.indicator_profile(request.path_params["value"])
     if "error" in result:
         return JSONResponse(result, status_code=503)
     return JSONResponse(result)
 
 
-async def selector_detail(request):
+def selector_detail(request):
     """Who else carries this selector value.
 
     Type and value arrive as QUERY params, not path segments. Selector
@@ -212,7 +212,7 @@ def _limit(request, default: int = 100) -> int:
         return default
 
 
-async def config(request):
+def config(request):
     """Lab-specific settings the frontend needs, read from the environment so
     no address is baked into the committed bundle. CTI_ARKIME_URL is the same
     variable the FlowCarp pcap pull uses."""
@@ -221,7 +221,7 @@ async def config(request):
     return JSONResponse({"arkime_sessions_url": f"{arkime}/sessions" if arkime else None})
 
 
-async def hunt(request):
+def hunt(request):
     """Run a key:value hunt query (cti/store/hunt_query.py). ?q=&limit="""
     from cti.store import hunt_query
 
@@ -235,7 +235,7 @@ async def hunt(request):
     return _store_read(lambda con: hunt_query.run(con, query, limit=_limit(request)))
 
 
-async def pairs(request):
+def pairs(request):
     """What an indicator shares, with whom and when. ?a=[&b=]&limit="""
     from cti.store import hunt_query
 
@@ -246,7 +246,7 @@ async def pairs(request):
     return _store_read(lambda con: hunt_query.pairs(con, a, b, limit=_limit(request, 25)))
 
 
-async def cluster_candidates(request):
+def cluster_candidates(request):
     """A cluster's candidates, best first; with ?value=, that one's evidence
     against the cluster's members."""
     from cti.store import entities, relatedness
@@ -273,14 +273,14 @@ async def cluster_candidates(request):
     return _store_read(read)
 
 
-async def findings_index(request):
+def findings_index(request):
     result = tracking_store.finding_days()
     if "error" in result:
         return JSONResponse(result, status_code=503)
     return JSONResponse(result)
 
 
-async def findings_detail(request):
+def findings_detail(request):
     day = request.path_params["date"]
     if not _NARRATIVE_DATE_RE.match(day):
         return JSONResponse({"error": "invalid date"}, status_code=400)
@@ -290,7 +290,7 @@ async def findings_detail(request):
     return JSONResponse(result)
 
 
-async def tracking_narratives(request):
+def tracking_narratives(request):
     ndir = tracking_digest.narrative_dir()
     if not ndir.is_dir():
         return JSONResponse({"dates": []})
@@ -299,7 +299,7 @@ async def tracking_narratives(request):
     return JSONResponse({"dates": dates})
 
 
-async def tracking_narrative_detail(request):
+def tracking_narrative_detail(request):
     day = request.path_params["date"]
     if not _NARRATIVE_DATE_RE.match(day):
         return JSONResponse({"error": "invalid date"}, status_code=400)
@@ -309,7 +309,7 @@ async def tracking_narrative_detail(request):
     return JSONResponse({"date": day, "content": path.read_text()})
 
 
-async def runs(request):
+def runs(request):
     """Which days have a recorded pipeline trace.
 
     The run trace is the piece the old design could not show at all:
@@ -320,7 +320,7 @@ async def runs(request):
     return JSONResponse({"dates": graph_trace.run_days()})
 
 
-async def run_detail(request):
+def run_detail(request):
     day = request.path_params["date"]
     if not _NARRATIVE_DATE_RE.match(day):
         return JSONResponse({"error": "invalid date"}, status_code=400)

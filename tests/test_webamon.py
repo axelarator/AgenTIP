@@ -185,3 +185,30 @@ def test_get_tells_quota_exceeded_from_rate_limit(monkeypatch):
 
     monkeypatch.setattr(http.urllib.request, "urlopen", raise_429("slow down"))
     assert webamon._get("/search", {"search": "x"}) == {"error": "webamon rate limited"}
+
+
+# --------------------------------------------------------------------------- #
+# values are data, never query syntax
+# --------------------------------------------------------------------------- #
+
+HOSTILE = 'evil.example" OR domain.name:*'
+
+
+@pytest.mark.parametrize("call", [
+    lambda: webamon.search_domain(HOSTILE),
+    lambda: webamon.search_ip(HOSTILE),
+    lambda: webamon.infostealers(HOSTILE),
+    lambda: webamon.fingerprint_siblings(HOSTILE),
+], ids=["search_domain", "search_ip", "infostealers", "fingerprint_siblings"])
+def test_a_value_with_a_quote_cannot_add_a_clause_to_the_query(monkeypatch, call):
+    """A domain lifted from report text is attacker-controlled."""
+    sent = []
+    monkeypatch.setattr(webamon, "_search",
+                        lambda body, **kw: sent.append(body) or {"error": "stub"})
+    call()
+
+    query = sent[0]["lucene_query"]
+    # Every quote that came from the value is escaped, so the phrase the
+    # value sits in is still open at the injected OR.
+    assert '\\" OR domain.name\\:\\*' in query
+    assert 'example" OR' not in query

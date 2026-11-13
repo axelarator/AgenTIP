@@ -1027,6 +1027,34 @@ def test_ingest_report_network_phase_does_not_hold_data_lock(tmp_path, monkeypat
     assert contended == [True]
 
 
+def test_ingest_report_download_does_not_hold_data_lock(tmp_path, monkeypatch):
+    """The report is downloaded from a third party's web server. With the
+    lock held through it, every other cluster write waited on that server."""
+    import fcntl
+    core.create_cluster("Lock Test")
+    lock_path = core.DATA_DIR / "_registry" / ".lock"
+    free = []
+
+    def probing_fetch(source):
+        f = open(lock_path, "w")
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            free.append(True)
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            free.append(False)
+        finally:
+            f.close()
+        return "New actor infra at c2-lock-test.xyz. T1059.001."
+
+    monkeypatch.setattr(core.report_ingest, "fetch_text", probing_fetch)
+    out = core.ingest_report("report.txt", cluster_name="Lock Test",
+                             create_if_missing=False)
+
+    assert free == [True]
+    assert [d["value"] for d in out["observables"]["domains"]] == ["c2-lock-test.xyz"]
+
+
 def test_pivot_and_expand_new_sibling_captures_enrichment_snapshot(monkeypatch):
     # subfinder surfaces the sibling to file; the enrichment sweep on the
     # newly-filed sibling then snapshots its own live cert via tls_grab.

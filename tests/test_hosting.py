@@ -31,3 +31,15 @@ def test_many_hostnames_alone_do_not_make_an_address_shared():
 
 def test_the_entry_verdict_reads_what_the_sweep_stamped():
     assert hosting.entry_shared({"shared_hosting": "PTR x"}) == (True, "PTR x")
+
+
+def test_shared_asn_check_accepts_the_forms_a_source_reports():
+    """RIPEstat reports ASNs as strings; a string never equalled the int in
+    the list, so a shared-hosting prefix looked dedicated."""
+    from cti.store import hosting
+    asn = hosting.shared_asns()[0]
+    assert hosting.is_shared_asn(asn)
+    assert hosting.is_shared_asn(str(asn))
+    assert hosting.is_shared_asn(f"AS{asn}")
+    assert not hosting.is_shared_asn(None)
+    assert not hosting.is_shared_asn("not an asn")

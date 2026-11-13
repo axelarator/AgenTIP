@@ -63,6 +63,19 @@ _TLDS = {
     "vip", "buzz", "space", "click", "link", "download", "stream",
     "work", "rest", "cyou", "monster", "bond", "cam", "pw", "sh",
     "app", "dev", "cloud", "host", "pro", "biz", "name", "email",
+    # Added 2026-11: country codes and abuse-heavy suffixes the list left
+    # out, so indicators on them were dropped from every report. Still a
+    # list and not the public-suffix file, on purpose: every domain kept
+    # here gets a live lookup from the probe, and a suffix that is also a
+    # file extension or a code attribute (.py .rs .md .zip .so .one .id)
+    # would turn file names in a report into traffic.
+    "ai", "eu", "ca", "au", "gg", "ly", "la", "st", "ac", "mx", "ar", "cl",
+    "vn", "th", "sg", "ph", "tr", "ua", "by", "kz", "ir", "il", "za", "ng",
+    "ke", "nz", "ie", "pt", "gr", "cz", "sk", "hu", "ro", "bg", "hr", "lt",
+    "lv", "ee", "lu", "li", "im", "fm", "am", "gd", "vc", "ag", "sx", "cx",
+    "nu", "sbs", "cfd", "quest", "lol", "wiki", "tech", "website",
+    "digital", "agency", "world", "life", "today", "mobi", "asia", "edu",
+    "gov",
 }
 
 _HASH_PATTERNS = {
