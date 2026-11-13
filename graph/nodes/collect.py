@@ -342,6 +342,9 @@ def corroborate(state: dict) -> dict:
         with store.connect() as con:
             priced = rarity.store_counts(con, counts)
 
+        # The search only reads, and scores hundreds of pairs: on a read
+        # connection it shares the database instead of locking it.
+        with store.connect_read() as con:
             promoted, held = [], []
             seen_pairs: set[tuple[str, str]] = set()
             for indicator in _indicators_touched(con, _day(state)):

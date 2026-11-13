@@ -38,8 +38,27 @@ never promote one, whatever their number. That is not a style
 preference: it is the guard against building a finding on `Server:
 cloudflare`, which eight of this repo's own indicators share.
 
+**The rule is applied to discounted evidence.** A fact counts in full only
+when nothing undercuts it. The scoring in `cti/store/relatedness.py` gives
+each fact a weight and reduces it when:
+
+- the two hosts held the value at different times (a page hash a year
+  apart is a template, not an operator);
+- the value is common across the internet;
+- the certificate is a server's default, or the address is a catch-all
+  that answers the same way for every name;
+- either end sits behind a CDN edge, where everything measured is the
+  CDN's.
+
+A link is promoted when its score reaches the `strong` band. With no
+discount that is exactly the rule above: one identity fact, or two
+independent structural ones. With a discount, a link the bare rule would
+promote can be held back, and its reason says which discount applied. The
+same score is what the candidate views show, so a link is never promoted
+in one place and noise in another.
+
 **The rule already ran before you see anything.** `cti/store/expand.py`
-applies it in code, and the digest's "Corroborated infrastructure links"
+reads that score, and the digest's "Corroborated infrastructure links"
 section is its output. Your job is never to decide whether the link
 exists — it is to say what the link *means*: one operator's rotation,
 one provider's tenants, one kit deployed by several people, or a real

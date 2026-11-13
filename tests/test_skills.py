@@ -124,19 +124,30 @@ def test_the_corroboration_rule_in_the_skill_matches_the_code():
     implementation's independence test changes, this prose is a lie."""
     import inspect
 
-    from cti.store import expand
-    source = inspect.getsource(expand)
+    from cti.store import expand, relatedness
+    # expand no longer counts facts itself: it promotes what relatedness
+    # scores `strong`. The rule in the skill is true only while the weights
+    # make it true, so pin the arithmetic rather than the wording.
+    assert expand.PROMOTING_BAND == "strong"
+    assert "pairs_between(con, indicator, other)" in inspect.getsource(expand)
+    strong = next(floor for floor, name in relatedness.BANDS if name == "strong")
+    identity = relatedness.CLASS_WEIGHT["identity"]
+    structural = relatedness.CLASS_WEIGHT["structural"]
+    assert identity >= strong, "one identity fact must promote"
+    assert 1 - (1 - structural) ** 2 >= strong, "two structural facts must promote"
+    assert structural < strong, "one structural fact must not"
+    assert 1 - (1 - structural) * (1 - relatedness.BEHAVIOURAL_CAP) < strong, \
+        "one structural fact plus any number of behavioural ones must not"
     # Independence is per ARTEFACT - the part most likely to be softened,
     # and the part that was wrong: counting by type made one certificate
     # read as three independent facts.
-    assert 'artefact(t) for t, _ in slot["structural"]' in source
-    assert 'structural_facts -= identity_facts' in source, \
-        "a certificate counted as identity must not be counted again"
+    assert "best[p.artefact]" in inspect.getsource(relatedness.combine)
     # Whitespace-normalized: prose wraps, and a content assertion should
     # not break because a sentence crossed a line.
     text = " ".join(PIVOTING.read_text().lower().split())
     assert "artefact" in text
     assert "two sans off one certificate are one fact" in text
+    assert "discount" in text, "the skill must say the rule is applied to discounted evidence"
 
 
 # --------------------------------------------------------------------------- #

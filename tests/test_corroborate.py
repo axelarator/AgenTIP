@@ -368,3 +368,95 @@ def test_global_count_lookups_run_with_no_database_connection_open(monkeypatch):
         assert con.execute(
             "SELECT global_count FROM selector_stats WHERE selector_value = ?",
             ["c" * 64]).fetchone() == (7,)
+
+
+# --------------------------------------------------------------------------- #
+# One judge: a link is promoted when relatedness scores it strong
+# --------------------------------------------------------------------------- #
+
+def _candidates(indicator):
+    from cti.store import expand
+    with tracking_store.connect(read_only=True) as con:
+        return {c.indicator: c for c in expand.candidates_for(con, indicator)}
+
+
+def _score(a, b):
+    from cti.store import relatedness
+    with tracking_store.connect(read_only=True) as con:
+        return relatedness.pairs_between(con, a, b)
+
+
+def test_a_shared_page_seen_a_year_apart_is_no_longer_promoted():
+    """The old rule counted facts and ignored when they were true. The same
+    page on two hosts a year apart is a template, not an operator."""
+    _seed([("a.example", "http.body_sha256", "b" * 64, "Actor")], day="2025-09-01")
+    _seed([("b.example", "http.body_sha256", "b" * 64, "Actor")], day="2026-09-20")
+
+    link = _candidates("b.example")["a.example"]
+
+    assert link.promoted is False and link.band in ("weak", "noise")
+    assert "day" in link.reason                     # says the gap is why
+
+
+def test_the_link_carries_the_score_the_candidate_view_would_show():
+    _seed([("a.example", "tls.cert_sha256", "c" * 64, "Actor"),
+           ("b.example", "tls.cert_sha256", "c" * 64, "Actor"),
+           ("c.example", "net.resolved_ip", "203.0.113.9", "Actor"),
+           ("a.example", "net.resolved_ip", "203.0.113.9", "Actor")])
+
+    links = _candidates("a.example")
+
+    for other, link in links.items():
+        scored = _score("a.example", other)
+        assert link.score == pytest.approx(scored.score)
+        assert link.band == scored.band
+        assert link.promoted is (scored.band == "strong")
+    assert links["b.example"].promoted and not links["c.example"].promoted
+
+
+def test_a_certificate_that_is_a_servers_default_does_not_promote():
+    """relatedness already knew this; expand promoted it anyway."""
+    _seed([("a.example", "tls.cert_sha256", "d" * 64, "Actor"),
+           ("b.example", "tls.cert_sha256", "d" * 64, "Actor"),
+           ("a.example", "tls.default_subject", "CN=localhost", "Actor"),
+           ("b.example", "tls.default_subject", "CN=localhost", "Actor")])
+
+    link = _candidates("a.example")["b.example"]
+
+    assert link.promoted is False
+    assert "default certificate" in link.reason
+
+
+def test_pairs_that_share_nothing_promotable_are_not_scored(monkeypatch):
+    """Nine in ten pairs share only behavioural or contextual values, which
+    cannot reach the promoting band however many there are. Scoring each
+    took the daily step from seconds to six minutes."""
+    from cti.store import expand
+    _seed([("a.example", "http.server", "nginx", "Actor"),
+           ("b.example", "http.server", "nginx", "Actor"),
+           ("a.example", "tls.cert_sha256", "c" * 64, "Actor"),
+           ("c.example", "tls.cert_sha256", "c" * 64, "Actor")])
+    scored = []
+    real = expand.pairs_between
+    monkeypatch.setattr(expand, "pairs_between",
+                        lambda con, a, b: scored.append(b) or real(con, a, b))
+
+    links = _candidates("a.example")
+
+    assert scored == ["c.example"]
+    assert links["b.example"].promoted is False and links["b.example"].band is None
+    assert "corroborating selectors only" in links["b.example"].reason
+    assert links["c.example"].promoted
+
+
+def test_the_link_search_does_not_hold_the_write_connection(monkeypatch):
+    from cti.store import connection, expand
+    held = []
+    real = expand.candidates_for
+    monkeypatch.setattr(expand, "candidates_for",
+                        lambda con, ind: held.append(connection._open_writes[0]) or real(con, ind))
+    _seed([("a.example", "tls.cert_sha256", "c" * 64, "Actor"),
+           ("b.example", "tls.cert_sha256", "c" * 64, "Actor")])
+
+    assert _run()["promoted_total"] == 1
+    assert held and set(held) == {0}
