@@ -27,18 +27,23 @@ the selector layer already makes).
 """
 from __future__ import annotations
 
+import json
+import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import os
+import duckdb
 
 from .. import core, membership
+from ..errors import TrackingBusy
 from ..store import cdn
 from ..store import entities
 
 # A host whose lifecycle moved within this window is still "hot" even once
 # it is back to active, so a change gets a few days of close attention.
 RECENT_MOVE_DAYS = 7
+log = logging.getLogger(__name__)
 CANDIDATES_PER_CLUSTER = 25
 
 
@@ -46,7 +51,9 @@ def _candidate_targets(slug: str, actor: str) -> list[dict[str, Any]]:
     floor = os.environ.get("CTI_CANDIDATE_SCAN_BAND", "weak")
     try:
         found = membership.candidates(slug, min_band=floor)
-    except Exception:
+    except (TrackingBusy, duckdb.Error) as e:
+        # The scan still runs on the cluster's own hosts; say what it lacks.
+        log.warning("watchlist: no candidates for %s this run: %s", slug, e)
         return []
     out = []
     for row in found[:CANDIDATES_PER_CLUSTER]:
@@ -92,7 +99,8 @@ def build(*, clusters: list[str] | None = None) -> list[dict[str, Any]]:
     for name in names:
         try:
             data = core.load_cluster(name)
-        except Exception:
+        except (core.ClusterNotFound, json.JSONDecodeError, OSError) as e:
+            log.warning("watchlist: cluster %s left out, cannot be read: %s", name, e)
             continue
         actor = data.get("name") or name
         for target in _candidate_targets(core._slug(data), actor):

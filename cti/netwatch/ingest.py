@@ -326,7 +326,7 @@ def ingest(*, client: Any = _UNSET, purge: bool = True) -> dict[str, Any]:
     files = sorted(spool_dir().glob("*.jsonl"))
     if not files:
         return {"files": 0, "snapshots": 0, "changes": 0, "selectors": 0,
-                "quarantined": []}
+                "quarantined": [], "rejected": 0}
 
     if client is _UNSET:
         try:
@@ -338,16 +338,29 @@ def ingest(*, client: Any = _UNSET, purge: bool = True) -> dict[str, Any]:
     by_target: dict[tuple[str, str], list[dict]] = {}
     control = control_target()
     quarantined = []
+    rejected = 0
     for path in list(files):
-        records = []
+        records, bad = [], 0
         for line in path.read_text().splitlines():
             line = line.strip()
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
+                rec = json.loads(line)
             except json.JSONDecodeError:
+                bad += 1
                 continue
+            # A record with no scan or target cannot be stored, and used to
+            # raise part-way through the write loop: rows before it stayed,
+            # the spool was kept, and every later run replayed and failed.
+            if not (isinstance(rec, dict) and rec.get("scan_id") and rec.get("target")):
+                bad += 1
+                continue
+            records.append(rec)
+        if bad:
+            log.warning("netwatch scan %s: %d unusable record(s) skipped",
+                        path.stem, bad)
+            rejected += bad
         fault = _control_fault(records)
         if fault:
             # Kept, not deleted: the records are evidence of what the path
@@ -401,4 +414,4 @@ def ingest(*, client: Any = _UNSET, purge: bool = True) -> dict[str, Any]:
             path.unlink(missing_ok=True)
     return {"files": len(files), "snapshots": snapshots,
             "changes": changes, "selectors": selectors,
-            "quarantined": quarantined}
+            "quarantined": quarantined, "rejected": rejected}

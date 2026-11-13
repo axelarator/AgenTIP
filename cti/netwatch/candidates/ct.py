@@ -125,7 +125,7 @@ async def stream(url: str = DEFAULT_STREAM_URL, *, seconds: float = 60.0,
         return {"error": "no CT-scoped hunt rules are enabled"}
 
     parsed: list[dict[str, Any]] = []
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     deadline = loop.time() + seconds
     try:
         async with websockets.connect(url, max_size=2 ** 20) as ws:

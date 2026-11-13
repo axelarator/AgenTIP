@@ -53,8 +53,10 @@ def drain(*, tiers: set[str] | None = None) -> list[dict[str, Any]]:
         try:
             batch = json.loads(path.read_text())
         except (json.JSONDecodeError, OSError) as e:
-            log.warning("bad queue file %s: %s", path, e)
-            path.unlink(missing_ok=True)
+            # Kept under another name: out of the queue, but still there
+            # to show what a discovery pass tried to write.
+            log.warning("bad queue file %s set aside as .bad: %s", path, e)
+            path.replace(path.with_name(path.name + ".bad"))
             continue
         kept = []
         for t in batch if isinstance(batch, list) else []:

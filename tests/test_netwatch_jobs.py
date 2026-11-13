@@ -233,3 +233,69 @@ def test_a_job_without_a_control_scan_is_still_ingested(monkeypatch):
     out = ingest.ingest(client=None)
 
     assert out["quarantined"] == [] and _snapshot_targets() == {"203.0.113.3"}
+
+
+# --------------------------------------------------------------------------- #
+# things that used to disappear without a word
+# --------------------------------------------------------------------------- #
+
+def test_a_busy_store_drops_candidates_with_a_warning_not_silently(monkeypatch, caplog):
+    from cti import store
+    from cti.netwatch import watchlist
+
+    def busy(slug, min_band="noise"):
+        raise store.TrackingBusy("locked by pid 1")
+    monkeypatch.setattr(watchlist.membership, "candidates", busy)
+
+    with caplog.at_level("WARNING"):
+        assert watchlist._candidate_targets("apt-w", "APT-W") == []
+    assert "apt-w" in caplog.text and "candidates" in caplog.text
+
+
+def test_an_unreadable_cluster_is_named_in_the_log(monkeypatch, caplog):
+    from cti import core
+    from cti.netwatch import watchlist
+    core.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (core.DATA_DIR / "broken.json").write_text("{not json")
+
+    with caplog.at_level("WARNING"):
+        assert watchlist.build(clusters=["broken"]) == []
+    assert "broken" in caplog.text
+
+
+def test_a_programming_error_in_the_watchlist_is_not_swallowed(monkeypatch):
+    from cti.netwatch import watchlist
+
+    def bug(slug, min_band="noise"):
+        raise TypeError("unexpected keyword")
+    monkeypatch.setattr(watchlist.membership, "candidates", bug)
+
+    with pytest.raises(TypeError):
+        watchlist._candidate_targets("apt-w", "APT-W")
+
+
+def test_a_malformed_record_does_not_stop_the_rest_of_the_spool(caplog):
+    from cti.netwatch import ingest
+    good = _rec("hot-mixed", "203.0.113.4", 443)
+    (jobs.spool_dir() / "hot-mixed.jsonl").write_text("\n".join([
+        json.dumps({"port": 443, "open": True}),          # no scan_id, no target
+        "{truncated",
+        json.dumps(good)]))
+
+    with caplog.at_level("WARNING"):
+        out = ingest.ingest(client=None)
+
+    assert out["snapshots"] == 1 and out["rejected"] == 2
+    assert _snapshot_targets() == {"203.0.113.4"}
+    assert "hot-mixed" in caplog.text
+    assert list(jobs.spool_dir().glob("*.jsonl")) == []
+
+
+def test_a_queue_file_that_cannot_be_read_is_kept_for_inspection():
+    path = queue.queue_dir() / "ct-broken.json"
+    path.write_text("{not json")
+
+    assert queue.drain(tiers={"hot"}) == []
+    assert not path.exists()
+    assert (queue.queue_dir() / "ct-broken.json.bad").read_text() == "{not json"
+    assert queue.pending() == 0
