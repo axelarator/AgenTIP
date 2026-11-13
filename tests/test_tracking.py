@@ -1604,3 +1604,57 @@ def test_wazuh_time_ranges_use_timestamp_in_epoch_seconds():
         "range": {"timestamp": {"gte": 1000, "lt": 2500, "format": "epoch_millis"}}}
     assert OpenSearchClient(backend="arkime").ts_range(gte=1.0) == {
         "range": {"ts": {"gte": 1.0}}}
+
+
+def test_xref_does_not_count_our_own_probes_as_sightings(monkeypatch):
+    """The one row this table held was our probe scanning a tracked address.
+    A session whose source is a lab vantage is us looking at them, not them
+    appearing in our network."""
+    for name in ("CTI_PROBE_HOST", "CTI_WIN_HOST"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CTI_PROBE_ZEEK_IP", "10.99.0.74")
+    monkeypatch.setenv("CTI_WIN_ZEEK_IP", "10.99.0.116")
+    client = FakeOpenSearch([], backend="wazuh")
+    with store.connect() as con:
+        _seed_actor_ip(con)
+        opensearch_xref.run_daily_xref(con, TODAY, client=client)
+
+    for query in client.queries:
+        excluded = query["bool"]["must_not"]
+        assert excluded == [{"terms": {"data.id_orig_h": ["10.99.0.116", "10.99.0.74"]}}]
+
+
+def test_xref_queries_the_sensor_with_no_database_connection_open():
+    from cti.store import connection
+    held = []
+
+    class Watching(FakeOpenSearch):
+        def search(self, query, **kw):
+            held.append(connection._open_writes[0])
+            return super().search(query, **kw)
+
+    with store.connect() as con:
+        _seed_actor_ip(con)
+    bucket = [{"key": "203.0.113.7", "doc_count": 3, "ports": {"buckets": []},
+               "first_ts": {"value": None}, "last_ts": {"value": None},
+               "log_files": {"buckets": []}}]
+
+    result = opensearch_xref.run(TODAY, client=Watching(bucket, backend="arkime"))
+
+    assert held and set(held) == {0}
+    assert result["matches"] == 2
+    with store.connect(read_only=True) as con:
+        assert con.execute("SELECT count(*) FROM zeek_matches").fetchone() == (2,)
+
+
+def test_the_xref_command_runs_it_for_a_day(monkeypatch, capsys):
+    from graph import __main__ as cli
+    seen = {}
+    monkeypatch.setattr(opensearch_xref, "run",
+                        lambda day, client=None: seen.update(day=day) or
+                        {"matches": 0, "ips_checked": 4})
+    monkeypatch.setattr("sys.argv", ["graph", "xref", "--date", "2026-11-12"])
+
+    assert cli.main() == 0
+    assert str(seen["day"]) == "2026-11-12"
+    assert "4" in capsys.readouterr().out

@@ -8,6 +8,7 @@ itself - that keeps query_opensearch off the MCP surface entirely.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -41,27 +42,39 @@ def _tracked_ips(con: duckdb.DuckDBPyConnection) -> dict[str, str]:
     return {ip: actor for ip, actor in rows}
 
 
-def run_daily_xref(con: duckdb.DuckDBPyConnection, day: date,
-                   client: OpenSearchClient | None = None) -> dict[str, Any]:
-    """Aggregate yesterday's Zeek hits per tracked IP and direction into
-    zeek_matches. OpenSearch being unreachable is a skip, not a crash."""
-    ip_actor = _tracked_ips(con)
-    if not ip_actor:
-        return {"matches": 0, "ips_checked": 0}
-    client = client or OpenSearchClient()
+def lab_vantages() -> list[str]:
+    """The lab machines that connect to tracked infrastructure on purpose:
+    the probe VM and the Windows client. A session from one of them to a
+    tracked address is us looking at it, not it appearing in our network.
+    Until this exclusion existed, the only match ever recorded was our own
+    probe scanning a tracked address."""
+    names = ("CTI_PROBE_ZEEK_IP", "CTI_PROBE_HOST", "CTI_WIN_ZEEK_IP", "CTI_WIN_HOST")
+    return sorted({v.strip() for v in (os.environ.get(n) or "" for n in names) if v.strip()})
+
+
+def collect(ip_actor: dict[str, str], day: date,
+            client: OpenSearchClient) -> tuple[list[dict[str, Any]], str | None]:
+    """Ask the sensor which tracked addresses it saw on `day`. Network
+    only: touches no database, so the caller holds no connection while it
+    runs. Returns (matches, error); matches found before an error are kept.
+    """
     lo, hi = _day_bounds_epoch(day)
     ips = sorted(ip_actor)
-    matches = 0
+    ours = lab_vantages()
+    found: list[dict[str, Any]] = []
     try:
         for i in range(0, len(ips), _CHUNK):
             chunk = ips[i:i + _CHUNK]
             for direction, logical in _DIRECTIONS.items():
                 field = client.field(logical)
                 ts = client.field("ts")
-                query = {"bool": {"filter": [
+                query: dict[str, Any] = {"bool": {"filter": [
                     {"terms": {field: chunk}},
                     client.ts_range(gte=lo, lt=hi),
                 ]}}
+                if ours:
+                    query["bool"]["must_not"] = [
+                        {"terms": {client.field("src_ip"): ours}}]
                 aggs = {"per_ip": {
                     "terms": {"field": field, "size": len(chunk)},
                     "aggs": {
@@ -76,8 +89,8 @@ def run_daily_xref(con: duckdb.DuckDBPyConnection, day: date,
                            .get("per_ip", {}).get("buckets", []))
                 for bucket in buckets:
                     ip = str(bucket["key"])
-                    store.upsert_zeek_match(
-                        con, day=day, indicator_value=ip, direction=direction,
+                    found.append(dict(
+                        day=day, indicator_value=ip, direction=direction,
                         hit_count=int(bucket["doc_count"]),
                         actor=ip_actor.get(ip),
                         ports=[int(b["key"]) for b
@@ -87,12 +100,52 @@ def run_daily_xref(con: duckdb.DuckDBPyConnection, day: date,
                         last_ts=_epoch_to_dt(client.agg_epoch(
                             bucket.get("last_ts", {}).get("value"))),
                         log_files=[str(b["key"]) for b
-                                   in bucket.get("log_files", {}).get("buckets", [])])
-                    matches += 1
+                                   in bucket.get("log_files", {}).get("buckets", [])]))
     except OpenSearchError as e:
         log.warning("Zeek xref unavailable: %s", e)
-        return {"skipped": str(e), "matches": matches, "ips_checked": len(ips)}
-    return {"matches": matches, "ips_checked": len(ips)}
+        return found, str(e)
+    return found, None
+
+
+def _summary(found: list[dict[str, Any]], error: str | None, checked: int) -> dict[str, Any]:
+    out: dict[str, Any] = {"matches": len(found), "ips_checked": checked}
+    if error:
+        out["skipped"] = error
+    return out
+
+
+def run_daily_xref(con: duckdb.DuckDBPyConnection, day: date,
+                   client: OpenSearchClient | None = None) -> dict[str, Any]:
+    """Cross-reference on a connection the caller already holds. Prefer
+    `run`, which does not keep the database open while the sensor answers."""
+    ip_actor = _tracked_ips(con)
+    if not ip_actor:
+        return {"matches": 0, "ips_checked": 0}
+    found, error = collect(ip_actor, day, client or OpenSearchClient())
+    for match in found:
+        store.upsert_zeek_match(con, **match)
+    return _summary(found, error, len(ip_actor))
+
+
+def run(day: date, client: OpenSearchClient | None = None) -> dict[str, Any]:
+    """Which tracked addresses appeared in the lab's own traffic on `day`.
+
+    Manual by design: the sensor only has something to say after the lab
+    has generated traffic (a probe session, a detonation), so running it
+    daily would mostly find nothing. `python -m graph xref --date <day>`
+    calls this. Reads the tracked addresses, closes the database, queries
+    the sensor, then reopens to record what it found.
+    """
+    with store.connect_read() as con:
+        ip_actor = _tracked_ips(con)
+    if not ip_actor:
+        return {"matches": 0, "ips_checked": 0}
+    found, error = collect(ip_actor, day, client or OpenSearchClient())
+    if found:
+        with store.connect_retry(read_only=False) as con:
+            for match in found:
+                store.upsert_zeek_match(con, **match)
+    return _summary(found, error, len(ip_actor))
 
 
 def _epoch_to_dt(value: Any) -> datetime | None:

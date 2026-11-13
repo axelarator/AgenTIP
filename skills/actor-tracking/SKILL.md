@@ -40,9 +40,10 @@ cross-reference is a completely separate, on-demand capability, not
 part of this daily loop or its digest/narrative at all: OpenSearch
 only has data when the lab VM originates traffic (probing indicators,
 or occasionally detonating malware), so checking it every day would
-mostly find nothing and just add noise. Run it only when asked, by
-calling `cti.tracking.opensearch_xref.run_daily_xref(con, day)`
-directly (there is no `daily_tracking.py` flag for this).
+mostly find nothing and just add noise. Run it only when asked:
+`python -m graph xref --date <day>`. Sessions that start from the lab's
+own probe VM or Windows client are excluded, since those are us looking
+at the infrastructure, not it appearing in our network.
 
 ## Tables
 
@@ -199,7 +200,7 @@ for new ones on the expansion weekday. Last, it writes
 
 Zeek/OpenSearch/Arkime cross-referencing is NOT part of this loop. It is
 a separate, on-demand capability
-(`cti.tracking.opensearch_xref.run_daily_xref`), useful right after
+(`python -m graph xref --date <day>`), useful right after
 probing a cluster's indicators or running malware that generated VM
 network traffic, but deliberately outside the daily narrative.
 

@@ -13,6 +13,8 @@
     python -m graph netwatch --flowcarp       # label unnamed services via FlowCarp
     python -m graph netwatch --win116         # also fetch due hosts as a Windows client
     python -m graph netwatch --ingest-only --win116   # only the Windows-client pass
+    python -m graph doctor                    # cluster files vs the membership table
+    python -m graph xref --date 2026-09-18    # tracked addresses in the lab's own traffic
     python -m graph hunt 'tls.jarm:<hash> AND NOT net.asn:13335'   # key:value hunt
     python -m graph hunt 'net.port:8443 during:[2026-03-01,2026-04-30]' --json
     python -m graph hunt --pairs update-trellix.com            # what is it most like
@@ -162,7 +164,7 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command",
                     choices=["draw", "analyze", "collect", "daily", "trace", "netwatch",
-                             "hunt", "doctor"])
+                             "hunt", "doctor", "xref"])
     ap.add_argument("query", nargs="*",
                     help="hunt: the key:value query (quote it), or with --pairs one or "
                          "two indicators")
@@ -237,6 +239,14 @@ def main() -> int:
 
     if args.command == "doctor":
         return _doctor()
+
+    if args.command == "xref":
+        from cti.tracking import opensearch_xref
+        out = opensearch_xref.run(date.fromisoformat(args.date))
+        print(f"xref {args.date}: {out['matches']} match(es) across "
+              f"{out['ips_checked']} tracked address(es)"
+              + (f"; sensor unavailable: {out['skipped']}" if out.get("skipped") else ""))
+        return 0
 
     if args.command == "trace":
         files = run_files(args.date)
