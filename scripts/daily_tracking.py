@@ -2,7 +2,7 @@
 """Stage A of the daily actor-tracking loop - pure Python, zero agent
 tokens. Run from cron (see setup.sh output) or manually:
 
-    mcp-server/.venv/bin/python mcp-server/scripts/daily_tracking.py
+    .venv/bin/python scripts/daily_tracking.py
     ... --seed          # one-time: import actors/IPs from the cluster store
     ... --date 2026-08-20   # backfill enrichment/analytics for a past day
     ... --skip-enrich   # no network calls (fast local re-run)
@@ -22,7 +22,7 @@ be written, so cron mail stays meaningful.
 Deliberately out of scope for this daily loop: open-port discovery
 (nmap) and open-directory listing (dirsearch), which are loud/active
 and run on demand via core.active_scan; and Zeek/OpenSearch/Arkime
-cross-referencing (cti_tools.tracking.opensearch_xref.run_daily_xref,
+cross-referencing (cti.tracking.opensearch_xref.run_daily_xref,
 invoked manually - see the infrastructure-pivoting skill's "probing"
 workflow), for correlating tracked infrastructure against this lab's
 own captured traffic right after a probe or malware-execution session.

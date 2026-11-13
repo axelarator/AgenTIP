@@ -5,7 +5,7 @@ client (Claude Code, GitHub Copilot / VS Code, Pi via pi-mcp-adapter)
 can call these as structured tools.
 
 Run:
-    python -m cti_tools.server
+    python -m cti.mcp.server
 """
 from __future__ import annotations
 

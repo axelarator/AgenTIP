@@ -1,503 +1,288 @@
-# cti-tools
+# Architecture
 
-Self-hosted MCP server for threat cluster tracking. Cluster tracking
-itself makes no external API calls — everything is local JSON under
-`../data/clusters/` (shared at the repo root so every harness surface
-sees the same store), with a regenerated markdown view alongside each.
-`core.py` is the single source of truth; `stix.py` and `server.py` are
-thin surfaces over it, which is what makes the same tool behave
-identically whether it's called over MCP or exported as STIX.
-`attack.py` bundles a static, offline MITRE ATT&CK technique lookup
-(see "MITRE ATT&CK technique validation" below) — the one static
-reference dataset in the repo, refreshed occasionally and offline, not
-fetched per call.
+How cti-graph is put together: what each part is for, how data moves
+through it, and the rules that hold it together. The README says what the
+project does and how to run it; `docs/probe-vm.md` covers the probe VM;
+`docs/audit-2026-11.md` records the last full review.
 
-The deliberate exceptions are infrastructure enrichment (see
-"Infrastructure pivoting" below — third-party lookups plus light-touch
-live checks from a lab probe VM, run on demand and by the daily
-actor-tracking sweep) and the on-demand `active_scan` (nmap/dirsearch
-from the same VM, only when explicitly asked).
+## The parts
 
-## Install
-
-From the repo root:
-
-```bash
-./setup.sh
+```
+cti/                    the library
+  clusters/             cluster profiles: files, lock, observables, pivots, scans, reports
+  core.py               one namespace over cti/clusters/ (re-exports; holds no code)
+  membership.py         who belongs to a cluster, in DuckDB
+  store/                DuckDB: schema, observations, selectors, scoring, queries
+  sources/              third-party data, one module each, over one transport
+  probe/                everything that leaves this host toward an indicator
+  netwatch/             scheduled re-scans of tracked hosts, and what they find
+  tracking/             the daily job's ingest, enrichment, analytics and digest
+  report/               threat-report text and indicator extraction
+  attack/               the bundled MITRE ATT&CK technique list
+  mcp/server.py         the MCP tools (47), thin wrappers over the above
+  stix.py               STIX 2.1 export and import
+graph/                  the daily pipeline (LangGraph) and its CLI
+dashboard/              read-only web UI (Starlette API, Svelte front end)
+probe_vm/               probe_helper.py and its installer, deployed to the probe VM
+sandbox/                the file-analysis container, built and run on the probe VM
+skills/                 agent skills; setup.sh copies them to each harness
+scripts/                migrations and backfills, run by hand
 ```
 
-or manually:
-
-```bash
-cd mcp-server
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e '.[test]'
-```
-
-Cluster data is read/written under `<repo root>/data/clusters/` by
-default (computed relative to `core.py`'s location). Override with the
-`CTI_DATA_DIR` environment variable if you want clusters stored
-somewhere else — e.g. a separate private repo, or an isolated directory
-for tests (the test suite does this automatically via a fixture).
-
-## Run tests
-
-```bash
-cd mcp-server && source .venv/bin/activate
-pytest
-```
-
-## Run standalone (sanity check)
-
-```bash
-python -c "from cti_tools import core; print(core.list_clusters())"
-```
-
-## Wiring into each harness
-
-**Claude Code** — native MCP support. `.mcp.json` at the repo root
-(written by `setup.sh`) already points at
-`mcp-server/.venv/bin/python -m cti_tools.server` with `cwd` set to
-`mcp-server`. Drop `skills/cluster-bookkeeping/` into
-`.claude/skills/`.
-
-**GitHub Copilot (VS Code)** — MCP support lives in VS Code's own MCP
-settings (`Cmd/Ctrl+Shift+P` → "MCP: Add Server"). Point it at the same
-interpreter/args as `.mcp.json` uses. Skills go wherever your VS Code
-Copilot build reads Agent Skills from — check `docs.github.com` for the
-current path, it's moved a couple of times.
-
-**Pi** — core Pi's loop is Read/Write/Edit/Bash plus the
-`pi-mcp-adapter` package (https://pi.dev/packages/pi-mcp-adapter),
-which gives it a native MCP client (the `mcp`/`mcpScript` tools). Wire
-it the same way as above via `.pi/mcp.json` (already written by
-`setup.sh`). `.pi/skills/cluster-bookkeeping/` is already
-populated.
-
-### Why `.mcp.json` uses absolute paths, not `${workspaceFolder}`
-
-Not every MCP client expands workspace-relative variables the same way
-(or at all) for stdio server configs, and a wrong assumption here fails
-silently as "server won't start" with little signal. `setup.sh` bakes in
-absolute paths for your actual checkout instead. Re-run it if you move
-or re-clone the repo.
-
-### Providers
-
-Point Pi (or any harness) at Ollama for local runs:
-
-```bash
-pi --provider ollama --model qwen3.5:9b
-```
-
-and swap to `--provider anthropic` (Claude subscription) when a task
-needs frontier-level reasoning (multi-step TTP correlation, ambiguous
-cluster merges) that the local model is thrashing on. Because both
-providers drive the exact same skill and tool surface, that swap is the
-cleanest isolated model-effect comparison you can run — harness and
-capabilities held constant, only the model changes.
-
-## MITRE ATT&CK technique validation
-
-`attack.py` bundles a flat `technique_id -> {name, display_name, tactics,
-revoked, deprecated, revoked_by}` lookup at
-`attack_data/enterprise_attack_techniques.json`, generated from the
-official MITRE STIX corpus (`mitre-attack/attack-stix-data`) by
-`scripts/refresh_attack_data.py`. `update_ttp` (and TTP auto-extraction
-during `ingest_report`) check every technique_id/technique_name pair
-against it:
-
-- unknown ID → warns, doesn't block the write (could be a legitimately
-  private/custom ID, or the bundle is stale),
-- revoked ID → warns with its replacement technique ID if MITRE recorded
-  one (ATT&CK restructures periodically — e.g. T1562 "Impair Defenses"
-  was revoked and replaced by T1685 "Disable or Modify Tools" upstream),
-- deprecated ID → warns,
-- name mismatch → warns with the canonical name, checked against both
-  ATT&CK's bare technique name and this repo's "Parent: Sub" display
-  convention for sub-techniques (e.g. "Steal or Forge Kerberos Tickets:
-  Kerberoasting" for T1558.003).
-
-The warning comes back as a `warning` key on the function's return value
-and is never written to the cluster's stored JSON — advisory, not a hard
-gate. Auto-extracted TTPs from report ingestion now also get their
-canonical display name filled in automatically (previously they were
-stored with `name` == the bare technique ID until someone corrected them
-by hand).
-
-Re-run `python scripts/refresh_attack_data.py` from `mcp-server/` when a
-new ATT&CK Enterprise release ships; it's a one-off/occasional script,
-not run automatically, consistent with this tool making no network calls
-at runtime.
-
-## Detections and technique usage
-
-Detections live in a shared registry
-(`data/clusters/_registry/detections.json`), not duplicated per cluster.
-`add_detection(detection_id, description, technique_ids, status="draft",
-cluster_name=None, scope=None)` requires at least one technique_id, and
-each detection has a `scope`:
-
-- `"technique"` — a generic behavioral detection (the same Kerberoasting
-  rule covers every adversary that Kerberoasts). It joins onto every
-  cluster whose TTP table shares one of its technique_ids.
-- `"cluster"` — keyed to one actor's artifacts (a C2 port, a code-signing
-  certificate, a YARA rule for their loader). It appears only on the
-  clusters it names, even when another cluster logs the same technique,
-  so it isn't shown as coverage it doesn't provide.
-
-`scope` defaults to `"cluster"` when `cluster_name` is given and
-`"technique"` otherwise, and is left unchanged on an update unless
-passed; a cluster-scoped detection must name at least one cluster.
-Registry entries without a `scope` field (written before scoping existed)
-behave as `"technique"`. A cluster's `detections` field (from
-`get_cluster` / `load_cluster`) is always a live join against the
-registry — computed at read time, never trusted from whatever was last
-written to that cluster's own JSON file — so it never goes stale
-relative to the cluster's current TTP table.
-
-`get_technique_usage(technique_id=None)` is the reverse index: given a
-technique, which tracked clusters use it and what detections cover it.
-Omit `technique_id` for the full matrix across every technique any
-tracked cluster has logged. Check this before writing a new detection —
-another cluster may already have one for the same technique.
-
-## STIX 2.1 export/import
-
-`export_stix_bundle` / `cti export-stix` renders a cluster as a STIX 2.1
-`bundle`:
-
-- one **Intrusion Set** (the cluster itself — name, description,
-  aliases, confidence is *not* a native Intrusion Set property so it
-  stays local-only, first_seen, last_seen),
-- one **Attack Pattern** per TTP entry, keyed to its ATT&CK technique ID
-  via `external_references` (`source_name: mitre-attack`), plus a
-  non-standard `x_cti_agent_coverage_status` custom property carrying
-  the 0-4 coverage score,
-- one **Relationship** (`uses`) per TTP, linking the Intrusion Set to
-  its Attack Pattern, carrying the TTP's notes as its description,
-- one **Relationship** per cross-cluster link added via
-  `add_relationship`, linking this Intrusion Set directly to another
-  cluster's Intrusion Set `stix_id` (the target object itself isn't
-  included in a single-cluster export, so its name is carried through
-  via a custom `x_cti_agent_target_name` property for a clean re-import
-  elsewhere),
-- one **Note** per hunt log entry, linked back to the Intrusion Set.
-
-The Intrusion Set's STIX id is minted once at cluster creation and
-persisted (`stix_id` in the cluster JSON), so re-exporting the same
-cluster always yields the same id — a receiving system can tell it's an
-update, not a duplicate. Attack Pattern ids are derived deterministically
-from the ATT&CK technique ID (UUIDv5 under a fixed namespace in
-`stix.py`), so the same technique gets the same id across every cluster
-and every export, without needing MITRE's own STIX corpus bundled in.
-Relationship ids are derived from `(source, target, relationship_type)`
-so a TTP `uses` link and a cross-cluster link never collide even when
-they'd otherwise share a source/target pair.
-
-`import_stix_bundle` / `cti import-stix` does the reverse: given a
-bundle with at least one Intrusion Set, it creates a new cluster (or
-merges into an existing one with `--overwrite`, unioning in TTPs,
-cross-cluster relationships, and hunt log notes without touching
-existing gaps). Detections aren't part of the bundle at all — they're
-resolved locally by joining the imported TTPs against your own
-detection registry.
-
-`export_stix_bundle` only ever includes *this* cluster's own Intrusion
-Set — a cross-cluster Relationship's `target_ref` points at another
-cluster's `stix_id`, but that target object isn't itself in the bundle,
-so a receiving system without it already loaded gets a dangling
-reference. `export_stix_ecosystem(name)` / `cti export-stix-ecosystem
-<name>` fixes that: it walks the relationship graph outward from
-`name` (via every visited cluster's own `relationships`), exports each
-reachable cluster, and merges them into one bundle via
-`stix.merge_bundles` (deduplicating objects by id, so a technique two
-clusters share doesn't end up as two copies of the same Attack
-Pattern). Every Relationship's target is guaranteed to resolve to an
-actual object in the result. A relationship pointing at a
-since-renamed/deleted cluster is skipped rather than failing the whole
-export.
-
-This is hand-rolled JSON, not the `stix2` library — the object graph is
-small and a hard dependency on a validating library isn't worth it for a
-tool whose whole design point is "no external services, minimal deps."
-If a downstream consumer needs strict spec validation, run the exported
-bundle through `stix2validator` before sharing it.
-
-## Report ingestion
-
-`ingest_report(source, cluster_name=None)` / `cti ingest-report <source>`
-fetches a threat report (URL or local file — `report_ingest.py` strips
-HTML to text; PDFs aren't supported yet, extract text first e.g. with
-`pdftotext`) and regex-extracts hashes (md5/sha1/sha256), domains, IPs
-(private/reserved ranges filtered out), URLs, and ATT&CK technique IDs.
-Extracted data is filed into a cluster — created automatically if it
-doesn't exist — with observables deduped by value (repeats just add a
-new source to that observable's provenance) and new TTPs added at
-coverage status 0 without ever touching an already-tracked TTP's
-status/notes.
-
-If `cluster_name` is omitted, it's inferred from the report text via a
-few vendor-style naming regexes (Microsoft weather names, CrowdStrike
-animal names, Mandiant/Proofpoint numbered clusters, or a name next to
-"ransomware"/"malware"/etc.). This is a heuristic, not attribution —
-zero or multiple candidates raises rather than guessing wrong. Use
-`analyze_report` / `cti analyze-report <source>` to preview extraction
-and candidate names without writing anything first.
-
-Both `analyze_report` and `ingest_report` add a `warning` field to their
-return value when regex extraction finds zero observables *and* zero
-TTPs — don't read that the same as "a clean report with nothing to
-report." It usually means the source keeps its IOCs/techniques in a
-table, image, or appendix the plain-text extractor can't reach (common
-in older vendor posts); check the source manually when that seems
-unlikely for the report at hand.
-
-`get_observables(name)` / `cti get-observables <name>` returns just the
-hashes/domains/ips/urls tracked for a cluster (with provenance and
-first/last seen) plus the list of report sources ingested — the fast
-path to "what's tied to this cluster" instead of the full cluster dump.
-
-`find_observable(value)` / `cti find-observable <value>` goes the other
-direction — given a hash (with or without its algo prefix), domain, ip,
-or url, which tracked clusters have seen it. The observable counterpart
-to `get_technique_usage`; there's no separate index to keep in sync, it
-just scans every tracked cluster the same way `get_technique_usage` does.
-
-`add_observable(name, category, value, source)` / `cti add-observable
-<name> <hashes|domains|ips|urls> <value> <source>` manually files a
-single observable onto a cluster — the counterpart to `ingest_report`'s
-automatic extraction, for an indicator that didn't come from a
-parseable report (a `pivot_observable` finding, something told to you
-directly). Same dedup/provenance semantics as `ingest_report`: a value
-already tracked just gets `source` appended to its provenance list.
-Categories also include `emails`, `cves`, `wallets`, and the JA4+/JARM
-fingerprint categories (`ja4`, `ja4s`, `ja4h`, `ja4l`, `ja4x`, `ja4t`,
-`ja4ts`, `ja4ssh`, `jarm`) — see the cluster-bookkeeping skill for
-why those nine are never auto-extracted and have to be filed by hand.
-
-## Infrastructure pivoting
-
-`pivot_observable(value)` / `cti pivot-observable <value>` is an
-on-demand "what else is tied to this indicator" lookup. Nothing it
-returns is written anywhere; it's display-only. If a pivot surfaces
-something worth keeping, record it yourself (`append_hunt_log`,
-`add_gap`, or file the new indicator into a cluster). `pivot_cluster`
-runs the same enrichment over every tracked domain/ip of a cluster and
-*does* write the snapshot back (the daily tracking cron calls it);
-`pivot_and_expand` files what a pivot surfaces.
-
-The design favors **live interaction over scan platforms**: accuracy
-and timeliness matter, and a scan platform's record of a host can be
-weeks old, while a TLS handshake or HTTP GET made right now can't be.
-So VirusTotal, Shodan InternetDB, Hackertarget, and Cert Spotter are
-retired (crt.sh is shut down), replaced by one passive index (Webamon)
-plus live checks from the lab probe VM. There is no passive open-port
-source any more; ports come from report text or `active_scan`.
-
-Registry/telemetry sources, implemented in `pivot.py` (all network I/O
-except HoneyLabs is proxied through the probe VM via `vm_proxy`):
-
-- **RDAP** (WHOIS's standardized successor) via the public `rdap.org`
-  bootstrap redirector — no API key. Domain/IP lookups only: registrar/
-  registrant handle, registration/expiry/transfer events, nameservers.
-- **RIPEstat**'s free Data API — no API key. IP lookups only: ASN,
-  routing prefix, AS holder name, geolocation. Despite the name, it
-  covers globally routed space, not just the RIPE region.
-- **ThreatFox** (abuse.ch) — free POST-JSON query API, requires your
-  own Auth-Key (`THREATFOX_API_KEY` env var; register at
-  https://auth.abuse.ch/ — abuse.ch's unified Auth Portal requires this
-  header on every ThreatFox call, including `search_ioc`, despite the
-  query API historically being keyless). Applies to every observable
-  kind: checks the literal value against abuse.ch's own malware-C2 IOC
-  database and returns any matching threat/malware-family tags.
-  `query_status: "no_result"` (not a known IOC) comes back as an empty
-  match list, not an error. Skipped with a note (not an error) if
-  `THREATFOX_API_KEY` isn't set.
-- **HoneyLabs** (honeylabs.net) — requires your own API key
-  (`HONEYLABS_API_KEY` env var; mint one from the HoneyLabs dashboard).
-  IP lookups only: honeypot-fleet telemetry — event volume/recency and
-  the ports, client fingerprints, and CVEs their sensors saw the IP
-  probing. Heavy presence reads as mass-scanner/opportunistic noise (a
-  counter-signal for dedicated C2); absence on an active IP is the
-  quiet-infrastructure signal. Credits are metered (1 credit per row;
-  free tier 500/day, 10 req/min), so cached lookups matter — honeypot
-  totals move slowly, so a longer `CTI_PIVOT_CACHE_TTL` (e.g. 86400) is
-  sensible if HoneyLabs becomes the dominant source. Skipped with a
-  note if the key isn't set; deliberately no keyless fallback. The same
-  lookup also backs `core.honeylabs_context`/`core.summarize_honeylabs`
-  (the daily enrichment's per-IP telemetry). For interactive
-  queries beyond per-IP lookups, the `honeylabs` remote MCP server in
-  `.mcp.json` exposes HoneyLabs' own tools directly.
-
-Plus:
-
-- **Webamon** (`cti_tools/webamon.py`, `https://pro.webamon.com`) —
-  requires `WEBAMON_API_KEY` (keep it in `~/.bashrc`, never the repo);
-  called directly from this host, not via the VM, since it hits
-  Webamon's SaaS rather than the indicator's own infrastructure (same
-  exception as HoneyLabs). A domain's latest scan from Webamon's index
-  (certificate, DNS, ASN, tech stack, page title, DOM/SSL kit
-  fingerprints, risk score); its infostealer-log hits (the plaintext
-  `password` field is dropped at the client, only the masked peek is
-  kept); an IP's hosted domains (the reverse-IP replacement); and
-  fingerprint siblings (other scanned domains sharing a kit
-  fingerprint). A soft daily budget (`CTI_WEBAMON_DAILY_BUDGET`, default
-  1000 calls) is tracked in a small counter file next to the pivot
-  cache; 401/403/429 and an exhausted budget come back as
-  `{"error": ...}`, never raised.
-- **Live checks from the probe VM** (`vm_proxy` → `probe_helper.py`):
-  `observe` (one CLI pass: the current certificate from tlsx — sha256/
-  issuer/subject/SANs/validity plus serial, SPKI hash and revocation —
-  page and favicon digests, DNS and registration; this replaced both Cert
-  Spotter's CT lookup and the separate openssl `tls_grab`), `http_probe` (status/
-  final URL/title/server, plus any autoindex listing), `dns_lookup`
-  (A/AAAA/MX/NS/TXT), PTR, and passive subdomain discovery via
-  `subfinder` and the Wayback Machine's CDX API.
-
-Which sources run depends on the observable's type (`pivot.classify`):
-ThreatFox runs for every kind if `THREATFOX_API_KEY` is set; domain →
-RDAP + TLS grab + HTTP probe + Webamon scan + Webamon infostealers
-(`pivot_cluster` adds live DNS resolution and subdomain discovery); ip → RDAP + RIPEstat + PTR + Webamon hosted-domains +
-HoneyLabs. A failure in one source doesn't kill the whole lookup —
-each records its own `{"error": ...}` in its own section rather than
-raising.
-
-If a pivot turns up something worth keeping as a tracked indicator (not
-just narrative), use `add_observable` to file it in with a source
-citation describing the pivot (e.g. `"pivot_observable(signspace.cloud)
-via Webamon hosted-domains, checked 2026-09-11"`), rather than a bare
-local file path — `add_observable` doesn't require the source to look
-like a report URL the way `ingest_report`'s sources do.
-
-The daily actor-tracking sweep (below) is the one scheduled use of
-these sources; it runs only the light-touch checks. The Zeek/OpenSearch
-cross-reference described there stays on-demand.
-
-## Active scanning (`active_scan`)
-
-`active_scan(target, cluster=None, tools=None)` is the loud, on-demand
-counterpart to the enrichment above — **probing, not pivoting**, so
-only run it when explicitly asked. From the probe VM it runs:
-
-- **nmap** — `--top-ports 100 -sV -Pn`, parsed from XML into
-  `[{port, proto, service, product, version}]`. Ports are unioned onto
-  the observable and diffed (`ports_changed`) — the only automatic
-  source of port changes now that Shodan InternetDB is gone.
-- **dirsearch** — a web path map with 404-baseline suppression (a
-  catch-all server that 200s everything doesn't flood the results),
-  plus a recursive listing of every open directory found: each file's
-  path, size, and mtime, recorded in the tracking store's
-  `opendir_files` table and diffed day over day, so a newly-dropped
-  payload on a known open directory surfaces in the digest.
-
-`tools` defaults to both. If `cluster` is given and the target is
-tracked there, results are stamped onto its observable. Every run is
-audited in `active_scans` with the Zeek timestamp window its traffic
-falls in, so the captured packets can be pulled up in OpenSearch/
-Arkime afterwards. The call is synchronous and blocks for up to
-`CTI_PROBE_LONG_TIMEOUT` seconds (default 900) — there's deliberately no
-job server on the VM; an async queue would be the next step if scans
-ever need to outlive an MCP call.
-
-## Probe VM build
-
-Everything that touches an indicator's own infrastructure (and the
-registry lookups that name it) runs from a dedicated lab VM, so the
-analyst's host never originates that traffic and every packet is
-captured. The VM can be any OS that runs the helper; the current build
-is Linux (it replaced the Win11 VM — same role, simpler tooling).
-
-Steps 2–4 are automated for Debian/Ubuntu by
-`scripts/setup_probe_vm.sh` — copy it and `probe_helper.py` to the VM
-and run `sudo bash setup_probe_vm.sh --pubkey id_ed25519_probe.pub`
-(generate the key on the cti host first:
-`ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_probe -N ''`). It finishes
-with the helper's self-check and prints the host-key and env lines for
-step 5.
-
-1. **Network:** VPN egress only; NIC on the tapped/mirrored bridge so
-   the Zeek sensor sees its traffic (Zeek → OpenSearch `zeek-*`,
-   Arkime full packet capture). Firewall it so it can't initiate
-   connections back to the cti host (the cti host always initiates,
-   over SSH).
-2. **Packages:** `python3`, `python3-certifi`, `dnsutils` (`dig`),
-   `openssl`, `curl`, `nmap`, `subfinder`, `dirsearch`, and Salesforce
-   `jarm` (cloned to `/opt/jarm/jarm.py` — adjust `JARM_CMD` in
-   `probe_helper.py` if elsewhere).
-3. **Helper:** copy `mcp-server/scripts/probe_helper.py` to
-   `/opt/cti/probe_helper.py` (check the tool-path constants at its
-   top).
-4. **SSH:** a dedicated user and key; pin the key in
-   `~/.ssh/authorized_keys` with a forced command and no forwarding:
-   `command="python3 /opt/cti/probe_helper.py",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA...`
-   Make sure no unrestricted line for the same key sits above it.
-5. **cti host env** (`~/.bashrc`, sourced by cron): `CTI_PROBE_HOST`,
-   `CTI_PROBE_USER`, `CTI_PROBE_SSH_KEY`, `CTI_PROBE_KNOWN_HOSTS`
-   (populate it with the VM's host key), and optionally
-   `CTI_PROBE_HELPER_CMD` (default `python3 /opt/cti/probe_helper.py`),
-   `CTI_PROBE_SSH_TIMEOUT` (default 60s), `CTI_PROBE_LONG_TIMEOUT`
-   (default 900s). Re-run `./setup.sh` so `.mcp.json` passes them
-   through.
-6. **Verify:** on the VM, `python3 /opt/cti/probe_helper.py
-   --check-access` reports tool availability; from the cti host,
-   `python -m graph netwatch --tiers hot` round-trips a scan through the
-   SSH hop and joins Zeek back from the SIEM. Then run a
-   `pivot_observable` on a domain you control and confirm the TLS/HTTP
-   request appears in OpenSearch `zeek-*`.
-
-## Actor tracking (DuckDB time-series layer)
-
-`cti_tools/tracking/` keeps per-day observation rows in DuckDB at
-`data/tracking/tracking.duckdb` so infrastructure changes on tracked
-actors (ASN moves, port shifts, activity gaps) are visible over time —
-the cluster JSON store stays canonical for cluster/TTP/diamond data,
-linked only by `actors.cluster_slug`.
-
-Daily loop (cron lines printed by `setup.sh`): Stage A
-(`scripts/daily_tracking.py`, pure Python) ingests threat-report
-CSV/JSON from `data/tracking/inbox/`, runs budgeted HoneyLabs +
-RIPEstat/RDAP enrichment — HoneyLabs over their hosted MCP server
-(`cti_tools/tracking/hl_mcp.py`), prefiltering each chunk of 32 IPs
-as one /32 cidr_set call so only IPs with events cost a full lookup;
-the free tier's 500 credits/day at 10 req/min is shared with
-interactive pivots, and the loop stays capped at CTI_HL_BUDGET
-(default 400) and self-slows on 429s — detects ASN/netname changes,
-and writes a bounded digest to `data/tracking/digests/`. The daily
-`core.pivot_cluster` sweep also diffs each tracked domain's live
-certificate (issuer/SANs, and its sha256 — auto-filed onto the
-cluster's own hash list as `cert-sha256:`), live HTTP server/title,
-Webamon kit fingerprint, new subdomains (subfinder + Wayback,
-flag-only), and infostealer hits, plus new domains Webamon saw on a
-tracked IP — surfaced the same way ASN changes are. Open ports and
-open-directory files change only via the on-demand `active_scan`,
-which also records into the same `attribute_changes` table.
-Zeek/OpenSearch/Arkime cross-referencing
-(`cti_tools.tracking.opensearch_xref.run_daily_xref`) is a separate,
-on-demand capability for correlating tracked infrastructure against
-this lab's own captured traffic right after a probe or malware-
-execution session — it is deliberately NOT part of this daily loop or
-its digest/narrative (those logs only have data when the VM originates
-traffic, so checking them daily by default would mostly find nothing
-and just add noise); run it by hand via `opensearch_xref.run_daily_xref`
-when it's actually relevant.
-Stage B (`scripts/daily_narrative.sh`) makes one headless `claude -p`
-pass over that digest — a `NO ACTIVITY` digest skips the agent
-entirely, so quiet days cost zero tokens.
-
-MCP tools: `query_duckdb` (read-only, row-capped), `get_actor_summary`
-(canned per-actor aggregate), `save_correlation` (persist a finding).
-See `skills/actor-tracking/SKILL.md` for the schema cheat-sheet and
-usage etiquette. One-time seeding from the cluster store:
-`scripts/daily_tracking.py --seed`.
-
-## Extending toward Censys / hunt.io / Validin
-
-If you do want a paid source later (better bulk/pivot throughput than
-the free stack above), the pattern is the same one `pivot.py` follows:
-add new functions to `core.py` (e.g. `censys_query(cert_hash)`), mirror
-them as a tool in `server.py`, and mention them in the skill's "Tool
-availability" section. Keep API keys out of
-this repo — read them from environment variables in `core.py`, never
-hardcode them, and don't let a skill or MCP tool description reference a
-literal key value.
+Three machines are involved:
+
+- **This host** holds all data, runs the pipeline, the MCP server and the
+  dashboard, and talks to third-party APIs.
+- **The probe VM** is the only machine that connects to adversary
+  infrastructure. This host reaches it over SSH with a key pinned to one
+  command; the VM cannot connect back.
+- **The sensor** (Zeek, read through the SIEM) records the probe VM's
+  traffic, which is where passive fingerprints come from.
+
+## Two stores
+
+**Cluster files** (`data/clusters/<slug>.json`, with a rendered `.md`
+beside each) hold what an analyst writes and curates: the profile, the
+Diamond fields, ATT&CK techniques, the hunt log, gaps, relationships, and
+the observables that are members of the cluster. `cti/clusters/storage.py`
+owns them. Every change takes one global file lock (`_data_lock`), so two
+processes cannot interleave a read-modify-write. The directory is not in
+git and is read from `CTI_DATA_DIR` once, at import.
+
+**DuckDB** (`data/tracking/tracking.duckdb`) holds everything measured over
+time: daily observations, selectors (the values two hosts can share),
+netwatch service snapshots and changes, open-directory listings and sample
+verdicts, active-scan history, memberships and candidate scores.
+`cti/store/` owns it.
+
+DuckDB allows one writer process at a time, and a writer locks out every
+reader in other processes. Three rules follow, and most of the 2026-11
+audit's findings were violations of them:
+
+1. Slow work, meaning anything that waits on the network, runs with no
+   connection open. Read the work list, close, do the work, reopen to write.
+2. Code that only reads uses `store.connect_read()`, which shares the file.
+3. Code that writes uses `store.connect_retry(read_only=False)`, which
+   waits for a locked database instead of dropping the write.
+
+**Membership is in both stores.** A cluster's members are observables in
+its file and rows in the `memberships` table; candidates and rejections
+live only in the table. Each change writes the table first and the file
+second. `python -m graph doctor` reports any disagreement, and the daily
+run does the same check.
+
+Everything else that is state but not a cluster lives under `data/`:
+`data/netwatch/` (scan spool, queue, outstanding jobs), `data/hunt_rules/`,
+`data/flowcarp/models/`, `data/reports/` (local report files), `data/runs/`
+(pipeline traces).
+
+## Where traffic may go
+
+`cti/sources/http.py` is the one transport, and every request names how it
+travels:
+
+- `via="probe"` sends it from the probe VM. Anything that names a tracked
+  indicator to a third party (RDAP, RIPEstat, DNS) or touches the indicator
+  itself goes this way, so this host never originates that traffic and the
+  sensor captures all of it.
+- `via="direct"` sends it from this host. Queries against a vendor's own
+  index go this way: Webamon, HoneyLabs, ThreatFox, Validin, InternetDB,
+  passive DNS, and the fetch of an analyst-supplied report URL.
+
+A request that carries a credential never goes through the probe; the
+transport refuses it. The probe VM is the least trusted machine in the lab
+and holds no API keys.
+
+Two words are defined terms in this project, and the
+infrastructure-pivoting skill holds the definitions: **pivoting** asks
+third parties and indexes about an indicator; **probing** connects to it.
+Probing that is loud (`active_scan`) or that downloads files
+(`analyze_opendir_samples`) happens only when an analyst asks for it by
+name.
+
+On the probe VM, `probe_helper.py` fetches only `http` and `https` URLs. A
+crawl or a download stays on the host and port it was pointed at, and no
+redirect may lead to a private or loopback address.
+
+## The cluster code
+
+`cti/clusters/` is layered; each module imports only from those above it.
+
+| Module | Holds |
+|---|---|
+| `storage` | cluster files, the write lock, the detection registry, the reverse index |
+| `profile` | description, techniques, hunt log, detections, relationships, gaps |
+| `lifecycle` | active, dormant and retired; how liveness is judged |
+| `enrich` | looking an indicator up; network work that never holds the lock |
+| `observables` | adding, removing and deciding indicators and candidates |
+| `expand` | `pivot_cluster` (the daily sweep) and `pivot_and_expand` |
+| `scan` | `active_scan` |
+| `reports` | report ingest, STIX import and export |
+| `doctor` | the check that the two membership records agree |
+
+Functions that both look things up and file the result are split in two:
+an unlocked phase that does the network work, then a locked phase that
+re-reads the cluster and writes. A cluster write never waits on a network
+call.
+
+`cti.core` re-exports all of it and is what the MCP server, the pipeline,
+the dashboard and the scripts import. To patch a function in a test, use
+`tests/cluster_patching.py`, which patches every module that holds the
+name.
+
+### Members, candidates, links
+
+An indicator a report or an analyst names is a **seed**, and a member. An
+indicator the system finds by pivoting is a **candidate**: it is scored
+against the cluster's members, shown to the analyst, and becomes a member
+only when accepted. A rejection is remembered so the same host is not
+filed again.
+
+The score comes from `cti/store/relatedness.py`. Each shared value is a
+fact with a class (identity, structural, behavioural, contextual), and
+facts about one certificate or one address count once. A fact is worth less
+when the two hosts held it at different times, when the value is common
+across the internet, when a certificate is a server's default, when an
+address answers the same way for every name, or when either end is a CDN
+edge.
+
+`cti/store/expand.py` decides which links between indicators the daily
+digest calls corroborated. It reads the same score and promotes a link in
+the `strong` band. With no discount that is the rule the skill states: one
+identity fact, or two independent structural ones.
+
+## The daily pipeline
+
+`python -m graph daily` runs two stages, drawn in `docs/graph-*.mmd`.
+
+**Collect** needs no model:
+
+1. `ingest_inbox` loads report CSV/JSON from the inbox, registers new
+   clusters, and ingests any netwatch results still spooled.
+2. `sweep` runs once per cluster, in parallel: `pivot_cluster` looks up
+   every tracked domain and address and records what changed.
+3. `enrich_and_write` enriches addresses that are due (HoneyLabs over its
+   hosted MCP server, RDAP, RIPEstat), under a daily budget.
+4. `run_analytics` computes the change tables.
+5. `corroborate` prices rare selector values and finds links between
+   indicators.
+6. `expand_coverage` expires stale candidates, re-scores the rest, and once
+   a week reverse-pivots each cluster's rare selectors. It ends with the
+   membership check.
+7. `write_digest` writes the day's digest.
+
+**Analyze** uses the model (`CTI_GRAPH_MODEL`): `rank` picks what is worth
+reading, in code, before any token is spent; five specialists run in
+parallel, one per family (`infra_change`, `cert_tls`, `hosting`,
+`opendir`, `infrastructure`); `persist` stores their findings; `narrate`
+writes the day's narrative. A quiet day skips the specialists.
+
+Each phase records its own failure and the run continues. Failed phases
+are listed at the top of the digest. Every run is traced to `data/runs/`.
+
+## netwatch
+
+`python -m graph netwatch` re-scans tracked hosts on a schedule and records
+what each port answers with.
+
+- `watchlist.py` builds the targets from the cluster files by lifecycle:
+  `hot` (hourly, a short port list), `full` (daily, a port sweep), `sweep`
+  (discovery).
+- `jobs.py` submits every job to the probe, polls them together, and
+  spools the results. A job that outlasts the run is collected by the next
+  one.
+- The probe's worker scans several targets at once and writes a record for
+  every port it checked, open or closed.
+- `ingest.py` loads the spool: it joins Zeek's passive fingerprints, writes
+  `service_snapshots`, diffs each port against its own vantage's last scan
+  into `service_changes`, and derives selectors.
+
+Three guards keep bad data out. Ports listed in
+`CTI_NETWATCH_INTERCEPTED_PORTS` count as open only with an application
+answer behind them. If `CTI_NETWATCH_CONTROL` names a host with known
+ports, a job whose scan of it is wrong is set aside in
+`spool/quarantine/`. A port sweep that reported an error closes nothing.
+
+Hunt rules, certificate-transparency and neighbourhood discovery, the
+Windows-client vantage and FlowCarp labelling are described in the README.
+
+## Probing on request
+
+**`active_scan(target, cluster, tools, ports)`** runs nmap (the top 100
+ports, plus any named) and a path and open-directory search from the probe
+VM. Ports are added to the observable and diffed. Each open directory is
+listed recursively into `opendir_files` and diffed, so a newly dropped file
+shows up in the digest. Every run is recorded in `active_scans` with the
+Zeek time window its traffic falls in.
+
+**`analyze_opendir_samples(indicator, urls)`** downloads named files on the
+probe VM and analyses them in a container with no network and no
+capabilities. Only JSON verdicts come back: hash, type, YARA matches, a
+strings sample, extracted indicators, archive contents. No sample byte
+reaches this host. Verdicts are stored per file URL in `opendir_samples`.
+
+## Reports, ATT&CK, detections, STIX
+
+**Reports.** `ingest_report(source, cluster_name)` reads a report and
+extracts hashes, domains, addresses, URLs, emails, CVEs, wallets and
+ATT&CK technique IDs by pattern. A URL must be public `http(s)`; a local
+file must be in `data/reports/` or a folder named in `CTI_REPORT_DIRS`.
+A local PDF needs `pdftotext` installed. `analyze_report` previews the
+extraction without writing. Extraction over-matches, and every new domain
+and address gets a live lookup, so `exclude` drops values before anything
+is sent. A report with no observables and no techniques returns a
+`warning`: it usually means the indicators are in a table or an image.
+
+**ATT&CK.** `cti/attack/` bundles a technique list generated from MITRE's
+STIX corpus by `scripts/refresh_attack_data.py`. `update_ttp` and report
+ingest check each ID and name against it and return a `warning` for an
+unknown, revoked or deprecated ID or a mismatched name. The warning never
+blocks the write.
+
+**Detections** live in one registry
+(`data/clusters/_registry/detections.json`). A `technique`-scoped detection
+joins onto every cluster that logs one of its techniques; a
+`cluster`-scoped one appears only on the clusters it names. A cluster's
+`detections` are joined at read time. `get_technique_usage` is the reverse
+view.
+
+**STIX.** `export_stix_bundle` renders a cluster as an Intrusion Set, an
+Attack Pattern and a `uses` Relationship per technique, a Relationship per
+cross-cluster link, and a Note per hunt log entry. IDs are stable across
+exports. `export_stix_ecosystem` walks the relationship graph so every
+reference resolves. `import_stix_bundle` creates or merges a cluster. The
+JSON is hand-built; run a bundle through `stix2validator` if a consumer
+needs strict validation.
+
+## The MCP server and the dashboard
+
+`cti/mcp/server.py` exposes 47 tools over stdio (`.mcp.json`, written by
+`setup.sh` with absolute paths). Each is a thin wrapper.
+
+- A tool that changes a cluster replies with what changed and the size of
+  each part, not the whole profile. `get_cluster` reads a profile.
+- Tools that reply with a dict turn a busy database, an unknown cluster or
+  a rejected argument into `{"error": ...}`.
+- `query_duckdb` is read-only and cannot reach the filesystem.
+
+The dashboard (`dashboard/server.py`) is read-only and has no login. It
+binds to `127.0.0.1` unless `CTI_DASHBOARD_HOST` is set.
+
+## Tests
+
+`pytest` runs about 1,240 tests in a minute and a half. `tests/conftest.py`
+points both stores at temporary directories before anything from `cti` is
+imported, asserts for every test that the cluster store is not under the
+repository's `data/`, blocks real sockets, and blocks the probe transport.
+`ruff check .` must pass; `tests/test_lint.py` runs it.
+
+A bug fix lands with a test that fails without it.
+
+## Adding a data source
+
+Add a module under `cti/sources/` that uses `http.fetch` with an explicit
+`via`. Read its API key from the environment, never from the repository,
+and give it a budget in `cti/sources/budget.py` if it is metered. Call it
+from `cti/clusters/enrich.py`, mirror it as a tool in `cti/mcp/server.py`
+if an analyst should be able to call it directly, and describe in the
+relevant skill what its answers do and do not prove.

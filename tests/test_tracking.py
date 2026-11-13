@@ -1,6 +1,6 @@
-"""Tests for the cti_tools.tracking actor-tracking layer. Run with:
+"""Tests for the cti.tracking actor-tracking layer. Run with:
 
-    cd mcp-server && source .venv/bin/activate && pip install -e '.[test]'
+    pip install -e '.[test]'
     pytest tests/test_tracking.py
 """
 from __future__ import annotations

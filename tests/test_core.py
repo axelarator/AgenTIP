@@ -1,6 +1,6 @@
-"""Tests for cti_tools.core. Run with:
+"""Tests for cti.core. Run with:
 
-    cd mcp-server && source .venv/bin/activate && pip install -e '.[test]'
+    pip install -e '.[test]'
     pytest
 """
 from __future__ import annotations

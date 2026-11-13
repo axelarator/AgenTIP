@@ -1,4 +1,4 @@
-"""Tests for cti_tools.vm_proxy. No real SSH/network calls - subprocess.run
+"""Tests for cti.probe.vm_proxy. No real SSH/network calls - subprocess.run
 is monkeypatched everywhere so the suite runs offline."""
 from __future__ import annotations
 

@@ -14,7 +14,7 @@ for when to reach for either by hand.
 
 The scan-platform sources this module used to carry (VirusTotal, Shodan
 InternetDB, Hackertarget reverse-IP, Cert Spotter CT logs) were retired
-in favor of the Webamon API (cti_tools/webamon.py, queried directly from
+in favor of the Webamon API (cti/sources/webamon.py, queried directly from
 the host) plus live interaction from the probe VM (a current TLS grab
 replaces Cert Spotter's CT cert, nmap replaces Shodan's ports, Webamon's
 server.ip search replaces reverse-IP co-hosting). crt.sh is gone (shut
@@ -47,7 +47,7 @@ down). What remains here are the live registry/telemetry sources:
 Every one of these lookups names a tracked indicator to a third party
 (the domain/IP/hash being pivoted on), so - same as active
 fingerprinting - none of it originates from this host. All HTTP calls
-and DNS resolution route through cti_tools.vm_proxy, which proxies them
+and DNS resolution route through cti.probe.vm_proxy, which proxies them
 through the probe VM over its restricted SSH channel. See
 vm_proxy's module docstring for why.
 """

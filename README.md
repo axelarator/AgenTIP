@@ -2,19 +2,21 @@
 
 Threat-cluster tracking as a LangGraph pipeline, over STIX 2.1 and DuckDB.
 
-A fork of [`cti-agent`](../cti-agent) at `096160c`. That repo still works
-and still runs its cron; this one is not a drop-in replacement until you
-cut over deliberately (see **Cutover**).
+It tracks threat clusters as curated profiles, watches their infrastructure
+for change every day, and has a model read only what a ranker in code
+judged worth reading. `docs/architecture.md` describes how it is built.
 
 ```
 cti/                    the library
-  store/                DuckDB: schema, observations, the change-detector registry
+  clusters/             cluster profiles: files, observables, pivots, scans, reports
+  core.py               one namespace over clusters/ (re-exports only)
+  store/                DuckDB: schema, observations, selectors, scoring
   sources/              external data, one module each, over one transport
   probe/                everything that leaves this host toward an indicator
-  core.py               cluster CRUD + enrichment orchestration (still one file)
-  report/ attack/ tracking/ mcp/ stix.py
+  netwatch/             scheduled re-scans of tracked hosts
+  report/ attack/ tracking/ mcp/ stix.py membership.py
 graph/                  the pipeline
-  nodes/                rank, the four specialists, collect's Stage A nodes
+  nodes/                rank, the five specialists, the collect nodes
   prompts/              one prompt per specialist + the shared rules
 sandbox/                the analysis container (built and run ON the probe VM)
 probe_vm/               probe_helper.py + its bootstrap, deployed to the VM
@@ -23,17 +25,20 @@ dashboard/              read-only web UI, incl. the per-run node timeline
 docs/graph-*.mmd/.png   generated from the graph, not drawn by hand
 ```
 
-## What changed from cti-agent, and why
+## Design decisions
+
+This project replaced an earlier one, `cti-agent`. The sections below keep
+the reasoning from that change that still constrains the code.
 
 ### Judgement runs in parallel
 
-Stage B was one `claude -p` pass over a 103-line prompt that encoded
-twelve distinct per-attribute judgements, capped at 3 items and 5 tool
-calls because that was the only way to bound one serial context.
+The analysis stage was once a single pass over a 103-line prompt that
+encoded twelve distinct per-attribute judgements, capped at 3 items and 5
+tool calls because that was the only way to bound one serial context.
 
-It is now four specialists running concurrently, each with a ~25-line
-prompt covering only the signals it owns, plus a `_common.md` for the
-rules that bind all of them:
+It is now five specialists running concurrently, each with a short prompt
+covering only the signals it owns, plus a `_common.md` for the rules that
+bind all of them:
 
 | Specialist | Owns |
 |---|---|
@@ -41,10 +46,11 @@ rules that bind all of them:
 | `cert_tls` | `cert`, `cert_hash`, `http` |
 | `hosting` | `ip_hostnames`, `subdomains`, `webamon_fingerprint`, `infostealer_hits` |
 | `opendir` | `opendir_files`, plus sandbox verdicts |
+| `infrastructure` | links between indicators (see "Members, candidates, and when a link was a link") |
 
 Writes stay centralized in one `persist` node. That is not style: DuckDB's
 write lock is process-exclusive and `connect_retry` retries only the
-connect, never the body, so four specialists calling `save_correlation`
+connect, never the body, so five specialists calling `save_correlation`
 would surface as "tracking DB busy" rather than queueing.
 
 Stage A is not write-free either, which an earlier version of this README
@@ -103,26 +109,23 @@ the container lives on the VM that did the download rather than here.
 It is gated separately from `active_scan`. Listing a directory is
 reconnaissance; downloading staged payloads is collection.
 
-### Redundancy
+### One of each
 
-Thirteen confirmed duplications collapsed — most of them documented in
-the old repo's own comments, which is how they survived. The ones that
-mattered:
+Duplicated mechanisms were where the earlier code went wrong, so each of
+these exists exactly once:
 
-- **Ten `_record_*_change` functions and twelve `latest_*_for` queries**
-  → ten `AttributeSpec` entries and one driver. Twenty-two functions,
-  ~500 lines, expressing ten table rows' worth of difference.
-- **Four HTTP transports** → `sources/http.py`, where `via="probe"` vs
-  `via="direct"` makes the OPSEC decision a required argument.
-- **Three file-backed TTL caches** → `sources/cache.py`, one file per
-  key. The pivot cache was an 8.8 MB JSON dict re-read and re-written in
-  full on every miss, under a lock, from a six-thread pool.
-- **Three separately-counted API budgets** → `sources/budget.py`, which
-  reserves under one `flock` before the call. Checking and incrementing
-  separately is exactly the race a fan-out exposes.
-- **Two ASN normalizers that disagreed** — `lstrip("AS")` takes a
-  character set, so `" AS16509"` parsed as `16509` in one and `None` in
-  the other.
+- **Change detection**: ten `AttributeSpec` entries and one driver
+  (`cti/store/changes.py`), not a function per attribute.
+- **HTTP**: `sources/http.py`, where `via="probe"` or `via="direct"` is a
+  required argument, so where a request leaves from is always a decision.
+- **Caching**: `sources/cache.py`, one file per key.
+- **API budgets**: `sources/budget.py`, which reserves under one `flock`
+  before the call. Checking and incrementing separately is exactly the
+  race a fan-out exposes.
+- **ASN parsing**: `util.asn_int`. Two versions once disagreed on
+  `" AS16509"`, and shared-hosting suppression silently did nothing.
+- **Judging a link**: `store/relatedness.py`. The digest's corroborated
+  links and the candidate scores come from the same score.
 
 ### The observations table went narrow
 
@@ -139,19 +142,6 @@ rows, 20 Cert Spotter rows). So are the five that measure 100% NULL —
 same as unused.
 
 ## Known incomplete
-
-`cti/core.py` is still 2379 lines (from 2774). The store, sources, probe,
-report and ATT&CK layers were lifted out of it, and the ten change
-detectors it carried are gone — but the cluster-JSON half (CRUD,
-observables, the detection registry, the reverse index, markdown
-rendering, and the pivot/scan orchestration) has not been split by
-concern.
-
-That split is organizational rather than behavioural, and it is not free:
-`tests/test_core.py` monkeypatches `core.<attr>` in 134 tests, and a
-façade that re-exports from submodules silently breaks that kind of
-patching. It is worth doing, with the patch targets moved in the same
-change, and it was not worth doing quickly.
 
 **The analysis stage is blind to a newly ingested report.** Found on the first
 real end-to-end run (the ESET FamousSparrow report). `rank` reads only
@@ -422,7 +412,9 @@ python -m graph collect         # Stage A  (defaults to today)
 python -m graph analyze         # Stage B
 python -m graph analyze --dry-run --date 2026-09-18   # no writes
 python -m graph trace --date 2026-09-18               # node timings
-pytest                          # 442 tests
+pytest                          # about 1,240 tests
+ruff check .                    # lint
+python -m graph doctor          # cluster files vs membership table
 ```
 
 Secrets stay in the environment (`~/.bashrc`, which cron sources):
@@ -440,18 +432,12 @@ FlowCarp (optional, `--flowcarp`): `CTI_ARKIME_URL`, `CTI_ARKIME_USER`,
 ## History
 
 Forked from `cti-agent` at `096160c` (`.forked-from`). The cutover finished
-on 2026-09-19 (the old cron was removed then; its crontab is kept in
-`~/archive/cti-agent-backups/`), and `cti-agent` was archived and deleted on
-2026-10-14. To rebuild the probe VM, run `probe_vm/setup_probe_vm.sh`; it
-builds the sandbox image and fails if `--network=none` lets a container
-reach the network.
-
-Until then, point this checkout at its own copy with `CTI_DUCKDB_PATH`
-and `CTI_DASHBOARD_PORT`.
+on 2026-09-19 and `cti-agent` was archived and deleted on 2026-10-14.
+`docs/audit-2026-11.md` is the November 2026 review and what it changed.
 
 ## Threat cluster tracking, briefly
 
-Unchanged from `cti-agent`. Each cluster is a Diamond-Model JSON record
+Each cluster is a Diamond-Model JSON record
 (adversary, capability, infrastructure, victim) plus STIX profile fields,
 an ATT&CK TTP coverage table, a detection inventory, a gaps backlog and an
 append-only hunt log. Clusters export as STIX 2.1 bundles (Intrusion Set +

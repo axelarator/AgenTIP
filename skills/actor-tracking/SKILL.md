@@ -41,7 +41,7 @@ part of this daily loop or its digest/narrative at all: OpenSearch
 only has data when the lab VM originates traffic (probing indicators,
 or occasionally detonating malware), so checking it every day would
 mostly find nothing and just add noise. Run it only when asked, by
-calling `cti_tools.tracking.opensearch_xref.run_daily_xref(con, day)`
+calling `cti.tracking.opensearch_xref.run_daily_xref(con, day)`
 directly (there is no `daily_tracking.py` flag for this).
 
 ## Tables
@@ -170,7 +170,7 @@ the daily job holds the write lock - wait a moment and retry.
 
 ## Pre-built analytics
 
-Named SQL constants in `mcp-server/cti_tools/tracking/analytics.py`,
+Named SQL constants in `cti/tracking/analytics.py`,
 usable verbatim through query_duckdb: RECENT_ACTOR_ACTIVITY (30d),
 ASN_PIVOTS (7d), ATTRIBUTE_CHANGES (1d, every attribute above,
 excludes first_seen baselines - see the `attribute_changes` table
@@ -199,7 +199,7 @@ for new ones on the expansion weekday. Last, it writes
 
 Zeek/OpenSearch/Arkime cross-referencing is NOT part of this loop. It is
 a separate, on-demand capability
-(`cti_tools.tracking.opensearch_xref.run_daily_xref`), useful right after
+(`cti.tracking.opensearch_xref.run_daily_xref`), useful right after
 probing a cluster's indicators or running malware that generated VM
 network traffic, but deliberately outside the daily narrative.
 

@@ -10,7 +10,7 @@ never on whatever host the MCP server itself runs on.
 
 Webamon and HoneyLabs lookups are the deliberate exceptions - they hit
 those vendors' SaaS, not the indicator's own infrastructure, and are
-called directly from the host (see cti_tools/webamon.py, tracking/hl_mcp.py).
+called directly from the host (see cti/sources/webamon.py, tracking/hl_mcp.py).
 
 Connection details come from the environment so the same code runs
 against whatever probe VM the lab currently uses (a Linux box now; a

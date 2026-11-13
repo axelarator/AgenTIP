@@ -8,7 +8,7 @@
 #
 # Network placement (VPN egress, NIC on the mirrored bridge so Zeek/Arkime
 # see its traffic, firewall blocking connections back to the cti host) is
-# NOT done here - see "Probe VM build" in mcp-server/README.md.
+# NOT done here - see docs/probe-vm.md.
 set -euo pipefail
 
 PROBE_USER=detonate            # matches vm_proxy.py's CTI_PROBE_USER default

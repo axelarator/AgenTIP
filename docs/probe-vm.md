@@ -151,7 +151,7 @@ this file's git history.
 Pin the probe VM's `authorized_keys` entry for this key to the helper
 with a forced command, so the key can do nothing else:
 `command="python3 /opt/cti/probe_helper.py",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA...`
-(full build checklist: "Probe VM build" in `mcp-server/README.md`).
+(the build steps are earlier in this file and in `probe_vm/setup_probe_vm.sh`).
 The forced `command=` restriction is worthless if a second,
 unrestricted line for the same key is sitting above it in that file
 (sshd matches the first line, not the most specific one) — if a raw

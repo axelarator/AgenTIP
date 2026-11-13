@@ -43,7 +43,7 @@ def pivot_cluster(name: str) -> dict[str, Any]:
     observable's asn/netname/cert/http/webamon/ip_hostnames/tags fields
     (see _apply_enrichment_snapshot) so the current-known-value snapshot
     stays fresh, AND a dated snapshot is recorded to the tracking-store
-    history (cti_tools.tracking.store), which also runs day-over-day
+    history (cti.tracking.store), which also runs day-over-day
     diffing and records a change when something moved - see
     _log_cluster_enrichment_history. Open ports are not discovered here
     (nothing passive replaced Shodan's); they come from report text and

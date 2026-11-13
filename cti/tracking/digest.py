@@ -207,7 +207,7 @@ def write(day: date, sections: dict[str, Any]) -> Path:
 
     Deliberately excludes Zeek/OpenSearch/Arkime cross-referencing -
     that's a separate, on-demand capability
-    (cti_tools.tracking.opensearch_xref.run_daily_xref), not part of
+    (cti.tracking.opensearch_xref.run_daily_xref), not part of
     this routine daily narrative (see daily_tracking.py's own docstring)."""
     out_dir = digest_dir()
     out_dir.mkdir(parents=True, exist_ok=True)

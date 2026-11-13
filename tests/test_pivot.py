@@ -1,4 +1,4 @@
-"""Tests for cti_tools.pivot. No real network calls (and no real SSH to
+"""Tests for cti.sources.pivot. No real network calls (and no real SSH to
 the Win11 VM) - _get_json/vm_proxy.http_fetch/vm_proxy.resolve_dns are
 monkeypatched everywhere so the suite runs offline."""
 from __future__ import annotations

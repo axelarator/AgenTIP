@@ -1,4 +1,4 @@
-"""One-off/occasional script to regenerate cti_tools/attack_data/
+"""One-off/occasional script to regenerate cti/attack/data/
 enterprise_attack_techniques.json from the official MITRE STIX corpus.
 
 Not run at install time or by any tool/server code - this tool makes no

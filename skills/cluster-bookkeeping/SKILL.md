@@ -35,10 +35,10 @@ The probe VM's build and runbook are operator documentation and live in
   the other cluster's name in `aliases` only once you're confident
   enough to actually merge — do not merge speculatively.
 - Receiving a STIX bundle from another team/tool that anchors on an
-  Intrusion Set → import it (`import_stix_bundle` / `cti import-stix`)
+  Intrusion Set → import it (`import_stix_bundle`)
   rather than hand-transcribing it into a new cluster.
 - Given a threat report (URL or file) to work through → use
-  `ingest_report` / `cti ingest-report` rather than manually copying
+  `ingest_report` rather than manually copying
   IOCs and TTPs out of the text. See "Ingesting threat reports" below.
 
 ## Cluster fields
@@ -49,7 +49,7 @@ The probe VM's build and runbook are operator documentation and live in
   false positive you can't take back.
 - **Profile metadata** (`aliases`, `confidence` 0–100, `first_seen`,
   `last_seen`) — these map directly onto STIX Intrusion Set properties.
-  Set them with `update_profile` / `cti update-profile` as they become
+  Set them with `update_profile` as they become
   known; don't leave them stuck at cluster-creation defaults once you
   have signal.
 - **STIX ID** — minted once at cluster creation and never changes. It's
@@ -61,21 +61,20 @@ The probe VM's build and runbook are operator documentation and live in
 
 Each cluster also tracks deduplicated hashes/domains/ips/urls, each with
 a provenance list (which report(s) it came from) and first/last seen
-timestamps. View them with `get_observables` / `cti get-observables` —
+timestamps. View them with `get_observables` —
 this is the fast path to "what's tied to this cluster", instead of
 scrolling the full `get_cluster` dump.
 
 Given a hash/domain/ip/url with no cluster context yet — e.g. an IOC
 that showed up somewhere else and you want to know if it's already
-tracked — use `find_observable(value)` / `cti find-observable <value>`
+tracked — use `find_observable(value)`
 instead of checking each cluster by hand. Hash lookups work with or
 without the algo prefix (`sha256:...` or bare).
 
 Extraction is best-effort and over-matches (a legitimate service the
 malware merely contacts, a shared-hosting IP, a version string that
 looks like an IP). When you spot a false positive or benign reference
-in a cluster, prune it with `remove_observable(name, category, value)` /
-`cti remove-observable <name> <category> <value>` — the counterpart to
+in a cluster, prune it with `remove_observable(name, category, value)` — the counterpart to
 `add_observable`. It matches case-insensitively (and, for hashes, with
 or without the algo prefix), removing every matching entry. Note why in
 the hunt log when you do, so the removal is auditable rather than silent.
@@ -156,8 +155,7 @@ JA4+ suite (`ja4`, `ja4s`, `ja4h`, `ja4l`, `ja4x`, `ja4t`, `ja4ts`,
 `ja4ssh`) and `jarm`. Unlike every other category, these are **never**
 produced by `ingest_report`'s regex extraction — report text doesn't
 carry a TLS fingerprint of infrastructure you haven't probed yourself.
-They only get filed via `add_observable(name, "ja4", value, source)` /
-`cti add-observable <name> ja4 <value> <source>` (swap in whichever of
+They only get filed via `add_observable(name, "ja4", value, source)` (swap in whichever of
 the nine categories applies), same as any other manually-filed
 observable.
 
@@ -219,14 +217,20 @@ There is no queue to drain: the old fingerprint queue was retired on
 
 ## Ingesting threat reports
 
-`ingest_report(source, cluster_name=None)` / `cti ingest-report <source>
-[--name ...]` fetches a report (URL or local file — HTML is stripped to
-text; PDFs are not supported yet, extract text first), extracts
+`ingest_report(source, cluster_name=None)` fetches a report, extracts
 hashes/domains/IPs/URLs and ATT&CK technique IDs with regexes, and files
 them into a cluster:
 
+`source` is one of two things, and anything else is refused:
+
+- a public `http(s)` URL (a URL that resolves to a private or local
+  address is refused, including after a redirect);
+- a file inside `data/reports/` or a folder named in `CTI_REPORT_DIRS`.
+  To ingest a report you were handed as a file, put it there first. A PDF
+  needs `pdftotext` installed on this host.
+
 - If the named cluster doesn't exist yet, it's created (unless
-  `create_if_missing=False` / `--no-create`).
+  `create_if_missing=False`).
 - Observables are deduped by value; a repeated observable adds a new
   source to its provenance list rather than duplicating.
 - Newly-seen TTPs are added to the coverage table at status 0 (no
@@ -254,7 +258,7 @@ rather than guessing, and you should re-run with an explicit
 explicitly whenever you can — you'll virtually always get this right
 where the regex can't.
 
-Use `analyze_report` / `cti analyze-report <source>` first if you want a
+Use `analyze_report` first if you want a
 preview (extraction + candidate names) without writing anything — useful
 when you're not sure yet which cluster a report belongs to, or want to
 sanity-check the candidates before committing.
@@ -272,8 +276,7 @@ private/custom ID shouldn't block recording what you observed). This
 warning is never persisted to the cluster's stored JSON.
 
 When the warning flags a revoked ID or a mis-attribution you'd rather
-correct than keep, drop the entry with `remove_ttp(name, technique_id)`
-/ `cti remove-ttp <name> <technique_id>` (the counterpart to
+correct than keep, drop the entry with `remove_ttp(name, technique_id)` (the counterpart to
 `update_ttp`, which only ever upserts) and re-add the right technique —
 e.g. replace a revoked `T1562.002` with its successor `T1685.001`.
 
@@ -332,7 +335,7 @@ service, a downstream payload, a suspected-same-actor overlap. Prose
 cross-references in the hunt log ("See cluster 'X'") are still fine for
 narrative detail, but for anything you want to survive a STIX export or
 be machine-queryable, use `add_relationship(name, relationship_type,
-target_cluster, description, source)` / `cti add-relationship` —
+target_cluster, description, source)` —
 common `relationship_type` values are `"uses"` (supply-chain/tooling:
 is a customer of, deploys, delivers) and `"related-to"` (suspected
 overlap, not confirmed enough to merge via `aliases`). This exports as
@@ -348,12 +351,11 @@ STIX Note objects tied to the cluster's Intrusion Set.
 
 ## Workflow
 
-1. Check whether a cluster already exists (`list_clusters` /
-   `cti list-clusters`) before creating one.
+1. Check whether a cluster already exists (`list_clusters`) before creating one.
 2. Create or load the cluster.
 3. As you learn Diamond Model or profile details (adversary,
    capability, infrastructure, victim, aliases, confidence, first/last
-   seen), record them with `update_profile` / `cti update-profile` —
+   seen), record them with `update_profile` —
    don't let them sit at `unknown` once you have evidence.
 4. As you investigate, append hunt log entries as you go, not at the end
    from memory.
@@ -383,17 +385,16 @@ STIX Note objects tied to the cluster's Intrusion Set.
    current TTP table rather than hand-building one — it should always
    reflect the stored data, not a snapshot.
 10. If asked to share a cluster, export it, or hand it to another
-    tool/team, use `export_stix_bundle` / `cti export-stix` rather than
+    tool/team, use `export_stix_bundle` rather than
     serializing the JSON record directly — the STIX form is the
     interoperable one. If the cluster has relationships to other
     tracked clusters and the receiving system won't already have those,
-    use `export_stix_ecosystem` / `cti export-stix-ecosystem` instead —
+    use `export_stix_ecosystem` instead —
     it bundles every transitively related cluster together so no
     Relationship in the export points at an object the receiving
     system doesn't have.
-11. If handed a STIX bundle to ingest, use `import_stix_bundle` /
-    `cti import-stix`. It fails on a name collision unless you pass
-    `overwrite`/`--overwrite`, which merges rather than replaces
+11. If handed a STIX bundle to ingest, use `import_stix_bundle`. It fails on a name collision unless you pass
+    `overwrite=True`, which merges rather than replaces
     (existing hunt log and gaps are preserved; TTPs, relationships, and
     notes are unioned in).
 
@@ -412,6 +413,28 @@ first, to create the venv and wire those files): `list_clusters`,
 `remove_observable`, `pivot_observable`,
 `pivot_cluster`, `pivot_and_expand`, `active_scan` (probing — only when
 asked), `analyze_report`, `ingest_report`.
+
+Also available: the candidate tools (`list_candidates`,
+`candidate_evidence`, `accept_candidate`, `reject_candidate`,
+`rescore_candidates`), `hunt_query` and `hunt_pairs`,
+`indicator_coverage`, and the sample tools `analyze_opendir_samples`
+(downloads named files to the probe VM — only when the analyst names the
+files) and `get_opendir_samples` (reads stored verdicts; never fetches).
+
+**What a tool replies with.** A tool that changes a cluster replies with a
+short acknowledgement: the cluster's name, what changed, and `counts` of
+its observables, techniques, gaps, hunt log entries, detections and
+relationships. It does not return the profile. Call `get_cluster` when you
+need to read one. A `warning` or `scan_skipped` from the change is carried
+in the acknowledgement. A failure you can act on (unknown cluster, a
+rejected argument, the tracking database busy) comes back as
+`{"error": ...}`; on "busy", wait a few seconds and try again.
+
+`analyze_opendir_samples` takes at most 20 URLs per call. Any beyond that
+are listed in `not_fetched` and were not downloaded; send them in a second
+call. Its reply carries only the first few strings and extracted values
+per file. For one file's full detail, call
+`get_opendir_samples(indicator, sha256=...)`.
 
 All harnesses write to the same JSON store via the same `cti-tools` MCP
 server, so the data is identical regardless of which harness you're

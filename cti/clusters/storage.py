@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 
 # Data lives at the repo root (`<repo>/data/clusters`) so it's shared
 # across every harness surface (MCP server, CLI, any future UI) rather
-# than nested inside mcp-server/. Override with CTI_DATA_DIR for tests
+# than nested inside a package. Override with CTI_DATA_DIR for tests
 # or alternate deployments (e.g. a separate private data repo).
 log = logging.getLogger(__name__)
 
