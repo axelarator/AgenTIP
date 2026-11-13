@@ -355,3 +355,55 @@ def test_threatfox_lookup_transport_failure_is_contained(monkeypatch):
     monkeypatch.setattr(pivot, "_post_json", boom)
     result = pivot.threatfox_lookup("1.2.3.4", "fake-tf-key")
     assert "error" in result
+
+
+# --------------------------------------------------------------------------- #
+# API keys never go to the probe VM
+# --------------------------------------------------------------------------- #
+
+def _routes(monkeypatch):
+    """Record (url, via) for every request pivot makes."""
+    from cti.sources import http
+    seen = []
+
+    def record(kind):
+        def fake(url, *args, via, headers=None, **kw):
+            seen.append((url.split("/")[2], via, sorted(headers or {})))
+            return {"query_status": "no_result"} if kind == "post" else {}
+        return fake
+    monkeypatch.setattr(http, "get_json", record("get"))
+    monkeypatch.setattr(http, "post_json", record("post"))
+    return seen
+
+
+def test_keyed_lookups_are_sent_from_this_host(monkeypatch):
+    """The probe is the machine that touches adversary infrastructure. It
+    was handed the HoneyLabs token and the ThreatFox key with every lookup."""
+    seen = _routes(monkeypatch)
+
+    try:
+        pivot.honeylabs_lookup("203.0.113.5", "hl-secret")
+    except pivot.PivotError:
+        pass
+    pivot.threatfox_lookup("evil.example", "tf-secret")
+
+    assert seen == [("honeylabs.net", "direct", ["Authorization"]),
+                    ("threatfox-api.abuse.ch", "direct", ["Auth-Key"])]
+
+
+def test_keyless_lookups_that_name_an_indicator_still_go_through_the_probe(monkeypatch):
+    seen = _routes(monkeypatch)
+    pivot.rdap_lookup("evil.example", "domain")
+    assert seen and all(via == "probe" for _, via, _ in seen)
+
+
+@pytest.mark.parametrize("header", ["Authorization", "auth-key", "X-API-Key",
+                                    "api-key", "Cookie", "X-Auth-Token"])
+def test_the_transport_refuses_to_hand_a_credential_to_the_probe(monkeypatch, header):
+    from cti.sources import http
+    from cti.probe import vm_proxy
+    monkeypatch.setattr(vm_proxy, "http_fetch",
+                        lambda *a, **k: pytest.fail("the request reached the probe"))
+
+    with pytest.raises(ValueError, match="credential"):
+        http.fetch("https://api.example/x", via="probe", headers={header: "secret"})

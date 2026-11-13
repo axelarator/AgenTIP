@@ -87,10 +87,18 @@ class PivotError(Exception):
 # now, with via="probe" naming the OPSEC decision explicitly: an RDAP
 # lookup on a malicious domain is still traffic that tells a third party
 # this host is interested in that domain.
+#
+# One exception, decided by the request itself: a lookup that carries an
+# API key goes direct. The probe VM connects to adversary infrastructure
+# and must not be handed keys (see sources/http.py).
+
+def _via(headers: dict[str, str] | None) -> http.Via:
+    return "direct" if http.carries_credential(headers) else "probe"
+
 
 def _get_json(url: str, headers: dict[str, str] | None = None) -> Any:
     try:
-        return http.get_json(url, via="probe", headers=headers)
+        return http.get_json(url, via=_via(headers), headers=headers)
     except http.HttpError as e:
         raise PivotError(str(e)) from e
 
@@ -99,7 +107,7 @@ def _get_text(url: str, headers: dict[str, str] | None = None) -> str:
     """Some free enrichment endpoints return newline-delimited text
     rather than JSON, which is why this exists alongside _get_json."""
     try:
-        return http.get_text(url, via="probe", headers=headers)
+        return http.get_text(url, via=_via(headers), headers=headers)
     except http.HttpError as e:
         raise PivotError(str(e)) from e
 
@@ -109,7 +117,7 @@ def _post_json(url: str, payload: dict[str, Any],
     """POST a JSON body and parse a JSON response - the ThreatFox-shaped
     counterpart to _get_json."""
     try:
-        return http.post_json(url, payload, via="probe", headers=headers)
+        return http.post_json(url, payload, via=_via(headers), headers=headers)
     except http.HttpError as e:
         raise PivotError(str(e)) from e
 

@@ -23,10 +23,17 @@ probe VM, because an RDAP lookup on a malicious domain is still traffic
 that tells a third party this host is interested in that domain, and a
 live grab reaches the adversary's own infrastructure.
 
-The documented exceptions go direct: Webamon and HoneyLabs are queries
-against a vendor's own index, not against the indicator, and routing
-them through the VM would burn its egress IP's shared allowance for no
-benefit.
+The exceptions go direct: Webamon, HoneyLabs and ThreatFox. They are
+queries against a vendor's own index, not against the indicator, and each
+carries an API key.
+
+A request that carries a credential never goes via the probe, and `fetch`
+refuses one that tries. The probe VM is the machine that connects to
+adversary infrastructure, which makes it the least trusted host in the
+lab; a key sent there with every lookup is a key it holds. Until
+2026-11-13 the HoneyLabs token and the ThreatFox key were both sent that
+way. The cost of going direct is that those two vendors see this host's
+address rather than the probe's.
 
 One undocumented exception existed and is now labelled: report_ingest
 fetched analyst-supplied report URLs from this host. That is usually a
@@ -81,6 +88,19 @@ class Response:
                             status=self.status, body=self.body[:400]) from e
 
 
+_CREDENTIAL_HEADERS = ("authorization", "proxy-authorization", "cookie")
+_CREDENTIAL_WORDS = ("auth", "api-key", "apikey", "api_key", "token", "secret")
+
+
+def carries_credential(headers: dict[str, str] | None) -> bool:
+    """True if any header looks like it holds a key, token or session."""
+    for name in headers or {}:
+        lowered = name.lower()
+        if lowered in _CREDENTIAL_HEADERS or any(w in lowered for w in _CREDENTIAL_WORDS):
+            return True
+    return False
+
+
 def fetch(url: str, *, via: Via, method: str = "GET",
           headers: dict[str, str] | None = None, data: str | None = None,
           timeout: int = DEFAULT_TIMEOUT, max_bytes: int = MAX_BYTES,
@@ -91,6 +111,11 @@ def fetch(url: str, *, via: Via, method: str = "GET",
         merged.setdefault("Content-Type", "application/json")
 
     if via == "probe":
+        secret = sorted(h for h in merged if carries_credential({h: merged[h]}))
+        if secret:
+            raise ValueError(
+                f"refusing to send a credential ({', '.join(secret)}) to the "
+                "probe VM; a keyed request goes via='direct'")
         resp = _fetch_probe(url, method, merged, data, timeout)
     elif via == "direct":
         resp = _fetch_direct(url, method, merged, data, timeout, max_bytes)
