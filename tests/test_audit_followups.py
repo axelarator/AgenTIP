@@ -264,3 +264,80 @@ def test_an_exact_description_wins_over_a_longer_one_that_starts_the_same():
     core.update_gap("Exact Test", "Find the panel", priority="high")
     by_text = {g["description"]: g["priority"] for g in core.load_cluster("Exact Test")["gaps"]}
     assert by_text == {"Find the panel": "high", "Find the panel operator": "low"}
+
+
+# R3 ------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("value, kind", [
+    ("203.0.113.5", "ip"), ("2001:db8::1", "ip"),
+    ("evil.example", "domain"), ("Sub.Evil.Example.", "domain"),
+    ("http://evil.example/x", "url"),
+    ("a" * 32, "hash"), ("a" * 64, "hash"), ("a" * 128, "hash"),
+    ("sha256:" + "a" * 64, "hash"),              # how the cluster store writes a hash
+    ("cert-sha256:" + "a" * 64, "hash"),
+    ("user@evil.example", "email"), ("CVE-2026-1234", "cve"),
+    ("203.0.113.5:8443", "unknown"), ("evil.example/path", "unknown"),
+    ("203.0.113.0/24", "unknown"), ("localhost", "unknown"), ("", "unknown"),
+    ("two words.example", "unknown"),
+])
+def test_one_answer_to_what_kind_of_value_this_is(value, kind):
+    """classify called a prefixed hash, an email, a CVE and host:port a
+    "domain", because domain was the fallback for anything unrecognised."""
+    assert pivot.classify(value) == kind
+
+
+@pytest.mark.parametrize("value", ["sha256:" + "a" * 64, "user@evil.example",
+                                   "CVE-2026-1234", "203.0.113.5:8443"])
+def test_a_value_that_is_not_a_host_gets_no_domain_lookups(monkeypatch, value):
+    """Each of these used to be sent to RDAP and Webamon as a domain and
+    probed from the VM as a hostname."""
+    from cluster_patching import patch_clusters
+    reached = []
+    for name in ("rdap_lookup", "ripestat_lookup", "ptr_lookup"):
+        monkeypatch.setattr(pivot, name, lambda *a, _n=name, **k: reached.append(_n) or {})
+    for name in ("_webamon_domain", "_webamon_infostealers", "_webamon_ip",
+                 "_observe", "_live_http"):
+        patch_clusters(monkeypatch, name, lambda *a, _n=name, **k: reached.append(_n) or {})
+
+    out = core.pivot_observable(value)
+
+    assert reached == []
+    assert out["kind"] not in ("domain", "ip")
+
+
+@pytest.mark.parametrize("target", ["203.0.113.5:8443", "user@evil.example",
+                                    "evil.example/admin", "sha256:" + "a" * 64])
+def test_active_scan_refuses_a_target_that_is_not_a_host(monkeypatch, target):
+    monkeypatch.setattr(core.vm_proxy, "nmap",
+                        lambda *a, **k: pytest.fail("a scan was started"))
+    monkeypatch.setattr(core.vm_proxy, "dirsearch",
+                        lambda *a, **k: pytest.fail("a scan was started"))
+    with pytest.raises(ValueError, match="domain/ip"):
+        core.active_scan(target)
+
+
+# S9 ------------------------------------------------------------------------- #
+
+def test_only_a_serialised_list_or_object_is_unpacked_for_a_json_field():
+    import importlib
+    observations = importlib.import_module("cti.store.observations")
+    assert observations._encode('["a", "b"]') == ["a", "b"]
+    assert observations._encode('{"k": 1}') == {"k": 1}
+    assert observations._encode("123") == "123"          # a string stays a string
+    assert observations._encode("true") == "true"
+    assert observations._encode(["a"]) == ["a"]
+
+
+# New: an empty CTI_DATA_DIR ---------------------------------------------------- #
+
+def test_an_empty_data_dir_setting_means_the_default_not_the_current_directory():
+    """`CTI_DATA_DIR=` (set but empty) made the cluster store the current
+    working directory, so every *.json in it was read as a cluster."""
+    import subprocess
+    import sys
+    done = subprocess.run(
+        [sys.executable, "-c",
+         "from cti.clusters import storage; print(storage.DATA_DIR)"],
+        capture_output=True, text=True, cwd=str(REPO),
+        env={"PATH": "/usr/bin:/bin", "CTI_DATA_DIR": ""})
+    assert done.stdout.strip().endswith("data/clusters"), done.stdout + done.stderr

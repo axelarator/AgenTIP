@@ -36,9 +36,13 @@ def _encode(value: Any) -> Any:
     because tracking/enrich.py relies on it."""
     if isinstance(value, str):
         try:
-            return json.loads(value)
+            parsed = json.loads(value)
         except json.JSONDecodeError:
             return value
+        # Only a serialised list or object is unpacked. Every JSON field
+        # holds one or the other; a bare string that happens to parse
+        # ("123", "true") is a string, and used to be stored as a number.
+        return parsed if isinstance(parsed, (list, dict)) else value
     return value
 
 

@@ -54,12 +54,14 @@ vm_proxy's module docstring for why.
 from __future__ import annotations
 
 import ipaddress
+import re
 from datetime import datetime, timezone
 import urllib.parse
 from typing import Any
 
 from ..errors import VMProxyError
 from ..probe import vm_proxy
+from ..store import entities
 from . import http
 
 HONEYLABS_API_KEY_ENV = "HONEYLABS_API_KEY"
@@ -161,21 +163,39 @@ def resolve_host(host: str) -> list[str] | None:
     return sorted(real)
 
 
+# A name that could be looked up in DNS: dot-separated labels, at least two,
+# nothing that is not a hostname character. No port, no path, no spaces.
+_HOSTNAME = re.compile(
+    r"^(?=.{1,253}\.?$)(?:[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?\.)+"
+    r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\.?$", re.IGNORECASE)
+
+
 def classify(value: str) -> str:
-    """Best-effort observable type: "ip", "url", "hash", or "domain"
-    (the fallback). Same shape of heuristic as report_ingest's
-    extraction, not a strict validator."""
+    """What kind of value this is, for deciding which lookups make sense:
+    "ip", "domain", "url", "hash", "email", "cve", or "unknown".
+
+    One answer, shared with the store: this is entities.entity_type with
+    the two address families folded into "ip" and a certificate digest
+    counted as a hash. It differs in one way. entity_type calls anything it
+    does not recognise a domain, which is right for filing a value and
+    wrong for acting on one: a "domain" here is sent to registries and
+    probed from the VM. So a value is a domain only if it is shaped like a
+    hostname, and anything else is "unknown".
+
+    This used to be a separate heuristic with domain as its fallback, so a
+    hash written the way the cluster store writes it (`sha256:...`), an
+    email address, a CVE id and `host:port` were all looked up, and
+    probed, as domains.
+    """
     v = value.strip()
-    try:
-        ipaddress.ip_address(v)
+    kind = entities.entity_type(v) if v else "unknown"
+    if kind in ("ipv4", "ipv6"):
         return "ip"
-    except ValueError:
-        pass
-    if v.startswith(("http://", "https://")):
-        return "url"
-    if len(v) in (32, 40, 64) and all(c in "0123456789abcdefABCDEF" for c in v):
+    if kind == "cert":
         return "hash"
-    return "domain"
+    if kind == "domain":
+        return "domain" if _HOSTNAME.match(v) else "unknown"
+    return kind
 
 
 def _q(value: str) -> str:

@@ -40,7 +40,10 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 log = logging.getLogger(__name__)
 
 _REPO_ROOT = repo_root()
-DATA_DIR = Path(os.environ.get("CTI_DATA_DIR", _REPO_ROOT / "data" / "clusters"))
+# `or`, not a default argument: CTI_DATA_DIR set but empty must mean the
+# default. Path("") is the current directory, and every *.json in it would
+# be read as a cluster.
+DATA_DIR = Path(os.environ.get("CTI_DATA_DIR") or _REPO_ROOT / "data" / "clusters")
 
 # The observable categories a cluster tracks. Single source of truth
 # lives in report_ingest (the extractor); re-exported here so the rest
