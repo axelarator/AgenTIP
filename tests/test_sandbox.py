@@ -202,7 +202,7 @@ def test_host_client_records_verdicts_and_never_receives_bytes(monkeypatch):
     out = sandbox.analyze_urls(["http://1.2.3.4:4443/beacon.pem"],
                                indicator="1.2.3.4", actor="sliver-c2")
     assert out["analyzed"] == 1
-    assert [r["path"] for r in out["notable"]] == ["beacon.pem"]
+    assert out["notable"] == ["beacon.pem"]
     # Nothing in the response carries file content.
     blob = json.dumps(out)
     assert "content" not in blob and "bytes" not in blob
@@ -860,3 +860,71 @@ def test_analyzer_refuses_an_unreadable_input_directory(tmp_path, monkeypatch, c
     monkeypatch.setattr("sys.argv", ["analyze", str(tmp_path)])
     assert analyze_mod.main() == 1
     assert "not readable" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# reply size: what a caller with a result limit gets back
+# --------------------------------------------------------------------------- #
+
+def _result(i, verdict="notable"):
+    return {"path": f"f{i}.bin", "url": f"http://1.2.3.4/f{i}.bin",
+            "sha256": f"{i:064x}", "size": 10, "magic": "ELF", "ext": ".bin",
+            "type_mismatch": False, "yara_hits": [{"rule": "r"}],
+            "strings_sample": [f"string {i}-{n} " + "s" * 60 for n in range(60)],
+            "extracted": {"urls": [f"http://c2.example/{n}" for n in range(50)],
+                          "ipv4": ["198.51.100.1"], "domains": []},
+            "verdict": verdict}
+
+
+def _fake_probe(monkeypatch, n):
+    def fake_fetch(urls, *, max_files, max_total_bytes):
+        return {"results": [_result(i) for i in range(min(n, len(urls)))],
+                "errors": [], "fetched": n, "analyzed": n, "error": None}
+    monkeypatch.setattr(sandbox.vm_proxy, "fetch_and_analyze", fake_fetch)
+
+
+def test_urls_past_the_file_cap_are_reported_not_silently_dropped(monkeypatch):
+    _fake_probe(monkeypatch, 20)
+    urls = [f"http://1.2.3.4/f{i}.bin" for i in range(23)]
+
+    out = sandbox.analyze_urls(urls, indicator="1.2.3.4", persist=False)
+
+    assert out["not_fetched"] == urls[20:]
+
+
+def test_notable_names_the_files_instead_of_repeating_their_results(monkeypatch):
+    _fake_probe(monkeypatch, 3)
+    out = sandbox.analyze_urls([f"http://1.2.3.4/f{i}.bin" for i in range(3)],
+                               indicator="1.2.3.4", persist=False)
+
+    assert out["notable"] == ["f0.bin", "f1.bin", "f2.bin"]
+
+
+def test_the_mcp_reply_for_a_full_batch_stays_small(monkeypatch):
+    from cti.mcp import server
+    _fake_probe(monkeypatch, 20)
+    monkeypatch.setattr(sandbox, "upsert_opendir_samples", lambda *a, **k: None)
+
+    out = server.analyze_opendir_samples(
+        "1.2.3.4", [f"http://1.2.3.4/f{i}.bin" for i in range(20)])
+
+    assert len(json.dumps(out)) < 40_000       # was about 150 KB
+    first = out["results"][0]
+    assert len(first["strings_sample"]) == sandbox.REPLY_STRINGS
+    assert first["strings_total"] == 60
+    assert first["extracted"]["urls_total"] == 50
+    assert first["sha256"] and first["yara_hits"]       # the verdict is whole
+    assert "20 file(s)" in out["summary"]
+
+
+def test_stored_verdicts_keep_every_string(monkeypatch):
+    """Only the reply is trimmed. get_opendir_samples reads the full row."""
+    stored = {}
+    _fake_probe(monkeypatch, 1)
+    monkeypatch.setattr(sandbox, "upsert_opendir_samples",
+                        lambda con, **kw: stored.update(kw))
+
+    from cti.mcp import server
+    server.analyze_opendir_samples("1.2.3.4", ["http://1.2.3.4/f0.bin"])
+
+    assert len(stored["results"][0]["strings_sample"]) == 60

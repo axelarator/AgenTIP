@@ -9,6 +9,7 @@ Run:
 """
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -19,26 +20,83 @@ from ..sources import validin
 
 mcp = FastMCP("cti-tools")
 
+_COUNTED = ("ttps", "gaps", "hunt_log", "detections", "relationships")
+# Messages a core function attaches to the cluster it returns.
+_MESSAGES = ("warning", "scan_skipped", "removed")
 
-@mcp.tool()
+
+def _ack(data: dict, **what: Any) -> dict:
+    """A short reply for a tool that changed a cluster.
+
+    The core functions return the whole cluster, which suits Python callers
+    and the tests. Over MCP that was 55 KB per call for a large cluster,
+    past the caller's result limit, to confirm a one-line change.
+    `get_cluster` is the way to read a profile; a mutator says what it did
+    and how big each part now is.
+    """
+    observables = data.get("observables") or {}
+    reply: dict[str, Any] = {"cluster": data.get("name"), **what}
+    reply["counts"] = {
+        "observables": {cat: len(v) for cat, v in observables.items() if v},
+        **{k: len(data.get(k) or []) for k in _COUNTED}}
+    reply.update({k: data[k] for k in _MESSAGES if k in data})
+    return reply
+
+
+def _guarded(fn):
+    """Reply with {"error": ...} for the failures a caller can act on: a
+    busy database (try again), an unknown cluster, a rejected argument."""
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any):
+        try:
+            return fn(*args, **kwargs)
+        except tracking.TrackingBusy as e:
+            return {"error": f"tracking database is busy, try again shortly: {e}"}
+        except core.ClusterNotFound as e:
+            return {"error": f"no such cluster: {e}"}
+        except ValueError as e:
+            return {"error": str(e)}
+    return wrapper
+
+
+def _without_state(result: dict) -> dict:
+    """A scan or pivot result with the whole-cluster copy replaced by its
+    counts; `filed` already says what changed."""
+    state = result.pop("cluster_state", None)
+    if isinstance(state, dict):
+        result["cluster"] = _ack(state)
+    return result
+
+
+def _tool(fn):
+    """Register an MCP tool. Tools that reply with a dict get _guarded; one
+    that replies with a list has no room for an error key, so it raises and
+    FastMCP reports the failure."""
+    returns = fn.__annotations__.get("return")
+    if returns in (dict, "dict"):
+        fn = _guarded(fn)
+    return mcp.tool()(fn)
+
+
+@_tool
 def list_clusters() -> list[str]:
     """List the names of all tracked threat clusters."""
     return core.list_clusters()
 
 
-@mcp.tool()
+@_tool
 def get_cluster(name: str) -> dict:
     """Get the full profile for a threat cluster by name."""
     return core.get_cluster(name)
 
 
-@mcp.tool()
+@_tool
 def create_cluster(name: str, description: str = "") -> dict:
     """Create a new threat cluster profile. Fails if one already exists."""
-    return core.create_cluster(name, description)
+    return _ack(core.create_cluster(name, description), created=True)
 
 
-@mcp.tool()
+@_tool
 def update_profile(name: str, description: str | None = None,
                     adversary: str | None = None,
                     capability: str | None = None,
@@ -51,33 +109,39 @@ def update_profile(name: str, description: str | None = None,
     """Update a cluster's description, Diamond Model corners, and/or
     STIX profile metadata (aliases, confidence 0-100, first_seen,
     last_seen). Only fields you pass are changed."""
-    return core.update_profile(name, description, adversary, capability,
-                                infrastructure, victim, aliases, confidence,
-                                first_seen, last_seen)
+    given = {"description": description, "adversary": adversary,
+             "capability": capability, "infrastructure": infrastructure,
+             "victim": victim, "aliases": aliases, "confidence": confidence,
+             "first_seen": first_seen, "last_seen": last_seen}
+    return _ack(core.update_profile(name, description, adversary, capability,
+                                    infrastructure, victim, aliases, confidence,
+                                    first_seen, last_seen),
+                updated=[k for k, v in given.items() if v is not None])
 
 
-@mcp.tool()
+@_tool
 def update_ttp(name: str, technique_id: str, technique_name: str,
                 status: int, notes: str = "") -> dict:
     """Upsert an ATT&CK technique's coverage status (0-4) on a cluster."""
-    return core.update_ttp(name, technique_id, technique_name, status, notes)
+    return _ack(core.update_ttp(name, technique_id, technique_name, status, notes),
+                ttp=technique_id, status=status)
 
 
-@mcp.tool()
+@_tool
 def remove_ttp(name: str, technique_id: str) -> dict:
     """Remove a technique from a cluster's TTP coverage table - the
     counterpart to update_ttp, for dropping a mis-attributed technique or
     one whose ATT&CK ID was revoked. Matches technique_id case-insensitively."""
-    return core.remove_ttp(name, technique_id)
+    return _ack(core.remove_ttp(name, technique_id), removed_ttp=technique_id)
 
 
-@mcp.tool()
+@_tool
 def append_hunt_log(name: str, entry: str) -> dict:
     """Append an entry to a cluster's hunt log. Append-only, never edits."""
-    return core.append_hunt_log(name, entry)
+    return _ack(core.append_hunt_log(name, entry), logged=True)
 
 
-@mcp.tool()
+@_tool
 def add_detection(detection_id: str, description: str, technique_ids: list[str],
                    status: str = "draft", cluster_name: str | None = None,
                    scope: str | None = None) -> dict:
@@ -89,11 +153,13 @@ def add_detection(detection_id: str, description: str, technique_ids: list[str],
     to "cluster" when cluster_name is given, else "technique"; unchanged
     on update unless passed. technique_ids is required. cluster_name adds
     that cluster to the detection and returns its refreshed view."""
-    return core.add_detection(detection_id, description, technique_ids, status,
-                               cluster_name, scope)
+    data = core.add_detection(detection_id, description, technique_ids, status,
+                              cluster_name, scope)
+    # A detection with no cluster is filed globally and has no profile.
+    return _ack(data, detection=detection_id) if "observables" in data else data
 
 
-@mcp.tool()
+@_tool
 def get_technique_usage(technique_id: str | None = None) -> dict:
     """Reverse index from ATT&CK technique to adversary: which tracked
     clusters use a technique and which detections cover it. Omit
@@ -102,23 +168,25 @@ def get_technique_usage(technique_id: str | None = None) -> dict:
     return core.get_technique_usage(technique_id)
 
 
-@mcp.tool()
+@_tool
 def add_relationship(name: str, relationship_type: str, target_cluster: str,
                       description: str = "", source: str = "") -> dict:
     """Record a structured relationship from this cluster to another
     tracked cluster (e.g. relationship_type="uses" for a supply-chain/
     tooling link, "related-to" for a suspected overlap). Exports as a
     real STIX Relationship between the two Intrusion Sets."""
-    return core.add_relationship(name, relationship_type, target_cluster, description, source)
+    return _ack(core.add_relationship(name, relationship_type, target_cluster,
+                                      description, source),
+                relationship=relationship_type, target=target_cluster)
 
 
-@mcp.tool()
+@_tool
 def add_gap(name: str, description: str, priority: str = "medium") -> dict:
     """Add an item to a cluster's gaps backlog."""
-    return core.add_gap(name, description, priority)
+    return _ack(core.add_gap(name, description, priority), gap_added=priority)
 
 
-@mcp.tool()
+@_tool
 def update_gap(name: str, description: str, new_description: str | None = None,
                 priority: str | None = None) -> dict:
     """Revise a gap in place - for when it's been investigated and its
@@ -127,25 +195,26 @@ def update_gap(name: str, description: str, new_description: str | None = None,
     data") rather than silently disappearing the way remove_gap would.
     Only fields you pass are changed. Matches the gap to update by its
     current exact description text - gaps have no separate id."""
-    return core.update_gap(name, description, new_description, priority)
+    return _ack(core.update_gap(name, description, new_description, priority),
+                gap_updated=True)
 
 
-@mcp.tool()
+@_tool
 def remove_gap(name: str, description: str) -> dict:
     """Remove a gap from a cluster's backlog outright - the counterpart
     to add_gap, for a gap that's fully closed and not worth keeping a
     record of (see update_gap to revise in place instead). Matches by
     exact description text (case-sensitive)."""
-    return core.remove_gap(name, description)
+    return _ack(core.remove_gap(name, description), gap_removed=True)
 
 
-@mcp.tool()
+@_tool
 def export_navigator_layer(name: str) -> dict:
     """Export a cluster's TTP table as an ATT&CK Navigator layer JSON."""
     return core.export_navigator_layer(name)
 
 
-@mcp.tool()
+@_tool
 def get_observables(name: str, include_inactive: bool = False) -> dict:
     """Get all observables (hashes, domains, ips, urls, emails, cves,
     wallets, and the JA4+/JARM fingerprint categories: ja4, ja4s, ja4h,
@@ -156,7 +225,7 @@ def get_observables(name: str, include_inactive: bool = False) -> dict:
     return core.get_observables(name, include_inactive)
 
 
-@mcp.tool()
+@_tool
 def find_observable(value: str) -> dict:
     """Reverse index from an observable value (hash - with or without
     its algo prefix - domain, ip, or url) to every tracked cluster that
@@ -165,7 +234,7 @@ def find_observable(value: str) -> dict:
     return core.find_observable(value)
 
 
-@mcp.tool()
+@_tool
 def add_observable(name: str, category: str, value: str, source: str,
                    metadata: dict | None = None) -> dict:
     """Manually file a single observable onto a cluster - the
@@ -185,10 +254,11 @@ def add_observable(name: str, category: str, value: str, source: str,
     metadata={"hash_kind": "file", "filenames": ["update.exe"]}, so that
     detail isn't lost the way it is in a pivot_observable/pivot_cluster
     finding that's never been manually filed."""
-    return core.add_observable(name, category, value, source, metadata)
+    return _ack(core.add_observable(name, category, value, source, metadata),
+                added=value, category=category)
 
 
-@mcp.tool()
+@_tool
 def remove_observable(name: str, category: str, value: str) -> dict:
     """Remove an observable (a false positive or benign reference the
     extractor over-matched) from a cluster - the counterpart to
@@ -197,10 +267,11 @@ def remove_observable(name: str, category: str, value: str) -> dict:
     "hashes", "domains", "ips", "urls", "emails", "cves", "wallets",
     "ja4", "ja4s", "ja4h", "ja4l", "ja4x", "ja4t", "ja4ts", "ja4ssh",
     "jarm"."""
-    return core.remove_observable(name, category, value)
+    return _ack(core.remove_observable(name, category, value),
+                removed=value, category=category)
 
 
-@mcp.tool()
+@_tool
 def accept_candidate(name: str, value: str, note: str = "") -> dict:
     """Accept a scored candidate (see list_candidates): it becomes a cluster
     member, joins the cluster JSON, starts exporting, and is scanned by
@@ -209,7 +280,7 @@ def accept_candidate(name: str, value: str, note: str = "") -> dict:
     return core.accept_candidate(name, value, note)
 
 
-@mcp.tool()
+@_tool
 def reject_candidate(name: str, value: str, reason: str) -> dict:
     """Reject a candidate. The membership store records the rejection with
     `reason`, so no pivot or sweep ever files it again. Its evidence stays
@@ -217,7 +288,7 @@ def reject_candidate(name: str, value: str, reason: str) -> dict:
     return core.reject_candidate(name, value, reason)
 
 
-@mcp.tool()
+@_tool
 def hunt_query(query: str, limit: int = 50) -> dict:
     """Search everything the store has observed with Censys/Hunt.io-style
     key:value terms. Keys: any selector type (tls.jarm, tls.cert_sha256,
@@ -239,7 +310,7 @@ def hunt_query(query: str, limit: int = 50) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@_tool
 def hunt_pairs(indicator: str, other: str = "", limit: int = 25) -> dict:
     """What an indicator shares with others, when, and what it is worth.
     With `other`: every key:value the two share, the gap between the spans
@@ -252,7 +323,7 @@ def hunt_pairs(indicator: str, other: str = "", limit: int = 25) -> dict:
         return H.pairs(con, indicator, other or None, limit=limit)
 
 
-@mcp.tool()
+@_tool
 def indicator_coverage(value: str) -> dict:
     """What has observed an indicator, from which vantage, and when: selector
     spans per (source, vantage), service scans per vantage (probe = Linux
@@ -263,7 +334,7 @@ def indicator_coverage(value: str) -> dict:
         return coverage.coverage(con, value)
 
 
-@mcp.tool()
+@_tool
 def list_candidates(name: str, min_band: str = "weak") -> list[dict]:
     """Candidates proposed for a cluster by pivots, scans and hunt rules,
     best first, with their relatedness score and band (strong / probable /
@@ -274,7 +345,7 @@ def list_candidates(name: str, min_band: str = "weak") -> list[dict]:
              for k, v in r.items()} for r in rows]
 
 
-@mcp.tool()
+@_tool
 def candidate_evidence(name: str, value: str) -> dict:
     """How strongly `value` relates to a cluster's members, and why: each
     shared key:value pair with its class, artefact, time gap (days between
@@ -284,7 +355,7 @@ def candidate_evidence(name: str, value: str) -> dict:
     return membership.score(core._slug(data), value, members=core.member_values(data))
 
 
-@mcp.tool()
+@_tool
 def candidate_score_history(name: str, value: str) -> list[dict]:
     """Every recorded score for a candidate, oldest first - how the
     evidence for it has moved over time."""
@@ -295,7 +366,7 @@ def candidate_score_history(name: str, value: str) -> list[dict]:
             for r in rows]
 
 
-@mcp.tool()
+@_tool
 def rescore_candidates(name: str) -> list[dict]:
     """Re-score every candidate on a cluster against its current members and
     record the results (score history grows by one row each)."""
@@ -303,7 +374,7 @@ def rescore_candidates(name: str) -> list[dict]:
             for r in membership.rescore(core._slug(name))]
 
 
-@mcp.tool()
+@_tool
 def pivot_observable(value: str) -> dict:
     """On-demand infrastructure pivot for a hash/domain/ip/url: RDAP
     (registration data), RIPEstat (ASN/network, IP only), Webamon (a
@@ -318,7 +389,7 @@ def pivot_observable(value: str) -> dict:
     return core.pivot_observable(value)
 
 
-@mcp.tool()
+@_tool
 def pivot_cluster(name: str) -> dict:
     """Sweep every tracked domain/ip for a cluster through the free pivot
     sources and stamp a lifecycle status onto each observable: domains
@@ -340,7 +411,7 @@ def pivot_cluster(name: str) -> dict:
     return core.pivot_cluster(name)
 
 
-@mcp.tool()
+@_tool
 def pivot_and_expand(value: str, cluster_name: str,
                      include_cohosted: bool = False) -> dict:
     """Pivot a domain/ip and file the high-confidence new indicators it
@@ -353,10 +424,10 @@ def pivot_and_expand(value: str, cluster_name: str,
     filed; the `review` block lists everything left for manual follow-up.
     Each newly-filed indicator also gets its own live asn/cert/tags
     enrichment snapshot."""
-    return core.pivot_and_expand(value, cluster_name, include_cohosted)
+    return _without_state(core.pivot_and_expand(value, cluster_name, include_cohosted))
 
 
-@mcp.tool()
+@_tool
 def active_scan(target: str, cluster: str | None = None,
                 tools: list[str] | None = None,
                 ports: list[int] | None = None) -> dict:
@@ -376,10 +447,10 @@ def active_scan(target: str, cluster: str | None = None,
     dirsearch then also maps each extra port nmap found open (up to 8).
     If the result's nmap block carries a `warning`, the probe helper is
     too old to scan extra ports and they were NOT checked."""
-    return core.active_scan(target, cluster, tools, ports)
+    return _without_state(core.active_scan(target, cluster, tools, ports))
 
 
-@mcp.tool()
+@_tool
 def analyze_opendir_samples(indicator: str, urls: list[str],
                             cluster: str | None = None) -> dict:
     """Download specific open-directory files on the probe VM and triage
@@ -394,21 +465,26 @@ def analyze_opendir_samples(indicator: str, urls: list[str],
     no network access and no capabilities, and deleted. What comes back is
     sha256, detected type, YARA matches, a strings sample and extracted
     URLs/addresses. No sample bytes reach this host.
+
+    At most 20 files per call; any further URLs are listed in `not_fetched`
+    and were not downloaded. The reply carries the first few strings and
+    extracted values per file (`*_total` gives the full count); the complete
+    results are stored and read back with `get_opendir_samples`.
     """
-    from .. import core
     from ..probe import sandbox
 
-    return sandbox.analyze_urls(urls, indicator=indicator, actor=cluster)
+    return sandbox.compact(
+        sandbox.analyze_urls(urls, indicator=indicator, actor=cluster))
 
 
-@mcp.tool()
+@_tool
 def get_opendir_samples(indicator: str) -> dict:
     """Sandbox verdicts already recorded for an indicator's open-directory
     files. Read-only - it never fetches anything."""
     return tracking.opendir_samples(indicator)
 
 
-@mcp.tool()
+@_tool
 def analyze_report(source: str) -> dict:
     """Fetch a threat report (URL or local file path) and extract
     observables/ATT&CK TTPs/candidate cluster names WITHOUT writing
@@ -417,7 +493,7 @@ def analyze_report(source: str) -> dict:
     return core.analyze_report(source)
 
 
-@mcp.tool()
+@_tool
 def ingest_report(source: str, cluster_name: str | None = None,
                    create_if_missing: bool = True,
                    exclude: list[str] | None = None) -> dict:
@@ -437,7 +513,7 @@ def ingest_report(source: str, cluster_name: str | None = None,
     return core.ingest_report(source, cluster_name, create_if_missing, exclude)
 
 
-@mcp.tool()
+@_tool
 def export_stix_bundle(name: str, include_inactive: bool = False) -> dict:
     """Export a cluster as a STIX 2.1 bundle (Intrusion Set, Attack
     Patterns, Indicators, Relationships, Notes) for sharing with other
@@ -447,7 +523,7 @@ def export_stix_bundle(name: str, include_inactive: bool = False) -> dict:
     return core.export_stix_bundle(name, include_inactive)
 
 
-@mcp.tool()
+@_tool
 def export_stix_ecosystem(name: str, include_inactive: bool = False) -> dict:
     """Export this cluster and every cluster it's transitively related
     to (via add_relationship) as one self-contained STIX 2.1 bundle -
@@ -458,16 +534,16 @@ def export_stix_ecosystem(name: str, include_inactive: bool = False) -> dict:
     return core.export_stix_ecosystem(name, include_inactive)
 
 
-@mcp.tool()
+@_tool
 def import_stix_bundle(bundle: dict[str, Any], name: str | None = None,
                         overwrite: bool = False) -> dict:
     """Create or update a cluster from an external STIX 2.1 bundle
     containing an Intrusion Set. Set overwrite=True to merge into an
     existing cluster of the same name instead of failing."""
-    return core.import_stix_bundle(bundle, name, overwrite)
+    return _ack(core.import_stix_bundle(bundle, name, overwrite), imported=True)
 
 
-@mcp.tool()
+@_tool
 def query_duckdb(sql: str) -> dict:
     """Run a read-only SQL query against the actor-tracking DuckDB
     (tables: observations, asn_changes, attribute_changes, actors,
@@ -476,7 +552,7 @@ def query_duckdb(sql: str) -> dict:
     return tracking.run_readonly_query(sql)
 
 
-@mcp.tool()
+@_tool
 def save_correlation(actor: str, correlation_type: str, indicators: list[str],
                      narrative: str, confidence: str = "medium",
                      suggested_opensearch_query: str | None = None) -> dict:
@@ -488,7 +564,7 @@ def save_correlation(actor: str, correlation_type: str, indicators: list[str],
                                      suggested_opensearch_query)
 
 
-@mcp.tool()
+@_tool
 def get_actor_summary(actor: str) -> dict:
     """Compact aggregate for one tracked actor: observation counts,
     known ASNs/ports, recent ASN changes and Zeek matches, correlation
@@ -506,7 +582,7 @@ def get_actor_summary(actor: str) -> dict:
 # one of fifty monthly lookups, so each takes a `reason` and reports what is
 # left.
 
-@mcp.tool()
+@_tool
 def validin_status() -> dict:
     """Validin quota: lookups left today and this month, ours and theirs.
 
@@ -517,7 +593,7 @@ def validin_status() -> dict:
     return validin.status()
 
 
-@mcp.tool()
+@_tool
 def validin_sync() -> dict:
     """Adopt Validin's own count of what this key has spent this month.
 
@@ -527,7 +603,7 @@ def validin_sync() -> dict:
     return validin.sync()
 
 
-@mcp.tool()
+@_tool
 def validin_reverse_selector(selector_type: str, value: str, reason: str) -> dict:
     """Who else has this selector value, according to Validin. ONE lookup.
 
@@ -543,7 +619,7 @@ def validin_reverse_selector(selector_type: str, value: str, reason: str) -> dic
         return validin.reverse_selector(selector_type, value)
 
 
-@mcp.tool()
+@_tool
 def validin_history(indicator: str, kind: str = "dns", reason: str = "") -> dict:
     """Passive history for one indicator. ONE lookup.
 
@@ -566,7 +642,7 @@ def validin_history(indicator: str, kind: str = "dns", reason: str = "") -> dict
                      "certificates or registration"}
 
 
-@mcp.tool()
+@_tool
 def netwatch_suggest_rule(cluster: str, min_hosts: int = 2) -> dict:
     """Draft a hunt rule for a cluster from the selectors its hosts share.
 
@@ -585,12 +661,12 @@ def netwatch_suggest_rule(cluster: str, min_hosts: int = 2) -> dict:
     indicators = [o["value"] for cat in ("domains", "ips")
                   for o in data["observables"].get(cat, [])
                   if core.lifecycle_of(o) == "active"]
-    with tracking.connect(read_only=True) as con:
+    with tracking.connect_retry(read_only=True) as con:
         return hunt_rules.suggest(con, indicators, cluster=cluster,
                                   min_hosts=min_hosts)
 
 
-@mcp.tool()
+@_tool
 def netwatch_list_rules() -> dict:
     """The hunt rules on disk, enabled and disabled, with their scope and
     action. Read-only: a rule is a file in data/hunt_rules/."""

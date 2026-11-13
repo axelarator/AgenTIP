@@ -42,6 +42,11 @@ def isolated_data(monkeypatch, tmp_path):
     test, not just the ones that remember to.
     """
     monkeypatch.setenv("CTI_DATA_DIR", str(tmp_path / "clusters"))
+    # cti.core reads CTI_DATA_DIR once, at import, into core.DATA_DIR, so the
+    # variable alone does not move it. A test that called core.create_cluster
+    # without patching this itself wrote the cluster into the live store.
+    from cti import core
+    monkeypatch.setattr(core, "DATA_DIR", tmp_path / "clusters")
     monkeypatch.setenv("CTI_DUCKDB_PATH", str(tmp_path / "tracking.duckdb"))
     # Pipeline traces too. This was missing, and a test that ran the real
     # collect graph wrote its 8 stub clusters into the live data/runs/ as if
