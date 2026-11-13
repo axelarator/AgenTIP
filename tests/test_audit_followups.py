@@ -222,3 +222,45 @@ def test_no_request_names_the_project_this_one_replaced():
         code = (REPO / path).read_text()
         assert 'USER_AGENT = "cti-agent' not in code, path
     assert "_DAILY_BUDGET_ENV" not in (REPO / "cti/sources/webamon.py").read_text()
+
+
+# C7 ------------------------------------------------------------------------- #
+
+LONG_GAP = ("Who hosts the admin panel? Pivoted the certificate serial on 2026-11-12 "
+            "and found three more hosts, none confirmed.")
+
+
+@pytest.fixture
+def gaps():
+    core.create_cluster("Gap Test")
+    core.add_gap("Gap Test", LONG_GAP, "medium")
+    core.add_gap("Gap Test", "Who hosts the staging server?", "low")
+    return "Gap Test"
+
+
+def test_a_gap_can_be_named_by_the_start_of_its_text(gaps):
+    """A caller had to resend the whole paragraph, exactly, to change a
+    priority."""
+    core.update_gap(gaps, "Who hosts the admin panel?", priority="high")
+    by_text = {g["description"]: g["priority"] for g in core.load_cluster(gaps)["gaps"]}
+    assert by_text[LONG_GAP] == "high"
+
+    out = core.remove_gap(gaps, "who hosts the staging")       # case does not matter
+    assert out["removed"]["description"] == "Who hosts the staging server?"
+
+
+def test_text_that_fits_more_than_one_gap_changes_none(gaps):
+    with pytest.raises(ValueError, match="2 gaps"):
+        core.update_gap(gaps, "Who hosts the", priority="high")
+    with pytest.raises(ValueError, match="2 gaps"):
+        core.remove_gap(gaps, "Who hosts the")
+    assert len(core.load_cluster(gaps)["gaps"]) == 2
+
+
+def test_an_exact_description_wins_over_a_longer_one_that_starts_the_same():
+    core.create_cluster("Exact Test")
+    core.add_gap("Exact Test", "Find the panel", "low")
+    core.add_gap("Exact Test", "Find the panel operator", "low")
+    core.update_gap("Exact Test", "Find the panel", priority="high")
+    by_text = {g["description"]: g["priority"] for g in core.load_cluster("Exact Test")["gaps"]}
+    assert by_text == {"Find the panel": "high", "Find the panel operator": "low"}

@@ -373,10 +373,9 @@ STIX Note objects tied to the cluster's Intrusion Set.
    answer: `update_gap` to revise it in place (e.g. downgrade priority
    and note what was tried and why it came up empty, so a future pass
    doesn't repeat the same dead-end pivot), or `remove_gap` if it's
-   fully resolved and not worth keeping a record of. Both match the
-   gap by its current exact description text - gaps have no separate
-   id, the description is the identifying content, same as
-   `remove_observable` matching by value.
+   fully resolved and not worth keeping a record of. Gaps have no
+   separate id: name one by its text, or by the start of its text if
+   that is the start of only one gap.
 8. When you identify a relationship to another tracked cluster (customer,
    downstream payload, suspected overlap), record it with
    `add_relationship` so it's structured and exportable, in addition to

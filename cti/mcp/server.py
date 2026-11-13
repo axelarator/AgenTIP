@@ -193,8 +193,9 @@ def update_gap(name: str, description: str, new_description: str | None = None,
     status/priority needs updating but is worth keeping a record of
     (e.g. "pivoted against X, came up empty, don't re-try without new
     data") rather than silently disappearing the way remove_gap would.
-    Only fields you pass are changed. Matches the gap to update by its
-    current exact description text - gaps have no separate id."""
+    Only fields you pass are changed. `description` names the gap: its
+    exact text, or just the start of it (any case) if that is the start of
+    only one gap. Gaps have no separate id."""
     return _ack(core.update_gap(name, description, new_description, priority),
                 gap_updated=True)
 
@@ -203,8 +204,9 @@ def update_gap(name: str, description: str, new_description: str | None = None,
 def remove_gap(name: str, description: str) -> dict:
     """Remove a gap from a cluster's backlog outright - the counterpart
     to add_gap, for a gap that's fully closed and not worth keeping a
-    record of (see update_gap to revise in place instead). Matches by
-    exact description text (case-sensitive)."""
+    record of (see update_gap to revise in place instead). `description`
+    is the gap's exact text, or the start of it if that is the start of
+    only one gap."""
     return _ack(core.remove_gap(name, description), gap_removed=True)
 
 

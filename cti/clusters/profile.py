@@ -252,6 +252,29 @@ def add_gap(name: str, description: str, priority: str = "medium") -> dict[str, 
     return data
 
 
+def _find_gap(data: dict[str, Any], description: str, name: str) -> dict[str, Any]:
+    """The one gap `description` names.
+
+    Gaps have no id; their text is what identifies them. An exact match
+    wins. Otherwise the text may be the start of a gap's description, in
+    any case, as long as it is the start of only one - so changing a
+    priority does not mean resending a paragraph character for character.
+    """
+    gaps = data["gaps"]
+    exact = [g for g in gaps if g["description"] == description]
+    if exact:
+        return exact[0]
+    needle = description.strip().lower()
+    starts = [g for g in gaps if needle and g["description"].lower().startswith(needle)]
+    if len(starts) == 1:
+        return starts[0]
+    if len(starts) > 1:
+        raise ValueError(
+            f"that text is the start of {len(starts)} gaps in cluster {name!r}; "
+            "give more of the description")
+    raise ValueError(f"no gap matching that description in cluster {name!r}")
+
+
 @_synchronized
 def update_gap(name: str, description: str, new_description: str | None = None,
                priority: str | None = None) -> dict[str, Any]:
@@ -263,20 +286,18 @@ def update_gap(name: str, description: str, new_description: str | None = None,
     as update_profile. Stamps an `updated` timestamp on the gap either
     way, so its history is visible even if only the priority moved.
 
-    Matches the gap to update by its current exact description text -
-    gaps have no separate id, same as add_gap/remove_gap. Raises if the
-    cluster doesn't exist or no gap matches that text."""
+    `description` names the gap by its text, or by the start of it (see
+    _find_gap). Raises if the cluster doesn't exist, no gap matches, or the
+    text is the start of more than one."""
     data = load_cluster(name)
-    for g in data["gaps"]:
-        if g["description"] == description:
-            if new_description is not None:
-                g["description"] = new_description
-            if priority is not None:
-                g["priority"] = priority
-            g["updated"] = now_iso()
-            save_cluster(data)
-            return data
-    raise ValueError(f"no gap matching that description in cluster {name!r}")
+    g = _find_gap(data, description, name)
+    if new_description is not None:
+        g["description"] = new_description
+    if priority is not None:
+        g["priority"] = priority
+    g["updated"] = now_iso()
+    save_cluster(data)
+    return data
 
 
 @_synchronized
@@ -286,22 +307,13 @@ def remove_gap(name: str, description: str) -> dict[str, Any]:
     record of (see update_gap instead if you'd rather revise it in
     place, e.g. downgrading priority with a note on what was tried).
 
-    Matches by exact description text (case-sensitive) - gaps have no
-    separate id, the description is the identifying content, same
-    convention as remove_observable matching by value. Raises if the
-    cluster doesn't exist or no gap matches. The returned cluster
-    carries a transient `removed` gap dict (not persisted)."""
+    `description` names the gap by its text, or by the start of it (see
+    _find_gap). Raises if the cluster doesn't exist, no gap matches, or the
+    text is the start of more than one. The returned cluster carries a
+    transient `removed` gap dict (not persisted)."""
     data = load_cluster(name)
-    kept: list[dict[str, Any]] = []
-    removed: dict[str, Any] | None = None
-    for g in data["gaps"]:
-        if removed is None and g["description"] == description:
-            removed = g
-        else:
-            kept.append(g)
-    if removed is None:
-        raise ValueError(f"no gap matching that description in cluster {name!r}")
-    data["gaps"] = kept
+    removed = _find_gap(data, description, name)
+    data["gaps"] = [g for g in data["gaps"] if g is not removed]
     save_cluster(data)
     return {**data, "removed": removed}
 

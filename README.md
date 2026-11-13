@@ -282,13 +282,17 @@ the Webamon fallback:
 
 - **hunt rules** over `service_snapshots` (`cti/netwatch/rules.py`),
 - **passive DNS** co-hosted names and historical IPs (`candidates/pdns.py`),
-- **neighbourhood** — the announced /24 around each active IP, swept weekly
+- **neighbourhood** — the announced /24 around each active IP
   (`candidates/neighbourhood.py`), and
 - **CT** — a self-hosted certstream feed matched against CT-scoped rules
   (`candidates/ct.py`).
 
 CT and neighbourhood drop extra scan targets on `data/netwatch/queue/`, which
-`graph netwatch` drains alongside the watchlist. To run them:
+`graph netwatch` drains alongside the watchlist.
+
+**Neither runs unless you schedule it.** The neighbourhood sweep is only
+queued by `--discover` and only scanned by a run whose `--tiers` includes
+`sweep`; the hourly and daily lines above do neither. To run it weekly, add:
 
 ```
 # weekly: queue the neighbourhood sweep, then scan the sweep tier
