@@ -466,6 +466,18 @@ def expand_coverage(state: dict) -> dict:
     sections["coverage_expansion"] = result
     sections["candidate_scores"] = _phase(sections, "rescore_candidates", _rescore) or {}
     sections["timeline"] = _phase(sections, "timeline", _timeline) or {}
+    return check_membership({"sections": sections})
+
+
+def check_membership(state: dict) -> dict:
+    """Compare every cluster file with the membership table and record any
+    disagreement for the digest. Runs last among the steps that change
+    membership, so what it reports is how the day left things."""
+    sections = dict(state.get("sections") or {})
+    drift = _phase(sections, "membership_check", core.membership_drift) or {}
+    if drift:
+        log.warning("membership drift in %d cluster(s): %s", len(drift), sorted(drift))
+    sections["membership_drift"] = drift
     return {"sections": sections}
 
 

@@ -223,6 +223,15 @@ def write(day: date, sections: dict[str, Any]) -> Path:
         lines += [f"- {phase}: {result}" for phase, result in failed.items()]
         lines.append("")
 
+    drift = sections.get("membership_drift") or {}
+    if drift:
+        lines += ["## Cluster files and membership table disagree", "",
+                  "Run `python -m graph doctor` for the full list.", ""]
+        for slug, found in drift.items():
+            counts = ", ".join(f"{len(v)} {k.replace('_', ' ')}" for k, v in found.items())
+            lines.append(f"- {slug}: {counts}")
+        lines.append("")
+
     sweep_errors = (sections.get("pivot_sweep") or {}).get("errors") or {}
     if sweep_errors:
         lines += ["## Pivot sweep issues", ""]

@@ -132,12 +132,37 @@ def _hunt(args) -> int:
     return 0
 
 
+_DRIFT_LABELS = {
+    "no_membership": "in the cluster file, no row in the membership table",
+    "no_observable": "seed or accepted in the membership table, not in the cluster file",
+    "role_mismatch": "a member in the cluster file, but the table says otherwise",
+}
+
+
+def _doctor() -> int:
+    """Report where the cluster files and the membership table disagree.
+    Exit status 1 if they do, so a cron line or a script can act on it."""
+    from cti import core
+    drift = core.membership_drift()
+    if not drift:
+        print("cluster files and the membership table agree")
+        return 0
+    for slug, found in drift.items():
+        print(slug)
+        for kind, items in found.items():
+            print(f"  {_DRIFT_LABELS[kind]}:")
+            for item in items:
+                print("    " + (f"{item['value']} (table: {item['store_role']})"
+                                if isinstance(item, dict) else str(item)))
+    return 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="graph", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command",
                     choices=["draw", "analyze", "collect", "daily", "trace", "netwatch",
-                             "hunt"])
+                             "hunt", "doctor"])
     ap.add_argument("query", nargs="*",
                     help="hunt: the key:value query (quote it), or with --pairs one or "
                          "two indicators")
@@ -209,6 +234,9 @@ def main() -> int:
 
     if args.command == "hunt":
         return _hunt(args)
+
+    if args.command == "doctor":
+        return _doctor()
 
     if args.command == "trace":
         files = run_files(args.date)

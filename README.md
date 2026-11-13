@@ -230,6 +230,21 @@ Censys-style `key:value` over everything observed: any selector type,
 cluster Candidates tab, and hunt rules with a `query:` field. Grammar:
 `cti/store/hunt_query.py`.
 
+### Checking the two membership records agree
+
+Who belongs to a cluster is recorded twice: in the cluster's JSON file and
+in the `memberships` table. Each change writes the table first and the file
+second, so a locked database stops a change before the file moves, but
+nothing ties the two writes together.
+
+    python -m graph doctor      # exit status 1 if they disagree
+
+It lists, per cluster, members in the file with no row in the table, seeds
+or accepted members in the table that the file lacks, and members the table
+holds as candidate or rejected. It repairs nothing. The daily run does the
+same check after its membership changes and puts any disagreement at the top
+of the digest.
+
 ## netwatch: scheduled re-scans of tracked infrastructure
 
 `python -m graph netwatch` scans the watchlist (built from the cluster

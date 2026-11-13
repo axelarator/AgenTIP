@@ -25,6 +25,7 @@ from .tracking.history import (
 )
 from .util import now_iso
 
+from .clusters.doctor import membership_drift
 from .clusters.storage import (
     log, _REPO_ROOT, DATA_DIR, OBSERVABLE_CATEGORIES, ClusterNotFound, _slug, _path,
     _lock_state, _data_lock, _synchronized, _new_cluster, _migrate, load_cluster,

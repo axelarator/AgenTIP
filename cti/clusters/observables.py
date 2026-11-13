@@ -148,12 +148,15 @@ def remove_observable(name: str, category: str, value: str) -> dict[str, Any]:
     if not removed:
         raise ValueError(f"no {category} observable matching {value!r} in cluster {name!r}")
     data["observables"][category] = kept
-    save_cluster(data)
     # The cluster's claim goes with the entry; the entity and its evidence
     # stay in the store, where a later pivot can still find and score it.
+    # Store first, file second, like every other change here: a locked
+    # database then stops the removal before the file has changed, rather
+    # than leaving a membership for a host the file no longer lists.
     for o in removed:
         if membership.member_value(category, o["value"]):
             membership.forget(_slug(data), o["value"])
+    save_cluster(data)
     return {**data, "removed": [o["value"] for o in removed]}
 
 

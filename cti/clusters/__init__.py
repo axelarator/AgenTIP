@@ -12,6 +12,7 @@ it in this list:
     expand        pivot_cluster and pivot_and_expand
     scan          active_scan
     reports       report ingest, STIX import and export
+    doctor        checks the cluster files against the membership table
 
 `cti.core` re-exports all of it, and is what callers outside this package
 import. To patch a function in a test, patch it in the module that defines
