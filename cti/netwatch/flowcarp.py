@@ -251,37 +251,51 @@ def label_services(*, con=None, scan_ids: list[str] | None = None,
     """
     summary = {"candidates": 0, "pulled": 0, "labelled": 0, "flows": 0,
                "changes": 0, "skipped": 0}
-    with ExitStack() as stack:
-        if con is None:
-            con = stack.enter_context(store.connect_retry(read_only=False))
+    # Three steps, and the database is open only for the first and last.
+    # The middle one pulls a pcap (60 s timeout) and runs the classifier
+    # (120 s) for up to `limit` services; with the write connection held
+    # through it, one run could lock everything else out for hours. A caller
+    # that passes its own `con` keeps it open and owns that choice.
+    if con is None:
+        with store.connect_read() as reader:
+            targets = candidates(reader, scan_ids=scan_ids, limit=limit)
+    else:
         targets = candidates(con, scan_ids=scan_ids, limit=limit)
-        summary["candidates"] = len(targets)
-        for t in targets:
-            src = _VANTAGE_IP.get(t["vantage"])
-            if not src:
-                summary["skipped"] += 1
-                continue
-            pcap = pull(expression_for(src, t["ip"], t["port"]))
-            if not pcap:
-                summary["skipped"] += 1
-                continue
-            summary["pulled"] += 1
-            eve = run(pcap)
-            if eve is None:
-                summary["skipped"] += 1
-                continue
-            verdict = parse_eve(eve)
-            if verdict["flows"]:
-                try:
-                    budget.spend("flowcarp", verdict["flows"])
-                except budget.BudgetExhausted as e:
-                    log.warning("flowcarp budget: %s", e)
-                    break
-                summary["flows"] += verdict["flows"]
-            if not verdict["app_proto"] and not verdict["c2_hits"]:
-                continue
-            summary["changes"] += _apply(con, t, verdict)
-            summary["labelled"] += 1
+    summary["candidates"] = len(targets)
+
+    verdicts: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for t in targets:
+        src = _VANTAGE_IP.get(t["vantage"])
+        if not src:
+            summary["skipped"] += 1
+            continue
+        pcap = pull(expression_for(src, t["ip"], t["port"]))
+        if not pcap:
+            summary["skipped"] += 1
+            continue
+        summary["pulled"] += 1
+        eve = run(pcap)
+        if eve is None:
+            summary["skipped"] += 1
+            continue
+        verdict = parse_eve(eve)
+        if verdict["flows"]:
+            try:
+                budget.spend("flowcarp", verdict["flows"])
+            except budget.BudgetExhausted as e:
+                log.warning("flowcarp budget: %s", e)
+                break
+            summary["flows"] += verdict["flows"]
+        if verdict["app_proto"] or verdict["c2_hits"]:
+            verdicts.append((t, verdict))
+
+    if verdicts:
+        with ExitStack() as stack:
+            writer = con if con is not None else stack.enter_context(
+                store.connect_retry(read_only=False))
+            for t, verdict in verdicts:
+                summary["changes"] += _apply(writer, t, verdict)
+                summary["labelled"] += 1
     return summary
 
 

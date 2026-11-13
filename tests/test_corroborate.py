@@ -342,3 +342,29 @@ def test_an_ungrouped_selector_is_its_own_artefact():
     assert artefact("whois.registrant_email") == "whois.registrant_email"
     # every type resolves to something, known or itself
     assert all(artefact(t) for t in TYPES)
+
+
+def test_global_count_lookups_run_with_no_database_connection_open(monkeypatch):
+    """Each lookup can take 30 s and there are up to 25 of them. Made inside
+    the write connection, they locked every other process out for minutes."""
+    from cti.sources import webamon
+    from cti.store import connection
+    open_during: list[int] = []
+
+    def count(selector_type, value):
+        open_during.append(connection._open_writes[0])
+        return {"count": 7, "source": "webamon", "exact": True}
+
+    monkeypatch.setattr(webamon, "global_count", count)
+    monkeypatch.setattr(webamon, "reversible", lambda t: True)
+    _seed([("a.example", "tls.cert_sha256", "c" * 64, "Actor"),
+           ("b.example", "tls.cert_sha256", "c" * 64, "Actor")])
+
+    out = _run()
+
+    assert open_during == [0]
+    assert out["priced"]["priced"] == 1
+    with tracking_store.connect(read_only=True) as con:
+        assert con.execute(
+            "SELECT global_count FROM selector_stats WHERE selector_value = ?",
+            ["c" * 64]).fetchone() == (7,)

@@ -166,7 +166,7 @@ def file_candidate(cluster: str, value: str, *, origin: str, decided_by: str,
 
 
 def role(cluster: str, value: str) -> str | None:
-    with store.connect_retry(read_only=False) as con:
+    with store.connect_read() as con:
         found = E.membership(con, cluster, value)
     return found["role"] if found else None
 
@@ -195,12 +195,12 @@ def forget(cluster: str, value: str) -> bool:
 
 
 def values_with_role(cluster: str, roles: tuple[str, ...]) -> set[str]:
-    with store.connect_retry(read_only=False) as con:
+    with store.connect_read() as con:
         return {m["entity"] for m in E.members(con, cluster, roles=roles)}
 
 
 def candidates(cluster: str, *, min_band: str = "noise") -> list[dict[str, Any]]:
-    with store.connect_retry(read_only=False) as con:
+    with store.connect_read() as con:
         found = E.members(con, cluster, roles=("candidate",))
     found = [c for c in found if band_at_least(c.get("band") or "noise", min_band)]
     found.sort(key=lambda c: -(c.get("score") or 0.0))
@@ -209,7 +209,9 @@ def candidates(cluster: str, *, min_band: str = "noise") -> list[dict[str, Any]]
 
 def score(cluster: str, value: str, *, record: bool = False,
           members: Iterable[str] = ()) -> dict[str, Any]:
-    with store.connect_retry(read_only=False) as con:
+    # Scoring reads; only recording the score writes.
+    with (store.connect_retry(read_only=False) if record
+          else store.connect_read()) as con:
         result = _score_against(con, cluster, value, members)
         if record:
             E.record_score(con, cluster, value, score=result.score, band=result.band,

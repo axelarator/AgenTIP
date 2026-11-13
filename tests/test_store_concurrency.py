@@ -165,3 +165,66 @@ def test_history_write_waits_for_a_busy_database_instead_of_giving_up(monkeypatc
     monkeypatch.setattr("time.sleep", lambda s: None)
     assert core._log_cluster_enrichment_history("A", datetime(2026, 9, 19), {}) is None
     assert len(attempts) == 3
+
+
+# --------------------------------------------------------------------------- #
+# reads that do not need the exclusive file lock
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def other_reader():
+    """Another process with the database open read-only, as the dashboard
+    has for the length of each request."""
+    import subprocess
+    import sys
+    with store.connect():
+        pass                                    # create the file and schema
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         "import duckdb, sys\n"
+         "con = duckdb.connect(sys.argv[1], read_only=True)\n"
+         "print('open', flush=True)\n"
+         "sys.stdin.read()\n", str(store.db_path())],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "open"
+    yield proc
+    proc.stdin.close()
+    proc.wait(timeout=10)
+
+
+def test_membership_reads_work_while_another_process_is_reading(other_reader):
+    from cti import membership
+    assert membership.candidates("apt-x") == []
+    assert membership.role("apt-x", "203.0.113.1") is None
+    assert membership.values_with_role("apt-x", ("seed",)) == set()
+    assert membership.score("apt-x", "203.0.113.1")["score"] == 0
+
+
+def test_connect_read_is_read_only_once_the_schema_exists():
+    with store.connect():
+        pass
+    with store.connect_read() as con:
+        with pytest.raises(duckdb.Error):
+            con.execute("CREATE TABLE nope (x INT)")
+
+
+def test_connect_read_creates_a_missing_database():
+    assert not store.db_path().exists()
+    with store.connect_read() as con:
+        assert con.execute("SELECT count(*) FROM observations").fetchone() == (0,)
+
+
+def test_connect_read_inside_an_open_write_connection():
+    """DuckDB refuses a read-only open of a file this process already has
+    open read-write, so a read nested in a write must share the write."""
+    with store.connect() as con:
+        con.execute("CREATE TABLE IF NOT EXISTS t_nested (x INT)")
+        with store.connect_read() as inner:
+            inner.execute("SELECT count(*) FROM t_nested").fetchone()
+
+
+def test_concurrent_reads_and_writes_in_one_process_do_not_conflict():
+    with store.connect():
+        pass
+    errors = _hammer(lambda n: store.connect_read() if n % 2 else store.connect())
+    assert errors == []

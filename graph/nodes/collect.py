@@ -259,7 +259,7 @@ def enrich_and_write(state: dict) -> dict:
         return {"sections": sections}
 
     def _enrich():
-        with store.connect() as con:
+        with store.connect_read() as con:
             worklist, rdap_due = enrich.build_worklist(con)
         log.info("enriching %d IPs (%d due registry lookup)",
                  len(worklist), len(rdap_due))
@@ -332,9 +332,15 @@ def corroborate(state: dict) -> dict:
 
         with store.connect() as con:
             stats = rarity.refresh(con)
-            priced = rarity.fill_global_counts(
-                con, webamon.global_count, limit=GLOBAL_COUNT_BUDGET,
-                can_price=webamon.reversible)
+            unpriced = rarity.unpriced(con, limit=GLOBAL_COUNT_BUDGET,
+                                       can_price=webamon.reversible)
+        # Up to GLOBAL_COUNT_BUDGET index lookups at up to 30 s each. Made
+        # inside the connection they locked the database for minutes; like
+        # the enrichment loop, they run with none open.
+        counts = rarity.price(unpriced, webamon.global_count)
+
+        with store.connect() as con:
+            priced = rarity.store_counts(con, counts)
 
             promoted, held = [], []
             seen_pairs: set[tuple[str, str]] = set()

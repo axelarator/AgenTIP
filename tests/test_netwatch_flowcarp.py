@@ -179,3 +179,26 @@ def test_model_args_lists_built_models(monkeypatch, tmp_path):
     (tmp_path / "xworm.fcp").write_text("x")
     (tmp_path / "readme.txt").write_text("ignore me")
     assert flowcarp.model_args() == ["--model", str(tmp_path / "xworm.fcp")]
+
+
+def test_pcap_pulls_and_classifier_runs_hold_no_database_connection(monkeypatch):
+    """A pull can take 60 s and a run 120 s, for up to 200 services."""
+    from cti.store import connection
+    monkeypatch.setattr(flowcarp, "_VANTAGE_IP", {"probe": "10.0.0.9"})
+    budget.reset("flowcarp")
+    with store.connect() as con:
+        _snapshot(con, scan_id="new", target="203.0.113.1", port=4444)
+    held: list[int] = []
+
+    def pull(expr):
+        held.append(connection._open_writes[0])
+        return b"PCAP"
+
+    def run(pcap):
+        held.append(connection._open_writes[0])
+        return json.dumps({"event_type": "flow", "app_proto": "Gh0st RAT"})
+
+    out = flowcarp.label_services(scan_ids=["new"], pull=pull, run=run)
+
+    assert held == [0, 0]
+    assert out["labelled"] == 1

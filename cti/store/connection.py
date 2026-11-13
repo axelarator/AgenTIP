@@ -61,6 +61,9 @@ _writer_lock = threading.RLock()
 # the SAME inode number. The first version trusted that key and left the
 # recreated file with no tables; a test caught it.
 _schema_ready: set[tuple[str, int]] = set()
+# Read-write connections this process has open. Changed only while holding
+# _writer_lock; a list so the context managers can mutate it in place.
+_open_writes = [0]
 
 _CORE_TABLES = ("observations", "observations_wide")
 
@@ -113,10 +116,12 @@ def connect(read_only: bool = False) -> Iterator[duckdb.DuckDBPyConnection]:
     path.parent.mkdir(parents=True, exist_ok=True)
     with _writer_lock:
         con = duckdb.connect(str(path), read_only=False)
+        _open_writes[0] += 1
         try:
             _ensure_schema(con, path)
             yield con
         finally:
+            _open_writes[0] -= 1
             con.close()
 
 
@@ -154,9 +159,53 @@ def connect_retry(read_only: bool, attempts: int = 4,
                     raise TrackingBusy(str(e)) from e
                 time.sleep(delay)
                 delay *= 2
+        if not read_only:
+            _open_writes[0] += 1
         try:
             if not read_only:
                 _ensure_schema(con, path)
             yield con
         finally:
+            if not read_only:
+                _open_writes[0] -= 1
             con.close()
+
+
+def _schema_known(path: Path) -> bool:
+    try:
+        return (str(path), os.stat(path).st_ino) in _schema_ready
+    except OSError:
+        return False
+
+
+@contextmanager
+def connect_read(attempts: int = 4,
+                 backoff: float = 0.5) -> Iterator[duckdb.DuckDBPyConnection]:
+    """A connection for code that only reads.
+
+    A read-write open takes the database file's exclusive lock, so it fails
+    while any other process has the file open at all - the dashboard, an
+    analyst's MCP session - and locks them out while it is held. Reads that
+    opened read-write did both, once per cluster, every hour. A read-only
+    open shares the file with other readers.
+
+    Two cases still open read-write, because they must:
+    - this process has not yet seen the schema on this file (new database,
+      or new code with a table to add), so there may be nothing to read;
+    - this thread already holds a write connection. DuckDB refuses a
+      read-only open of a file the process has open read-write.
+
+    It holds the writer lock throughout, for the second reason: a write
+    opened by another thread while this read is open would be refused the
+    same way.
+    """
+    path = db_path()
+    with _writer_lock:
+        if _open_writes[0] or not _schema_known(path):
+            with connect_retry(read_only=False, attempts=attempts,
+                               backoff=backoff) as con:
+                yield con
+            return
+        with connect_retry(read_only=True, attempts=attempts,
+                           backoff=backoff) as con:
+            yield con

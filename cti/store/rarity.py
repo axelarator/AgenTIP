@@ -139,6 +139,13 @@ def fill_global_counts(con: duckdb.DuckDBPyConnection, counter, *,
     local spread first, at most `limit` per run. A value that links nothing
     does not need a price, and the budget is better spent on the ones that do.
     """
+    candidates = unpriced(con, limit=limit, can_price=can_price)
+    return store_counts(con, price(candidates, counter))
+
+
+def unpriced(con: duckdb.DuckDBPyConnection, *, limit: int = 50,
+             can_price=None) -> list[dict[str, Any]]:
+    """The values fill_global_counts would price: a read, nothing more."""
     candidates = []
     for row in rows(con, """
             SELECT selector_type, selector_value, local_count
@@ -152,9 +159,13 @@ def fill_global_counts(con: duckdb.DuckDBPyConnection, counter, *,
         candidates.append(row)
         if len(candidates) >= limit:
             break
+    return candidates
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    priced, skipped, errors = 0, 0, []
+
+def price(candidates: list[dict[str, Any]], counter) -> dict[str, Any]:
+    """Ask the counter about each value. Touches no database, so a caller
+    can make these requests - up to 30 s each - with no connection open."""
+    counts, skipped, errors = [], 0, []
     for row in candidates:
         result = counter(row["selector_type"], row["selector_value"])
         if not isinstance(result, dict) or "error" in result:
@@ -164,15 +175,24 @@ def fill_global_counts(con: duckdb.DuckDBPyConnection, counter, *,
         if count is None:
             skipped += 1
             continue
+        counts.append((row["selector_type"], row["selector_value"], int(count),
+                       result.get("source") or "unknown"))
+    return {"candidates": len(candidates), "counts": counts,
+            "unpriceable": skipped, "errors": errors}
+
+
+def store_counts(con: duckdb.DuckDBPyConnection,
+                 priced: dict[str, Any]) -> dict[str, Any]:
+    """Write what price() learned. Returns fill_global_counts' summary."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for selector_type, selector_value, count, source in priced["counts"]:
         con.execute("""
             UPDATE selector_stats SET global_count = ?, global_source = ?,
                                       checked_at = ?
             WHERE selector_type = ? AND selector_value = ?""",
-            [int(count), result.get("source") or "unknown", now,
-             row["selector_type"], row["selector_value"]])
-        priced += 1
-    return {"candidates": len(candidates), "priced": priced,
-            "unpriceable": skipped, "errors": errors}
+            [count, source, now, selector_type, selector_value])
+    return {"candidates": priced["candidates"], "priced": len(priced["counts"]),
+            "unpriceable": priced["unpriceable"], "errors": priced["errors"]}
 
 
 def apexes_for(con: duckdb.DuckDBPyConnection, selector_type: str,

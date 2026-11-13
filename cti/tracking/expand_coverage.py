@@ -169,7 +169,7 @@ def _rule_candidates(slug: str, data: dict[str, Any], owners: dict[str, str],
         return []
     skip = _tracked_values(data) | _denied(data)
     filed: list[dict[str, Any]] = []
-    with store.connect() as con:
+    with store.connect_read() as con:
         hits = hunt_rules.evaluate(con, rules)
     for hit in hits:
         host = hit["indicator"].lower().rstrip(".")
@@ -255,7 +255,7 @@ def expand_cluster(slug: str) -> dict[str, Any]:
     # 2. Passive DNS neighbours, then Webamon as the fallback.
     via = _pdns_candidates(data, owners, report)
     if len(via) < EXPAND_HOSTS_PER_CLUSTER:
-        with store.connect() as con:
+        with store.connect_read() as con:
             seeds = seeds_for(con, data)
         report["seeds"] = [f"{s['selector_type']}={str(s['selector_value'])[:64]}"
                            for s in seeds]
