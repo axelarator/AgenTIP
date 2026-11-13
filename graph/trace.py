@@ -25,7 +25,7 @@ import re
 import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 
 def runs_dir() -> Path:

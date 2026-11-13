@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 import time
 from datetime import date
@@ -120,7 +119,7 @@ def main() -> int:
             for slug in core.list_clusters():
                 try:
                     core.pivot_cluster(slug)
-                except Exception as e:  # one bad cluster shouldn't sink the sweep
+                except Exception as e:  # noqa: BLE001 - one bad cluster must not sink the sweep; recorded
                     errors[slug] = str(e)
                 else:
                     swept += 1

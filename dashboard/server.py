@@ -23,6 +23,7 @@ import os
 import re
 from pathlib import Path
 
+import duckdb
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
@@ -130,7 +131,7 @@ def _open_candidates() -> int | None:
         with tracking_store.connect_retry(read_only=True, attempts=1) as con:
             return con.execute("SELECT count(*) FROM memberships "
                                "WHERE role = 'candidate'").fetchone()[0]
-    except Exception:
+    except (tracking_store.TrackingBusy, duckdb.Error):
         return None
 
 
@@ -254,7 +255,7 @@ def cluster_candidates(request):
     name = request.path_params["name"]
     try:
         data = core.load_cluster(name)
-    except Exception as e:
+    except core.ClusterNotFound as e:
         return JSONResponse({"error": str(e)}, status_code=404)
     slug = core._slug(data)
     value = request.query_params.get("value")

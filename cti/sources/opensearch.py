@@ -229,7 +229,7 @@ class OpenSearchClient:
         if self._conn is not None:
             try:
                 self._conn.close()
-            except Exception:
+            except Exception:  # noqa: BLE001 - closing a connection that is already dead
                 pass
             self._conn = None
 

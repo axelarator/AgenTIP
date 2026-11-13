@@ -19,7 +19,7 @@ from cti.store.schema import init_schema
 from graph.nodes.analyze import _resolve_actor
 from graph.nodes.rank import ITEMS_PER_FAMILY, rank
 from graph.sdk import load_prompt, parse_findings
-from graph.state import ATTRIBUTE_FAMILY, FAMILY_ATTRIBUTES
+from graph.state import FAMILY_ATTRIBUTES
 
 
 def _digest(**sections):

@@ -142,7 +142,7 @@ def _fetch_direct(url, method, headers, data, timeout, max_bytes) -> Response:
     except urllib.error.HTTPError as e:
         try:
             body = e.read(max_bytes).decode("utf-8", errors="replace")
-        except Exception:
+        except Exception:  # noqa: BLE001 - an error reply's body is optional
             body = ""
         return Response(status=e.code, body=body,
                         headers={k.lower(): v for k, v in (e.headers or {}).items()},

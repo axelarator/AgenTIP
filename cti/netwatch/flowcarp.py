@@ -152,7 +152,7 @@ def _arkime_pcap(expression: str) -> bytes | None:
             url.rstrip("/") + "/api/sessions/pcap",
             params={"expression": expression}, auth=auth,
             timeout=ARKIME_TIMEOUT, verify=os.environ.get("CTI_ARKIME_CA", True))
-    except Exception as e:  # network, TLS, DNS - all a clean skip
+    except (requests.RequestException, OSError) as e:  # network, TLS, DNS - a clean skip
         log.warning("flowcarp: Arkime pull failed: %s", e)
         return None
     if resp.status_code != 200:

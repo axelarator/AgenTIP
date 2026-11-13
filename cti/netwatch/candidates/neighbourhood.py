@@ -28,7 +28,6 @@ from ... import core
 from ...sources import pivot
 from ...store import hosting
 from .. import queue
-from . import Candidate
 
 log = logging.getLogger(__name__)
 

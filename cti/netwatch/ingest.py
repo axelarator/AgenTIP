@@ -393,7 +393,7 @@ def ingest(*, client: Any = _UNSET, purge: bool = True) -> dict[str, Any]:
     if client is _UNSET:
         try:
             client = OpenSearchClient()
-        except Exception as e:
+        except (OpenSearchError, OSError, ValueError, KeyError) as e:
             log.warning("no Zeek backend for passive join: %s", e)
             client = None
 

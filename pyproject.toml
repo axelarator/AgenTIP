@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "pytest-asyncio>=0.24"]
+test = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6"]
 viz = ["pygraphviz"]
 
 [build-system]
@@ -33,3 +33,24 @@ include = ["cti*", "graph*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["dashboard/ui", "dashboard/static", "data"]
+
+[tool.ruff.lint]
+# A conservative set: real mistakes, not style. F is pyflakes (unused and
+# undefined names), E9 is syntax, B a few bug patterns, and BLE001 the
+# blind `except Exception` that hid the sandbox and Zeek-window failures -
+# every remaining one carries a comment saying why it is broad.
+select = ["F", "E9", "E7", "B006", "B008", "B015", "B018", "B023", "BLE001", "PLE"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["BLE001", "E701", "E702", "E731", "E741"]
+"cti/core.py" = ["F401"]            # a namespace of re-exports
+# Both run on the probe VM and change only with a redeploy; their broad
+# excepts were reviewed in the 2026-11 audit (H5 fixed) and are left as they
+# are until the next probe-side change.
+"probe_vm/probe_helper.py" = ["BLE001"]
+"sandbox/analyze.py" = ["BLE001"]

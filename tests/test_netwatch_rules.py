@@ -3,12 +3,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-import pytest
 import yaml
 
 from cti import store
 from cti.netwatch import queue, rules
-from cti.netwatch.candidates import ct, neighbourhood, pdns
+from cti.netwatch.candidates import ct, neighbourhood
 
 NOW = datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -131,7 +130,6 @@ def test_suggest_builds_a_draft_from_shared_rare_selectors():
             _selector(con, host, "tls.jarm", "RAREJARM")
             _selector(con, host, "http.server", "nginx")   # contextual: excluded
             _snapshot(con, host, 8443)
-        store.selectors.record  # keep import used
     with store.connect(read_only=True) as con:
         out = rules.suggest(con, ["203.0.113.1", "203.0.113.2"], cluster="c")
     draft = out["draft"]

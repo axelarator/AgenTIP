@@ -529,8 +529,6 @@ def test_go_install_failures_keep_their_error():
     # The failure branch must report what go actually said, not a fixed
     # string. (Checking the string is absent entirely matched the comment
     # explaining the old behaviour, which proved nothing.)
-    failure = [l for l in script.splitlines()
-               if "$tool: FAILED" in l and "go" not in l.split("FAILED")[0].lower()]
     assert any('$err' in l for l in script.splitlines()
                if "$tool: FAILED -" in l), "the go failure must include go's own output"
 

@@ -15,8 +15,6 @@ from typing import Any
 
 import duckdb
 
-from ..errors import TrackingBusy
-from .connection import connect_retry
 
 CORRELATION_TYPES = {"asn_pivot", "port_pattern", "temporal_cluster",
                      "new_infrastructure", "shared_fingerprint", "zeek_hit"}

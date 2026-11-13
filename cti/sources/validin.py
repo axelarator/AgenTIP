@@ -132,7 +132,7 @@ def _automatic_caller() -> str | None:
     """
     try:
         frame = sys._getframe(1)
-    except Exception:
+    except Exception:  # noqa: BLE001 - fails closed, as the docstring says
         return "unreadable stack"
     repo = str(_REPO_ROOT) + os.sep
     try:
@@ -147,7 +147,7 @@ def _automatic_caller() -> str | None:
                     and filename.startswith(repo)):
                 return f"{os.path.relpath(filename, _REPO_ROOT)}:{code.co_name}"
             frame = frame.f_back
-    except Exception:
+    except Exception:  # noqa: BLE001 - fails closed
         return "unreadable stack"
     return None
 

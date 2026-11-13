@@ -28,7 +28,7 @@ from typing import Any
 import duckdb
 
 from .rarity import assess
-from .selectors import (CLASS_ORDER, artefact, normalize, selector_class,
+from .selectors import (artefact, selector_class,
                         sharing)
 
 

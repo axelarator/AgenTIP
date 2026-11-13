@@ -490,7 +490,7 @@ def _ip_lifecycle(value: str, ports: list[int] | None = None,
         # just skips the gate rather than raising a second time.
         try:
             ripe = ripe_done.result()
-        except Exception:
+        except Exception:  # noqa: BLE001 - whatever the lookup raised; see above
             ripe = None
         asn = ripe.get("asn") if isinstance(ripe, dict) else None
         return _pdns(value, asn=asn)
@@ -564,7 +564,7 @@ def _sweep_lifecycle(domains: list[str], ips: list[str],
                 cat, v = futures[fut]
                 try:
                     results[(cat, v)] = fut.result()
-                except Exception as e:  # a single lookup blowing up shouldn't sink the sweep
+                except Exception as e:  # noqa: BLE001 - one lookup must not sink the sweep; recorded
                     results[(cat, v)] = ("unknown", {"error": str(e)}, {})
     return results
 

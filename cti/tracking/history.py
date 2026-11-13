@@ -27,7 +27,6 @@ from .. import store as tracking_store
 from ..errors import ok
 from ..sources import observe as observe_source
 from ..store import cdn as cdn_ranges
-from ..util import now_iso
 
 # How many passive-DNS records to keep on one observation row. A busy name
 # returns hundreds and the tail is repetition; the count and the total are

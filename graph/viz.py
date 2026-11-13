@@ -20,7 +20,7 @@ def write_png(compiled, path: Path) -> Path | None:
     a run over - the mermaid source is the artifact that matters."""
     try:
         png = compiled.get_graph(xray=True).draw_mermaid_png()
-    except Exception:
+    except Exception:  # noqa: BLE001 - optional; see the docstring
         return None
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(png)

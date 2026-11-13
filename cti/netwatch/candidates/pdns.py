@@ -18,7 +18,6 @@ it and checks it links back before it becomes anything.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from ...sources import budget, passive
 from . import Candidate

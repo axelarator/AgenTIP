@@ -9,7 +9,6 @@ from typing import Any
 from .. import attack
 from .. import membership
 from .. import store as tracking_store
-from ..errors import ok
 from ..sources import pivot
 from ..store import entities
 from ..util import now_iso

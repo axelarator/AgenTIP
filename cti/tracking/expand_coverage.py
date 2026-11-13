@@ -121,7 +121,11 @@ def _owned_elsewhere(slug: str) -> dict[str, str]:
             continue
         try:
             data = core.load_cluster(name)
-        except Exception:
+        except (core.ClusterNotFound, ValueError, OSError) as e:
+            # Not silently: its indicators would look unowned and could be
+            # filed as another cluster's candidates.
+            log.warning("expand: cluster %s cannot be read, its indicators "
+                        "are not counted as owned: %s", name, e)
             continue
         for value in _tracked_values(data):
             owners.setdefault(value, data["name"])

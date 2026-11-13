@@ -425,3 +425,24 @@ def test_no_handler_blocks_the_event_loop():
     handlers = [r.endpoint for r in server.routes if isinstance(r, Route)]
     assert len(handlers) >= 20
     assert [h.__name__ for h in handlers if inspect.iscoroutinefunction(h)] == []
+
+
+def test_candidates_for_an_unknown_cluster_is_a_404_and_a_bug_is_not():
+    from starlette.testclient import TestClient
+    from dashboard import server
+    client = TestClient(server.app, raise_server_exceptions=False)
+
+    assert client.get("/api/clusters/nope/candidates").status_code == 404
+
+
+def test_a_bug_loading_a_cluster_is_not_reported_as_not_found(monkeypatch):
+    """Every failure used to come back as 404 "no such cluster"."""
+    from starlette.testclient import TestClient
+    from dashboard import server
+
+    def bug(name):
+        raise TypeError("unexpected argument")
+    monkeypatch.setattr(server.core, "load_cluster", bug)
+    client = TestClient(server.app, raise_server_exceptions=False)
+
+    assert client.get("/api/clusters/nope/candidates").status_code == 500

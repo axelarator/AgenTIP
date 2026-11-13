@@ -147,7 +147,7 @@ def verify(source: Path, dest: Path) -> int:
     if n_src != n_dst:
         problems.append("observations row count")
 
-    print(f"\nper-column non-null counts (through observations_wide):")
+    print("\nper-column non-null counts (through observations_wide):")
     for col in checked:
         a = src.execute(f'SELECT count("{col}") FROM observations').fetchone()[0]
         try:

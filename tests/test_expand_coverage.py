@@ -163,3 +163,26 @@ def test_a_pdns_neighbour_is_scored_on_its_dated_link(cluster, monkeypatch):
     score = membership.score("kit", "old-tenant.example", members=["known.example"])
     [pair] = [e for e in score["evidence"] if e["type"] == "net.historical_ip"]
     assert pair["gap_days"] > 900 and score["band"] == "noise"
+
+
+def test_an_unreadable_cluster_is_named_when_ownership_is_worked_out(caplog):
+    """Skipped silently, its indicators looked unowned and could be filed
+    as another cluster's candidates."""
+    core.create_cluster("Readable")
+    (core.DATA_DIR / "broken.json").write_text("{not json")
+
+    with caplog.at_level("WARNING"):
+        X._owned_elsewhere("someone-else")
+
+    assert "broken" in caplog.text
+
+
+def test_a_bug_while_working_out_ownership_is_not_swallowed(monkeypatch):
+    core.create_cluster("Readable")
+
+    def bug(name):
+        raise TypeError("unexpected argument")
+    monkeypatch.setattr(X.core, "load_cluster", bug)
+
+    with pytest.raises(TypeError):
+        X._owned_elsewhere("someone-else")

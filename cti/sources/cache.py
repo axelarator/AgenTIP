@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..errors import is_failure
-from ..util import atomic_write_text, read_json, write_json
+from ..util import read_json, write_json
 from ..util import data_dir
 
 DEFAULT_TTL = 3600

@@ -6,10 +6,9 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import duckdb
 import pytest
 
-from cti import core, store
+from cti import store
 from cti.store import entities
 from cti.netwatch import ingest, jobs, watchlist
 from cluster_patching import patch_clusters

@@ -31,7 +31,7 @@ import duckdb
 
 from ..sources import pivot
 from .. import store
-from ..store.changes import STALE_BASELINE_DAYS, asn_confidence
+from ..store.changes import asn_confidence
 from ..util import asn_int, to_int
 from . import hl_mcp
 

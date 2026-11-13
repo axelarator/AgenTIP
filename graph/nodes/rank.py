@@ -164,7 +164,9 @@ def _asn_index(digest: dict[str, Any], indicators: list[str]) -> dict[str, int]:
 
 
 def _asn_from_store(indicators: list[str]) -> dict[str, int]:
-    from cti.store import connect_retry
+    import duckdb
+
+    from cti.store import TrackingBusy, connect_retry
 
     placeholders = ", ".join("?" for _ in indicators)
     try:
@@ -177,7 +179,7 @@ def _asn_from_store(indicators: list[str]) -> dict[str, int]:
                         FROM observations_wide
                         WHERE indicator_value IN ({placeholders}) AND asn IS NOT NULL
                     ) WHERE rn = 1""", list(indicators)).fetchall()
-    except Exception:
+    except (TrackingBusy, duckdb.Error):
         return {}
     return {value: asn for value, asn in rows if asn is not None}
 
