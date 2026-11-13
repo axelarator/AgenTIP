@@ -7,7 +7,7 @@ hand it, but this module reaches out to third-party enrichment
 services to ask "what else is tied to this indicator". pivot_observable
 is strictly on-demand - only when a caller names a specific value.
 pivot_cluster (core.py) sweeps a whole cluster and IS run on a
-schedule: the daily cron (scripts/daily_tracking.py) calls it once per
+schedule: the daily cron (`python -m graph daily`) calls it once per
 tracked cluster so lifecycle status and open ports don't go stale
 between manual pivots. See SKILL.md's "Infrastructure pivoting" section
 for when to reach for either by hand.

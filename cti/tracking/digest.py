@@ -199,7 +199,7 @@ def _timeline_lines(timeline: dict[str, Any]) -> list[str]:
 
 def write(day: date, sections: dict[str, Any]) -> Path:
     """Render and write the digest for `day`. `sections` carries the
-    phase results assembled by daily_tracking.py: status (per-phase
+    phase results assembled by the collect stage: status (per-phase
     ok/failed), ingest, register, pivot_sweep, enrich, enrich_notes,
     plus the analytics lists (asn_pivots, attribute_changes,
     port_patterns, new_indicators_in_known_asns,
@@ -208,7 +208,7 @@ def write(day: date, sections: dict[str, Any]) -> Path:
     Deliberately excludes Zeek/OpenSearch/Arkime cross-referencing -
     that's a separate, on-demand capability
     (cti.tracking.opensearch_xref.run_daily_xref), not part of
-    this routine daily narrative (see daily_tracking.py's own docstring)."""
+    this routine daily narrative (run it with `python -m graph xref`)."""
     out_dir = digest_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
     md_path = out_dir / f"{day.isoformat()}.md"

@@ -185,9 +185,7 @@ Now the two are separate, in DuckDB:
   decays the weight. The history is append-only.
 
 `cti/membership.py` is the one door into this for core, the pipeline and
-the MCP server. `scripts/backfill_spans.py` and
-`scripts/rebuild_from_seeds.py` migrated the existing data (both dry-run
-by default).
+the MCP server.
 
 ### Change over time
 

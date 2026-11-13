@@ -213,8 +213,9 @@ indicators, and shared-hosting rows (ASN list in
 sees them.
 
 To ingest a new threat report: drop the CSV/JSON in the inbox and
-either wait for the next run or run `python -m graph collect`. One-time seeding
-from the cluster store: `daily_tracking.py --seed`.
+either wait for the next run or run `python -m graph collect`. A new
+cluster needs no seeding: each collect run registers any cluster the
+tracking store has not seen yet.
 
 ## Budget etiquette
 

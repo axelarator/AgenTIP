@@ -142,8 +142,8 @@ echo "  (default helper: python3 /opt/cti/probe_helper.py on the Linux probe VM)
 echo "Tunables (env): CTI_DUCKDB_PATH (default data/tracking/tracking.duckdb),"
 echo "  CTI_HL_BUDGET (HoneyLabs lookups/day, default 400),"
 echo "  CTI_WEBAMON_DAILY_BUDGET (default 1000), CTI_WEBAMON_RESCAN_DAYS (default 7)."
-echo "One-time seed from the cluster store:"
-echo "  .venv/bin/python scripts/daily_tracking.py --seed"
+echo "Clusters enter the daily loop on their own: each collect run registers"
+echo "  any cluster the tracking store has not seen yet."
 echo
 echo "Pipeline diagrams (regenerate after changing the graph):"
 echo "  .venv/bin/python -m graph draw"

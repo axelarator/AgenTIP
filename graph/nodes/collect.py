@@ -1,6 +1,6 @@
 """Stage A as graph nodes: deterministic, no model involved.
 
-Ported from scripts/daily_tracking.py, which ran this as a straight
+Ported from the old scripts/daily_tracking.py (removed 2026-11), which ran this as a straight
 sequence. The one structural change is `sweep`: the old loop swept eight
 clusters strictly one after another, each internally parallel across its
 own observables but never across clusters. Here the clusters fan out.

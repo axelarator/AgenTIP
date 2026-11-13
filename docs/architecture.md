@@ -26,7 +26,7 @@ dashboard/              read-only web UI (Starlette API, Svelte front end)
 probe_vm/               probe_helper.py and its installer, deployed to the probe VM
 sandbox/                the file-analysis container, built and run on the probe VM
 skills/                 agent skills; setup.sh copies them to each harness
-scripts/                migrations and backfills, run by hand
+scripts/                maintenance tools, run by hand
 ```
 
 Three machines are involved:
