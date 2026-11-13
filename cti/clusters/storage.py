@@ -177,7 +177,11 @@ def _migrate(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def load_cluster(name: str) -> dict[str, Any]:
+def load_cluster(name: str, *, registry: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Read one cluster, with its detections joined from the registry.
+
+    `registry` is for an operation that loads many clusters: read the
+    registry once and pass it, instead of each load reading it again."""
     p = _path(name)
     if not p.exists():
         raise ClusterNotFound(f"No cluster named {name!r}")
@@ -186,7 +190,7 @@ def load_cluster(name: str) -> dict[str, Any]:
     # duplicated per cluster - so what a cluster "has" is always a live
     # join against its current TTP table, computed on every load rather
     # than trusted from whatever was last written to disk.
-    data["detections"] = _detections_for_cluster(data)
+    data["detections"] = _detections_for_cluster(data, registry)
     return data
 
 
@@ -273,7 +277,7 @@ def _build_reverse_index() -> dict[str, Any]:
     observables: dict[str, list[dict[str, Any]]] = {}
     techniques: dict[str, dict[str, Any]] = {}
     for cname in list_clusters():
-        data = load_cluster(cname)
+        data = load_cluster(cname, registry=registry)
         for category in OBSERVABLE_CATEGORIES:
             for o in data["observables"].get(category, []):
                 match = {
@@ -339,7 +343,8 @@ def _detection_scope(det: dict[str, Any]) -> str:
     return det.get("scope", "technique")
 
 
-def _detections_for_cluster(data: dict[str, Any]) -> list[dict[str, Any]]:
+def _detections_for_cluster(data: dict[str, Any],
+                            registry: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Detections relevant to this cluster. A technique-scoped detection
     (generic behavior - one Kerberoasting rule catches every adversary
     that Kerberoasts) joins onto any cluster whose TTP table shares one
@@ -350,7 +355,8 @@ def _detections_for_cluster(data: dict[str, Any]) -> list[dict[str, Any]]:
     doesn't provide. Either kind appears on a cluster it explicitly
     names (e.g. filed before the TTP that justifies it was added). Each
     result is annotated with which of this cluster's TTPs it covers."""
-    registry = _load_detection_registry()
+    if registry is None:
+        registry = _load_detection_registry()
     ttp_ids = {t["id"].upper() for t in data["ttps"]}
     name = data["name"]
     result = []

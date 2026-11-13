@@ -341,3 +341,110 @@ def test_an_empty_data_dir_setting_means_the_default_not_the_current_directory()
         capture_output=True, text=True, cwd=str(REPO),
         env={"PATH": "/usr/bin:/bin", "CTI_DATA_DIR": ""})
     assert done.stdout.strip().endswith("data/clusters"), done.stdout + done.stderr
+
+
+# S13 ------------------------------------------------------------------------ #
+
+_QUERY_CALLS = {
+    "run_readonly_query": lambda q: q.run_readonly_query("SELECT 1"),
+    "save_correlation": lambda q: q.save_correlation(
+        "A", sorted(q.CORRELATION_TYPES)[0], ["203.0.113.5"], "n"),
+    "actor_summary": lambda q: q.actor_summary("A"),
+    "tracked_observables": lambda q: q.tracked_observables(),
+    "finding_days": lambda q: q.finding_days(),
+    "findings_for": lambda q: q.findings_for("2026-11-13"),
+    "indicator_index": lambda q: q.indicator_index(),
+    "selector_types_for": lambda q: q.selector_types_for("x"),
+    "selector_detail": lambda q: q.selector_detail("tls.jarm", "x"),
+    "indicator_profile": lambda q: q.indicator_profile("203.0.113.5"),
+    "observable_history": lambda q: q.observable_history("203.0.113.5"),
+    "opendir_samples": lambda q: q.opendir_samples("203.0.113.5"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_QUERY_CALLS))
+@pytest.mark.parametrize("failure, word", [("busy", "busy"), ("io", "unavailable")])
+def test_every_store_query_reports_a_locked_or_missing_database_the_same_way(
+        monkeypatch, name, failure, word):
+    import importlib
+
+    import duckdb
+    query = importlib.import_module("cti.store.query")
+    with store.connect():
+        pass
+
+    def broken(*a, **k):
+        if failure == "busy":
+            raise store.TrackingBusy("locked by pid 1")
+        raise duckdb.IOException("cannot open file")
+    monkeypatch.setattr(query, "connect_retry", broken)
+
+    out = _QUERY_CALLS[name](query)
+
+    assert word in out["error"]
+
+
+def test_the_error_mapping_is_written_once():
+    code = (REPO / "cti/store/query.py").read_text()
+    assert code.count("tracking DB busy") == 1
+    assert code.count("except TrackingBusy") == 1
+
+
+# C10 ------------------------------------------------------------------------ #
+
+def _counting(monkeypatch, name):
+    from cluster_patching import patch_clusters
+    from cti.clusters import storage
+    calls = []
+    real = getattr(storage, name)
+    patch_clusters(monkeypatch, name, lambda *a, **k: calls.append(a) or real(*a, **k))
+    return calls
+
+
+@pytest.fixture
+def three_clusters():
+    for name in ("Det A", "Det B", "Det C"):
+        core.create_cluster(name)
+        core.update_ttp(name, "T1059", "Command and Scripting Interpreter", 1)
+    return ["Det A", "Det B", "Det C"]
+
+
+def test_add_detection_reads_each_cluster_and_the_registry_once(three_clusters, monkeypatch):
+    """It loaded every cluster twice, and every load re-read the registry."""
+    loads = _counting(monkeypatch, "load_cluster")
+    registry_reads = _counting(monkeypatch, "_load_detection_registry")
+
+    out = core.add_detection("DET-1", "PowerShell ancestry", ["T1059"], "draft", "Det A",
+                             scope="technique")
+
+    assert len(loads) <= len(three_clusters) + 1          # was 2 x clusters + 2
+    assert len(registry_reads) == 1
+    # and it still does its job: joined onto all three, saved on each
+    assert [d["id"] for d in out["detections"]] == ["DET-1"]
+    for name in three_clusters:
+        assert [d["id"] for d in core.load_cluster(name)["detections"]] == ["DET-1"]
+        assert "DET-1" in (core.DATA_DIR / f"{name.lower().replace(' ', '-')}.md").read_text()
+
+
+def test_narrowing_a_detection_still_refreshes_the_clusters_it_left(three_clusters):
+    core.add_detection("DET-2", "generic", ["T1059"], "draft")              # technique scope
+    core.add_detection("DET-2", "generic", ["T1059"], "draft", "Det A", scope="cluster")
+    assert [d["id"] for d in core.load_cluster("Det A")["detections"]] == ["DET-2"]
+    for name in ("Det B", "Det C"):
+        assert core.load_cluster(name)["detections"] == []
+        assert "DET-2" not in (core.DATA_DIR / f"{name.lower().replace(' ', '-')}.md").read_text()
+
+
+def test_the_reverse_index_reads_the_registry_once(three_clusters, monkeypatch):
+    core.add_detection("DET-3", "generic", ["T1059"], "draft")
+    registry_reads = _counting(monkeypatch, "_load_detection_registry")
+    usage = core.get_technique_usage("T1059")
+    assert len(usage["used_by"]) == 3 and len(registry_reads) <= 1
+
+
+def test_the_ipv4_check_agrees_with_the_one_classifier():
+    from cti.clusters import enrich
+    from cti.store import entities
+    for value in ("203.0.113.5", " 203.0.113.5 ", "2001:db8::1", "evil.example",
+                  "203.0.113.5:80", "999.1.1.1", ""):
+        assert enrich._is_ipv4(value) == (entities.entity_type(value) == "ipv4"), value

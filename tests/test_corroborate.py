@@ -460,3 +460,25 @@ def test_the_link_search_does_not_hold_the_write_connection(monkeypatch):
 
     assert _run()["promoted_total"] == 1
     assert held and set(held) == {0}
+
+
+def test_the_same_question_gets_the_same_answer_in_the_same_order():
+    """The evidence lists came back in whatever order the database produced
+    them, so two identical calls could differ."""
+    for i, host in enumerate(("b.example", "c.example", "d.example", "e.example")):
+        _seed([(host, "http.server", "nginx", "Actor"),
+               (host, "http.title", f"Login {i % 2}", "Actor"),
+               (host, "tls.cert_sha256", "c" * 64, "Actor"),
+               (host, "net.port_set", "80,443", "Actor")])
+    _seed([("a.example", "http.server", "nginx", "Actor"),
+           ("a.example", "http.title", "Login 0", "Actor"),
+           ("a.example", "tls.cert_sha256", "c" * 64, "Actor"),
+           ("a.example", "net.port_set", "80,443", "Actor")])
+    from cti.store import expand
+    with tracking_store.connect(read_only=True) as con:
+        first = [c.to_dict() for c in expand.candidates_for(con, "a.example")]
+    for link in first:
+        for key in ("identity", "structural", "corroborating"):
+            assert link[key] == sorted(link[key])
+    keys = [(not c["promoted"], -(c["score"] or 0.0), c["indicator"]) for c in first]
+    assert keys == sorted(keys)

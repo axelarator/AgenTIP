@@ -184,13 +184,15 @@ def candidates_for(con: duckdb.DuckDBPyConnection, indicator: str
                       f"{', '.join(sorted(structural))}")
         else:
             reason = _why_held(result, identity, structural)
+        # Sorted: the pairs arrive in whatever order the database returns
+        # them, and the same question asked twice should give the same answer.
         out.append(Candidate(
             indicator=other, actor=actor, promoted=promoted, reason=reason,
-            identity=slots["identity"], structural=slots["structural"],
-            corroborating=slots["corroborating"],
+            identity=sorted(slots["identity"]), structural=sorted(slots["structural"]),
+            corroborating=sorted(slots["corroborating"]),
             score=result.score, band=result.band))
 
-    out.sort(key=lambda c: (not c.promoted, -(c.score or 0.0)))
+    out.sort(key=lambda c: (not c.promoted, -(c.score or 0.0), c.indicator))
     return out
 
 

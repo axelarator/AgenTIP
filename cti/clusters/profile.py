@@ -8,7 +8,8 @@ from typing import Any
 from .. import attack
 from ..util import now_iso
 from .storage import (
-    DETECTION_SCOPES, _detection_scope, _load_detection_registry, _reverse_index,
+    DETECTION_SCOPES, _detection_scope, _detections_for_cluster,
+    _load_detection_registry, _reverse_index, _slug,
     _save_detection_registry, _synchronized, list_clusters, load_cluster,
     save_cluster,
 )
@@ -151,10 +152,9 @@ def add_detection(detection_id: str, description: str, technique_ids: list[str],
         raise ValueError("add_detection requires at least one technique_id")
     if scope is not None and scope not in DETECTION_SCOPES:
         raise ValueError(f"scope must be one of {DETECTION_SCOPES}, got {scope!r}")
-    if cluster_name is not None:
-        load_cluster(cluster_name)  # raises ClusterNotFound if it doesn't exist
-
     registry = _load_detection_registry()
+    if cluster_name is not None:
+        load_cluster(cluster_name, registry=registry)  # raises ClusterNotFound if it doesn't exist
     now = now_iso()
     existing = next((d for d in registry["detections"] if d["id"] == detection_id), None)
     new_scope = scope or (_detection_scope(existing) if existing
@@ -167,9 +167,12 @@ def add_detection(detection_id: str, description: str, technique_ids: list[str],
 
     # Clusters it was joined onto before this update, so any it drops off
     # (e.g. narrowed to cluster scope) get their views refreshed too.
-    before = {c for c in list_clusters()
-              if existing and any(d["id"] == detection_id
-                                  for d in load_cluster(c)["detections"])}
+    # Every cluster is read once, here, and reused below: this runs under
+    # the cluster lock, so nothing else can change them in between. It used
+    # to load each one twice, and each load re-read the registry.
+    clusters = {c: load_cluster(c, registry=registry) for c in list_clusters()}
+    before = {c for c, data in clusters.items()
+              if existing and any(d["id"] == detection_id for d in data["detections"])}
 
     if existing:
         existing.update(description=description, status=status, scope=new_scope,
@@ -187,14 +190,14 @@ def add_detection(detection_id: str, description: str, technique_ids: list[str],
     # is a snapshot from the last time that cluster was saved - refresh
     # every cluster this detection now joins onto or just left, not only
     # cluster_name, so no cluster's .md view is left stale.
-    for cname in list_clusters():
-        data = load_cluster(cname)
+    for cname, data in clusters.items():
+        data["detections"] = _detections_for_cluster(data, registry)
         joined = any(d["id"] == detection_id for d in data["detections"])
         if joined or cname in before:
             save_cluster(data)
 
     if cluster_name:
-        return load_cluster(cluster_name)
+        return clusters[_slug(cluster_name)]
     return next(d for d in registry["detections"] if d["id"] == detection_id)
 
 

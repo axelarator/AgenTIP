@@ -22,6 +22,7 @@ from ..probe import vm_proxy
 from ..sources import cache
 from ..sources import passive
 from ..sources import pivot
+from ..store import entities
 from ..sources import webamon
 from ..store import cdn as cdn_ranges
 from ..store import hosting
@@ -77,10 +78,7 @@ def _is_ipv4(value: str) -> bool:
     """True only for a parseable IPv4 literal. Used to strip IPv6 out of
     pivot results before filing - functional rule: ignore IPv6 for
     pivoting and probing, since the probe VM has no IPv6 route."""
-    try:
-        return ipaddress.ip_address(value).version == 4
-    except ValueError:
-        return False
+    return entities.entity_type(str(value)) == "ipv4"
 
 
 def _is_probe_worthy(category: str, value: str) -> tuple[bool, str]:

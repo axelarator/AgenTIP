@@ -9,6 +9,7 @@ provider swap, so they contributed nothing but confusion.
 """
 from __future__ import annotations
 
+import functools
 import json
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -25,6 +26,25 @@ QUERY_MAX_ROWS = 200
 QUERY_MAX_BYTES = 20_000
 
 
+def _reports_store_errors(fn):
+    """Reply with {"error": ...} when the tracking database is locked or
+    cannot be opened, instead of raising.
+
+    Every function here that opens the database is read by the MCP server or
+    the dashboard, which show the text. The same two `except` clauses were
+    written out under twelve of them.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any):
+        try:
+            return fn(*args, **kwargs)
+        except TrackingBusy:
+            return {"error": "tracking DB busy (daily job likely running); retry shortly"}
+        except duckdb.IOException as e:
+            return {"error": f"tracking DB unavailable: {e}"}
+    return wrapper
+
+
 def _cell(value: Any) -> Any:
     if isinstance(value, (datetime, date)):
         return value.isoformat()
@@ -33,6 +53,7 @@ def _cell(value: Any) -> Any:
     return value
 
 
+@_reports_store_errors
 def run_readonly_query(sql: str, max_rows: int = QUERY_MAX_ROWS) -> dict[str, Any]:
     """Run an arbitrary SELECT against the tracking DB, read-only.
 
@@ -54,12 +75,10 @@ def run_readonly_query(sql: str, max_rows: int = QUERY_MAX_ROWS) -> dict[str, An
             cur = con.execute(sql)
             columns = [d[0] for d in cur.description]
             raw = cur.fetchmany(max_rows + 1)
-    except TrackingBusy:
-        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
-    except duckdb.IOException as e:
-        return {"error": f"tracking DB unavailable: {e}"}
+    except duckdb.IOException:
+        raise                       # the database itself; reported by the decorator
     except duckdb.Error as e:
-        return {"error": str(e)}
+        return {"error": str(e)}    # the query: a syntax error, a refused statement
     truncated = len(raw) > max_rows
     rows = [[_cell(v) for v in row] for row in raw[:max_rows]]
     kept, size = [], 2
@@ -77,6 +96,7 @@ def run_readonly_query(sql: str, max_rows: int = QUERY_MAX_ROWS) -> dict[str, An
     return result
 
 
+@_reports_store_errors
 def save_correlation(actor: str, correlation_type: str, indicators: list[str],
                      narrative: str, confidence: str = "medium",
                      suggested_opensearch_query: str | None = None) -> dict[str, Any]:
@@ -90,62 +110,55 @@ def save_correlation(actor: str, correlation_type: str, indicators: list[str],
     if not indicators or not narrative.strip():
         return {"error": "indicators and narrative are both required"}
     now = utcnow_naive()
-    try:
-        with connect_retry(read_only=False) as con:
-            insert_correlation(con, actor=actor, correlation_type=correlation_type,
-                               indicators=indicators, narrative=narrative,
-                               confidence=confidence,
-                               suggested_opensearch_query=suggested_opensearch_query)
-            con.execute(
-                """UPDATE actors SET last_observed =
-                       greatest(coalesce(last_observed, ?), ?)
-                   WHERE actor_name = ?""", [now, now, actor])
-    except TrackingBusy:
-        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
+    with connect_retry(read_only=False) as con:
+        insert_correlation(con, actor=actor, correlation_type=correlation_type,
+                           indicators=indicators, narrative=narrative,
+                           confidence=confidence,
+                           suggested_opensearch_query=suggested_opensearch_query)
+        con.execute(
+            """UPDATE actors SET last_observed =
+                   greatest(coalesce(last_observed, ?), ?)
+               WHERE actor_name = ?""", [now, now, actor])
     return {"saved": True, "actor": actor, "correlation_type": correlation_type,
             "indicator_count": len(indicators)}
 
 
+@_reports_store_errors
 def actor_summary(actor: str) -> dict[str, Any]:
     """Canned aggregate for one actor - cheaper in agent tokens than
     composing the equivalent four queries through query_duckdb."""
-    try:
-        with connect_retry(read_only=True) as con:
-            row = con.execute(
-                """SELECT first_observed, last_observed, known_asns,
-                          known_ports, cluster_slug, notes, tracked
-                   FROM actors WHERE actor_name = ?""", [actor]).fetchone()
-            if row is None:
-                known = [r[0] for r in con.execute(
-                    "SELECT actor_name FROM actors ORDER BY actor_name").fetchall()]
-                return {"error": f"unknown actor {actor!r}", "known_actors": known}
-            obs = con.execute(
-                """SELECT count(*), count(DISTINCT indicator_value),
-                          min(observed_at), max(observed_at)
-                   FROM observations_wide WHERE actor = ?""", [actor]).fetchone()
-            top_ports = con.execute(
-                """SELECT port, count(*) AS n FROM (
-                       SELECT unnest(cast(hl_ports AS INTEGER[])) AS port
-                       FROM observations_wide
-                       WHERE actor = ? AND hl_ports IS NOT NULL)
-                   GROUP BY port ORDER BY n DESC, port LIMIT 10""",
-                [actor]).fetchall()
-            changes = con.execute(
-                """SELECT detected_at, indicator_value, old_asn, new_asn,
-                          change_type, confidence
-                   FROM asn_changes WHERE actor = ?
-                   ORDER BY detected_at DESC LIMIT 10""", [actor]).fetchall()
-            zeek = con.execute(
-                """SELECT day, indicator_value, direction, hit_count
-                   FROM zeek_matches WHERE actor = ?
-                   ORDER BY day DESC LIMIT 10""", [actor]).fetchall()
-            corr = con.execute(
-                "SELECT count(*) FROM correlations WHERE actor = ?",
-                [actor]).fetchone()
-    except TrackingBusy:
-        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
-    except duckdb.IOException as e:
-        return {"error": f"tracking DB unavailable: {e}"}
+    with connect_retry(read_only=True) as con:
+        row = con.execute(
+            """SELECT first_observed, last_observed, known_asns,
+                      known_ports, cluster_slug, notes, tracked
+               FROM actors WHERE actor_name = ?""", [actor]).fetchone()
+        if row is None:
+            known = [r[0] for r in con.execute(
+                "SELECT actor_name FROM actors ORDER BY actor_name").fetchall()]
+            return {"error": f"unknown actor {actor!r}", "known_actors": known}
+        obs = con.execute(
+            """SELECT count(*), count(DISTINCT indicator_value),
+                      min(observed_at), max(observed_at)
+               FROM observations_wide WHERE actor = ?""", [actor]).fetchone()
+        top_ports = con.execute(
+            """SELECT port, count(*) AS n FROM (
+                   SELECT unnest(cast(hl_ports AS INTEGER[])) AS port
+                   FROM observations_wide
+                   WHERE actor = ? AND hl_ports IS NOT NULL)
+               GROUP BY port ORDER BY n DESC, port LIMIT 10""",
+            [actor]).fetchall()
+        changes = con.execute(
+            """SELECT detected_at, indicator_value, old_asn, new_asn,
+                      change_type, confidence
+               FROM asn_changes WHERE actor = ?
+               ORDER BY detected_at DESC LIMIT 10""", [actor]).fetchall()
+        zeek = con.execute(
+            """SELECT day, indicator_value, direction, hit_count
+               FROM zeek_matches WHERE actor = ?
+               ORDER BY day DESC LIMIT 10""", [actor]).fetchall()
+        corr = con.execute(
+            "SELECT count(*) FROM correlations WHERE actor = ?",
+            [actor]).fetchone()
     return {
         "actor": actor,
         "tracked": row[6],
@@ -406,6 +419,7 @@ def indicator_status(now: datetime, indicator_type: str | None,
     return _tracking_status(now, row)
 
 
+@_reports_store_errors
 def tracked_observables() -> dict[str, Any]:
     """Dashboard-facing snapshot: every indicator in scope for tracking
     (mirrors enrich.build_worklist's own definition - any observation
@@ -416,13 +430,8 @@ def tracked_observables() -> dict[str, Any]:
     context) and the status labels are dashboard presentation, not a
     generic query result."""
     now = utcnow_naive()
-    try:
-        with connect_retry(read_only=True) as con:
-            rows = _rows(con, _TRACKED_OBSERVABLES_SQL)
-    except TrackingBusy:
-        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
-    except duckdb.IOException as e:
-        return {"error": f"tracking DB unavailable: {e}"}
+    with connect_retry(read_only=True) as con:
+        rows = _rows(con, _TRACKED_OBSERVABLES_SQL)
     for r in rows:
         # Status first, while timestamps are still real datetime/date
         # objects fresh off the connection - _cell() below turns them
@@ -504,23 +513,20 @@ def _selector_detail(con, indicator: str) -> list[dict[str, Any]]:
     return out
 
 
+@_reports_store_errors
 def finding_days() -> dict[str, Any]:
     """Days that have findings, newest first."""
-    try:
-        with connect_retry(read_only=True) as con:
-            found = _rows(con,
-                """SELECT day, count(*) AS findings,
-                          count(*) FILTER (WHERE correlation_type IS NOT NULL) AS saved
-                   FROM findings GROUP BY day ORDER BY day DESC""")
-    except TrackingBusy:
-        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
-    except duckdb.IOException as e:
-        return {"error": f"tracking DB unavailable: {e}"}
+    with connect_retry(read_only=True) as con:
+        found = _rows(con,
+            """SELECT day, count(*) AS findings,
+                      count(*) FILTER (WHERE correlation_type IS NOT NULL) AS saved
+               FROM findings GROUP BY day ORDER BY day DESC""")
     for row in found:
         row["day"] = _cell(row["day"])
     return {"days": found, "count": len(found)}
 
 
+@_reports_store_errors
 def findings_for(day: str) -> dict[str, Any]:
     """One day's findings, with every indicator at full length.
 
@@ -528,17 +534,12 @@ def findings_for(day: str) -> dict[str, Any]:
     prose: `indicators` has always carried complete values, and rendering
     them as chips does not depend on the narrative saying so.
     """
-    try:
-        with connect_retry(read_only=True) as con:
-            found = _rows(con,
-                """SELECT id, day, family, actor, headline, detail, indicators,
-                          correlation_type, confidence, created_at
-                   FROM findings WHERE day = ?
-                   ORDER BY correlation_type IS NULL, family, headline""", [day])
-    except TrackingBusy:
-        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
-    except duckdb.IOException as e:
-        return {"error": f"tracking DB unavailable: {e}"}
+    with connect_retry(read_only=True) as con:
+        found = _rows(con,
+            """SELECT id, day, family, actor, headline, detail, indicators,
+                      correlation_type, confidence, created_at
+               FROM findings WHERE day = ?
+               ORDER BY correlation_type IS NULL, family, headline""", [day])
     for row in found:
         row["day"] = _cell(row["day"])
         row["created_at"] = _cell(row["created_at"])
@@ -547,6 +548,7 @@ def findings_for(day: str) -> dict[str, Any]:
     return {"day": day, "findings": found, "count": len(found)}
 
 
+@_reports_store_errors
 def indicator_index() -> dict[str, Any]:
     """One row per indicator that has ever been observed.
 
@@ -555,41 +557,36 @@ def indicator_index() -> dict[str, Any]:
     observations and a full selector bag while that flag is off, and it
     should still be findable.
     """
-    try:
-        with connect_retry(read_only=True) as con:
-            found = _rows(con, """
-                WITH obs AS (
-                    SELECT indicator_value,
-                           max(indicator_type) AS indicator_type,
-                           min(observed_at)    AS first_seen,
-                           max(observed_at)    AS last_seen,
-                           count(*)            AS observations,
-                           count(DISTINCT source) AS sources
-                    FROM observations_wide GROUP BY indicator_value
-                ),
-                sel AS (
-                    SELECT indicator_value, count(*) AS selectors
-                    FROM selectors GROUP BY indicator_value
-                ),
-                act AS (
-                    SELECT indicator_value, actor FROM (
-                        SELECT indicator_value, actor,
-                               row_number() OVER (PARTITION BY indicator_value
-                                                  ORDER BY observed_at DESC) AS rn
-                        FROM observations_wide WHERE actor IS NOT NULL
-                    ) WHERE rn = 1
-                )
-                SELECT o.indicator_value, o.indicator_type, a.actor,
-                       o.first_seen, o.last_seen, o.observations, o.sources,
-                       coalesce(s.selectors, 0) AS selectors
-                FROM obs o
-                LEFT JOIN sel s ON s.indicator_value = o.indicator_value
-                LEFT JOIN act a ON a.indicator_value = o.indicator_value
-                ORDER BY o.last_seen DESC, o.indicator_value""")
-    except TrackingBusy:
-        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
-    except duckdb.IOException as e:
-        return {"error": f"tracking DB unavailable: {e}"}
+    with connect_retry(read_only=True) as con:
+        found = _rows(con, """
+            WITH obs AS (
+                SELECT indicator_value,
+                       max(indicator_type) AS indicator_type,
+                       min(observed_at)    AS first_seen,
+                       max(observed_at)    AS last_seen,
+                       count(*)            AS observations,
+                       count(DISTINCT source) AS sources
+                FROM observations_wide GROUP BY indicator_value
+            ),
+            sel AS (
+                SELECT indicator_value, count(*) AS selectors
+                FROM selectors GROUP BY indicator_value
+            ),
+            act AS (
+                SELECT indicator_value, actor FROM (
+                    SELECT indicator_value, actor,
+                           row_number() OVER (PARTITION BY indicator_value
+                                              ORDER BY observed_at DESC) AS rn
+                    FROM observations_wide WHERE actor IS NOT NULL
+                ) WHERE rn = 1
+            )
+            SELECT o.indicator_value, o.indicator_type, a.actor,
+                   o.first_seen, o.last_seen, o.observations, o.sources,
+                   coalesce(s.selectors, 0) AS selectors
+            FROM obs o
+            LEFT JOIN sel s ON s.indicator_value = o.indicator_value
+            LEFT JOIN act a ON a.indicator_value = o.indicator_value
+            ORDER BY o.last_seen DESC, o.indicator_value""")
 
     # Status is not computed here. It needs the per-indicator evidence
     # tracked_observables and indicator_profile gather, and recomputing it
@@ -601,6 +598,7 @@ def indicator_index() -> dict[str, Any]:
     return {"indicators": found, "count": len(found)}
 
 
+@_reports_store_errors
 def selector_types_for(value: Any) -> dict[str, Any]:
     """Which selector types carry this value.
 
@@ -612,26 +610,22 @@ def selector_types_for(value: Any) -> dict[str, Any]:
     an SPKI digest both went to a body-hash page that found nothing, making
     real links look like dead ends.
     """
-    try:
-        with connect_retry(read_only=True) as con:
-            found = _rows(con,
-                """SELECT selector_type,
-                          count(DISTINCT indicator_value) AS indicators,
-                          min(first_seen) AS first_seen,
-                          max(last_seen)  AS last_seen
-                   FROM selectors WHERE selector_value = ?
-                   GROUP BY selector_type
-                   ORDER BY indicators DESC, selector_type""", [str(value)])
-    except TrackingBusy:
-        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
-    except duckdb.IOException as e:
-        return {"error": f"tracking DB unavailable: {e}"}
+    with connect_retry(read_only=True) as con:
+        found = _rows(con,
+            """SELECT selector_type,
+                      count(DISTINCT indicator_value) AS indicators,
+                      min(first_seen) AS first_seen,
+                      max(last_seen)  AS last_seen
+               FROM selectors WHERE selector_value = ?
+               GROUP BY selector_type
+               ORDER BY indicators DESC, selector_type""", [str(value)])
     for row in found:
         row["first_seen"] = _cell(row["first_seen"])
         row["last_seen"] = _cell(row["last_seen"])
     return {"value": str(value), "types": found}
 
 
+@_reports_store_errors
 def selector_detail(selector_type: str | None, selector_value: Any) -> dict[str, Any]:
     """Who else carries this selector value, and what that is worth.
 
@@ -655,15 +649,10 @@ def selector_detail(selector_type: str | None, selector_value: Any) -> dict[str,
         other_types = []
 
     spec = S.TYPES.get(selector_type)
-    try:
-        with connect_retry(read_only=True) as con:
-            verdict = rarity.assess(con, selector_type, selector_value)
-            carriers = S.sharing(con, selector_type, selector_value)
-            apexes = rarity.apexes_for(con, selector_type, selector_value)
-    except TrackingBusy:
-        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
-    except duckdb.IOException as e:
-        return {"error": f"tracking DB unavailable: {e}"}
+    with connect_retry(read_only=True) as con:
+        verdict = rarity.assess(con, selector_type, selector_value)
+        carriers = S.sharing(con, selector_type, selector_value)
+        apexes = rarity.apexes_for(con, selector_type, selector_value)
 
     return {
         "selector_type": selector_type,
@@ -686,6 +675,53 @@ def selector_detail(selector_type: str | None, selector_value: Any) -> dict[str,
     }
 
 
+def _status_from_history(observations: list[dict[str, Any]],
+                         asn_changes: list[dict[str, Any]],
+                         zeek_matches: list[dict[str, Any]],
+                         domain_change_at: Any, *,
+                         hl_events, hl_last_seen) -> tuple[str | None, str]:
+    """(indicator_type, status) for one indicator, from its rows oldest
+    first with payloads already decoded.
+
+    The one place the two detail views work this out. It was written out in
+    both, eighty lines apart, and tests/test_tracking.py pins that the
+    answer equals the one tracked_observables() gives for the same
+    indicator - so all three must feed indicator_status the same facts.
+
+    `hl_events` and `hl_last_seen` read those two fields off the latest
+    HoneyLabs row, since one caller has them as columns and the other in
+    the payload.
+    """
+    indicator_type = next((o["indicator_type"] for o in reversed(observations)
+                           if o.get("indicator_type")), None)
+    latest_hl = next((o for o in reversed(observations)
+                      if o["source"] == "honeylabs"), None)
+    # 'first_seen' rows fire on an indicator's first enrichment, not on a
+    # move, and must not make a fresh address read as "moved".
+    latest_change = next((c for c in reversed(asn_changes)
+                          if c["change_type"] != "first_seen"), None)
+    latest_zeek = zeek_matches[-1] if zeek_matches else None
+    latest_resolve = next(
+        (o for o in reversed(observations)
+         if o["source"] in ("dns_resolve", "observe_dns")
+         and (o.get("payload") or {}).get("resolved_ip") is not None), None)
+    status = indicator_status(utcnow_naive(), indicator_type, {
+        "hl_observed_at": latest_hl["observed_at"] if latest_hl else None,
+        "hl_events": hl_events(latest_hl) if latest_hl else None,
+        "hl_last_seen": hl_last_seen(latest_hl) if latest_hl else None,
+        "asn_change_at": latest_change["detected_at"] if latest_change else None,
+        "zeek_day": latest_zeek["day"] if latest_zeek else None,
+        "zeek_last_ts": latest_zeek["last_ts"] if latest_zeek else None,
+        "last_observed_at": observations[-1]["observed_at"] if observations else None,
+        "resolve_observed_at": latest_resolve["observed_at"] if latest_resolve else None,
+        "resolved_ip": ((latest_resolve.get("payload") or {}).get("resolved_ip")
+                        if latest_resolve else None),
+        "domain_change_at": domain_change_at,
+    })
+    return indicator_type, status
+
+
+@_reports_store_errors
 def indicator_profile(value: str) -> dict[str, Any]:
     """Everything known about one indicator, domain or IP.
 
@@ -701,85 +737,59 @@ def indicator_profile(value: str) -> dict[str, Any]:
     """
     from . import expand
 
-    try:
-        with connect_retry(read_only=True) as con:
-            observations = _rows(con,
-                """SELECT observed_at, source, actor, indicator_type, payload
-                   FROM observations_wide WHERE indicator_value = ?
-                   ORDER BY observed_at ASC""", [value])
-            changes = _rows(con,
-                """SELECT detected_at, attribute, change_type, old_value,
-                          new_value, confidence, actor
-                   FROM attribute_changes WHERE indicator_value = ?
-                   ORDER BY detected_at DESC""", [value])
-            asn_changes = _rows(con,
-                """SELECT detected_at, old_asn, old_netname, new_asn,
-                          new_netname, change_type, confidence
-                   FROM asn_changes WHERE indicator_value = ?
-                   ORDER BY detected_at ASC""", [value])
-            zeek_matches = _rows(con,
-                """SELECT day, direction, hit_count, ports, first_ts, last_ts
-                   FROM zeek_matches WHERE indicator_value = ?
-                   ORDER BY day ASC""", [value])
-            opendirs = _rows(con,
-                """SELECT url, path, is_dir, size, mtime, first_seen, last_seen
-                   FROM opendir_files WHERE indicator_value = ?
-                   ORDER BY last_seen DESC, path""", [value])
-            scans = _rows(con,
-                """SELECT ran_at, tools, summary FROM active_scans
-                   WHERE indicator_value = ? ORDER BY ran_at DESC""", [value])
-            # indicators is a JSON array, so this is a containment test
-            # rather than a join. Verified against the live table.
-            correlations = _rows(con,
-                """SELECT id, created_at, actor, correlation_type, indicators,
-                          confidence, narrative
-                   FROM correlations
-                   WHERE list_contains(CAST(indicators AS VARCHAR[]), ?)
-                   ORDER BY created_at DESC""", [value])
-            changed = con.execute(
-                """SELECT max(detected_at) FROM attribute_changes
-                   WHERE indicator_value = ?
-                     AND attribute IN ('resolved_ip', 'cert', 'cert_hash')
-                     AND change_type NOT IN ('first_seen', 'cert_renewed')""", [value]).fetchone()
-            domain_change_at = changed[0] if changed else None
+    with connect_retry(read_only=True) as con:
+        observations = _rows(con,
+            """SELECT observed_at, source, actor, indicator_type, payload
+               FROM observations_wide WHERE indicator_value = ?
+               ORDER BY observed_at ASC""", [value])
+        changes = _rows(con,
+            """SELECT detected_at, attribute, change_type, old_value,
+                      new_value, confidence, actor
+               FROM attribute_changes WHERE indicator_value = ?
+               ORDER BY detected_at DESC""", [value])
+        asn_changes = _rows(con,
+            """SELECT detected_at, old_asn, old_netname, new_asn,
+                      new_netname, change_type, confidence
+               FROM asn_changes WHERE indicator_value = ?
+               ORDER BY detected_at ASC""", [value])
+        zeek_matches = _rows(con,
+            """SELECT day, direction, hit_count, ports, first_ts, last_ts
+               FROM zeek_matches WHERE indicator_value = ?
+               ORDER BY day ASC""", [value])
+        opendirs = _rows(con,
+            """SELECT url, path, is_dir, size, mtime, first_seen, last_seen
+               FROM opendir_files WHERE indicator_value = ?
+               ORDER BY last_seen DESC, path""", [value])
+        scans = _rows(con,
+            """SELECT ran_at, tools, summary FROM active_scans
+               WHERE indicator_value = ? ORDER BY ran_at DESC""", [value])
+        # indicators is a JSON array, so this is a containment test
+        # rather than a join. Verified against the live table.
+        correlations = _rows(con,
+            """SELECT id, created_at, actor, correlation_type, indicators,
+                      confidence, narrative
+               FROM correlations
+               WHERE list_contains(CAST(indicators AS VARCHAR[]), ?)
+               ORDER BY created_at DESC""", [value])
+        changed = con.execute(
+            """SELECT max(detected_at) FROM attribute_changes
+               WHERE indicator_value = ?
+                 AND attribute IN ('resolved_ip', 'cert', 'cert_hash')
+                 AND change_type NOT IN ('first_seen', 'cert_renewed')""", [value]).fetchone()
+        domain_change_at = changed[0] if changed else None
 
-            selectors_here = _selector_detail(con, value)
-            links = [c.to_dict() for c in expand.candidates_for(con, value)]
-    except TrackingBusy:
-        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
-    except duckdb.IOException as e:
-        return {"error": f"tracking DB unavailable: {e}"}
+        selectors_here = _selector_detail(con, value)
+        links = [c.to_dict() for c in expand.candidates_for(con, value)]
 
     for o in observations:
         o["payload"] = json.loads(o["payload"]) if o["payload"] is not None else {}
 
-    indicator_type = next((o["indicator_type"] for o in reversed(observations)
-                           if o.get("indicator_type")), None)
-
-    now = utcnow_naive()
-    latest_hl = next((o for o in reversed(observations)
-                      if o["source"] == "honeylabs"), None)
-    latest_change = next((c for c in asn_changes[::-1]
-                          if c["change_type"] != "first_seen"), None)
-    latest_zeek = zeek_matches[-1] if zeek_matches else None
-    latest_resolve = next(
-        (o for o in reversed(observations)
-         if o["source"] in ("dns_resolve", "observe_dns")
-         and (o.get("payload") or {}).get("resolved_ip") is not None), None)
-    status = indicator_status(now, indicator_type, {
-        "hl_observed_at": latest_hl["observed_at"] if latest_hl else None,
-        "hl_events": (latest_hl["payload"].get("hl_events") if latest_hl else None),
-        "hl_last_seen": _parse_ts((latest_hl["payload"].get("hl_last_seen")
-                                   if latest_hl else None)),
-        "asn_change_at": latest_change["detected_at"] if latest_change else None,
-        "zeek_day": latest_zeek["day"] if latest_zeek else None,
-        "zeek_last_ts": latest_zeek["last_ts"] if latest_zeek else None,
-        "last_observed_at": observations[-1]["observed_at"] if observations else None,
-        "resolve_observed_at": latest_resolve["observed_at"] if latest_resolve else None,
-        "resolved_ip": ((latest_resolve.get("payload") or {}).get("resolved_ip")
-                        if latest_resolve else None),
-        "domain_change_at": domain_change_at,
-    })
+    # This query selects the payload only, so the HoneyLabs fields are read
+    # out of it; observable_history selects them as columns.
+    indicator_type, status = _status_from_history(
+        observations, asn_changes, zeek_matches, domain_change_at,
+        hl_events=lambda o: o["payload"].get("hl_events"),
+        hl_last_seen=lambda o: _parse_ts(o["payload"].get("hl_last_seen")))
 
     current = _fold_current([{**o, "observed_at": _cell(o["observed_at"])}
                              for o in observations])
@@ -842,6 +852,7 @@ def _parse_ts(value: Any) -> datetime | None:
     return None
 
 
+@_reports_store_errors
 def observable_history(ip: str) -> dict[str, Any]:
     """Full time series for one indicator - every observation, ASN
     change, and Zeek match on record, oldest first. No row cap (unlike
@@ -851,36 +862,31 @@ def observable_history(ip: str) -> dict[str, Any]:
     "never-enriched" - a tracked-but-unenriched IP is a legitimate
     state, and this doesn't require the IP to already be in the
     "tracked" scope tracked_observables() uses."""
-    try:
-        with connect_retry(read_only=True) as con:
-            observations = _rows(con,
-                """SELECT observed_at, source, source_url, actor, campaign,
-                          indicator_type, payload,
-                          hl_events, hl_events_7d, hl_first_seen, hl_last_seen,
-                          hl_ports, hl_tags, hl_threat_level,
-                          nmap_ports, threatfox_matches,
-                          asn, netname, country_code, abuse_contact, metadata
-                   FROM observations_wide WHERE indicator_value = ?
-                   ORDER BY observed_at ASC""", [ip])
-            asn_changes = _rows(con,
-                """SELECT detected_at, old_asn, old_netname, new_asn,
-                          new_netname, change_type, confidence
-                   FROM asn_changes WHERE indicator_value = ?
-                   ORDER BY detected_at ASC""", [ip])
-            zeek_matches = _rows(con,
-                """SELECT day, direction, hit_count, ports, first_ts, last_ts
-                   FROM zeek_matches WHERE indicator_value = ?
-                   ORDER BY day ASC""", [ip])
-            changed = con.execute(
-                """SELECT max(detected_at) FROM attribute_changes
-                   WHERE indicator_value = ?
-                     AND attribute IN ('resolved_ip', 'cert', 'cert_hash')
-                     AND change_type NOT IN ('first_seen', 'cert_renewed')""", [ip]).fetchone()
-            domain_change_at = changed[0] if changed else None
-    except TrackingBusy:
-        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
-    except duckdb.IOException as e:
-        return {"error": f"tracking DB unavailable: {e}"}
+    with connect_retry(read_only=True) as con:
+        observations = _rows(con,
+            """SELECT observed_at, source, source_url, actor, campaign,
+                      indicator_type, payload,
+                      hl_events, hl_events_7d, hl_first_seen, hl_last_seen,
+                      hl_ports, hl_tags, hl_threat_level,
+                      nmap_ports, threatfox_matches,
+                      asn, netname, country_code, abuse_contact, metadata
+               FROM observations_wide WHERE indicator_value = ?
+               ORDER BY observed_at ASC""", [ip])
+        asn_changes = _rows(con,
+            """SELECT detected_at, old_asn, old_netname, new_asn,
+                      new_netname, change_type, confidence
+               FROM asn_changes WHERE indicator_value = ?
+               ORDER BY detected_at ASC""", [ip])
+        zeek_matches = _rows(con,
+            """SELECT day, direction, hit_count, ports, first_ts, last_ts
+               FROM zeek_matches WHERE indicator_value = ?
+               ORDER BY day ASC""", [ip])
+        changed = con.execute(
+            """SELECT max(detected_at) FROM attribute_changes
+               WHERE indicator_value = ?
+                 AND attribute IN ('resolved_ip', 'cert', 'cert_hash')
+                 AND change_type NOT IN ('first_seen', 'cert_renewed')""", [ip]).fetchone()
+        domain_change_at = changed[0] if changed else None
 
     # The whole reason this function looked empty. The SELECT above named
     # nineteen columns, every one of them from the IP enrichment path, and
@@ -894,40 +900,13 @@ def observable_history(ip: str) -> dict[str, Any]:
     for o in observations:
         o["payload"] = json.loads(o["payload"]) if o["payload"] is not None else {}
 
-    now = utcnow_naive()
-    # Status first, from raw datetime/date objects, before the loops
-    # below stringify everything below for JSON (see the same ordering
-    # note in tracked_observables()).
-    latest_hl = next((o for o in reversed(observations) if o["source"] == "honeylabs"), None)
-    # Exclude 'first_seen' rows for the same reason tracked_observables()'s
-    # SQL does: they fire on an indicator's first-ever enrichment, not an
-    # actual pivot, and shouldn't make "moved" fire on a fresh IP.
-    latest_change = next((c for c in reversed(asn_changes) if c["change_type"] != "first_seen"), None)
-    latest_zeek = zeek_matches[-1] if zeek_matches else None
-
-    # The domain half, read off the rows already in hand rather than by
-    # querying again. tests/test_tracking.py pins that this detail status
-    # equals the one tracked_observables() computes, so the two must be fed
-    # the same facts from the same ladder.
-    indicator_type = next((o["indicator_type"] for o in reversed(observations)
-                           if o.get("indicator_type")), None)
-    latest_resolve = next(
-        (o for o in reversed(observations)
-         if o["source"] in ("dns_resolve", "observe_dns")
-         and (o.get("payload") or {}).get("resolved_ip") is not None), None)
-    status = indicator_status(now, indicator_type, {
-        "hl_observed_at": latest_hl["observed_at"] if latest_hl else None,
-        "hl_events": latest_hl["hl_events"] if latest_hl else None,
-        "hl_last_seen": latest_hl["hl_last_seen"] if latest_hl else None,
-        "asn_change_at": latest_change["detected_at"] if latest_change else None,
-        "zeek_day": latest_zeek["day"] if latest_zeek else None,
-        "zeek_last_ts": latest_zeek["last_ts"] if latest_zeek else None,
-        "last_observed_at": observations[-1]["observed_at"] if observations else None,
-        "resolve_observed_at": latest_resolve["observed_at"] if latest_resolve else None,
-        "resolved_ip": ((latest_resolve.get("payload") or {}).get("resolved_ip")
-                        if latest_resolve else None),
-        "domain_change_at": domain_change_at,
-    })
+    # Status first, from raw datetime/date objects, before the loops below
+    # stringify everything for JSON (see the same ordering note in
+    # tracked_observables()).
+    _, status = _status_from_history(
+        observations, asn_changes, zeek_matches, domain_change_at,
+        hl_events=lambda o: o["hl_events"],
+        hl_last_seen=lambda o: o["hl_last_seen"])
 
     for o in observations:
         for k in ("observed_at", "hl_first_seen", "hl_last_seen"):
@@ -946,6 +925,7 @@ def observable_history(ip: str) -> dict[str, Any]:
             "asn_changes": asn_changes, "zeek_matches": zeek_matches}
 
 
+@_reports_store_errors
 def opendir_samples(indicator: str, sha256: str | None = None) -> dict[str, Any]:
     """Sandbox verdicts recorded for one indicator's open-directory files,
     newest first, in the same {columns, rows} shape run_readonly_query
@@ -961,15 +941,10 @@ def opendir_samples(indicator: str, sha256: str | None = None) -> dict[str, Any]
         columns += ["strings_sample", "extracted"]
         where += " AND sha256 = ?"
         params.append(sha256.strip().lower())
-    try:
-        with connect_retry(read_only=True) as con:
-            raw = con.execute(
-                f"SELECT {', '.join(columns)} FROM opendir_samples "
-                f"WHERE {where} ORDER BY analyzed_at DESC, path",
-                params).fetchall()
-    except TrackingBusy:
-        return {"error": "tracking DB busy (daily job likely running); retry shortly"}
-    except duckdb.IOException as e:
-        return {"error": f"tracking DB unavailable: {e}"}
+    with connect_retry(read_only=True) as con:
+        raw = con.execute(
+            f"SELECT {', '.join(columns)} FROM opendir_samples "
+            f"WHERE {where} ORDER BY analyzed_at DESC, path",
+            params).fetchall()
     return {"columns": columns, "rows": [[_cell(v) for v in row] for row in raw],
             "truncated": False}
