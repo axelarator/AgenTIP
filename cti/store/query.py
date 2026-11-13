@@ -946,18 +946,27 @@ def observable_history(ip: str) -> dict[str, Any]:
             "asn_changes": asn_changes, "zeek_matches": zeek_matches}
 
 
-def opendir_samples(indicator: str) -> dict[str, Any]:
+def opendir_samples(indicator: str, sha256: str | None = None) -> dict[str, Any]:
     """Sandbox verdicts recorded for one indicator's open-directory files,
     newest first, in the same {columns, rows} shape run_readonly_query
-    returns."""
+    returns.
+
+    Without `sha256` this is the list: one line per file. With it, the rows
+    for that file also carry its strings sample and extracted indicators,
+    which are too large to return for every file at once."""
     columns = ["path", "url", "sha256", "size", "magic", "mime", "verdict",
                "yara_hits", "analyzed_at"]
+    where, params = "indicator_value = ?", [indicator]
+    if sha256:
+        columns += ["strings_sample", "extracted"]
+        where += " AND sha256 = ?"
+        params.append(sha256.strip().lower())
     try:
         with connect_retry(read_only=True) as con:
             raw = con.execute(
                 f"SELECT {', '.join(columns)} FROM opendir_samples "
-                "WHERE indicator_value = ? ORDER BY analyzed_at DESC, path",
-                [indicator]).fetchall()
+                f"WHERE {where} ORDER BY analyzed_at DESC, path",
+                params).fetchall()
     except TrackingBusy:
         return {"error": "tracking DB busy (daily job likely running); retry shortly"}
     except duckdb.IOException as e:

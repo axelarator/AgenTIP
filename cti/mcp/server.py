@@ -478,10 +478,15 @@ def analyze_opendir_samples(indicator: str, urls: list[str],
 
 
 @_tool
-def get_opendir_samples(indicator: str) -> dict:
+def get_opendir_samples(indicator: str, sha256: str | None = None) -> dict:
     """Sandbox verdicts already recorded for an indicator's open-directory
-    files. Read-only - it never fetches anything."""
-    return tracking.opendir_samples(indicator)
+    files. Read-only - it never fetches anything.
+
+    Without `sha256`: one line per file (name, URL, hash, type, verdict,
+    YARA hits). With `sha256`: that file's rows, including its full strings
+    sample and extracted URLs, addresses and domains.
+    """
+    return tracking.opendir_samples(indicator, sha256)
 
 
 @_tool

@@ -221,6 +221,13 @@ def upsert_opendir_samples(con: duckdb.DuckDBPyConnection, *, indicator_value: s
     `results` holds JSON verdicts only - sha256, magic/MIME, YARA hits,
     a strings sample. No sample bytes ever cross the SSH channel, so
     there is deliberately nothing here to write to disk as a file.
+
+    Each row is stored under the file's own URL (`result["url"]`) and the
+    name the server gave it. `url` is only the fallback for a result that
+    carries none. It used to be the key for the whole batch - the URL of
+    whichever file happened to be first - so files with the same name in
+    different folders overwrote each other, and the same file analysed in
+    two batches became two rows.
     """
     if not results:
         return 0
@@ -236,7 +243,8 @@ def upsert_opendir_samples(con: duckdb.DuckDBPyConnection, *, indicator_value: s
                strings_sample = excluded.strings_sample,
                extracted = excluded.extracted, verdict = excluded.verdict,
                analyzed_at = excluded.analyzed_at""",
-        [[indicator_value, url, r.get("path"), r.get("sha256"), r.get("size"),
+        [[indicator_value, r.get("url") or url, r.get("path"), r.get("sha256"),
+          r.get("size"),
           r.get("magic"), r.get("mime"), _json(r.get("yara_hits")),
           _json(r.get("strings_sample")), _json(r.get("extracted")),
           r.get("verdict"), actor, analyzed_at] for r in results])

@@ -113,7 +113,7 @@ def compact(response: dict[str, Any], *, strings: int | None = None,
         rows.append(row)
     out = {**response, "results": rows, "summary": summarize(response)}
     if rows:
-        out["full_results"] = "get_opendir_samples(indicator)"
+        out["full_results"] = "get_opendir_samples(indicator, sha256)"
     return out
 
 
