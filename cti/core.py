@@ -2233,9 +2233,14 @@ def active_scan(target: str, cluster: str | None = None,
             if isinstance(dres, dict) and not dres.get("error"):
                 found = dres.get("opendirs") or []
                 opendirs.extend(found)
-                runs.append({"url": url, "hits": len(dres.get("hits") or []),
-                             "opendirs": len(found),
-                             "baseline_404": dres.get("baseline_404")})
+                run = {"url": url, "hits": len(dres.get("hits") or []),
+                       "opendirs": len(found),
+                       "baseline_404": dres.get("baseline_404")}
+                # The crawl still ran; only the wordlist search failed. Zero
+                # hits then means "did not look", not "nothing there".
+                if dres.get("dirsearch_error"):
+                    run["path_search_error"] = dres["dirsearch_error"]
+                runs.append(run)
             else:
                 runs.append({"url": url, "error": dres.get("error")})
         if len(runs) == 1:

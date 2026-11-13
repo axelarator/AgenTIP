@@ -45,10 +45,20 @@ its absence dates the deployed helper:
 | `ports: null` when nothing scanned | "Stop reporting an unscanned host as having no open ports" |
 | `extra_ports` in an `nmap` result | "Let active_scan add specific ports to nmap's top-100 list" |
 | `fetch_and_analyze` returns `analyzed` > 0 (or an `error`) instead of a silent `analyzed: 0` | "Let the sandbox container read its staged samples" |
+| `http_fetch` of a `file://` URL returns an `error` saying only http and https are fetched | "Keep the probe's crawler and downloader on the host they were pointed at" |
+| `dirsearch_error` key in a `dirsearch` result; `open: false` records in a netwatch job | same change |
 
 The `nmap` check is its own call (`vm_proxy.nmap(target, ports=[...])`):
 a helper that predates it ignores `ports` and returns no `extra_ports`,
 and `active_scan` then puts a `warning` in its nmap summary.
+
+The `file://` check contacts nothing outside the probe VM, so it is the one
+to use after a deploy:
+
+```python
+from cti.probe import vm_proxy
+vm_proxy.http_fetch("file:///etc/hostname")["error"]   # "...only http and https..."
+```
 
 ```python
 from cti.probe import vm_proxy
@@ -64,6 +74,21 @@ SSH key by a forced command. It deliberately **cannot deploy code**:
 there is no verb that writes `probe_helper.py` or a Dockerfile. Helper
 and sandbox changes go through `setup_probe_vm.sh`, run by a human who
 has read the diff.
+
+`sandbox/tlds.txt` (the top-level domains the analyser accepts) is derived
+from the bundled public-suffix list. After refreshing that list:
+
+```bash
+awk '/===BEGIN ICANN DOMAINS===/{p=1} /===END ICANN DOMAINS===/{p=0} p && !/^\/\// && NF && !/\./ && !/^[*!]/' \
+  cti/store/data/public_suffix_list.dat | grep -v '[^a-z0-9-]' | sort -u
+```
+
+### Settings read on the probe VM
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CTI_PROBE_ALLOW_PRIVATE` | unset | `1` lets the downloader and redirects reach private and loopback addresses. Leave unset unless the target itself is in the lab. |
+| `CTI_NETWATCH_WORKERS` | `4` | Targets scanned at once within a netwatch job. |
 
 
 ---

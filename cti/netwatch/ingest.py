@@ -258,8 +258,68 @@ def _flatten(rec: dict[str, Any], passive: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _diff(con, row: dict[str, Any]) -> int:
-    """Record what moved on this (target, port) since the last scan."""
+# Profiles whose scan looks for ports itself (naabu), so two scans of the
+# same profile cover the same ground and can be compared as sets. The hot
+# profile only checks a short list and what the cluster already recorded; it
+# cannot speak for a port outside that list.
+SWEEP_PROFILES = {"full"}
+
+
+def _previous_sweep(con, records: list[dict[str, Any]]) -> tuple[str, set[int]] | None:
+    """(scan_id, open ports) of this target's last sweep of the same kind,
+    or None if this group is not a clean sweep or there was none before.
+
+    A sweep that reported an error did not look, and is not evidence either
+    way: it neither closes ports now nor serves as the baseline later (it
+    left no per-port rows, which is how it is recognised).
+    """
+    first = records[0]
+    if first.get("profile") not in SWEEP_PROFILES or any(r.get("error") for r in records):
+        return None
+    vantage = first.get("vantage") or "probe"
+    found = con.execute(
+        """SELECT scan_id FROM service_snapshots
+           WHERE target = ? AND vantage = ? AND profile = ? AND scan_id <> ?
+             AND scanned_at < ? AND port > 0
+           ORDER BY scanned_at DESC LIMIT 1""",
+        [first["target"], vantage, first["profile"], first["scan_id"],
+         _parse_ts(first.get("ts"))]).fetchone()
+    if not found:
+        return None
+    ports = {r[0] for r in con.execute(
+        "SELECT port FROM service_snapshots WHERE scan_id = ? AND target = ? "
+        "AND vantage = ? AND open AND port > 0",
+        [found[0], first["target"], vantage]).fetchall()}
+    return found[0], ports
+
+
+def _unreported_closures(records: list[dict[str, Any]],
+                         previous: tuple[str, set[int]]) -> list[dict[str, Any]]:
+    """A closed record for each port the last sweep found open and this one
+    says nothing about.
+
+    A sweep reports what answered. The probe adds `open: false` for the
+    ports on its fixed lists, but a port naabu found last time and not this
+    time appears nowhere, so the per-port diff never ran for it: 289 times
+    a host's open ports shrank between scans, and one closing was recorded.
+    """
+    scan_id, was_open = previous
+    first = records[0]
+    reported = {int(r.get("port") or 0) for r in records}
+    return [{"scan_id": first["scan_id"], "ts": first.get("ts"),
+             "vantage": first.get("vantage") or "probe",
+             "profile": first.get("profile"), "target": first["target"],
+             "ip": first.get("ip"), "port": port, "open": False,
+             "actor": first.get("actor"), "inferred_closed_from": scan_id}
+            for port in sorted(was_open - reported)]
+
+
+def _diff(con, row: dict[str, Any], *, swept_before: bool = False) -> int:
+    """Record what moved on this (target, port) since the last scan.
+
+    `swept_before` says the host has an earlier sweep of the same kind. A
+    port open now with no earlier snapshot at all is then a port that
+    opened, not one seen for the first time because nobody had looked."""
     base = store.latest_service_snapshot(
         con, row["target"], row["port"], before_scan_id=row["scan_id"],
         vantage=row["vantage"], before=row["scanned_at"])
@@ -268,6 +328,8 @@ def _diff(con, row: dict[str, Any]) -> int:
     if base is not None and bool(base.get("open")) != row["open"]:
         changes.append(("open", "port_opened" if row["open"] else "port_closed",
                         base.get("open"), row["open"]))
+    elif base is None and swept_before and row["open"] and row["port"] > 0:
+        changes.append(("open", "port_opened", None, True))
     if row["open"]:
         for field, change_type in _DIFF_FIELDS.items():
             new = row.get(field)
@@ -394,10 +456,13 @@ def ingest(*, client: Any = _UNSET, purge: bool = True) -> dict[str, Any]:
             kind = "ip" if records and records[0].get("ip") == target else "domain"
             observed_at = _parse_ts(records[0].get("ts"))
 
+            previous = _previous_sweep(con, records)
+            if previous:
+                records = records + _unreported_closures(records, previous)
             for rec in records:
                 row = _flatten(rec, passive_by_port.get(rec.get("port"), {}))
                 store.upsert_service_snapshot(con, row=row)
-                changes += _diff(con, row)
+                changes += _diff(con, row, swept_before=previous is not None)
                 snapshots += 1
 
             result = _observe_result(records, passive_by_port)

@@ -72,6 +72,7 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 HTTP_TIMEOUT = 20
 TCP_PRECHECK_TIMEOUT = 3
 HTTP_PROBE_MAX_BYTES = 512_000        # bounded body read for http_probe
+HTTP_FETCH_MAX_BYTES = 16 * 1024 * 1024   # http_fetch: API replies, not downloads
 WAYBACK_TIMEOUT = 30
 NMAP_TIMEOUT = 600
 DIRSEARCH_TIMEOUT = 600
@@ -110,6 +111,105 @@ def resolve_target_ip(target: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Where a fetch may go
+#
+# The crawler and the downloader take URLs from an adversary's own directory
+# listing, and every fetch follows redirects the far end chooses. urllib also
+# opens file:// and ftp://, so unguarded, a listing entry or a redirect could
+# point this VM at its own files or at the lab behind it and hand back what it
+# found. Every fetch in this file goes through _open, which allows only http
+# and https and checks each redirect before following it.
+# --------------------------------------------------------------------------- #
+ALLOW_PRIVATE = os.environ.get("CTI_PROBE_ALLOW_PRIVATE") == "1"
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(url: str) -> tuple[str, int] | None:
+    """(host, port) of an http(s) URL, or None for anything else."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        scheme = parts.scheme.lower()
+        if scheme not in _DEFAULT_PORTS or not parts.hostname:
+            return None
+        return parts.hostname.lower(), parts.port or _DEFAULT_PORTS[scheme]
+    except ValueError:
+        return None
+
+
+def _same_origin(url: str, origin: tuple[str, int]) -> bool:
+    """Same host and port - or the same host answering on 443 after an
+    http listing redirected to https, which is one server, not two."""
+    here = _origin(url)
+    if here is None:
+        return False
+    if here == origin:
+        return True
+    return (here[0] == origin[0] and origin[1] == 80 and here[1] == 443
+            and urllib.parse.urlsplit(url).scheme.lower() == "https")
+
+
+def _is_private_host(host: str) -> bool:
+    """True if the name is, or resolves to, an address that is not on the
+    public internet. A name that does not resolve is not private; the fetch
+    will fail on its own."""
+    try:
+        addresses = {ipaddress.ip_address(host)}
+    except ValueError:
+        try:
+            addresses = {ipaddress.ip_address(info[4][0].split("%")[0])
+                         for info in socket.getaddrinfo(host, None)}
+        except (OSError, ValueError):
+            return False
+    return any(a.is_private or a.is_loopback or a.is_link_local or a.is_reserved
+               or a.is_multicast or a.is_unspecified for a in addresses)
+
+
+def _refusal(url: str, *, origin: tuple[str, int] | None, strict: bool) -> str | None:
+    """Why `url` must not be fetched, or None if it may be.
+
+    `origin` is the host and port the caller was pointed at. With `strict`
+    (a crawl, a sample download) nothing off that origin is fetched at all.
+    Without it (a probe of a page) other public hosts are allowed, since a
+    redirect to www. or to a CDN is ordinary, but a private, loopback or
+    link-local address is refused unless it is the origin itself.
+    """
+    here = _origin(url)
+    if here is None:
+        return "only http and https URLs are fetched"
+    if origin is not None and _same_origin(url, origin):
+        return None
+    if strict and origin is not None:
+        return f"leaves {origin[0]}:{origin[1]}"
+    if not ALLOW_PRIVATE and _is_private_host(here[0]):
+        return f"{here[0]} is a private or local address"
+    return None
+
+
+class _GuardedRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, origin: tuple[str, int] | None, strict: bool):
+        self.origin, self.strict = origin, strict
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        reason = _refusal(newurl, origin=self.origin, strict=self.strict)
+        if reason:
+            raise urllib.error.URLError(f"redirect refused: {reason}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open(req: urllib.request.Request, *, timeout: float, context,
+          strict: bool = False, origin: tuple[str, int] | None = None):
+    """urlopen for http(s) only, with every redirect checked by _refusal.
+    `origin` defaults to the request's own host and port."""
+    if _origin(req.full_url) is None:
+        raise urllib.error.URLError("only http and https URLs are fetched")
+    origin = origin or _origin(req.full_url)
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=context),
+        _GuardedRedirect(origin, strict))
+    return opener.open(req, timeout=timeout)
+
+
+# --------------------------------------------------------------------------- #
 # TCP pre-check and one plain handshake (used by the netwatch worker)
 # --------------------------------------------------------------------------- #
 def tcp_precheck(resolved_ip: str, port: int) -> bool:
@@ -118,6 +218,21 @@ def tcp_precheck(resolved_ip: str, port: int) -> bool:
             return True
     except OSError:
         return False
+
+
+PRECHECK_WORKERS = 32
+
+
+def _live_ports(resolved_ip: str, ports: list[int]) -> list[int]:
+    """The ports that accept a connection, checked together. One at a time,
+    a dark host on the full profile cost a 3 s timeout per port - over a
+    minute - before the next target could start."""
+    from concurrent.futures import ThreadPoolExecutor
+    if not ports:
+        return []
+    with ThreadPoolExecutor(max_workers=min(PRECHECK_WORKERS, len(ports))) as pool:
+        answers = list(pool.map(lambda p: tcp_precheck(resolved_ip, p), ports))
+    return [p for p, up in zip(ports, answers) if up]
 
 
 def run_tls_handshake(target: str, resolved_ip: str, port: int) -> None:
@@ -158,18 +273,24 @@ def action_http_fetch(request: dict) -> dict:
     data = request.get("data")
     insecure = bool(request.get("insecure", False))
     body_bytes = data.encode("utf-8") if data is not None else None
+    if _origin(url) is None:
+        return {"status": None, "body": None, "headers": {}, "final_url": url,
+                "error": f"refused {url!r}: only http and https URLs are fetched"}
     req = urllib.request.Request(url, data=body_bytes, method=method, headers=headers)
     context = _INSECURE_CONTEXT if insecure else _HTTPS_CONTEXT
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=context) as resp:
+        with _open(req, timeout=HTTP_TIMEOUT, context=context) as resp:
+            # One byte past the cap, to tell "exactly the cap" from "more".
+            raw = resp.read(HTTP_FETCH_MAX_BYTES + 1)
             return {"status": resp.status,
-                    "body": resp.read().decode("utf-8", errors="replace"),
+                    "body": raw[:HTTP_FETCH_MAX_BYTES].decode("utf-8", errors="replace"),
+                    "truncated": len(raw) > HTTP_FETCH_MAX_BYTES,
                     "headers": {k.lower(): v for k, v in resp.headers.items()},
                     "final_url": resp.geturl(),
                     "error": None}
     except urllib.error.HTTPError as e:
         return {"status": e.code,
-                "body": e.read().decode("utf-8", errors="replace"),
+                "body": e.read(HTTP_FETCH_MAX_BYTES).decode("utf-8", errors="replace"),
                 "headers": {k.lower(): v for k, v in (e.headers or {}).items()},
                 "final_url": url,
                 "error": None}
@@ -225,11 +346,20 @@ _AUTOINDEX_MARKERS = ("Index of /", "<title>Index of", "Directory Listing For",
 
 
 def _fetch(url: str, insecure: bool = False, max_bytes: int = HTTP_PROBE_MAX_BYTES,
-           timeout: int = HTTP_TIMEOUT) -> dict:
+           timeout: int = HTTP_TIMEOUT, strict: bool = False,
+           origin: tuple[str, int] | None = None) -> dict:
+    """One bounded GET. `strict` and `origin` are _refusal's: a crawl passes
+    the listing's origin and strict=True so nothing off that host is asked."""
     context = _INSECURE_CONTEXT if insecure else _HTTPS_CONTEXT
+    reason = (_refusal(url, origin=origin, strict=True) if strict and origin
+              else None if _origin(url) else "only http and https URLs are fetched")
+    if reason:
+        return {"status": None, "final_url": url, "headers": {}, "body": "",
+                "error": f"refused {url!r}: {reason}"}
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
+        with _open(req, timeout=timeout, context=context, strict=strict,
+                   origin=origin) as resp:
             body = resp.read(max_bytes)
             return {"status": resp.status, "final_url": resp.geturl(),
                     "headers": {k.lower(): v for k, v in resp.headers.items()},
@@ -254,6 +384,7 @@ def parse_autoindex(body: str, base_url: str) -> list[dict] | None:
     if not any(m in body for m in _AUTOINDEX_MARKERS):
         return None
     files: list[dict] = []
+    origin = _origin(base_url)
     # One anchor per entry, then whatever trails it up to the row/line end -
     # covers Apache/nginx `<pre>` listings (date + size as plain text after
     # the link), table-based listings (`</td><td>` cells), and Python
@@ -272,13 +403,20 @@ def parse_autoindex(body: str, base_url: str) -> list[dict] | None:
         href, name, tail = m.group(1), html.unescape(m.group(2).strip()), m.group(3)
         if href in ("../", "..", "/") or name in ("Parent Directory", ".."):
             continue
-        if href.startswith(("?", "#", "http://", "https://", "mailto:")):
+        if href.startswith(("?", "#")):
+            continue
+        # The listing is the adversary's. An entry is kept only if it
+        # resolves to the listing's own host and port: no other scheme
+        # (file:, ftp:, mailto:, in any case), no other host, no
+        # scheme-relative //host/ link.
+        resolved = urllib.parse.urljoin(base_url, href)
+        if origin is None or _refusal(resolved, origin=origin, strict=True):
             continue
         tail = re.sub(r"<[^>]+>", " ", tail)
         dm, sm = date_re.search(tail), size_re.search(tail.strip())
         files.append({
             "name": name.rstrip("/"),
-            "href": urllib.parse.urljoin(base_url, href),
+            "href": resolved,
             "is_dir": href.endswith("/"),
             "size": (sm.group(1).strip() if sm and sm.group(1).strip() not in ("", "-") else None),
             "mtime": (dm.group(1).strip() if dm else None),
@@ -464,14 +602,17 @@ def _is_soft_404(status: int | None, size: int, baseline: dict) -> bool:
 
 
 def _crawl_opendir(url: str, baseline: dict, max_depth: int, max_files: int,
-                   seen: set[str], files_acc: list[dict], depth: int = 0) -> dict | None:
+                   seen: set[str], files_acc: list[dict], depth: int = 0,
+                   origin: tuple[str, int] | None = None) -> dict | None:
     """Breadth-first autoindex crawl from `url`, bounded by max_depth and a
     global max_files. Returns the listing dict for `url`, recursing into
-    listed subdirectories."""
+    listed subdirectories. Every request stays on the host and port the
+    crawl started from (`origin`, taken from the first URL)."""
+    origin = origin or _origin(url)
     if url in seen or len(files_acc) >= max_files or depth > max_depth:
         return None
     seen.add(url)
-    r = _fetch(url, timeout=OPENDIR_DIR_TIMEOUT)
+    r = _fetch(url, timeout=OPENDIR_DIR_TIMEOUT, strict=True, origin=origin)
     if r["error"]:
         return None
     files = parse_autoindex(r["body"], r["final_url"])
@@ -485,7 +626,7 @@ def _crawl_opendir(url: str, baseline: dict, max_depth: int, max_files: int,
         files_acc.append({"url": r["final_url"], **f})
         if f["is_dir"]:
             _crawl_opendir(f["href"], baseline, max_depth, max_files,
-                           seen, files_acc, depth + 1)
+                           seen, files_acc, depth + 1, origin)
     return listing
 
 
@@ -502,6 +643,7 @@ def action_dirsearch(request: dict) -> dict:
 
     baseline = _baseline_404(url)
     hits: list[dict] = []
+    dirsearch_error = None
     # Path discovery via dirsearch, if available. Absence is non-fatal - the
     # open-directory crawl below is the higher-value half and needs no wordlist.
     if shutil.which(DIRSEARCH_CMD[0]):
@@ -523,8 +665,10 @@ def action_dirsearch(request: dict) -> dict:
                     continue
                 hits.append({"path": item.get("path") or item.get("url"),
                              "status": status, "size": size})
-        except Exception:
-            pass
+        except Exception as e:
+            # A crash, a timeout and an unreadable report all used to look
+            # exactly like "no paths found".
+            dirsearch_error = f"{type(e).__name__}: {e}"[:400]
         finally:
             try:
                 os.unlink(report)
@@ -537,13 +681,16 @@ def action_dirsearch(request: dict) -> dict:
     opendirs: list[dict] = []
     roots = [url] + [urllib.parse.urljoin(url, h["path"]) for h in hits
                      if str(h.get("path", "")).endswith("/")]
+    origin = _origin(url)
     for root in roots:
-        listing = _crawl_opendir(root, baseline, max_depth, max_files, seen, files_acc)
+        listing = _crawl_opendir(root, baseline, max_depth, max_files, seen,
+                                 files_acc, origin=origin)
         if listing:
             opendirs.append(listing)
         if len(files_acc) >= max_files:
             break
-    return {"hits": hits, "opendirs": opendirs, "baseline_404": baseline, "error": None}
+    return {"hits": hits, "opendirs": opendirs, "baseline_404": baseline,
+            "dirsearch_error": dirsearch_error, "error": None}
 # --------------------------------------------------------------------------- #
 # fetch_and_analyze - download open-directory samples and triage them inside a
 # container, ON THIS VM. Only the JSON verdicts travel back over SSH, so no
@@ -562,13 +709,26 @@ def _safe_name(url: str, index: int) -> str:
     return f"{index:03d}_{tail or 'sample'}"
 
 
+def _original_name(url: str) -> str:
+    """The file's name as the server has it, for reporting. Never used as a
+    path: leading dots and spaces are kept, control characters are not."""
+    tail = urllib.parse.unquote(urllib.parse.urlsplit(url).path).rsplit("/", 1)[-1]
+    return "".join(c for c in tail if c.isprintable())[:255]
+
+
 def _download(url: str, dest: Path, budget: int) -> dict:
-    """One capped download. Returns {"bytes": n} or {"error": ...}."""
+    """One capped download. Returns {"bytes": n} or {"error": ...}.
+
+    The URL usually comes from a listing the adversary wrote. It must be
+    http(s) and public, and a redirect may not leave its host and port."""
     cap = min(SAMPLE_MAX_BYTES, budget)
+    reason = _refusal(url, origin=None, strict=False)
+    if reason:
+        return {"error": f"refused: {reason}"}
     try:
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=SAMPLE_FETCH_TIMEOUT,
-                                    context=_HTTPS_CONTEXT) as resp:
+        with _open(req, timeout=SAMPLE_FETCH_TIMEOUT, context=_HTTPS_CONTEXT,
+                   strict=True) as resp:
             written = 0
             with dest.open("wb") as fh:
                 while written < cap:
@@ -658,11 +818,14 @@ def action_fetch_and_analyze(request: dict) -> dict:
         shutil.rmtree(staging, ignore_errors=True)
 
     # The container only ever saw the staged names; map its records back to
-    # the URLs they came from and restore the original filenames.
+    # the URLs they came from. `path` is the name on the server, taken from
+    # the URL - the staged name had its leading dots and odd characters
+    # removed, so `.bash_history` was reported as `bash_history`.
     for record in payload.get("results", []):
         staged = record.get("path") or ""
-        record["url"] = name_to_url.get(staged)
-        record["path"] = staged.split("_", 1)[-1]
+        url = name_to_url.get(staged)
+        record["url"] = url
+        record["path"] = (_original_name(url) if url else "") or staged.split("_", 1)[-1]
 
     analyzed = payload.get("analyzed", 0)
     sandbox_errors = payload.get("errors", [])
@@ -1248,27 +1411,51 @@ def _banner_sha256(resolved_ip: str, port: int) -> str | None:
     return hashlib.sha256(chunk).hexdigest() if chunk else None
 
 
-def _nuclei_c2(target: str, ports: list[int]) -> list[str]:
+def _nuclei_port(record: dict) -> int:
+    """The port a nuclei match was on, or 0 if the record does not say."""
+    port = str(record.get("port") or "")
+    if port.isdigit():
+        return int(port)
+    for key in ("matched-at", "matched", "url", "host"):
+        value = str(record.get(key) or "")
+        if "://" in value:
+            origin = _origin(value)
+            if origin:
+                return origin[1]
+        elif ":" in value:
+            tail = value.rsplit(":", 1)[1].split("/")[0]
+            if tail.isdigit():
+                return int(tail)
+    return 0
+
+
+def _nuclei_c2(target: str, ports: list[int]) -> dict[int, list[str]]:
     """Run our own C2 templates against the target; return the template IDs
-    that matched. No network if the templates dir or nuclei is absent."""
+    that matched, by the port each matched on (0 when a record names none).
+    No network if the templates dir or nuclei is absent."""
     if not ports or not _tool_present(NUCLEI_CMD) or not os.path.isdir(C2_TEMPLATES_DIR):
-        return []
+        return {}
     urls = "\n".join(f"{target}:{p}" for p in ports)
     records = _json_records(
         NUCLEI_CMD + ["-jsonl", "-silent", "-nc", "-duc", "-t", C2_TEMPLATES_DIR,
                       "-timeout", "10"],
         stdin_text=urls, timeout=NAABU_TIMEOUT)
-    hits = []
+    hits: dict[int, set[str]] = {}
     for r in records:
         tid = r.get("template-id") or r.get("templateID")
         if tid:
-            hits.append(tid)
-    return sorted(set(hits))
+            hits.setdefault(_nuclei_port(r), set()).add(tid)
+    return {port: sorted(ids) for port, ids in hits.items()}
 
 
 def _scan_target(entry: dict, vantage: str, profile: str, scan_id: str) -> list[dict]:
-    """One target -> a service record per open port (plus a single dark row
-    when nothing answered). Shapes the record cti/netwatch ingests."""
+    """One target -> a record per port checked: a service record for each
+    that answered, and `open: false` for each that did not. Shapes the
+    record cti/netwatch ingests.
+
+    The closed records are what makes a closing visible. Only answering
+    ports used to be written, so a port that had been open and no longer
+    was left nothing behind for the diff to compare."""
     target = (entry.get("value") or entry.get("target") or "").strip()
     known_ports = entry.get("ports") or entry.get("known_ports") or []
     actor = entry.get("actor")
@@ -1282,16 +1469,21 @@ def _scan_target(entry: dict, vantage: str, profile: str, scan_id: str) -> list[
                  "error": f"resolve failed: {e}"}]
 
     ports, port_error = _netwatch_ports(target, profile, known_ports)
-    live = [p for p in ports if tcp_precheck(resolved_ip, p)]
+    live = _live_ports(resolved_ip, ports)
+    # A sweep that failed did not look, so it cannot say a port is closed.
+    closed = [] if port_error else [
+        {**base, "ip": resolved_ip, "port": p, "open": False, "transport": "tcp"}
+        for p in ports if p not in live]
     if not live:
         return [{**base, "ip": resolved_ip, "port": 0, "open": False,
-                 "error": port_error}]
+                 "error": port_error}] + closed
 
     http = _httpx_by_port(target, live)
     tls = _tlsx_by_port(target, live)
-    c2_by_port: dict[int, list[str]] = {}
-    for tid in _nuclei_c2(target, live):
-        c2_by_port.setdefault(0, []).append(tid)   # template output is not per-port
+    # A hit belongs to the port it matched on. All hits used to be attached
+    # to every open port of the host. One whose record names no port (key 0)
+    # still is, rather than being dropped.
+    c2_by_port = _nuclei_c2(target, live)
 
     records = []
     for port in live:
@@ -1301,7 +1493,8 @@ def _scan_target(entry: dict, vantage: str, profile: str, scan_id: str) -> list[
                "transport": "tcp",
                "sni": None if is_ip_literal(target) else target,
                "http": h or None, "tls": t or None,
-               "c2_hits": c2_by_port.get(0, []) or None}
+               "c2_hits": sorted(set(c2_by_port.get(port, []))
+                                  | set(c2_by_port.get(0, []))) or None}
         if not h and not t:
             rec["banner_sha256"] = _banner_sha256(resolved_ip, port)
         records.append(rec)
@@ -1313,7 +1506,7 @@ def _scan_target(entry: dict, vantage: str, profile: str, scan_id: str) -> list[
                 run_tls_handshake(target, resolved_ip, port)
             except Exception:
                 pass
-    return records
+    return records + closed
 
 
 # --- the spool: submit / status / collect, plus the worker loop ------------
@@ -1392,6 +1585,37 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+NETWATCH_WORKERS = max(1, int(os.environ.get("CTI_NETWATCH_WORKERS") or 4))
+
+
+def _run_job(job: dict, out: Path) -> None:
+    """Scan a job's targets, a few at a time, into `out`.
+
+    Targets are independent, and most of a scan is waiting on a far end, so
+    one at a time made forty targets take as long as forty timeouts. Each
+    target's records are written together, as soon as it finishes, so a
+    worker killed mid-job leaves whole targets and not half of one.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def scan(entry: dict) -> list[dict]:
+        try:
+            return _scan_target(entry, job.get("vantage", "probe"),
+                                job.get("profile", "hot"), job["job_id"])
+        except Exception as e:
+            return [{"scan_id": job["job_id"], "ts": _now_iso(),
+                     "target": entry.get("value") or entry.get("target"),
+                     "port": 0, "open": False,
+                     "error": f"scan crashed: {type(e).__name__}: {e}"}]
+
+    targets = job.get("targets", [])
+    with out.open("w") as fh, ThreadPoolExecutor(max_workers=NETWATCH_WORKERS) as pool:
+        for done in as_completed([pool.submit(scan, entry) for entry in targets]):
+            for rec in done.result():
+                fh.write(json.dumps(rec) + "\n")
+            fh.flush()
+
+
 def run_netwatch_worker(poll_interval: float = 5.0, once: bool = False) -> int:
     """Drain the jobs spool forever (systemd service on the probe VM).
 
@@ -1416,19 +1640,7 @@ def run_netwatch_worker(poll_interval: float = 5.0, once: bool = False) -> int:
             except (OSError, json.JSONDecodeError):
                 running.rename(dirs["done"] / running.name)
                 continue
-            out = dirs["results"] / f"{job['job_id']}.jsonl"
-            with out.open("w") as fh:
-                for entry in job.get("targets", []):
-                    try:
-                        for rec in _scan_target(entry, job.get("vantage", "probe"),
-                                                job.get("profile", "hot"), job["job_id"]):
-                            fh.write(json.dumps(rec) + "\n")
-                    except Exception as e:
-                        fh.write(json.dumps({
-                            "scan_id": job["job_id"], "ts": _now_iso(),
-                            "target": entry.get("value") or entry.get("target"),
-                            "port": 0, "open": False,
-                            "error": f"scan crashed: {type(e).__name__}: {e}"}) + "\n")
+            _run_job(job, dirs["results"] / f"{job['job_id']}.jsonl")
             running.rename(dirs["done"] / running.name)
         if once:
             return 0

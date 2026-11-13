@@ -299,3 +299,88 @@ def test_a_queue_file_that_cannot_be_read_is_kept_for_inspection():
     assert not path.exists()
     assert (queue.queue_dir() / "ct-broken.json.bad").read_text() == "{not json"
     assert queue.pending() == 0
+
+
+# --------------------------------------------------------------------------- #
+# ports closing and opening
+# --------------------------------------------------------------------------- #
+
+def _full(scan_id, target, port, ts, open_=True, **kw):
+    return {**_rec(scan_id, target, port, open_), "profile": "full", "ts": ts, **kw}
+
+
+def _changes():
+    from cti import store
+    with store.connect(read_only=True) as con:
+        return sorted(con.execute(
+            "SELECT port, change_type, scan_id FROM service_changes").fetchall())
+
+
+T1, T2, T3 = ("2026-11-10T06:00:00+00:00", "2026-11-11T06:00:00+00:00",
+              "2026-11-12T06:00:00+00:00")
+HOST = "203.0.113.9"
+
+
+def _ingest_scan(scan_id, records):
+    from cti.netwatch import ingest
+    _spool_file(scan_id, records)
+    return ingest.ingest(client=None)
+
+
+def test_a_closed_record_after_an_open_one_is_a_port_closed():
+    _ingest_scan("full-1", [_full("full-1", HOST, 8199, T1)])
+    _ingest_scan("full-2", [_full("full-2", HOST, 8199, T2, open_=False)])
+    assert _changes() == [(8199, "port_closed", "full-2")]
+
+
+def test_a_port_the_sweep_no_longer_finds_is_closed_without_a_record_for_it():
+    """naabu reports what answers. A port outside the fixed lists that stops
+    answering leaves no record at all; the previous sweep of the same kind
+    is the evidence that it was there."""
+    _ingest_scan("full-1", [_full("full-1", HOST, 443, T1),
+                            _full("full-1", HOST, 31337, T1)])
+    _ingest_scan("full-2", [_full("full-2", HOST, 443, T2)])
+
+    assert _changes() == [(31337, "port_closed", "full-2")]
+    from cti import store
+    with store.connect(read_only=True) as con:
+        row = con.execute("SELECT open, record FROM service_snapshots "
+                          "WHERE scan_id = 'full-2' AND port = 31337").fetchone()
+    assert row[0] is False and "full-1" in row[1]
+
+
+def test_a_closing_is_reported_once_not_on_every_later_scan():
+    _ingest_scan("full-1", [_full("full-1", HOST, 443, T1),
+                            _full("full-1", HOST, 31337, T1)])
+    _ingest_scan("full-2", [_full("full-2", HOST, 443, T2)])
+    _ingest_scan("full-3", [_full("full-3", HOST, 443, T3)])
+    assert _changes() == [(31337, "port_closed", "full-2")]
+
+
+def test_a_hot_scan_does_not_close_ports_it_never_looked_at():
+    """The hot profile checks a short list. Only the full sweep can speak
+    for a port outside it."""
+    _ingest_scan("full-1", [_full("full-1", HOST, 443, T1),
+                            _full("full-1", HOST, 31337, T1)])
+    _ingest_scan("hot-2", [{**_rec("hot-2", HOST, 443), "ts": T2}])
+    assert _changes() == []
+
+
+def test_a_sweep_that_errored_closes_nothing():
+    _ingest_scan("full-1", [_full("full-1", HOST, 31337, T1)])
+    _ingest_scan("full-2", [_full("full-2", HOST, 0, T2, open_=False,
+                                  error="naabu: timed out")])
+    assert _changes() == []
+
+
+def test_a_new_port_on_a_host_swept_before_is_a_port_opened():
+    _ingest_scan("full-1", [_full("full-1", HOST, 443, T1)])
+    _ingest_scan("full-2", [_full("full-2", HOST, 443, T2),
+                            _full("full-2", HOST, 8199, T2)])
+    assert _changes() == [(8199, "port_opened", "full-2")]
+
+
+def test_the_first_sweep_of_a_host_opens_nothing():
+    _ingest_scan("full-1", [_full("full-1", HOST, 443, T1),
+                            _full("full-1", HOST, 8199, T1)])
+    assert _changes() == []

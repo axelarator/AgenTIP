@@ -288,3 +288,16 @@ def test_zeek_window_is_none_only_when_the_sensor_is_down(monkeypatch):
     monkeypatch.setattr(opensearch.OpenSearchClient, "current_max_ts", bug)
     with pytest.raises(AttributeError):
         _REAL_MAX_TS()
+
+
+def test_a_dirsearch_failure_reaches_the_scan_summary(monkeypatch):
+    """The helper used to swallow it, so a crashed or timed-out path search
+    read as a search that found no paths."""
+    monkeypatch.setattr(core.vm_proxy, "dirsearch", lambda url, **kw: {
+        "hits": [], "opendirs": [], "baseline_404": {"status": 404, "size": 0},
+        "dirsearch_error": "TimeoutExpired: timed out after 600 seconds",
+        "error": None})
+
+    out = core.active_scan("203.0.113.7", tools=["dirsearch"])
+
+    assert "TimeoutExpired" in out["dirsearch"]["path_search_error"]
