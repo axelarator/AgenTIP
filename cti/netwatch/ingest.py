@@ -177,6 +177,48 @@ def intercepted_ports() -> set[int]:
     return {int(p) for p in raw.split(",") if p.strip().isdigit()}
 
 
+def control_target() -> tuple[str, set[int]] | None:
+    """A host whose open ports are known, scanned with every job.
+
+    `CTI_NETWATCH_CONTROL=host=80,443` names it and the ports that must be
+    open (none after the `=` means none). The intercepted-port list only
+    covers ports already known to be faked; between 2026-11-06 and 11-11
+    the egress path answered on 443 and 8080 for every target and nothing
+    noticed. A host under our own control notices: if it scans as anything
+    but what it is, the path is lying and the whole job is set aside.
+    Unset, there is no check.
+    """
+    raw = os.environ.get("CTI_NETWATCH_CONTROL", "").strip()
+    host, sep, ports = raw.partition("=")
+    if not host.strip() or not sep:
+        return None
+    return host.strip(), {int(p) for p in ports.split(",") if p.strip().isdigit()}
+
+
+def _control_fault(records: list[dict[str, Any]]) -> str | None:
+    """Why this job's control scan is wrong, or None if it is right (or the
+    job carried no control scan, as jobs submitted before one was set do)."""
+    control = control_target()
+    if control is None:
+        return None
+    host, expected = control
+    mine = [r for r in records if r.get("target") == host]
+    if not mine:
+        return None
+    seen = {int(r.get("port") or 0) for r in mine
+            if r.get("open") and not _intercepted(r)}
+    if seen == expected:
+        return None
+    return (f"control {host} scanned open on {sorted(seen)}, expected "
+            f"{sorted(expected)}")
+
+
+def quarantine_dir() -> Path:
+    path = spool_dir() / "quarantine"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _intercepted(rec: dict[str, Any]) -> bool:
     return (bool(rec.get("open")) and int(rec.get("port") or 0) in intercepted_ports()
             and not (rec.get("http") or rec.get("tls") or rec.get("banner_sha256")
@@ -283,7 +325,8 @@ def ingest(*, client: Any = _UNSET, purge: bool = True) -> dict[str, Any]:
     sensor)."""
     files = sorted(spool_dir().glob("*.jsonl"))
     if not files:
-        return {"files": 0, "snapshots": 0, "changes": 0, "selectors": 0}
+        return {"files": 0, "snapshots": 0, "changes": 0, "selectors": 0,
+                "quarantined": []}
 
     if client is _UNSET:
         try:
@@ -293,14 +336,30 @@ def ingest(*, client: Any = _UNSET, purge: bool = True) -> dict[str, Any]:
             client = None
 
     by_target: dict[tuple[str, str], list[dict]] = {}
-    for path in files:
+    control = control_target()
+    quarantined = []
+    for path in list(files):
+        records = []
         for line in path.read_text().splitlines():
             line = line.strip()
             if not line:
                 continue
             try:
-                rec = json.loads(line)
+                records.append(json.loads(line))
             except json.JSONDecodeError:
+                continue
+        fault = _control_fault(records)
+        if fault:
+            # Kept, not deleted: the records are evidence of what the path
+            # did, and can be ingested by hand if the control was at fault.
+            log.error("netwatch scan %s not ingested: %s; moved to %s",
+                      path.stem, fault, quarantine_dir())
+            path.replace(quarantine_dir() / path.name)
+            files.remove(path)
+            quarantined.append(path.stem)
+            continue
+        for rec in records:
+            if control and rec.get("target") == control[0]:
                 continue
             by_target.setdefault((rec.get("scan_id"), rec.get("target")), []).append(rec)
 
@@ -341,4 +400,5 @@ def ingest(*, client: Any = _UNSET, purge: bool = True) -> dict[str, Any]:
         for path in files:
             path.unlink(missing_ok=True)
     return {"files": len(files), "snapshots": snapshots,
-            "changes": changes, "selectors": selectors}
+            "changes": changes, "selectors": selectors,
+            "quarantined": quarantined}

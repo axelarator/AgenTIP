@@ -249,6 +249,19 @@ The probe side (worker + scanner tools + C2 templates) is deployed by
 re-running `probe_vm/setup_probe_vm.sh` as root on the probe VM; the
 forced-command keys deliberately cannot deploy code.
 
+A run submits all its jobs and then polls them together. A job still
+running when the run gives up (30 minutes) is listed in
+`data/netwatch/outstanding.json` and collected whole by the next run; its
+targets are not re-submitted in the meantime.
+
+**Control target.** Set `CTI_NETWATCH_CONTROL=host=80,443` to a host you
+run yourself and the ports it really has open. It is scanned first in every
+job. If it comes back with any other set of open ports, the path from the
+probe is altering results, so that job's file is moved to
+`data/netwatch/spool/quarantine/` and logged as an error instead of being
+ingested. Unset, there is no check, and the only guard is the fixed list in
+`CTI_NETWATCH_INTERCEPTED_PORTS` (default `53`).
+
 ### Hunt rules and candidate discovery
 
 A **hunt rule** (`data/hunt_rules/*.yaml`, see that dir's README) is a saved
