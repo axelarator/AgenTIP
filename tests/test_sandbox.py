@@ -928,3 +928,91 @@ def test_stored_verdicts_keep_every_string(monkeypatch):
     server.analyze_opendir_samples("1.2.3.4", ["http://1.2.3.4/f0.bin"])
 
     assert len(stored["results"][0]["strings_sample"]) == 60
+
+
+# --------------------------------------------------------------------------- #
+# Analyser: what was wrong with the 2026-11-12 collection
+# --------------------------------------------------------------------------- #
+
+ELF = b"\x7fELF\x02\x01\x01" + b"\x00" * 64
+
+
+@pytest.mark.parametrize("name", ["runner", "sweep", "000_beacon", "sudo-hax-me-a-sandwich"])
+def test_an_elf_with_no_extension_is_not_a_type_mismatch(tmp_path, name):
+    """Linux tools almost never have an extension. Treating "no extension"
+    as "claims to be text" marked every one of them notable."""
+    path = tmp_path / name
+    path.write_bytes(ELF)
+    result = analyze_mod.analyze(path, None)
+    assert result["type_mismatch"] is False and result["verdict"] != "notable"
+
+
+def test_code_identifiers_are_not_reported_as_domains(tmp_path):
+    path = tmp_path / "beacon"
+    path.write_bytes(b"\x00".join([
+        b"os.fork", b"fmt.pp", b"runtime.main", b"sync.map", b"time.now",
+        b"libcrypto.so", b"loader.py", b"net.http",
+        b"c2.evil-panel.com", b"update.example.net", b"cdn.example.co.uk"]))
+    domains = analyze_mod.analyze(path, None)["extracted"]["domains"]
+    assert domains == ["c2.evil-panel.com", "update.example.net", "cdn.example.co.uk"]
+
+
+def test_the_suffix_list_ships_with_the_image():
+    assert (REPO / "sandbox" / "tlds.txt").read_text().count("\n") > 1000
+    assert "COPY tlds.txt /opt/tlds.txt" in (REPO / "sandbox" / "Dockerfile").read_text()
+
+
+def test_the_strings_sample_prefers_readable_strings_to_code_fragments(tmp_path):
+    """A stripped binary's first printable runs are instruction bytes."""
+    junk = [b"UUUUUUUUH!%d" % i for i in range(40)] + [b"H(H+H0H%dAWAVAUATUSH" % i
+                                                       for i in range(40)]
+    useful = [b"POST /check_in HTTP/1.1", b"http://198.51.100.156:8199/result",
+              b"/tmp/.cache/session.lock", b"failed to open reverse shell: %s"]
+    path = tmp_path / "beacon"
+    path.write_bytes(ELF + b"\x00".join(junk + useful))
+
+    sample = analyze_mod.analyze(path, None)["strings_sample"]
+
+    assert len(sample) <= analyze_mod.MAX_STRINGS
+    for text in useful:
+        assert text.decode() in sample
+
+
+def test_an_archive_lists_its_members_without_unpacking(tmp_path):
+    import io
+    import tarfile
+    path = tmp_path / "hax3156.tgz"
+    with tarfile.open(path, "w:gz") as tar:
+        for name, data in (("hax/exploit.c", b"int main(){}"), ("hax/Makefile", b"all:")):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+    result = analyze_mod.analyze(path, None)
+
+    assert result["archive"]["members"] == [
+        {"name": "hax/exploit.c", "size": 12}, {"name": "hax/Makefile", "size": 4}]
+    assert result["verdict"] != "unremarkable"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["hax3156.tgz"]
+
+
+def test_a_zip_lists_its_members_and_a_broken_archive_is_not_fatal(tmp_path):
+    import zipfile
+    good = tmp_path / "kit.zip"
+    with zipfile.ZipFile(good, "w") as z:
+        z.writestr("panel/index.php", "<?php")
+    assert analyze_mod.analyze(good, None)["archive"]["members"] == [
+        {"name": "panel/index.php", "size": 5}]
+
+    bad = tmp_path / "broken.zip"
+    bad.write_bytes(b"PK\x03\x04" + b"\x00" * 40)
+    result = analyze_mod.analyze(bad, None)
+    assert result["archive"]["members"] == [] and result["archive"]["error"]
+
+
+@pytest.mark.parametrize("domain", [b"panel.badhost.top", b"gate.example.site",
+                                    b"c2.example.online", b"x.example.dev"])
+def test_domains_on_abused_suffixes_are_kept(tmp_path, domain):
+    path = tmp_path / "beacon"
+    path.write_bytes(ELF + domain)
+    assert analyze_mod.analyze(path, None)["extracted"]["domains"] == [domain.decode()]

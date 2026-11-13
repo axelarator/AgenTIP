@@ -23,6 +23,7 @@ RUN apt-get update \
  && pip install --no-cache-dir yara-python==4.5.1 python-magic==0.4.27
 
 COPY analyze.py /opt/analyze.py
+COPY tlds.txt /opt/tlds.txt
 COPY rules /opt/rules
 
 USER nobody
