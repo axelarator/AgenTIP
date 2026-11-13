@@ -15,17 +15,14 @@ from typing import Any
 
 import duckdb
 
+from ..util import json_text
+
 
 CORRELATION_TYPES = {"asn_pivot", "port_pattern", "temporal_cluster",
                      "new_infrastructure", "shared_fingerprint", "zeek_hit"}
 
 
-def _json(value: Any) -> str | None:
-    """A caller may pass an already-serialized string; pass it through
-    rather than double-encoding it."""
-    if value is None:
-        return None
-    return value if isinstance(value, str) else json.dumps(value)
+_json = json_text
 
 
 def latest_asn_for(con: duckdb.DuckDBPyConnection, ip: str,

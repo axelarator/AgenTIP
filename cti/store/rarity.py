@@ -119,25 +119,30 @@ def refresh(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
     Free: one GROUP BY, no network. `global_count` is left untouched so a
     source that can fill it later is not clobbered by a local refresh.
     """
-    computed = con.execute("""
-        SELECT selector_type, selector_value,
-               count(DISTINCT indicator_value) AS local_count,
-               count(DISTINCT actor) FILTER (WHERE actor IS NOT NULL) AS actors
-        FROM selectors GROUP BY 1, 2""").fetchall()
-
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    written = 0
-    for selector_type, selector_value, local_count, actors in computed:
-        con.execute("""
-            INSERT INTO selector_stats
-                (selector_type, selector_value, local_count, global_count,
-                 global_source, checked_at)
-            VALUES (?, ?, ?, NULL, NULL, ?)
-            ON CONFLICT (selector_type, selector_value) DO UPDATE SET
-                local_count = excluded.local_count,
-                checked_at = excluded.checked_at""",
-            [selector_type, selector_value, local_count, now])
-        written += 1
+    # One statement, not one INSERT per distinct value: this runs inside the
+    # daily job's write connection, over tens of thousands of values.
+    con.execute("""
+        INSERT INTO selector_stats
+            (selector_type, selector_value, local_count, global_count,
+             global_source, checked_at)
+        SELECT selector_type, selector_value,
+               count(DISTINCT indicator_value), NULL, NULL, ?
+        FROM selectors GROUP BY 1, 2
+        ON CONFLICT (selector_type, selector_value) DO UPDATE SET
+            local_count = excluded.local_count,
+            checked_at = excluded.checked_at""", [now])
+    # A value nothing holds any more keeps its row, because its global
+    # count was paid for and the value may come back, but it is no longer
+    # reported as held by anyone.
+    con.execute("""
+        UPDATE selector_stats SET local_count = 0, checked_at = ?
+        WHERE local_count <> 0 AND NOT EXISTS (
+            SELECT 1 FROM selectors s
+            WHERE s.selector_type = selector_stats.selector_type
+              AND s.selector_value = selector_stats.selector_value)""", [now])
+    written = con.execute(
+        "SELECT count(*) FROM selector_stats WHERE local_count > 0").fetchone()[0]
     return {"values": written}
 
 

@@ -36,12 +36,9 @@ from typing import Any
 from . import budget, http
 
 BASE_URL = os.environ.get("CTI_WEBAMON_BASE", "https://pro.webamon.com")
-USER_AGENT = "cti-agent"
 WEBAMON_API_KEY_ENV = "WEBAMON_API_KEY"
 HTTP_TIMEOUT = 30
 
-_DAILY_BUDGET_ENV = "CTI_WEBAMON_DAILY_BUDGET"
-_DAILY_BUDGET_DEFAULT = 1000
 _RESCAN_DAYS_ENV = "CTI_WEBAMON_RESCAN_DAYS"
 _RESCAN_DAYS_DEFAULT = 7
 

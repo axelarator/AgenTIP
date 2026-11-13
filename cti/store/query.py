@@ -16,7 +16,7 @@ from typing import Any
 import duckdb
 
 from ..errors import TrackingBusy
-from ..util import rows as _rows
+from ..util import rows as _rows, utcnow_naive
 from .connection import connect_retry
 from .writes import CORRELATION_TYPES, insert_correlation
 
@@ -89,7 +89,7 @@ def save_correlation(actor: str, correlation_type: str, indicators: list[str],
         return {"error": "confidence must be high, medium, or low"}
     if not indicators or not narrative.strip():
         return {"error": "indicators and narrative are both required"}
-    now = datetime.now()
+    now = utcnow_naive()
     try:
         with connect_retry(read_only=False) as con:
             insert_correlation(con, actor=actor, correlation_type=correlation_type,
@@ -415,7 +415,7 @@ def tracked_observables() -> dict[str, Any]:
     run_readonly_query/actor_summary, which are sized for agent
     context) and the status labels are dashboard presentation, not a
     generic query result."""
-    now = datetime.now()
+    now = utcnow_naive()
     try:
         with connect_retry(read_only=True) as con:
             rows = _rows(con, _TRACKED_OBSERVABLES_SQL)
@@ -756,7 +756,7 @@ def indicator_profile(value: str) -> dict[str, Any]:
     indicator_type = next((o["indicator_type"] for o in reversed(observations)
                            if o.get("indicator_type")), None)
 
-    now = datetime.now()
+    now = utcnow_naive()
     latest_hl = next((o for o in reversed(observations)
                       if o["source"] == "honeylabs"), None)
     latest_change = next((c for c in asn_changes[::-1]
@@ -831,7 +831,7 @@ def indicator_profile(value: str) -> dict[str, Any]:
 
 def _parse_ts(value: Any) -> datetime | None:
     """payload timestamps come back as ISO strings; the status ladder diffs
-    them against datetime.now()."""
+    them against utcnow_naive()."""
     if isinstance(value, datetime):
         return value
     if isinstance(value, str):
@@ -894,7 +894,7 @@ def observable_history(ip: str) -> dict[str, Any]:
     for o in observations:
         o["payload"] = json.loads(o["payload"]) if o["payload"] is not None else {}
 
-    now = datetime.now()
+    now = utcnow_naive()
     # Status first, from raw datetime/date objects, before the loops
     # below stringify everything below for JSON (see the same ordering
     # note in tracked_observables()).

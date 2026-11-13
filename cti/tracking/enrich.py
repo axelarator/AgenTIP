@@ -32,7 +32,7 @@ import duckdb
 from ..sources import pivot
 from .. import store
 from ..store.changes import asn_confidence
-from ..util import asn_int, to_int
+from ..util import asn_int, to_int, utcnow_naive
 from . import hl_mcp
 
 log = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ def build_worklist(con: duckdb.DuckDBPyConnection,
     # HoneyLabs/RDAP/RIPEstat are IP-only sources - exclude domain
     # observations (e.g. from pivot_cluster's TLS/Webamon/ThreatFox history
     # logging) so they don't reach the IP-prefilter/CIDR logic below.
-    fresh_cutoff = datetime.now() - timedelta(days=RECHECK_AFTER_DAYS)
+    fresh_cutoff = utcnow_naive() - timedelta(days=RECHECK_AFTER_DAYS)
     never = [r[0] for r in con.execute(
         """SELECT DISTINCT o.indicator_value FROM observations_wide o
            JOIN actors a ON a.actor_name = o.actor
@@ -88,7 +88,7 @@ def build_worklist(con: duckdb.DuckDBPyConnection,
     worklist = [ip for ip in never + stale
                 if not (ip in seen or seen.add(ip))][:budget]
 
-    rdap_cutoff = datetime.now() - timedelta(days=RDAP_RECHECK_DAYS)
+    rdap_cutoff = utcnow_naive() - timedelta(days=RDAP_RECHECK_DAYS)
     rdap_fresh = {r[0] for r in con.execute(
         """SELECT indicator_value FROM observations_wide
            WHERE source = 'rdap' GROUP BY indicator_value

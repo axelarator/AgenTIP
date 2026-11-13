@@ -31,7 +31,7 @@ from typing import Any, Callable
 
 import duckdb
 
-from ..util import is_stale
+from ..util import is_stale, json_text
 from .selectors import canonical_dn
 
 # A baseline this old is re-checked for the first time in months; a
@@ -376,10 +376,7 @@ def record_attribute_change(con: duckdb.DuckDBPyConnection, *, detected_at,
          _as_json(old_value), _as_json(new_value), confidence])
 
 
-def _as_json(value: Any) -> str | None:
-    if value is None:
-        return None
-    return value if isinstance(value, str) else json.dumps(value)
+_as_json = json_text
 
 
 def detect(con: duckdb.DuckDBPyConnection, attribute: str, *,

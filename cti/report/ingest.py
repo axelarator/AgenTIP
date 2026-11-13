@@ -26,7 +26,7 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
-USER_AGENT = "cti-agent-report-ingest/1.0 (+local analysis tool, no telemetry)"
+USER_AGENT = "cti-graph-report-ingest/1.0 (+local analysis tool, no telemetry)"
 FETCH_TIMEOUT = 20
 
 # The observable categories a cluster tracks, in a single place so the

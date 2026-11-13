@@ -14,14 +14,14 @@ import csv
 import ipaddress
 import json
 import os
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import duckdb
 
 from .. import store
-from ..util import repo_root
+from ..util import repo_root, utc_today
 
 _REPO_ROOT = repo_root()
 
@@ -61,7 +61,7 @@ def _parse_row(row: dict[str, Any]) -> dict[str, Any] | None:
     except ValueError:
         observed_at = None
     if observed_at is None:
-        observed_at = datetime.combine(date.today(), datetime.min.time())
+        observed_at = datetime.combine(utc_today(), datetime.min.time())
     return {
         "ip": str(addr),
         "indicator_type": f"ipv{addr.version}",
@@ -106,7 +106,7 @@ def ingest_inbox(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
             new_ips.add(parsed["ip"])
             summary["ingested"] += 1
         archive.mkdir(parents=True, exist_ok=True)
-        path.rename(archive / f"{date.today().isoformat()}-{path.name}")
+        path.rename(archive / f"{utc_today().isoformat()}-{path.name}")
         files.append(summary)
     return {
         "files": files,
@@ -156,7 +156,7 @@ def seed_from_clusters(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
     daily-safe version that leaves already-tracked actors untouched."""
     from .. import core  # deferred: pulls in the whole cluster stack
 
-    today = datetime.combine(date.today(), datetime.min.time())
+    today = datetime.combine(utc_today(), datetime.min.time())
     seeded: dict[str, int] = {}
     for slug in core.list_clusters():
         name, count = _import_cluster(con, slug, today)
@@ -178,7 +178,7 @@ def register_new_clusters(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
     known_slugs = {r[0] for r in con.execute(
         "SELECT cluster_slug FROM actors WHERE cluster_slug IS NOT NULL"
     ).fetchall()}
-    today = datetime.combine(date.today(), datetime.min.time())
+    today = datetime.combine(utc_today(), datetime.min.time())
     registered: dict[str, int] = {}
     for slug in core.list_clusters():
         if slug in known_slugs:

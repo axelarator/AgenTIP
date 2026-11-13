@@ -11,7 +11,7 @@ import os
 import re
 import tempfile
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -36,8 +36,36 @@ def now_stix() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def utcnow_naive() -> datetime:
+    """Now, in UTC, without a timezone: the form every DuckDB timestamp in
+    this project is stored in. Comparing a stored timestamp with the local
+    clock is wrong by the host's offset, which went unnoticed only because
+    the host runs on UTC."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def utc_today() -> date:
+    return utcnow_naive().date()
+
+
 def is_stale(observed_at: datetime, days: int) -> bool:
-    return datetime.now() - observed_at > timedelta(days=days)
+    return utcnow_naive() - observed_at > timedelta(days=days)
+
+
+def json_text(value: Any) -> str | None:
+    """A value as text for a JSON column. A string that is already valid
+    JSON is passed through, so a caller holding serialised JSON is not
+    double-encoded; any other string is encoded. It used to be passed
+    through whatever it was, and a plain string is not valid JSON."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            json.loads(value)
+            return value
+        except ValueError:
+            return json.dumps(value)
+    return json.dumps(value)
 
 
 # --------------------------------------------------------------------------- #

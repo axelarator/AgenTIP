@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tomllib
 from pathlib import Path
 
@@ -158,3 +159,66 @@ def test_every_imported_third_party_package_is_declared(package):
 def test_no_empty_leftover_package_directories():
     for name in ("graph/nodes/analyze", "graph/nodes/collect", "cti/enrich"):
         assert not (REPO / name).exists(), f"{name}/ sits beside a module of the same name"
+
+
+# S3 ------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("value, stored", [
+    ("njRAT", '"njRAT"'),                 # a plain string is not JSON until encoded
+    ('["a", "b"]', '["a", "b"]'),         # already-serialised JSON is left alone
+    (["a"], '["a"]'), ({"k": 1}, '{"k": 1}'), (None, None),
+])
+def test_a_json_column_always_receives_valid_json(value, stored):
+    import importlib
+    writes = importlib.import_module("cti.store.writes")
+    changes = importlib.import_module("cti.store.changes")
+    for encode in (writes._json, changes._as_json):
+        out = encode(value)
+        assert out == stored
+        if out is not None:
+            json.loads(out)
+
+
+# S14 ------------------------------------------------------------------------ #
+
+def test_staleness_is_measured_in_utc_not_local_time(monkeypatch):
+    """Timestamps are stored as naive UTC. Compared with local time they are
+    wrong by the host's offset; the host is on UTC today, which hid it."""
+    from datetime import datetime, timedelta
+    from cti import util
+    fixed = datetime(2026, 11, 13, 12, 0, 0)
+    monkeypatch.setattr(util, "utcnow_naive", lambda: fixed)
+    assert util.is_stale(fixed - timedelta(days=3), days=2)
+    assert not util.is_stale(fixed - timedelta(days=1), days=2)
+    assert util.utcnow_naive.__name__      # the helper exists
+
+
+def test_no_store_or_tracking_code_reads_the_local_clock():
+    for path in ("cti/store/query.py", "cti/tracking/enrich.py", "cti/util.py",
+                 "cti/tracking/ingest.py"):
+        code = (REPO / path).read_text()
+        assert "datetime.now()" not in code.replace("datetime.now().", "datetime.now()"), path
+        assert "date.today()" not in code, path
+
+
+# S7 ------------------------------------------------------------------------- #
+
+def test_refresh_zeroes_a_value_nothing_holds_and_keeps_its_price():
+    with store.connect() as con:
+        _sel(con, "a.example", "tls.cert_sha256", "c" * 64)
+        _sel(con, "b.example", "tls.cert_sha256", "c" * 64)
+        rarity.refresh(con)
+        con.execute("UPDATE selector_stats SET global_count = 7, global_source = 'webamon'")
+        con.execute("DELETE FROM selectors")
+        rarity.refresh(con)
+        row = con.execute("SELECT local_count, global_count FROM selector_stats").fetchone()
+    assert row == (0, 7)
+
+
+# R5 ------------------------------------------------------------------------- #
+
+def test_no_request_names_the_project_this_one_replaced():
+    for path in ("cti/sources/webamon.py", "cti/report/ingest.py"):
+        code = (REPO / path).read_text()
+        assert 'USER_AGENT = "cti-agent' not in code, path
+    assert "_DAILY_BUDGET_ENV" not in (REPO / "cti/sources/webamon.py").read_text()
