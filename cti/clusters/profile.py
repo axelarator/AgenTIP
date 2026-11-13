@@ -76,10 +76,14 @@ def update_ttp(name: str, technique_id: str, technique_name: str,
                 status: int, notes: str = "") -> dict[str, Any]:
     if not 0 <= status <= 4:
         raise ValueError("status must be 0-4")
+    # ATT&CK ids are upper case. remove_ttp already matched without regard
+    # to case; this did not, so t1059 and T1059 could both be stored.
+    technique_id = technique_id.strip().upper()
     data = load_cluster(name)
     ttps = data["ttps"]
     for t in ttps:
-        if t["id"] == technique_id:
+        if t["id"].upper() == technique_id:
+            t["id"] = technique_id
             t.update(name=technique_name, status=status, notes=notes,
                       updated=now_iso())
             break

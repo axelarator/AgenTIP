@@ -38,8 +38,20 @@ STATIC_DIR = Path(__file__).parent / "static"
 _NARRATIVE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
+_UNREADABLE = (core.ClusterNotFound, ValueError, OSError, KeyError)
+
+
 def _cluster_summary(name: str) -> dict:
-    data = core.load_cluster(name)
+    try:
+        data = core.load_cluster(name)
+    except _UNREADABLE as e:
+        # One damaged file used to return HTTP 500 for the whole page. It
+        # is listed, with the reason, so it is seen rather than missing.
+        return {"slug": name, "name": name, "aliases": [], "confidence": None,
+                "description": f"This cluster file cannot be read: {e}",
+                "first_seen": None, "last_seen": None, "ttp_count": 0,
+                "observable_count": 0, "gap_count": 0, "detection_count": 0,
+                "relationship_count": 0, "error": str(e)}
     return {
         "slug": name,
         "name": data["name"],
@@ -75,8 +87,13 @@ def stats(request):
     names = core.list_clusters()
     totals = {"observable_count": 0, "ttp_count": 0, "gap_count": 0, "detection_count": 0}
     activity = []
+    unreadable = []
     for n in names:
-        data = core.load_cluster(n)
+        try:
+            data = core.load_cluster(n)
+        except _UNREADABLE:
+            unreadable.append(n)
+            continue
         totals["observable_count"] += sum(len(v) for v in data["observables"].values())
         totals["ttp_count"] += len(data["ttps"])
         totals["gap_count"] += len(data["gaps"])
@@ -88,6 +105,7 @@ def stats(request):
         "cluster_count": len(names),
         "candidate_count": _open_candidates(),
         "recent_activity": activity[:20],
+        "unreadable_clusters": unreadable,
         **totals,
     })
 

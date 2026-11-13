@@ -128,9 +128,9 @@ JOIN first_seen fs ON fs.indicator_value = o.indicator_value
 WHERE o.observed_at >= current_date - INTERVAL (?) DAY
   AND o.actor IS NOT NULL
   AND o.actor <> a.actor_name
-  AND o.asn NOT IN ({shared_asns})
+  AND NOT list_contains(?, o.asn)
 ORDER BY o.observed_at DESC
-""".format(shared_asns=", ".join(str(a) for a in SHARED_HOSTING_ASNS))
+"""
 
 TEMPORAL_CLUSTERS = """
 WITH weekly AS (
@@ -183,7 +183,10 @@ def new_indicators_in_known_asns(con, days: int = 1) -> list[dict[str, Any]]:
 
 
 def cross_actor_asn_overlap(con, days: int = 1) -> list[dict[str, Any]]:
-    return _rows(con, CROSS_ACTOR_ASN_OVERLAP, [days])
+    # The list is a parameter. Formatted into the SQL at import, an empty
+    # list produced `NOT IN ()`, a syntax error on every daily run.
+    return _rows(con, CROSS_ACTOR_ASN_OVERLAP,
+                 [days, [int(a) for a in SHARED_HOSTING_ASNS]])
 
 
 def temporal_clusters(con, weeks: int = 8) -> list[dict[str, Any]]:

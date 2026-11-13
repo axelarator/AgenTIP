@@ -760,7 +760,7 @@ def neighbours(con: duckdb.DuckDBPyConnection, indicator_value: str, *,
         SELECT s.indicator_value, s.actor,
                count(DISTINCT s.selector_type) AS via_types,
                string_agg(DISTINCT s.selector_type, ', ') AS via,
-               string_agg(DISTINCT s.selector_type || '=' || s.selector_value, '|') AS pairs,
+               list(DISTINCT struct_pack(t := s.selector_type, v := s.selector_value)) AS pairs,
                max(s.last_seen) AS last_seen
         FROM selectors s JOIN mine m
           ON s.selector_type = m.selector_type AND s.selector_value = m.selector_value
@@ -769,7 +769,9 @@ def neighbours(con: duckdb.DuckDBPyConnection, indicator_value: str, *,
         ORDER BY 3 DESC""", [indicator_value, indicator_value])
     out = []
     for r in result:
-        pairs = [p.split("=", 1) for p in (r.pop("pairs", "") or "").split("|") if "=" in p]
+        # A list of structs, not a delimited string: a page title with a
+        # "|" in it used to be cut into pieces here.
+        pairs = [(p["t"], p["v"]) for p in (r.pop("pairs", None) or [])]
         types = [t.strip() for t in (r["via"] or "").split(",") if t.strip()]
         if promotable_only:
             # Filter on the type AND the value it matched on, so a link that

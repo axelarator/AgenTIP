@@ -13,8 +13,10 @@ from __future__ import annotations
 from typing import Any
 
 
-class ClusterNotFound(KeyError):
-    """No cluster JSON under this name."""
+class ClusterNotFound(LookupError):
+    """No cluster JSON under this name. The one such class: cti.core and
+    cti.clusters.storage use this, where they once defined their own and a
+    caller catching this one caught nothing."""
 
 
 class TrackingBusy(RuntimeError):

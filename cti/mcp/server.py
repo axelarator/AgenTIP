@@ -625,7 +625,7 @@ def validin_reverse_selector(selector_type: str, value: str, reason: str) -> dic
 
 
 @_tool
-def validin_history(indicator: str, kind: str = "dns", reason: str = "") -> dict:
+def validin_history(indicator: str, reason: str, kind: str = "dns") -> dict:
     """Passive history for one indicator. ONE lookup.
 
     kind: "dns" (resolution history - what this resolved to before, which
@@ -633,8 +633,11 @@ def validin_history(indicator: str, kind: str = "dns", reason: str = "") -> dict
     "certificates" (Certificate Transparency - the crt.sh replacement, since
     crt.sh serves a frozen archive and no longer ingests), or "registration"
     (WHOIS/RDAP history, where a registrant who has since gone private is
-    still visible)."""
-    with validin.manual_invocation(reason or "history lookup"):
+    still visible).
+
+    `reason` is required: say why this lookup is worth one of the fifty a
+    month."""
+    with validin.manual_invocation(reason):
         if kind == "dns":
             return validin.dns_history(indicator)
         if kind == "dns_ip":

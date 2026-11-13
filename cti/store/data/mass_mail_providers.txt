@@ -1,0 +1,39 @@
+# Mail-exchanger suffixes belonging to providers with a mass customer base.
+#
+# The same distinction mass_dns_providers.txt draws for nameservers: two
+# domains whose mail goes to Google share a provider, not an operator. A
+# custom mail host (mail.someactor.com) is a real link; these are not.
+#
+# Kept as data so adding one is not a code change.
+google.com
+googlemail.com
+outlook.com
+office365.us
+zoho.com
+zoho.eu
+zoho.in
+protonmail.ch
+proton.me
+mimecast.com
+pphosted.com
+ppe-hosted.com
+secureserver.net
+yandex.net
+yandex.ru
+mail.ru
+messagingengine.com
+icloud.com
+ovh.net
+privateemail.com
+registrar-servers.com
+titan.email
+hostinger.com
+emailsrvr.com
+mailgun.org
+sendgrid.net
+amazonaws.com
+improvmx.com
+forwardemail.net
+cloudflare.net
+qq.com
+163.com

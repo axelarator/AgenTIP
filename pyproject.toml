@@ -13,6 +13,12 @@ dependencies = [
     "langgraph>=0.2",
     "langchain-core>=0.3",
     "claude-agent-sdk>=0.1",
+    # Imported directly; they used to arrive only as other packages'
+    # dependencies, so a clean install could lose them without notice.
+    "starlette>=0.37",    # dashboard
+    "uvicorn>=0.30",      # dashboard
+    "pyyaml>=6",          # hunt rules (cti/netwatch/rules.py)
+    "requests>=2.31",     # Arkime pcap pull (cti/netwatch/flowcarp.py)
 ]
 
 [project.optional-dependencies]

@@ -282,7 +282,9 @@ def score_against(con: duckdb.DuckDBPyConnection, entity: str,
         if not sharers:
             continue
         key = (selector_type, value)
-        verdict = verdicts.setdefault(key, assess(con, selector_type, value))
+        if key not in verdicts:
+            verdicts[key] = assess(con, selector_type, value)
+        verdict = verdicts[key]
         cls = selector_class(selector_type)
         group = artefact(selector_type)
         note = None

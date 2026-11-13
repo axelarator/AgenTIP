@@ -50,14 +50,35 @@ from .selectors import can_promote, normalize
 _PROVIDERS_PATH = Path(__file__).with_name("data") / "mass_dns_providers.txt"
 
 
-@functools.lru_cache(maxsize=1)
-def _mass_providers() -> tuple[str, ...]:
+_MAIL_PROVIDERS_PATH = Path(__file__).with_name("data") / "mass_mail_providers.txt"
+
+
+@functools.lru_cache(maxsize=4)
+def _suffixes(path: Path) -> tuple[str, ...]:
     try:
-        text = _PROVIDERS_PATH.read_text()
+        text = path.read_text()
     except OSError:
         return ()
     return tuple(line.strip().lower() for line in text.splitlines()
                  if line.strip() and not line.startswith("#"))
+
+
+def _mass_providers() -> tuple[str, ...]:
+    return _suffixes(_PROVIDERS_PATH)
+
+
+def _names_a_provider(value: str, providers: tuple[str, ...]) -> bool:
+    for member in str(value).lower().split(","):
+        member = member.strip().rstrip(".")
+        if any(member == p or member.endswith("." + p) for p in providers):
+            return True
+    return False
+
+
+def is_mass_mail(value: str) -> bool:
+    """Whether a mail-exchanger set belongs to a provider with mass
+    customers. Matched per member, like is_mass_dns."""
+    return _names_a_provider(value, _suffixes(_MAIL_PROVIDERS_PATH))
 
 
 def is_mass_dns(value: str) -> bool:
@@ -80,8 +101,16 @@ def is_mass_dns(value: str) -> bool:
 def value_is_provider_scale(selector_type: str, selector_value: Any) -> bool:
     """Whether this VALUE names a shared service rather than a resource."""
     if selector_type == "dns.ns_set":
-        return is_mass_dns(str(selector_value))
+        return is_mass_dns(_as_set_text(selector_value))
+    if selector_type == "dns.mx_set":
+        # Structural like the nameserver set, with the same trap: two
+        # domains whose mail goes to Google share a provider, not an owner.
+        return is_mass_mail(_as_set_text(selector_value))
     return False
+
+
+def _as_set_text(value: Any) -> str:
+    return ",".join(str(v) for v in value) if isinstance(value, (list, tuple, set)) else str(value)
 
 
 def refresh(con: duckdb.DuckDBPyConnection) -> dict[str, int]:

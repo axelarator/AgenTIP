@@ -21,6 +21,7 @@ from typing import Iterator
 from .. import attack
 from .. import stix
 from ..clusters_render import write_markdown
+from ..errors import ClusterNotFound      # the one such class; see cti/errors.py
 from ..report import ingest as report_ingest
 from ..util import atomic_write_text
 from ..util import now_iso
@@ -48,8 +49,6 @@ DATA_DIR = Path(os.environ.get("CTI_DATA_DIR", _REPO_ROOT / "data" / "clusters")
 OBSERVABLE_CATEGORIES = report_ingest.OBSERVABLE_CATEGORIES
 
 
-class ClusterNotFound(Exception):
-    pass
 
 
 def _slug(data_or_name: dict[str, Any] | str) -> str:

@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import ipaddress
 from datetime import datetime, timezone
+import urllib.parse
 from typing import Any
 
 from ..errors import VMProxyError
@@ -177,6 +178,13 @@ def classify(value: str) -> str:
     return "domain"
 
 
+def _q(value: str) -> str:
+    """A value as one URL path or query component. Indicators come from
+    report text; one with a slash, a space or a question mark must not be
+    able to change which resource is asked for."""
+    return urllib.parse.quote(str(value).strip(), safe=":")
+
+
 def rdap_lookup(value: str, kind: str) -> dict[str, Any]:
     """Registration data (registrar/holder, creation/expiry events,
     nameservers) via rdap.org - the public bootstrap redirector that
@@ -184,7 +192,7 @@ def rdap_lookup(value: str, kind: str) -> dict[str, Any]:
     doesn't need its own per-TLD/per-RIR bootstrap table."""
     path = "ip" if kind == "ip" else "domain"
     try:
-        data = _get_json(f"https://rdap.org/{path}/{value}")
+        data = _get_json(f"https://rdap.org/{path}/{_q(value)}")
     except PivotError as e:
         return {"error": str(e)}
     return {
@@ -208,7 +216,7 @@ def ripestat_lookup(ip: str) -> dict[str, Any]:
     result: dict[str, Any] = {}
 
     try:
-        net = _get_json(f"https://stat.ripe.net/data/network-info/data.json?resource={ip}")
+        net = _get_json(f"https://stat.ripe.net/data/network-info/data.json?resource={_q(ip)}")
         net_data = net.get("data") or {}
         result["asn"] = net_data.get("asns")
         result["prefix"] = net_data.get("prefix")
@@ -224,7 +232,7 @@ def ripestat_lookup(ip: str) -> dict[str, Any]:
             result["as_overview_error"] = str(e)
 
     try:
-        geo = _get_json(f"https://stat.ripe.net/data/geoloc/data.json?resource={ip}")
+        geo = _get_json(f"https://stat.ripe.net/data/geoloc/data.json?resource={_q(ip)}")
         locations = (geo.get("data") or {}).get("locations") or []
         result["geolocation"] = locations[0] if locations else None
     except PivotError as e:

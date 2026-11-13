@@ -41,6 +41,14 @@ def _date_only(value: str | None) -> str | None:
         return value
     year, month, day = m.groups()
     return f"{year}-{month}-{day or '01'}"
+def _cell(value: Any) -> str:
+    """Text made safe for one Markdown table cell. A pipe ends the cell and
+    a line break ends the row, so a note containing either used to spill
+    across the table."""
+    text = "" if value is None else str(value)
+    return text.replace("|", "\\|").replace("\r\n", "<br>").replace("\n", "<br>")
+
+
 def write_markdown(data: dict[str, Any], md_path: Path) -> None:
     """Regenerate the human-readable view. Never hand-edit the .md file —
     it's derived from the .json, which is the source of truth."""
@@ -68,12 +76,12 @@ def write_markdown(data: dict[str, Any], md_path: Path) -> None:
         "|---|---|---|---|---|",
     ]
     for t in data["ttps"]:
-        lines.append(f"| {t['id']} | {t['name']} | {t['status']} | "
-                      f"{t.get('notes', '')} | {t['updated']} |")
+        lines.append(f"| {t['id']} | {_cell(t['name'])} | {t['status']} | "
+                      f"{_cell(t.get('notes', ''))} | {t['updated']} |")
     lines += ["", "## Detection inventory (this cluster's detections plus technique-scoped ones from the shared registry)",
               "| ID | Description | Status | Scope | Covers | Updated |", "|---|---|---|---|---|---|"]
     for det in data["detections"]:
-        lines.append(f"| {det['id']} | {det['description']} | {det['status']} | "
+        lines.append(f"| {det['id']} | {_cell(det['description'])} | {det['status']} | "
                       f"{det.get('scope', 'technique')} | "
                       f"{', '.join(det.get('covers_ttps', [])) or ', '.join(det['technique_ids'])} | "
                       f"{det['updated']} |")
@@ -86,7 +94,7 @@ def write_markdown(data: dict[str, Any], md_path: Path) -> None:
     lines += ["", "## Gaps backlog", "| Description | Priority | Created |",
               "|---|---|---|"]
     for g in data["gaps"]:
-        lines.append(f"| {g['description']} | {g['priority']} | {g['created']} |")
+        lines.append(f"| {_cell(g['description'])} | {g['priority']} | {g['created']} |")
     lines += ["", "## Observables"]
     obs = data["observables"]
     for category in OBSERVABLE_CATEGORIES:
@@ -101,7 +109,8 @@ def write_markdown(data: dict[str, Any], md_path: Path) -> None:
                 # pivot_cluster) is the "last actually re-verified" date,
                 # so it gets its own column rather than piggybacking on
                 # Status like it used to.
-                lines.append(f"| {o['value']} | {o.get('status') or ''} | {', '.join(o['sources'])} | "
+                lines.append(f"| {_cell(o['value'])} | {_cell(o.get('status') or '')} | "
+                              f"{_cell(', '.join(o['sources']))} | "
                               f"{_date_only(o.get('first_seen')) or ''} | "
                               f"{_date_only(o.get('last_seen')) or ''} | "
                               f"{_date_only(o.get('status_checked')) or ''} |")
