@@ -17,7 +17,7 @@ from typing import Any
 
 from cti.store import CORRELATION_TYPES, save_correlation
 
-from ..sdk import load_prompt, parse_findings, run_turn
+from ..sdk import SPECIALIST_MAX_TURNS, load_prompt, parse_findings, run_turn
 from ..state import CTIState, Family, Finding, Item
 
 # Read-only. A specialist that could write could also write something no
@@ -25,10 +25,7 @@ from ..state import CTIState, Family, Finding, Item
 # single-writer design avoids.
 SPECIALIST_TOOLS = ["query_duckdb", "get_actor_summary"]
 
-# A turn is one model response; each tool call costs one. At 4 a specialist
-# had three lookups and its answer, and the fourth lookup aborted it with
-# nothing kept - 5 of 112 runs before 2026-10-17, two of four that day.
-MAX_TURNS = 6
+MAX_TURNS = SPECIALIST_MAX_TURNS
 _TURN_LIMIT = "maximum number of turns"
 _NO_TOOLS_RETRY = (
     "\n\nYou have no tools for this answer and cannot look anything up. Report "

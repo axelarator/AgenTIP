@@ -130,7 +130,7 @@ def test_the_router_splits_before_decoding():
     decoding first would tear it in half at the slash."""
     router = (SRC / "lib" / "router.js").read_text()
     split_at = router.index(".split(")
-    decode_at = router.index(".map(decodeURIComponent)")
+    decode_at = router.index(".map(decode)")
     assert split_at < decode_at
 
 
@@ -446,3 +446,64 @@ def test_a_bug_loading_a_cluster_is_not_reported_as_not_found(monkeypatch):
     client = TestClient(server.app, raise_server_exceptions=False)
 
     assert client.get("/api/clusters/nope/candidates").status_code == 500
+
+
+# --------------------------------------------------------------------------- #
+# The front-end review of 2026-11-14
+# --------------------------------------------------------------------------- #
+
+def test_a_stray_percent_in_the_address_does_not_break_the_router():
+    """decodeURIComponent throws on "100%". Uncaught inside the route store,
+    that stopped every later navigation until a reload."""
+    got = _node("""
+      const { parseHash: p } = await import("./src/lib/router.js");
+      console.log(JSON.stringify([p("#/search/100%"), p("#/indicator/a%zz.example"),
+                                  p("#/selector/http.server/nginx%2F1.29.3")]));
+    """)
+    assert got[0] == {"name": "search", "query": "100%"}
+    assert got[1] == {"name": "indicator", "value": "a%zz.example"}
+    assert got[2]["value"] == "nginx/1.29.3", "a good escape is still decoded"
+
+
+def test_no_view_fetches_without_showing_a_failure():
+    """Three views called the API with `.then().finally()` and no `.catch`:
+    a failed request rendered as "Nothing found" or "No findings recorded
+    yet", and a slow answer for the page just left could overwrite the one
+    now open. `resource` handles both."""
+    offenders = []
+    for path in SRC.rglob("*.svelte"):
+        text = path.read_text()
+        if ".finally(" in text and ".catch(" not in text:
+            offenders.append(str(path.relative_to(SRC)))
+    assert offenders == []
+    for view in ("Indicator", "SelectorValue", "Findings"):
+        text = (SRC / "views" / f"{view}.svelte").read_text()
+        assert "resource(" in text and "Failed to load" in text, view
+
+
+def test_a_closed_panel_fetches_nothing():
+    """The candidates tab fetched its whole list twice on load and again on
+    every close, because the evidence panel had a URL even when shut."""
+    assert "if (!url)" in (SRC / "lib" / "resource.svelte.js").read_text()
+    candidates = (SRC / "views" / "cluster" / "Candidates.svelte").read_text()
+    evidence = candidates[candidates.index("const evidence"):]
+    assert ": null);" in evidence[:300]
+
+
+def test_links_show_the_score_that_judged_them():
+    """Links are promoted on a score band now. The page still explained
+    every held-back link by the counting rule alone, and told the reader an
+    identity value "counts toward a link" beside a verdict that it had been
+    discounted to nothing."""
+    held = (SRC / "components" / "HeldBack.svelte").read_text()
+    assert "BandChip" in held
+    assert "given no weight for this pair" in held
+    assert "strong band" in held
+    indicator = (SRC / "views" / "Indicator.svelte").read_text()
+    promoted = indicator[indicator.index("link--promoted"):]
+    assert "BandChip" in promoted[:400]
+
+
+def test_an_unknown_cluster_name_is_not_a_link_to_the_overview():
+    chip = (SRC / "components" / "ClusterChip.svelte").read_text()
+    assert ': "#"}' not in chip

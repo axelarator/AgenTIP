@@ -43,6 +43,16 @@ DEFAULT_MODEL = os.environ.get("CTI_GRAPH_MODEL", "claude-sonnet-5")
 
 log = logging.getLogger(__name__)
 
+# A turn is one model response; each tool call costs one. At 4 a specialist
+# had three lookups and its answer, and the fourth lookup aborted it with
+# nothing kept - 5 of 112 runs before 2026-10-17, two of four that day.
+#
+# It lives here, not beside the specialists, because the shared prompt
+# states it: the prompt said "at most two tool calls" while this allowed
+# five, and a specialist that believed the prompt and one that did not were
+# both within the rules.
+SPECIALIST_MAX_TURNS = 6
+
 
 def selector_taxonomy() -> str:
     """The selector taxonomy, rendered from the code that enforces it.
@@ -102,7 +112,9 @@ def load_prompt(name: str, *, with_common: bool = True) -> str:
         body = body.replace("{{SELECTOR_TAXONOMY}}", selector_taxonomy())
     if not with_common:
         return body
-    return (PROMPTS / "_common.md").read_text() + "\n\n---\n\n" + body
+    common = (PROMPTS / "_common.md").read_text().replace(
+        "{{MAX_LOOKUPS}}", str(SPECIALIST_MAX_TURNS - 1))
+    return common + "\n\n---\n\n" + body
 
 
 def mcp_config() -> dict[str, Any]:

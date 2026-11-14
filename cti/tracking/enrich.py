@@ -1,8 +1,8 @@
 """Budgeted daily enrichment: HoneyLabs telemetry + registry ASN data,
 with ASN-change detection against prior observations.
 
-HoneyLabs telemetry comes over their hosted MCP server (see hl_mcp for
-why, and for the OPSEC exception it makes): one session per batch,
+HoneyLabs telemetry comes over their hosted MCP server, directly from
+this host (see hl_mcp for why): one session per batch,
 back-to-back calls with light pacing, so the HoneyLabs phase runs in
 minutes rather than the half hour the direct 10 req/min API took. The
 MCP quota is not publicly documented, so the batch stays capped

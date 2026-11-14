@@ -1,5 +1,6 @@
 <script>
-  import { api, selectorUrl } from "../lib/api.js";
+  import { selectorUrl } from "../lib/api.js";
+  import { resource } from "../lib/resource.svelte.js";
   import { href } from "../lib/router.js";
   import { dayOf } from "../lib/format.js";
   import Busy from "../components/Busy.svelte";
@@ -7,18 +8,16 @@
   import SelectorMeaning from "../components/SelectorMeaning.svelte";
 
   let { type, value } = $props();
-  let loading = $state(true);
-  let d = $state(null);
-
-  $effect(() => {
-    loading = true;
-    d = null;
-    api(selectorUrl(type, value)).then((r) => (d = r)).finally(() => (loading = false));
-  });
+  // `resource`: a failed request is shown as one, and a slow answer for
+  // the value just left cannot land on the one now open.
+  const res = resource(() => selectorUrl(type, value));
+  const d = $derived(res.data);
 </script>
 
-{#if loading}
+{#if res.loading}
   <p class="muted">Loading…</p>
+{:else if res.error}
+  <p class="muted">Failed to load: {res.error}</p>
 {:else if d?.busy}
   <Busy error={d.error} />
 {:else if d?.not_a_selector}

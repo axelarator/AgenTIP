@@ -1,7 +1,10 @@
 <script>
-  import { api, indicatorUrl } from "../lib/api.js";
+  import { indicatorUrl } from "../lib/api.js";
+  import { resource } from "../lib/resource.svelte.js";
+  import { clusters } from "../lib/store.js";
   import { href } from "../lib/router.js";
   import { dayOf, formatDate, humanBytes } from "../lib/format.js";
+  import BandChip from "../components/BandChip.svelte";
   import Busy from "../components/Busy.svelte";
   import CopyValue from "../components/CopyValue.svelte";
   import IndicatorChip from "../components/IndicatorChip.svelte";
@@ -11,8 +14,11 @@
   import StatusChip from "../components/StatusChip.svelte";
 
   let { value } = $props();
-  let loading = $state(true);
-  let p = $state(null);
+  // `resource`, not a bare fetch: a failed request used to leave the page
+  // saying "Nothing found", and a slow answer for the indicator just left
+  // could land on top of the one now open.
+  const res = resource(() => indicatorUrl(value));
+  const p = $derived(res.data && !res.data.busy ? res.data : null);
   let tab = $state("current");
   let sourceFilter = $state("all");
   // 172 observations over 27 days is a lot of scrolling to reach last week.
@@ -20,16 +26,17 @@
   let jumpDate = $state("");
 
   $effect(() => {
-    loading = true;
-    p = null;
+    value;
     tab = "current";
     sourceFilter = "all";
     windowDays = 7;
     jumpDate = "";
-    api(indicatorUrl(value))
-      .then((d) => (p = d))
-      .finally(() => (loading = false));
   });
+  // The cluster's real slug when the sidebar knows it; the guess from the
+  // name only until it has loaded.
+  const clusterHref = (actor) => href.cluster(
+    $clusters.find((c) => c.name === actor)?.slug
+      ?? actor.toLowerCase().replace(/\s+/g, "-"));
 
   const CLASS_ORDER = ["identity", "structural", "behavioural", "contextual"];
   const byClass = $derived(
@@ -88,10 +95,12 @@
   const isLong = (v) => typeof v === "string" && /^[0-9a-f]{32,}$/i.test(v);
 </script>
 
-{#if loading}
+{#if res.loading}
   <p class="muted">Loading…</p>
-{:else if p?.busy}
-  <Busy error={p.error} />
+{:else if res.error}
+  <p class="muted">Failed to load: {res.error}</p>
+{:else if res.data?.busy}
+  <Busy error={res.data.error} />
 {:else if !p}
   <p class="muted">Nothing found.</p>
 {:else}
@@ -101,7 +110,7 @@
       <StatusChip status={p.status} />
       <span>{p.indicator_type ?? "unknown type"}</span>
       {#each p.actors as a}
-        <a href={href.cluster(a.toLowerCase().replace(/\s+/g, "-"))}>{a}</a>
+        <a href={clusterHref(a)}>{a}</a>
       {/each}
       <span>{p.observation_count} observations · {p.sources.length} sources</span>
       <span>{dayOf(p.first_seen)} → {dayOf(p.last_seen)}</span>
@@ -223,7 +232,9 @@
         <article class="link link--promoted">
           <div class="link__top">
             <IndicatorChip value={l.indicator} />
+            {#if l.band}<BandChip band={l.band} score={l.score} />{/if}
             {#if l.actor}<span class="muted">{l.actor}</span>{/if}
+            <a class="muted" href={href.pairs(p.indicator, l.indicator)}>why</a>
           </div>
           <p class="link__reason">{l.reason}</p>
           {#each [...l.identity, ...l.structural] as [t, v]}
@@ -235,7 +246,8 @@
     {#if held.length}
       <h2 class="cls">Held back ({held.length})</h2>
       <p class="muted">
-        The corroboration rule declined these. That is the filter working, not a gap.
+        Not promoted: a link is promoted only when its evidence scores in the
+        strong band. That is the filter working, not a gap.
       </p>
       {#each held.slice(0, 25) as l}
         <HeldBack link={l} classes={selectorClasses} />

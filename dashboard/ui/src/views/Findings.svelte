@@ -1,25 +1,20 @@
 <script>
-  import { api } from "../lib/api.js";
+  import { resource } from "../lib/resource.svelte.js";
   import { href } from "../lib/router.js";
-  import { dayOf } from "../lib/format.js";
   import Busy from "../components/Busy.svelte";
   import IndicatorChip from "../components/IndicatorChip.svelte";
 
   let { date = null } = $props();
-  let loading = $state(true);
-  let data = $state(null);
-
-  $effect(() => {
-    loading = true;
-    data = null;
-    api(date ? `/api/findings/${encodeURIComponent(date)}` : "/api/findings")
-      .then((d) => (data = d))
-      .finally(() => (loading = false));
-  });
+  // A failed request used to read as "No findings recorded yet".
+  const res = resource(() =>
+    date ? `/api/findings/${encodeURIComponent(date)}` : "/api/findings");
+  const data = $derived(res.data);
 </script>
 
-{#if loading}
+{#if res.loading}
   <p class="muted">Loading…</p>
+{:else if res.error}
+  <p class="muted">Failed to load: {res.error}</p>
 {:else if data?.busy}
   <Busy error={data.error} />
 {:else if !date}

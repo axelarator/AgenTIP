@@ -11,9 +11,11 @@
 
   // One candidate's evidence at a time, fetched on demand.
   let open = $state(null);
+  // Closed, it fetches nothing: it used to fetch the whole list a second
+  // time on load and again on every close.
   const evidence = resource(() => open
     ? `/api/clusters/${encodeURIComponent(data.name)}/candidates?value=${encodeURIComponent(open)}`
-    : `/api/clusters/${encodeURIComponent(data.name)}/candidates`);
+    : null);
   const gap = (g) => g == null ? "undated" : g === 0 ? "overlapping" : `${Math.round(g)}d apart`;
 </script>
 
@@ -45,6 +47,8 @@
               {#if open === c.entity}
                 <tr><td colspan="5">
                   {#if evidence.loading}<div class="loading">Scoring…</div>
+                  {:else if evidence.error}<div class="hint">Failed to load: {evidence.error}</div>
+                  {:else if evidence.data?.busy}<div class="hint">{evidence.data.error}</div>
                   {:else if evidence.data?.evidence}
                     {#each evidence.data.evidence as e}
                       <div class="ev mono">

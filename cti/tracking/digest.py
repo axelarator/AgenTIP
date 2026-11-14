@@ -3,9 +3,9 @@ the Stage B agent reads by default.
 
 Token frugality is the design constraint: every section is capped at
 MAX_ROWS with an explicit "...N more, query the DB" line, and a day
-with no signals collapses to a single NO ACTIVITY marker that Stage B's
-wrapper script uses to skip the agent invocation entirely. A .json
-twin is written alongside for tests and any future dashboard view.
+with no signals collapses to a single NO ACTIVITY marker. A .json twin is
+written alongside: it is what the analyze stage ranks from, and what the
+dashboard and the tests read.
 """
 from __future__ import annotations
 
@@ -83,6 +83,13 @@ def _table(rows: list[dict[str, Any]], columns: list[str]) -> list[str]:
 
 
 def _has_signals(sections: dict[str, Any]) -> bool:
+    """Whether the markdown digest has anything to show beyond its header.
+
+    This decides what a person reading the file sees, and nothing else. It
+    was written when a wrapper script skipped the model on a NO ACTIVITY
+    file; the analyze stage now ranks from the JSON twin whatever this
+    returns, and a specialist with no items is simply not called. The
+    comments below that speak of "waking" the analysis date from then."""
     ingest = sections.get("ingest") or {}
     enrich = sections.get("enrich") or {}
     register = sections.get("register") or {}

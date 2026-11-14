@@ -8,7 +8,7 @@
 </script>
 
 <PageHeader title="Daily narrative"
-  sub="Stage B's analyst writeup over each day's tracking digest — skipped on quiet days." />
+  sub="The analyst writeup over each day's tracking digest. A quiet day gets two lines; a day the analysis failed says so at the top." />
 
 <Async {res}>
   {#snippet children(d)}

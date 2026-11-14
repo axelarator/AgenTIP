@@ -4,12 +4,24 @@ import { readable } from "svelte/store";
 // keep working. The split happens BEFORE decoding, which is load-bearing:
 // a selector value can contain an encoded '/' (nginx/1.29.3) and must not
 // be torn in half by the segmenter.
+//
+// A hand-typed '%' that is not an escape ("#/search/100%") makes
+// decodeURIComponent throw. Uncaught, that killed the route store and with
+// it every later navigation; the segment is kept as typed instead.
+function decode(segment) {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
 export function parseHash(raw) {
   const parts = String(raw || "")
     .replace(/^#\/?/, "")
     .split("/")
     .filter(Boolean)
-    .map(decodeURIComponent);
+    .map(decode);
   const [head, ...rest] = parts;
   switch (head) {
     case undefined:

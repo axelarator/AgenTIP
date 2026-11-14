@@ -263,3 +263,12 @@ def test_no_prompt_points_at_a_field_no_item_carries():
     assert "`revoked` is true" not in load_prompt("cert_tls")
     # opendir.md read as if analysis results arrived on the item.
     assert "never carries analysis results" in load_prompt("opendir")
+
+
+def test_the_lookup_limit_in_the_prompt_is_the_one_the_code_enforces():
+    """The prompt said "at most two tool calls" while the code allowed five."""
+    for family in FAMILY_ATTRIBUTES:
+        prompt = load_prompt(family)
+        assert "{{" not in prompt
+        assert f"The hard limit is {analyze.MAX_TURNS - 1}:" in prompt, family
+    assert "at most two tool calls" not in load_prompt("cert_tls")

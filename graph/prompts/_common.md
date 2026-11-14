@@ -24,8 +24,10 @@ on an otherwise active address is the quiet-infrastructure signal.
 contains them; they are a separate, on-demand, post-probe capability.
 Never suggest an OpenSearch or Arkime query as a follow-up.
 
-**Tool budget.** You may make at most two tool calls, and only
-`query_duckdb` and `get_actor_summary`. Never run a broad query over raw
+**Tool budget.** Only `query_duckdb` and `get_actor_summary`. Aim for two
+calls or fewer. The hard limit is {{MAX_LOOKUPS}}: one call more and you
+are stopped and asked to answer from the items alone, without what you
+looked up. Never run a broad query over raw
 observations - no `SELECT * FROM observations_wide`, no unfiltered scans.
 If the item alone tells you what you need, make no calls at all.
 

@@ -210,7 +210,9 @@ network traffic, but deliberately outside the daily narrative.
 
 Analyze runs rank, the specialist agents and narrate over the digest. It
 saves correlations and `data/tracking/narratives/<date>.md`. A
-`NO ACTIVITY` digest skips the agents entirely. Rank drops routine
+specialist with no items is not called, so a day with nothing to rank
+costs no model call; the `NO ACTIVITY` marker only shortens the markdown
+digest. Rank drops routine
 certificate renewals (`cert_renewed`), changes on dormant or retired
 indicators, and shared-hosting rows (ASN list in
 `cti/store/data/shared_hosting_asns.txt`, plus CDN PTRs) before any model

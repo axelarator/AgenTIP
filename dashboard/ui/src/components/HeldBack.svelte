@@ -1,4 +1,5 @@
 <script>
+  import BandChip from "./BandChip.svelte";
   import CopyValue from "./CopyValue.svelte";
   import IndicatorChip from "./IndicatorChip.svelte";
 
@@ -8,10 +9,16 @@
   // candidate, just never shown.
   let { link, classes } = $props();
 
+  //
+  // `counted` is whether the value carried any weight for this pair. An
+  // identity or structural value listed under `corroborating` is one the
+  // scorer discounted to nothing (a default certificate, a catch-all
+  // address); saying it "counts toward a link" beside a verdict that it did
+  // not was the page contradicting itself.
   const shared = $derived([
-    ...link.identity.map(([t, v]) => [t, v, "identity"]),
-    ...link.structural.map(([t, v]) => [t, v, "structural"]),
-    ...link.corroborating.map(([t, v]) => [t, v, classes[t] ?? "contextual"]),
+    ...link.identity.map(([t, v]) => [t, v, "identity", true]),
+    ...link.structural.map(([t, v]) => [t, v, "structural", true]),
+    ...link.corroborating.map(([t, v]) => [t, v, classes[t] ?? "contextual", false]),
   ]);
 
   const WHY = {
@@ -23,6 +30,7 @@
 <article class="held">
   <div class="held__top">
     <IndicatorChip value={link.indicator} />
+    {#if link.band}<BandChip band={link.band} score={link.score} />{/if}
     {#if link.actor}<span class="muted">{link.actor}</span>{/if}
   </div>
 
@@ -33,19 +41,30 @@
       These two share {shared.length} selector{shared.length === 1 ? "" : "s"}:
     </p>
     <ul class="held__list">
-      {#each shared as [type, value, cls]}
+      {#each shared as [type, value, cls, counted]}
         <li>
           <span class="held__type">{type}</span>
           <CopyValue {value} />
           <span class="held__why">
-            {WHY[cls] ?? `${cls} — counts toward a link`}
+            {WHY[cls] ?? (counted
+              ? `${cls} — counts toward a link`
+              : `${cls} — given no weight for this pair`)}
           </span>
         </li>
       {/each}
     </ul>
     <p class="held__rule">
-      A link needs one identity selector, or two structural selectors read
-      off different things. Nothing above clears that bar.
+      {#if link.band}
+        A link is promoted only when it scores in the strong band. Undiscounted,
+        that takes one identity selector, or two structural selectors read off
+        different things; a value that is old, common, a server default or
+        behind a CDN counts for less, so a pair can hold those and still fall
+        short. The verdict above says which applied.
+      {:else}
+        A link needs one identity selector, or two structural selectors read
+        off different things. Nothing above clears that bar, so the pair was
+        not scored.
+      {/if}
     </p>
   {/if}
 </article>

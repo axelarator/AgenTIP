@@ -7,4 +7,5 @@
   const match = $derived($clusters.find((c) => c.name === name));
 </script>
 
-<Chip href={match ? href.cluster(match.slug) : "#"}>{name}</Chip>
+<!-- No link when the cluster is not one we hold: "#" went to the overview. -->
+<Chip href={match ? href.cluster(match.slug) : null}>{name}</Chip>

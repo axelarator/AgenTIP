@@ -9,6 +9,9 @@ export function resource(getUrl) {
   $effect(() => {
     const url = getUrl();
     const mine = ++latest;
+    // No URL means nothing to fetch yet (a panel that is closed). Counting
+    // it as a request still retires any answer on its way for the last one.
+    if (!url) { s.loading = false; s.data = null; s.error = null; return; }
     s.loading = true;
     s.error = null;
     api(url)
