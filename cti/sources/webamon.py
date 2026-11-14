@@ -6,11 +6,11 @@ ASN, tech stack, kit fingerprints), an IP's hosted domains (the reverse-IP
 / passive-hostname replacement), and infostealer-log hits, and can submit
 a fresh scan when the index has nothing recent.
 
-Unlike pivot.py's sources, these calls are made **directly from this host**
-rather than through the probe VM: they hit Webamon's SaaS, not the tracked
-indicator's own infrastructure, so there's no adversary-facing traffic to
-keep off the analyst's host - the same deliberate exception already made
-for the HoneyLabs MCP server.
+Unlike pivot.py's registry and live lookups, these calls are made
+**directly from this host** rather than through the probe VM: they hit
+Webamon's SaaS, not the tracked indicator's own infrastructure, so there's
+no adversary-facing traffic to keep off the analyst's host - the same
+exception every keyed vendor index gets (`cti/sources/http.py`).
 
 Every function returns a plain dict, or `{"error": "..."}` on failure -
 never raises into the enrichment sweep - so `_cached_pivot` and the
@@ -68,7 +68,7 @@ def rescan_days() -> int:
 # sources/budget.py, shared with RDAP and HoneyLabs and safe under the
 # parallel fan-out. The urllib transport is now sources/http.py.
 #
-# Webamon is one of the two documented via="direct" exceptions: it queries
+# Webamon is one of the documented via="direct" exceptions: it queries
 # the vendor's own scan index, not the indicator's own infrastructure, so
 # routing it through the probe VM would spend that host's egress allowance
 # for no OPSEC benefit.

@@ -1,8 +1,13 @@
 Your remit: **what the host presents** - certificates and served content.
 
 **Issuer change (`cert_issuer_changed`).** The stronger certificate
-signal. A different issuer usually means the infrastructure was rebuilt
-rather than renewed.
+signal, but read both issuer names before weighing it. A different
+certificate authority (the `O=` differs: Let's Encrypt to Sectigo, a public
+CA to self-signed) usually means the infrastructure was rebuilt rather than
+renewed. A different intermediate of the same authority (Let's Encrypt
+`YR2` to `YR1`, one "Microsoft TLS G2 RSA CA OCSP" number to another) is
+the authority rotating its own intermediates, and is as routine as a
+renewal: report nothing for it unless something else on the item changed.
 
 **New SANs (`cert_sans_changed`).** New sibling hostnames on an existing
 certificate are worth a look for related infrastructure, but they are not
@@ -17,7 +22,9 @@ the host that served it, which is what makes it pivotable. To see who
 else has served it, query
 `SELECT indicator_value, first_seen, last_seen FROM selectors WHERE
 selector_type = 'tls.cert_sha256' AND selector_value = '<hash>'`; never
-say it was "filed to the hash list". If `revoked` is true, lead with that.
+say it was "filed to the hash list". The item carries only the old and new
+hash; it does not say whether either certificate was revoked, so do not
+claim it.
 
 **Dates.** Each item carries the date it was detected. When that is not
 the digest's own day, say when the change happened ("rotated on

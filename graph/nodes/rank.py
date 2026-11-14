@@ -255,24 +255,42 @@ def _items_from_infrastructure_links(digest: dict[str, Any]) -> list[Item]:
     held = links.get("held_back_total") or 0
     out = []
     for row in promoted:
+        new_value = {"linked_to": row.get("linked_to"),
+                     # The judge's own numbers. Absent from a digest written
+                     # before links were scored, so they are passed only
+                     # when the row has them.
+                     **{k: row[k] for k in ("score", "band") if row.get(k) is not None},
+                     "reason": row.get("reason")}
+        for slot in ("identity", "structural", "corroborating"):
+            new_value.update(_sample(slot, row.get(slot) or []))
         out.append(Item(
             family="infrastructure", attribute="selector_link",
             actor=row.get("actor"),
             indicator=row.get("seed") or "",
             change_type="selector_link",
-            # The rule is deterministic and was applied before this point:
-            # an identity selector, or two independent structural ones. That
-            # is a high-confidence claim by construction.
+            # The link was scored and reached the promoting band before this
+            # point. That is a high-confidence claim by construction.
             confidence="high",
             detected_at=str(digest.get("day") or "") or None,
             old_value={"held_back": held},
-            new_value={"linked_to": row.get("linked_to"),
-                       "reason": row.get("reason"),
-                       "identity": row.get("identity"),
-                       "structural": row.get("structural"),
-                       "corroborating": row.get("corroborating")},
+            new_value=new_value,
             source_section="infrastructure_links",
         ))
+    return out
+
+
+# How many values of each evidence class an item shows. Two load balancers
+# can share forty certificates, and the specialist reads a bounded slice of
+# each item: listed in full, the identity values alone filled it and the
+# structural and corroborating evidence was cut off unseen. A few of each,
+# with the count of the rest, says the same thing in the space there is.
+EVIDENCE_SHOWN = 3
+
+
+def _sample(slot: str, pairs: list) -> dict[str, Any]:
+    out: dict[str, Any] = {slot: pairs[:EVIDENCE_SHOWN]}
+    if len(pairs) > EVIDENCE_SHOWN:
+        out[f"{slot}_not_shown"] = len(pairs) - EVIDENCE_SHOWN
     return out
 
 
@@ -334,7 +352,7 @@ def _latest_per_indicator(items: list[Item]) -> list[Item]:
 
     The digest window is several days wide, so a domain whose resolved IP
     moves every day contributes one row per day. Spending a specialist's
-    two-item budget on the same domain twice is the same mistake the
+    few-item budget on the same domain twice is the same mistake the
     single pass made, just smaller.
     """
     best: dict[tuple[str, str, str], Item] = {}

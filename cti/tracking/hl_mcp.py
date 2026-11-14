@@ -1,17 +1,16 @@
 """HoneyLabs lookups over their hosted MCP server (mcp.honeylabs.net)
 instead of the plain lookup API.
 
-Why this exists alongside pivot.honeylabs_lookup: pivot routes every
-call through the probe VM SSH hop and looks IPs up one at a time, so a
+Why this exists alongside pivot.honeylabs_lookup: pivot looks IPs up one
+at a time (and, until 2026-11-13, through the probe VM's SSH hop), so a
 300-IP batch took half an hour and a single transient 429 used to end
 telemetry for the day. The MCP endpoint authenticates with the same
 HONEYLABS_API_KEY and answers in ~0.6s per call over one session.
 
 OPSEC note: these calls go straight from this host, NOT via the probe
-VM. That is a deliberate exception to pivot.py's "nothing originates
-from this host" rule: HoneyLabs is a threat-intel provider we already
-authenticate to (and query interactively over this same MCP endpoint),
-not candidate adversary infrastructure. Registry lookups (RIPEstat,
+VM, like every keyed vendor lookup (`cti/sources/http.py`): HoneyLabs is a
+threat-intel provider we already authenticate to (and query interactively
+over this same MCP endpoint), not candidate adversary infrastructure. Registry lookups (RIPEstat,
 RDAP) keep riding the VM hop.
 
 Both surfaces share the plan's limits (free tier: 500 credits/day, 10

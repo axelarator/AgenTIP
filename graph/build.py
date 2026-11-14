@@ -46,7 +46,7 @@ def build_collect():
 
 
 def build_analyze():
-    """Stage B: rank -> four specialists in parallel -> persist -> narrate."""
+    """Stage B: rank -> five specialists in parallel -> persist -> narrate."""
     g = StateGraph(CTIState)
     g.add_node("rank", rank.rank)
     for family in FAMILY_ATTRIBUTES:

@@ -2,15 +2,15 @@
 public data sources.
 
 This is a deliberate, narrow exception to this tool's "no external API
-calls" design: report_ingest.py already fetches a URL you explicitly
+calls" design: cti/report/ingest.py already fetches a URL you explicitly
 hand it, but this module reaches out to third-party enrichment
 services to ask "what else is tied to this indicator". pivot_observable
 is strictly on-demand - only when a caller names a specific value.
-pivot_cluster (core.py) sweeps a whole cluster and IS run on a
+pivot_cluster (cti/clusters/enrich.py) sweeps a whole cluster and IS run on a
 schedule: the daily cron (`python -m graph daily`) calls it once per
 tracked cluster so lifecycle status and open ports don't go stale
-between manual pivots. See SKILL.md's "Infrastructure pivoting" section
-for when to reach for either by hand.
+between manual pivots. See the infrastructure-pivoting skill for when to
+reach for either by hand.
 
 The scan-platform sources this module used to carry (VirusTotal, Shodan
 InternetDB, Hackertarget reverse-IP, Cert Spotter CT logs) were retired
@@ -41,15 +41,18 @@ down). What remains here are the live registry/telemetry sources:
   here usually reads as mass-scanner/opportunistic background noise -
   a counter-signal for "dedicated C2" - while absence on an otherwise
   active IP is the quiet-infrastructure signal. Skipped gracefully if
-  no key is configured; deliberately no keyless fallback (keyless
-  lookups would burn the probe VM egress IP's shared 60/hr allowance).
+  no key is configured; deliberately no keyless fallback (a keyless
+  lookup is rate-limited by source address, 60 an hour).
 
 Every one of these lookups names a tracked indicator to a third party
-(the domain/IP/hash being pivoted on), so - same as active
-fingerprinting - none of it originates from this host. All HTTP calls
-and DNS resolution route through cti.probe.vm_proxy, which proxies them
-through the probe VM over its restricted SSH channel. See
-vm_proxy's module docstring for why.
+(the domain/IP/hash being pivoted on). The registry lookups (RDAP,
+RIPEstat) and DNS resolution therefore do not originate from this host:
+they go through cti.probe.vm_proxy, which proxies them through the probe
+VM over its restricted SSH channel, the same as active fingerprinting. See
+vm_proxy's module docstring for why. The two keyed lookups, ThreatFox and
+HoneyLabs, go directly from this host instead, because a request that
+carries a credential is never handed to the probe VM
+(cti/sources/http.py).
 """
 from __future__ import annotations
 

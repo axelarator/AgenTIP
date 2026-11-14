@@ -553,8 +553,10 @@ def import_stix_bundle(bundle: dict[str, Any], name: str | None = None,
 @_tool
 def query_duckdb(sql: str) -> dict:
     """Run a read-only SQL query against the actor-tracking DuckDB
-    (tables: observations, asn_changes, attribute_changes, actors,
-    correlations, zeek_matches). Writes are rejected; output is capped at
+    (main tables: observations, observations_wide, asn_changes,
+    attribute_changes, actors, correlations, selectors, memberships,
+    opendir_files, opendir_samples, active_scans, zeek_matches; `SHOW
+    TABLES` lists the rest). Writes are rejected; output is capped at
     200 rows - aggregate or filter instead of paging through raw tables."""
     return tracking.run_readonly_query(sql)
 
@@ -565,7 +567,7 @@ def save_correlation(actor: str, correlation_type: str, indicators: list[str],
                      suggested_opensearch_query: str | None = None) -> dict:
     """Persist a correlation finding for a tracked actor.
     correlation_type: asn_pivot | port_pattern | temporal_cluster |
-    new_infrastructure | zeek_hit. confidence: high | medium | low."""
+    new_infrastructure | shared_fingerprint | zeek_hit. confidence: high | medium | low."""
     return tracking.save_correlation(actor, correlation_type, indicators,
                                      narrative, confidence,
                                      suggested_opensearch_query)

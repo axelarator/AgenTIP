@@ -177,6 +177,13 @@ parallel, one per family (`infra_change`, `cert_tls`, `hosting`,
 `opendir`, `infrastructure`); `persist` stores their findings; `narrate`
 writes the day's narrative. A quiet day skips the specialists.
 
+The model calls run on the operator's subscription. A call refused for a
+usage limit waits until the reset time the refusal names and tries again,
+for up to `CTI_LIMIT_WAIT_HOURS` in all (default 8; 0 turns the waiting
+off). If specialists still fail, the narrative says the day was not
+analysed and names them, and `python -m graph analyze --date <day>`
+re-runs the stage over the digest already written.
+
 Each phase records its own failure and the run continues. Failed phases
 are listed at the top of the digest. Every run is traced to `data/runs/`.
 

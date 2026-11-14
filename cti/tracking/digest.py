@@ -28,11 +28,10 @@ def digest_dir() -> Path:
 
 
 def narrative_dir() -> Path:
-    """Where Stage B (scripts/daily_narrative.sh) writes its one
-    markdown file per day. That script hardcodes the same default path
-    rather than reading this env var - CTI_TRACKING_NARRATIVES exists
-    here for parity with digest_dir() (tests, dashboard) but isn't yet
-    plumbed into the shell script."""
+    """Where the analyze stage (`python -m graph analyze`) writes its one
+    markdown file per day, and where the dashboard reads it.
+    `CTI_TRACKING_NARRATIVES` overrides the default, as
+    `CTI_TRACKING_DIGESTS` does for digest_dir()."""
     return Path(os.environ.get("CTI_TRACKING_NARRATIVES",
                                _REPO_ROOT / "data" / "tracking" / "narratives"))
 

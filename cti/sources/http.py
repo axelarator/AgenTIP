@@ -18,14 +18,15 @@ timeout constant and its own idea of what an error looks like:
 
 That choice is an OPSEC decision, not a performance one, so it is a
 required argument with no default. Anything that *names a tracked
-indicator* - RDAP, RIPEstat, ThreatFox, DNS, TLS, HTTP - goes via the
-probe VM, because an RDAP lookup on a malicious domain is still traffic
+indicator* to a registry or to the indicator itself - RDAP, RIPEstat, DNS,
+TLS, HTTP - goes via the probe VM, because an RDAP lookup on a malicious domain is still traffic
 that tells a third party this host is interested in that domain, and a
 live grab reaches the adversary's own infrastructure.
 
-The exceptions go direct: Webamon, HoneyLabs and ThreatFox. They are
-queries against a vendor's own index, not against the indicator, and each
-carries an API key.
+The exceptions go direct: Webamon, HoneyLabs, ThreatFox and Validin, which
+each carry an API key, and the two keyless passive sources in `passive.py`
+(Shodan InternetDB and mnemonic). They are queries against a vendor's own
+index, not against the indicator.
 
 A request that carries a credential never goes via the probe, and `fetch`
 refuses one that tries. The probe VM is the machine that connects to

@@ -56,7 +56,7 @@ FINGERPRINTABLE_CATEGORIES = _FINGERPRINTABLE_CATEGORIES
 # positive, so only the bare apex domain (never itself attacker infra)
 # is listed. Curated, not exhaustive - extend as new false positives
 # turn up in real ingests, the same way _TLDS is extended in
-# report_ingest.py. This only gates the fingerprinting *queue*; the
+# cti/report/ingest.py. This only gates the fingerprinting *queue*; the
 # value is still tracked as an observable exactly as before.
 _KNOWN_NON_ACTOR_DOMAINS = {
     "microsoft.com", "microsoftinternetsafety.net", "google.com",

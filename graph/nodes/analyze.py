@@ -1,13 +1,13 @@
 """The specialist nodes, and the reducer that follows them.
 
-Four specialists run concurrently, each with its own short prompt and a
+Five specialists run concurrently, each with its own short prompt and a
 read-only tool budget. They write only to `findings` and `errors`, which
 are the graph's two reducer fields - that is what makes running them at
 the same time safe without a lock.
 
 Writes are centralized in `persist`, deliberately. DuckDB's write lock is
 process-exclusive and `connect_retry` retries only the connect, never the
-body, so four nodes each calling save_correlation would surface as
+body, so five nodes each calling save_correlation would surface as
 "tracking DB busy" rather than queueing. One writer, at the end.
 """
 from __future__ import annotations
@@ -52,13 +52,21 @@ def _render_items(items: list[Item]) -> str:
         lines.append(f"- attribute: {item.attribute}  (change: {item.change_type})")
         lines.append(f"- detected: {item.detected_at}")
         lines.append(f"- stored confidence: {item.confidence}")
-        lines.append(f"- old: {_trim(item.old_value)}")
-        lines.append(f"- new: {_trim(item.new_value)}")
+        limit = ITEM_CHARS.get(item.family, DEFAULT_ITEM_CHARS)
+        lines.append(f"- old: {_trim(item.old_value, limit)}")
+        lines.append(f"- new: {_trim(item.new_value, limit)}")
         lines.append("")
     return "\n".join(lines)
 
 
-def _trim(value: Any, limit: int = 600) -> str:
+# How much of one value a specialist reads. A link carries its evidence, up
+# to nine selector values of some 90 characters each (rank.EVIDENCE_SHOWN of
+# each class), and cut at the default it lost the classes listed last.
+DEFAULT_ITEM_CHARS = 600
+ITEM_CHARS = {"infrastructure": 1600}
+
+
+def _trim(value: Any, limit: int = DEFAULT_ITEM_CHARS) -> str:
     text = value if isinstance(value, str) else json.dumps(value, default=str)
     if text is None:
         return "null"
@@ -208,6 +216,8 @@ async def narrate(state: CTIState) -> dict:
     """Turn the findings into the day's narrative file."""
     findings = state.get("findings") or []
     if not findings:
+        # No model call, so the narration prompt's rule about failed
+        # specialists has to be kept here too.
         return {"narrative": _quiet_day(state)}
 
     payload = {
@@ -234,9 +244,26 @@ async def narrate(state: CTIState) -> dict:
 def _quiet_day(state: CTIState) -> str:
     items = state.get("items") or []
     suppressed = sum(1 for i in items if i.suppressed)
+    failed = _failures(state)
+    if failed:
+        # "Nothing noteworthy" was what a day read like when every
+        # specialist had been refused: no findings, because nothing looked.
+        return (f"# {state.get('day')}\n\n"
+                f"**Not analysed.** {len(failed)} specialist(s) failed, so no "
+                f"findings does not mean a quiet day. {len(items)} digest rows "
+                f"were ranked, {suppressed} suppressed as routine.\n\n"
+                + "".join(f"- {e}\n" for e in failed)
+                + f"\nRe-run with `python -m graph analyze --date {state.get('day')}`.\n")
     return (f"# {state.get('day')}\n\n"
             f"Nothing noteworthy. {len(items)} digest rows reviewed, "
             f"{suppressed} suppressed as routine before analysis.\n")
+
+
+def _failures(state: CTIState) -> list[str]:
+    """The run's errors that mean a specialist produced nothing. A note
+    that one answered without its lookups is not one of them."""
+    return [e for e in state.get("errors") or []
+            if "answered without further lookups" not in e]
 
 
 def _fallback_narrative(state: CTIState) -> str:

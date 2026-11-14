@@ -1,9 +1,12 @@
-"""Daily cross-reference of tracked-actor IPs against the lab's Zeek
-logs (Wazuh archives by default; see cti/sources/opensearch.py).
+"""Cross-reference of one day's tracked-actor IPs against the lab's Zeek
+logs (Wazuh archives by default; see cti/sources/opensearch.py). Run on
+request with `python -m graph xref --date`; the daily pipeline does not
+run it and the digest never carries its results.
 
-Pre-computes aggregate matches into the zeek_matches table so the
-Stage B agent reads a handful of rows instead of querying OpenSearch
-itself - that keeps query_opensearch off the MCP surface entirely.
+Pre-computes aggregate matches into the zeek_matches table so an agent
+reads a handful of rows through query_duckdb instead of querying
+OpenSearch itself - that keeps query_opensearch off the MCP surface
+entirely.
 """
 from __future__ import annotations
 

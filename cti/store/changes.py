@@ -213,9 +213,11 @@ SPECS: dict[str, AttributeSpec] = {
         attribute="ports", bare=True, source="nmap", guard="nmap_ports",
         columns=("nmap_ports",), json_columns=frozenset({"nmap_ports"}),
         classify=lambda old, new: _sorted_list_changed(old, new, "ports_changed"),
-        note="Ports come from on-demand nmap now that Shodan InternetDB is "
-             "retired, so a change here means someone actively rescanned the "
-             "host - not routine daily churn.",
+        note="Ports here come from on-demand nmap only, so a change means "
+             "someone actively rescanned the host - not routine daily churn. "
+             "Shodan InternetDB's passive port set is kept apart, under its "
+             "own source and selector (cti/sources/passive.py), and never "
+             "feeds this attribute.",
     ),
     "ptr": AttributeSpec(
         attribute="ptr", bare=True, source="ptr", guard=None,

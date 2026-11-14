@@ -16,8 +16,8 @@ a host can be weeks old."
 It is back for the half of that rule which does not hold. Staleness is a
 reason not to trust it for LIVENESS. It is not a reason to refuse
 COVERAGE: after the retirement there was no passive port source at all,
-and `changes.py` still says so ("Ports come from on-demand nmap now that
-Shodan InternetDB is gone"). A port set nobody had to scan for is worth
+and the `ports` attribute in `changes.py` is still fed by on-demand nmap
+alone. A port set nobody had to scan for is worth
 having, as long as nothing mistakes it for one we confirmed - which is why
 it gets its own source name, its own selector type, and a class that
 cannot promote anything.

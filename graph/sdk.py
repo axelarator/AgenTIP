@@ -4,14 +4,14 @@
 
 Two reasons, and the first is the decisive one.
 
-**Auth.** The pipeline's only LLM call today is `claude -p`, which uses
-the operator's Claude subscription. There is no ANTHROPIC_API_KEY in this
-environment. A LangChain `ChatAnthropic` node would need one, and would
+**Auth.** The pipeline this replaced made its one LLM call with
+`claude -p`, on the operator's Claude subscription, and the SDK uses the
+same login. There is no ANTHROPIC_API_KEY in this environment. A LangChain `ChatAnthropic` node would need one, and would
 bill per token - which matters when the point of this change is to run
 *more* model passes per day, in parallel.
 
 **Tools.** The tool surface the specialists need already exists as an MCP
-server with 33 tools, wired by .mcp.json, with the read-only subset
+server, wired by .mcp.json, with the read-only subset
 already allow-listed. The SDK speaks MCP natively, so a specialist gets
 `query_duckdb` and `get_actor_summary` by naming them. Re-exposing them
 as LangChain tools would mean a second definition of each to keep in sync.
@@ -23,10 +23,13 @@ which is what the fan-out needs anyway.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +40,8 @@ PROMPTS = Path(__file__).parent / "prompts"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_MODEL = os.environ.get("CTI_GRAPH_MODEL", "claude-sonnet-5")
+
+log = logging.getLogger(__name__)
 
 
 def selector_taxonomy() -> str:
@@ -120,11 +125,91 @@ class TurnResult:
     error: str | None = None
 
 
+# --- waiting out a usage limit ---------------------------------------------
+#
+# The pipeline runs on the operator's subscription, which the operator also
+# uses by hand. When the two meet, every model call of the 06:15 run fails
+# at once with "You've hit your session limit - resets 7:30am (UTC)", and
+# the day's narrative used to be written from nothing. On 2026-11-12 and
+# 2026-11-13 the analysis had to be re-run by hand.
+#
+# The limit says when it ends, so the call waits until then and tries
+# again. Waiting here, inside the call, means the rest of the run needs no
+# second pass: the specialists that were refused all sleep to the same
+# minute, then answer, and persist and narrate run once, as on any day.
+
+_LIMIT = re.compile(r"\b(?:session|usage|weekly|rate)[ -]limit\b|\bhit your limit\b",
+                    re.IGNORECASE)
+_RESETS = re.compile(r"resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(UTC\)",
+                     re.IGNORECASE)
+# After the stated reset, before trying: the clocks need not agree.
+RESET_MARGIN = timedelta(minutes=3)
+# When the message names no time this code can read.
+BLIND_WAIT = timedelta(minutes=30)
+
+
+def limit_wait_hours() -> float:
+    """How long a run may spend waiting for a usage limit to lift, in all.
+    `CTI_LIMIT_WAIT_HOURS`, default 8; 0 turns the waiting off, which is
+    what a run started by hand to see the error wants."""
+    try:
+        return max(0.0, float(os.environ.get("CTI_LIMIT_WAIT_HOURS", "8")))
+    except ValueError:
+        return 8.0
+
+
+def is_usage_limit(error: str | None) -> bool:
+    return bool(error and _LIMIT.search(error))
+
+
+def limit_resets_at(error: str, now: datetime) -> datetime | None:
+    """When the limit in this message lifts: the next time the clock reads
+    what the message says. None if it names no UTC time."""
+    m = _RESETS.search(error or "")
+    if not m:
+        return None
+    hour, minute = int(m.group(1)) % 12, int(m.group(2) or 0)
+    if m.group(3).lower() == "pm":
+        hour += 12
+    if hour > 23 or minute > 59:
+        return None
+    at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return at if at > now else at + timedelta(days=1)
+
+
 async def run_turn(*, system: str, prompt: str, allowed_tools: list[str],
                    max_turns: int = 4, model: str = DEFAULT_MODEL,
                    mcp: bool = True) -> TurnResult:
     """One bounded agent turn. Never raises - a specialist that fails is
-    a gap in the day's narrative, not a failed run."""
+    a gap in the day's narrative, not a failed run.
+
+    A turn refused for a usage limit is tried again once the limit lifts,
+    for as long as `limit_wait_hours` allows. A turn that fails any other
+    way is returned as it is."""
+    give_up = datetime.now(timezone.utc) + timedelta(hours=limit_wait_hours())
+    while True:
+        result = await _one_turn(system=system, prompt=prompt,
+                                 allowed_tools=allowed_tools, max_turns=max_turns,
+                                 model=model, mcp=mcp)
+        if not is_usage_limit(result.error):
+            return result
+        now = datetime.now(timezone.utc)
+        resets = limit_resets_at(result.error, now)
+        retry_at = resets + RESET_MARGIN if resets else now + BLIND_WAIT
+        if retry_at > give_up:
+            # Said plainly, so the log shows a wait that was declined and
+            # not one that was never considered.
+            log.warning("usage limit; not waiting (next attempt %s is past the "
+                        "%.1f h allowed)", f"{retry_at:%Y-%m-%d %H:%M} UTC",
+                        limit_wait_hours())
+            return result
+        log.warning("usage limit; waiting until %s to try again",
+                    f"{retry_at:%Y-%m-%d %H:%M} UTC")
+        await asyncio.sleep((retry_at - now).total_seconds())
+
+
+async def _one_turn(*, system: str, prompt: str, allowed_tools: list[str],
+                    max_turns: int, model: str, mcp: bool) -> TurnResult:
     options = ClaudeAgentOptions(
         system_prompt=system,
         allowed_tools=[f"mcp__cti-tools__{t}" for t in allowed_tools],
