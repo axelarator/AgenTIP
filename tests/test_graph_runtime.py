@@ -435,8 +435,9 @@ def test_the_printed_cron_runs_the_stages_as_one_job():
     It took 21 minutes on 2026-09-20 with an empty enrich worklist, and has
     since grown a corroborate stage; when it overruns, analyze exits with
     "no digest for <today>" and the day's analysis is lost."""
+    # The scan lines are separate jobs by design; this is about the stages.
     lines = [l for l in (REPO / "setup.sh").read_text().splitlines()
-             if 'echo "  ' in l and "* * *" in l]
+             if 'echo "  ' in l and "* * *" in l and "netwatch" not in l]
     assert len(lines) == 1, "collect and analyze must not be separate jobs"
     assert "graph daily" in lines[0]
 

@@ -131,7 +131,13 @@ echo "Daily actor-tracking loop (skills/actor-tracking/): add to crontab -e:"
 # <today>" and the day's analysis is simply lost. `daily` starts analyze
 # when collect finishes.
 echo "  15 6 * * * . \$HOME/.bashrc && cd $ROOT && .venv/bin/python -m graph daily >> data/tracking/logs/daily.log 2>&1"
-echo "  (defaults to today. The stages can still be run separately by hand:"
+# The scheduled scans. Without them the watchlist is never scanned and the
+# daily run has nothing new to read; these two lines were only ever in the
+# crontab itself.
+echo "  5 * * * *  . \$HOME/.bashrc && cd $ROOT && .venv/bin/python -m graph netwatch --tiers hot >> data/tracking/logs/netwatch.log 2>&1"
+echo "  0 6 * * *  . \$HOME/.bashrc && cd $ROOT && .venv/bin/python -m graph netwatch --tiers full --win116 >> data/tracking/logs/netwatch.log 2>&1"
+echo "  (drop --win116 if there is no Windows vantage.)"
+echo "  (daily defaults to today. The stages can still be run separately by hand:"
 echo "   -m graph collect, then -m graph analyze.)"
 echo "  Verify cron's view of the environment before trusting it:"
 echo "    env -i HOME=\$HOME SHELL=/bin/bash PATH=/usr/bin:/bin bash -c '. \$HOME/.bashrc; echo \$CTI_PROBE_HOST'"
@@ -141,7 +147,9 @@ echo "Probe VM (env): CTI_PROBE_HOST/USER/SSH_KEY/KNOWN_HOSTS/HELPER_CMD"
 echo "  (default helper: python3 /opt/cti/probe_helper.py on the Linux probe VM)."
 echo "Tunables (env): CTI_DUCKDB_PATH (default data/tracking/tracking.duckdb),"
 echo "  CTI_HL_BUDGET (HoneyLabs lookups/day, default 400),"
-echo "  CTI_WEBAMON_DAILY_BUDGET (default 1000), CTI_WEBAMON_RESCAN_DAYS (default 7)."
+echo "  CTI_WEBAMON_DAILY_BUDGET (default 1000), CTI_WEBAMON_RESCAN_DAYS (default 7),"
+echo "  CTI_LIMIT_WAIT_HOURS (how long analysis waits out a usage limit, default 8),"
+echo "  CTI_DASHBOARD_HOST (address the dashboard binds, default 127.0.0.1)."
 echo "Clusters enter the daily loop on their own: each collect run registers"
 echo "  any cluster the tracking store has not seen yet."
 echo

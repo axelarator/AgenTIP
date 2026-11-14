@@ -67,7 +67,10 @@ def test_the_build_is_not_older_than_its_sources():
     newest_source = max(p.stat().st_mtime for p in _sources())
     newest_build = max(p.stat().st_mtime
                        for p in BUILD.rglob("*") if p.is_file())
-    assert newest_build >= newest_source, (
+    # A checkout writes both trees in the same instant, in no fixed order,
+    # and left the bundle a millisecond "older" than a source it was built
+    # from. A source edited after a build is minutes newer, not milliseconds.
+    assert newest_build + 5 >= newest_source, (
         "dashboard/static is older than dashboard/ui/src - "
         "run `npm run build` in dashboard/ui")
 

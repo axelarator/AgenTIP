@@ -5,6 +5,10 @@
 #
 # Run as root ON THE PROBE VM, with probe_helper.py beside this script:
 #   sudo bash setup_probe_vm.sh --pubkey id_ed25519_probe.pub [--user detonate]
+#        [--provision-pubkey id_ed25519_cti_provision.pub]
+#
+# authorized_keys is rewritten on every run. Leave --provision-pubkey off and
+# the provisioning key (cti-provision) is removed.
 #
 # Network placement (VPN egress, NIC on the mirrored bridge so Zeek/Arkime
 # see its traffic, firewall blocking connections back to the cti host) is
@@ -25,7 +29,7 @@ while [[ $# -gt 0 ]]; do
     --provision-pubkey) PROVISION_PUBKEY="$2"; shift 2 ;;
     --user)   PROBE_USER="$2"; shift 2 ;;
     --helper) HELPER_SRC="$2"; shift 2 ;;
-    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -38,6 +42,16 @@ command -v apt-get >/dev/null || { echo "this script targets Debian/Ubuntu (apt)
 KEY_LINE=$(grep -v '^[[:space:]]*#' "$PUBKEY" | grep -m1 . || true)
 [[ $KEY_LINE == ssh-* || $KEY_LINE == ecdsa-* ]] \
   || { echo "$PUBKEY doesn't look like an OpenSSH public key" >&2; exit 1; }
+
+echo "== user $PROBE_USER"
+# Created first: the netwatch spool and the worker unit further down are
+# owned by and run as this user. Created after them, as it used to be, a
+# from-scratch build stopped at the spool with "invalid user" - every
+# rebuild of an existing VM worked, which is how it went unnoticed.
+if ! id "$PROBE_USER" >/dev/null 2>&1; then
+  useradd --create-home --shell /bin/bash "$PROBE_USER"
+fi
+usermod -p '*' "$PROBE_USER"                     # no password; key-only, not "locked"
 
 echo "== packages"
 export DEBIAN_FRONTEND=noninteractive
@@ -173,6 +187,16 @@ if [[ -d "$SANDBOX_SRC" ]]; then
   echo "   built cti-sbx:latest"
   # Prove the isolation flags actually isolate. A sandbox that can reach
   # the network is not a sandbox, and the failure would be silent.
+  #
+  # First that the probe can run at all. The check below passes when the
+  # connection fails, and it fails just as well when python is not where
+  # the image is expected to have it - which would "verify" nothing.
+  if ! docker run --rm --network=none --cap-drop=ALL \
+       --security-opt=no-new-privileges --entrypoint python cti-sbx:latest \
+       -c "import socket" 2>/dev/null; then
+    echo "   ERROR: cannot run python in cti-sbx:latest, so its isolation cannot be checked" >&2
+    exit 1
+  fi
   if docker run --rm --network=none --cap-drop=ALL \
        --security-opt=no-new-privileges --entrypoint python cti-sbx:latest \
        -c "import socket; socket.create_connection(('1.1.1.1',53),2)" 2>/dev/null; then
@@ -196,6 +220,9 @@ echo "== netwatch C2 templates -> /opt/cti/c2-templates"
 TEMPLATES_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/c2-templates"
 if [[ -d "$TEMPLATES_SRC" ]]; then
   install -d -m 0755 -o root -g root /opt/cti/c2-templates
+  # Emptied first: a template deleted from the repo otherwise stays on the
+  # VM and keeps matching.
+  rm -f /opt/cti/c2-templates/*.yaml
   install -m 0644 -o root -g root "$TEMPLATES_SRC"/*.yaml /opt/cti/c2-templates/ 2>/dev/null || true
   echo "   installed $(ls /opt/cti/c2-templates/*.yaml 2>/dev/null | wc -l) template(s)"
 else
@@ -243,11 +270,7 @@ systemctl restart netwatch-worker.service \
   && echo "   netwatch-worker.service restarted onto this helper" \
   || echo "   WARNING: could not restart netwatch-worker.service"
 
-echo "== user $PROBE_USER"
-if ! id "$PROBE_USER" >/dev/null 2>&1; then
-  useradd --create-home --shell /bin/bash "$PROBE_USER"
-fi
-usermod -p '*' "$PROBE_USER"                     # no password; key-only, not "locked"
+echo "== access for $PROBE_USER"
 # Needed for fetch_and_analyze. Note this is effectively root-equivalent on
 # this VM - which is why the probe VM is disposable, isolated on its own
 # VLAN, and unable to initiate a connection back to the cti host.
@@ -257,6 +280,8 @@ install -d -m 0700 -o "$PROBE_USER" -g "$PROBE_USER" "$home/.ssh"
 # Written from scratch, not appended: sshd uses the FIRST line matching a
 # key, so a leftover unrestricted line for the same key would void the
 # forced command. This user exists only for the probe key.
+had_provision_key=no
+grep -qs 'cti-provision' "$home/.ssh/authorized_keys" && had_provision_key=yes
 opts='command="python3 /opt/cti/probe_helper.py",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty'
 printf '%s %s\n' "$opts" "$KEY_LINE" > "$home/.ssh/authorized_keys"
 
@@ -264,11 +289,19 @@ printf '%s %s\n' "$opts" "$KEY_LINE" > "$home/.ssh/authorized_keys"
 # the truncating write above, never before it.
 if [[ -n "${PROVISION_PUBKEY:-}" && -f "$PROVISION_PUBKEY" ]]; then
   prov_line=$(grep -v '^[[:space:]]*#' "$PROVISION_PUBKEY" | grep -m1 . || true)
+  [[ $prov_line == ssh-* || $prov_line == ecdsa-* ]] \
+    || { echo "$PROVISION_PUBKEY doesn't look like an OpenSSH public key" >&2; exit 1; }
   prov_opts='command="/usr/local/sbin/cti-provision",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty'
   printf '%s %s\n' "$prov_opts" "$prov_line" >> "$home/.ssh/authorized_keys"
   echo "   pinned the provisioning key to /usr/local/sbin/cti-provision"
 elif [[ -n "${PROVISION_PUBKEY:-}" ]]; then
   echo "   WARNING: --provision-pubkey $PROVISION_PUBKEY not found" >&2
+elif [[ $had_provision_key == yes ]]; then
+  # The file is rewritten from scratch above, so a run without the flag
+  # takes the provisioning key out. Said out loud: the next thing to notice
+  # it would be a tool install failing with "permission denied".
+  echo "   WARNING: the provisioning key was installed and has been REMOVED." >&2
+  echo "            Re-run with --provision-pubkey <file> to keep it." >&2
 fi
 
 chown "$PROBE_USER:$PROBE_USER" "$home/.ssh/authorized_keys"

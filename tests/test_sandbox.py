@@ -1014,3 +1014,92 @@ def test_domains_on_abused_suffixes_are_kept(tmp_path, domain):
     path = tmp_path / "beacon"
     path.write_bytes(ELF + domain)
     assert analyze_mod.analyze(path, None)["extracted"]["domains"] == [domain.decode()]
+
+
+# --------------------------------------------------------------------------- #
+# The setup scripts, read in full on 2026-11-14
+# --------------------------------------------------------------------------- #
+
+def _setup_script() -> str:
+    return (REPO / "probe_vm" / "setup_probe_vm.sh").read_text()
+
+
+def _scripts():
+    return [REPO / "setup.sh", REPO / "probe_vm" / "setup_probe_vm.sh",
+            REPO / "probe_vm" / "cti-provision", REPO / "probe_vm" / "win116" / "deploy.sh"]
+
+
+def test_every_shell_script_parses():
+    import subprocess
+    for script in _scripts():
+        out = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
+        assert out.returncode == 0, f"{script.name}: {out.stderr}"
+
+
+def test_the_probe_user_exists_before_anything_is_handed_to_it():
+    """The spool directories and the worker unit are owned by the probe
+    user. It was created after them, so a from-scratch build stopped at
+    `install -o detonate` with "invalid user"; only rebuilds worked."""
+    script = _setup_script()
+    created = script.index("useradd --create-home")
+    for needs_user in ('-o "$PROBE_USER" -g "$PROBE_USER" /var/spool/netwatch',
+                       "User=$PROBE_USER", 'runuser -u "$PROBE_USER"'):
+        assert created < script.index(needs_user), needs_user
+
+
+def test_the_sandbox_isolation_check_can_actually_fail():
+    """It passes when a connection from inside the container fails - which
+    it also does when python cannot start there at all."""
+    script = _setup_script()
+    can_run = script.index('-c "import socket" 2>/dev/null')
+    isolated = script.index("socket.create_connection(")
+    assert can_run < isolated
+
+
+def test_a_template_deleted_from_the_repo_is_deleted_from_the_vm():
+    script = _setup_script()
+    assert script.index("rm -f /opt/cti/c2-templates/*.yaml") < script.index(
+        '"$TEMPLATES_SRC"/*.yaml /opt/cti/c2-templates/')
+
+
+def test_dropping_the_provisioning_key_is_said_out_loud():
+    """authorized_keys is rewritten on every run, so leaving the flag off
+    removes the provisioning key. It did so silently."""
+    script = _setup_script()
+    assert "had_provision_key=yes" in script
+    assert script.index("had_provision_key=no") < script.index('> "$home/.ssh/authorized_keys"')
+    assert "has been REMOVED" in script
+    # and the key that is written is checked the way the probe key is
+    assert script.count("doesn't look like an OpenSSH public key") == 2
+
+
+def test_the_go_download_does_not_use_a_fixed_name_in_tmp():
+    """It runs as root; the probe user can create files in /tmp first."""
+    script = _provision_script()
+    assert '"/tmp/${GO_VERSION}' not in script
+    assert "mktemp -d" in script
+
+
+def test_provisioning_checks_tools_for_the_user_who_asked():
+    script = _provision_script()
+    assert 'PROBE_USER="${SUDO_USER:-' in script
+
+
+def test_the_two_allowlists_hold_the_same_tools():
+    """The earlier test only checked the client's list against the script.
+    nuclei and zgrab2 were added to the script alone, so asking for either
+    from this host was refused before it reached the VM."""
+    import re
+
+    from cti.probe import provision
+
+    script = _provision_script()
+    maps = re.findall(r"declare -A (?:APT|GO)_TOOLS=\((.*?)\n\)", script, re.S)
+    on_vm = set(re.findall(r"^\s*\[([a-z0-9]+)\]=", "\n".join(maps), re.M))
+    assert on_vm == set(provision.TOOLS)
+
+
+def test_setup_prints_every_cron_line_the_pipeline_needs():
+    text = (REPO / "setup.sh").read_text()
+    assert "-m graph daily" in text
+    assert "netwatch --tiers hot" in text and "netwatch --tiers full" in text

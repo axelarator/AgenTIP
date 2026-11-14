@@ -26,7 +26,11 @@ set -euo pipefail
 
 LOG=/var/log/cti-provision.log
 GOBIN=/usr/local/bin
-PROBE_USER="${CTI_PROBE_USER:-detonate}"
+# Who the tools are for. After the sudo re-exec that is the user who ran
+# sudo; the environment is stripped by then, so a VM set up with --user
+# something-else used to have its tools checked against "detonate".
+PROBE_USER="${SUDO_USER:-${CTI_PROBE_USER:-$(id -un)}}"
+[[ $PROBE_USER == root ]] && PROBE_USER="${CTI_PROBE_USER:-detonate}"
 
 # Go, from upstream rather than the distro. Debian bookworm ships 1.19.8 and
 # the tools below need far newer - httpx declares go 1.26.0, tlsx 1.25.0 - so
@@ -152,22 +156,28 @@ ensure_go() {
     echo "  distro go is $have, too old for these modules - fetching $GO_VERSION" >&2
   fi
 
-  local tarball="/tmp/${GO_VERSION}.linux-amd64.tar.gz"
+  # A directory of our own, not a fixed name in /tmp: this runs as root, and
+  # the probe user can create files there first.
+  local workdir tarball
+  workdir=$(mktemp -d) || { echo "  go: FAILED - no temporary directory" >&2; return 1; }
+  tarball="$workdir/${GO_VERSION}.linux-amd64.tar.gz"
   log "downloading $GO_VERSION"
   if ! timeout 600 curl -fsSL -o "$tarball" \
         "https://go.dev/dl/${GO_VERSION}.linux-amd64.tar.gz"; then
+    rm -rf "$workdir"
     echo "  go: FAILED - could not download $GO_VERSION" >&2
     return 1
   fi
   local got
   got=$(sha256sum "$tarball" | awk '{print $1}')
   if [[ $got != "$GO_SHA256" ]]; then
-    rm -f "$tarball"
+    rm -rf "$workdir"
     echo "  go: FAILED - checksum mismatch (expected $GO_SHA256, got $got)" >&2
     return 1
   fi
   rm -rf "$GO_ROOT"
-  tar -C /usr/local -xzf "$tarball" && rm -f "$tarball"
+  tar -C /usr/local -xzf "$tarball"
+  rm -rf "$workdir"
   [[ -x $GO_BIN ]] || { echo "  go: FAILED - $GO_BIN missing after extract" >&2; return 1; }
   echo "  go: installed $GO_VERSION -> $GO_BIN"
 }
@@ -289,7 +299,8 @@ main() {
         exit 2
       fi ;;
     update)
-      [[ -n ${GO_TOOLS[$arg]:-} ]] || {
+      # An empty name is not a valid array subscript; test for it first.
+      [[ -n $arg && -n ${GO_TOOLS[$arg]:-} ]] || {
         echo "update only applies to Go tools: ${!GO_TOOLS[*]}" >&2; exit 2; } ;;
     *) echo "unknown verb: $verb" >&2; usage >&2; exit 2 ;;
   esac

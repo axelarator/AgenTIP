@@ -75,6 +75,10 @@ there is no verb that writes `probe_helper.py` or a Dockerfile. Helper
 and sandbox changes go through `setup_probe_vm.sh`, run by a human who
 has read the diff.
 
+`setup_probe_vm.sh` rewrites the probe user's `authorized_keys` on every
+run. Pass `--provision-pubkey <file>` each time, or the provisioning key
+is removed; the script says so when that happens.
+
 `sandbox/tlds.txt` (the top-level domains the analyser accepts) is derived
 from the bundled public-suffix list. After refreshing that list:
 

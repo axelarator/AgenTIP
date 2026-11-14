@@ -35,7 +35,8 @@ PROVISION_TIMEOUT = int(os.environ.get("CTI_PROVISION_TIMEOUT", "900"))
 # the VM's copy is the one that enforces, this one only gives a clear local
 # error instead of a round trip that ends in "not in the allowlist".
 TOOLS = ("whois", "dnsutils", "nmap", "openssl",
-         "httpx", "tlsx", "dnsx", "naabu", "cdncheck", "asnmap")
+         "httpx", "tlsx", "dnsx", "naabu", "cdncheck", "asnmap",
+         "nuclei", "zgrab2")
 
 
 def _run(request: str, *, timeout: int | None = None) -> str:
