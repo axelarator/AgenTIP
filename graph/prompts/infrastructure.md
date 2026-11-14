@@ -12,7 +12,8 @@ One structural fact alone is never enough. The score can also hold back a
 link that meets that count, because a fact is discounted when it is weak
 evidence of one operator: a server's default certificate, a catch-all
 address, a value seen behind a CDN, a value the two hosts held months
-apart, or a value common across the internet. Every link you see scored in
+apart, a page or favicon that is a web server's stock default page, or a
+value common across the internet. Every link you see scored in
 the top band (`strong`) after those discounts.
 
 A fact is one thing observed, not one column it filled. Two SANs off one

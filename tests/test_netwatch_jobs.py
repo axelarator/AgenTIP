@@ -384,3 +384,75 @@ def test_the_first_sweep_of_a_host_opens_nothing():
     _ingest_scan("full-1", [_full("full-1", HOST, 443, T1),
                             _full("full-1", HOST, 8199, T1)])
     assert _changes() == []
+
+
+# --------------------------------------------------------------------------- #
+# Two runs at once: the 06:00 sweep is still waiting when the 06:05 run starts
+# --------------------------------------------------------------------------- #
+
+def _listed():
+    try:
+        return sorted(j["job_id"] for j in json.loads(jobs.outstanding_path().read_text()))
+    except FileNotFoundError:
+        return []
+
+
+def test_a_job_another_run_collected_is_not_put_back(monkeypatch):
+    """On 2026-11-14 the hourly run read the sweep's two jobs as outstanding,
+    the sweep collected them, and the hourly run then wrote its stale list
+    back. An hour later both were "unknown to the probe; dropped"."""
+    _watch(monkeypatch, [_t("203.0.113.1")])
+    sweep = {"job_id": "full-sweep", "profile": "full", "values": ["203.0.113.9"]}
+    jobs.outstanding_path().write_text(json.dumps([sweep]))
+    probe = FakeProbe(monkeypatch, finish=lambda job_id: not job_id.startswith("full"))
+    probe.jobs["full-sweep"] = {"job_id": "full-sweep", "profile": "full",
+                                "targets": [_t("203.0.113.9", "full")]}
+    real_status = probe.status
+
+    def status(job_id):
+        # While this run waits on its own job, the sweep's run finishes and
+        # takes its job off the list.
+        if job_id.startswith("hot") and "full-sweep" in probe.jobs:
+            del probe.jobs["full-sweep"]
+            jobs._update_outstanding(remove=["full-sweep"])
+        return real_status(job_id)
+
+    monkeypatch.setattr(vm_proxy, "netwatch_status", status)
+
+    jobs.run(tiers={"hot"})
+
+    assert _listed() == []
+
+
+def test_one_run_finishing_does_not_erase_the_jobs_of_another(monkeypatch):
+    """The other half: a run that finished first wrote its own view of the
+    list over a job a second run had just submitted. Had that second run
+    been killed while waiting, its results would have stayed on the probe
+    with nothing here that knew to fetch them."""
+    _watch(monkeypatch, [_t("203.0.113.1")])
+    monkeypatch.setattr(jobs, "POLL_TIMEOUT", 0.0)
+    probe = FakeProbe(monkeypatch, finish=lambda job_id: False)
+    real_status = probe.status
+    seen = {}
+
+    def status(job_id):
+        if job_id.startswith("hot") and not seen:
+            # Another run ends here, having collected a job of its own.
+            jobs._update_outstanding(remove=["full-sweep"])
+            seen["listed"] = _listed()
+        return real_status(job_id)
+
+    monkeypatch.setattr(vm_proxy, "netwatch_status", status)
+
+    out = jobs.run(tiers={"hot"})
+
+    (job_id,) = out["outstanding"]
+    assert seen["listed"] == [job_id], "the running job was on record while it ran"
+    assert _listed() == [job_id]
+
+
+def test_adding_a_job_twice_lists_it_once():
+    job = {"job_id": "hot-1", "profile": "hot", "values": ["203.0.113.1"]}
+    jobs._update_outstanding(add=[job])
+    jobs._update_outstanding(add=[job, {**job, "job_id": "hot-2"}], remove=["nothing"])
+    assert _listed() == ["hot-1", "hot-2"]

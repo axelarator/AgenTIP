@@ -9,6 +9,7 @@ costs a scan.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import time
@@ -89,6 +90,31 @@ def _save_outstanding(jobs: list[dict[str, Any]]) -> None:
     tmp.replace(path)
 
 
+def _update_outstanding(*, add: list[dict[str, Any]] | None = None,
+                        remove: list[str] | None = None) -> None:
+    """Add jobs to the list and take job ids off it, as one locked step.
+
+    Two runs overlap every morning: the full sweep starts at 06:00 and is
+    still waiting when the hourly run starts at 06:05. Each used to write
+    back the whole list as it had read it. The hourly run, finishing last,
+    restored the sweep's two jobs after the sweep had collected them (they
+    were then "unknown to the probe; dropped" an hour later); and a sweep
+    finishing first wrote an empty list over the hourly run's jobs, so a
+    run killed while waiting left its results on the probe with nothing
+    here that knew to fetch them.
+
+    Each run now changes only the entries that are its own to change.
+    """
+    lock = outstanding_path().with_suffix(".lock")
+    with lock.open("w") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        gone = set(remove or [])
+        jobs = [j for j in _load_outstanding() if j["job_id"] not in gone]
+        known = {j["job_id"] for j in jobs}
+        jobs += [j for j in add or [] if j["job_id"] not in known]
+        _save_outstanding(jobs)
+
+
 def _spool(job_id: str) -> int:
     """Pull a finished job's records into the local spool and clear it off
     the probe. Written under a temporary name first, so ingest never loads
@@ -158,8 +184,12 @@ def run(*, tiers: set[str] | None = None,
     """
     tiers = tiers or {"hot", "full"}
     # Jobs a previous run left on the probe: collect what has finished.
-    spooled, total, late = _gather(_load_outstanding(), wait=0)
-    _save_outstanding(late)
+    # (A run still in progress may own some of them; whichever of the two
+    # sees a job finished first spools it, and the other finds it gone.)
+    left = _load_outstanding()
+    spooled, total, late = _gather(left, wait=0)
+    waiting = {j["job_id"] for j in late}
+    _update_outstanding(remove=[j["job_id"] for j in left if j["job_id"] not in waiting])
     busy = {(j.get("profile"), v) for j in late for v in j.get("values") or []}
 
     targets = [t for t in watchlist.for_tiers(tiers, clusters=clusters)
@@ -200,12 +230,13 @@ def run(*, tiers: set[str] | None = None,
         submitted.append({"job_id": job["job_id"], "profile": job["profile"],
                           "values": [t["value"] for t in job["targets"]]})
     # Recorded before the wait, so a run killed while polling loses nothing.
-    _save_outstanding(late + submitted)
+    _update_outstanding(add=submitted)
     done, records, unfinished = _gather(submitted, wait=POLL_TIMEOUT)
     for job in unfinished:
         log.warning("netwatch job %s did not finish within %ss; left for the "
                     "next run", job["job_id"], POLL_TIMEOUT)
-    _save_outstanding(late + unfinished)
+    still = {j["job_id"] for j in unfinished}
+    _update_outstanding(remove=[j["job_id"] for j in submitted if j["job_id"] not in still])
     return {**summary, "jobs": len(submitted), "records": total + records,
             "spooled": spooled + done,
             "outstanding": [j["job_id"] for j in late + unfinished]}

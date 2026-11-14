@@ -401,3 +401,74 @@ def test_a_live_resolution_and_a_pdns_record_of_one_address_meet(con):
 def test_an_all_zero_jarm_links_nothing():
     assert S.normalize("tls.jarm", "0" * 62) is None
     assert S.normalize("tls.jarm", "27d40d40d00040d1dc42d43d00041d") is not None
+
+
+# --------------------------------------------------------------------------- #
+# A default page is the software's, not the operator's
+# --------------------------------------------------------------------------- #
+
+def _served(con, target, *, port, title, body, favicon, scan="s1"):
+    from cti import store
+    store.upsert_service_snapshot(con, row={
+        "scan_id": scan, "scanned_at": DAY, "vantage": "probe", "profile": "full",
+        "target": target, "port": port, "open": True, "http_title": title,
+        "body_sha256": body, "favicon_mmh3": favicon})
+
+
+def test_a_stock_default_page_is_not_identity(con):
+    """Two DragonForce hosts were reported on 2026-11-14 as sharing "page"
+    and "favicon" identity. Both were Plesk's placeholder page."""
+    seed(con, "c", "m.example")
+    for host in ("m.example", "c.example"):
+        add(con, host, "http.body_sha256", "d" * 64)
+        add(con, host, "http.favicon_mmh3", "-134375033")
+        _served(con, host, port=80, title="Web Server's Default Page",
+                body="d" * 64, favicon="-134375033", scan=f"s-{host}")
+
+    result = R.score_candidate(con, "c", "c.example")
+
+    by_type = {p.selector_type: p for p in result.pairs}
+    for selector_type in ("http.body_sha256", "http.favicon_mmh3"):
+        assert by_type[selector_type].cls == "behavioural", selector_type
+        assert by_type[selector_type].note == "default page"
+    assert result.band != "strong"
+
+
+def test_a_versioned_default_title_is_still_a_default_page(con):
+    seed(con, "c", "m.example")
+    for host in ("m.example", "c.example"):
+        add(con, host, "http.body_sha256", "d" * 64)
+        _served(con, host, port=80, title="Apache2 Ubuntu Default Page: It works",
+                body="d" * 64, favicon=None, scan=f"s-{host}")
+    (page,) = R.score_candidate(con, "c", "c.example").pairs
+    assert page.note == "default page"
+
+
+def test_an_operators_own_page_beside_a_default_one_keeps_its_weight(con):
+    """nginx's welcome page on 80 and a panel on 8443 is the usual shape of
+    a C2 host. The panel's favicon is the evidence, and it must not be
+    written off because the same host also shows a stock page."""
+    seed(con, "c", "m.example")
+    for host in ("m.example", "c.example"):
+        add(con, host, "http.favicon_mmh3", "777")
+        add(con, host, "http.body_sha256", "d" * 64)
+        _served(con, host, port=80, title="Welcome to nginx!",
+                body="d" * 64, favicon=None, scan=f"s80-{host}")
+        _served(con, host, port=8443, title="Operator Panel",
+                body="a" * 64, favicon="777", scan=f"s8443-{host}")
+
+    result = R.score_candidate(con, "c", "c.example")
+
+    by_type = {p.selector_type: p for p in result.pairs}
+    assert by_type["http.favicon_mmh3"].cls == "identity"
+    assert by_type["http.favicon_mmh3"].note is None
+    assert by_type["http.body_sha256"].note == "default page"
+    assert result.band == "strong"
+
+
+def test_a_page_never_seen_in_a_scan_is_left_as_it_was(con):
+    seed(con, "c", "m.example")
+    for host in ("m.example", "c.example"):
+        add(con, host, "http.body_sha256", "d" * 64)
+    (page,) = R.score_candidate(con, "c", "c.example").pairs
+    assert page.cls == "identity" and page.note is None

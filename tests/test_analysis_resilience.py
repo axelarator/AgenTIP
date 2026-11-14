@@ -272,3 +272,10 @@ def test_the_lookup_limit_in_the_prompt_is_the_one_the_code_enforces():
         assert "{{" not in prompt
         assert f"The hard limit is {analyze.MAX_TURNS - 1}:" in prompt, family
     assert "at most two tool calls" not in load_prompt("cert_tls")
+
+
+def test_the_narrator_does_not_announce_that_nothing_failed():
+    """The first narrative under the new prompt opened with "No specialist
+    failures today - all five remits reported in"."""
+    prompt = load_prompt("narrate", with_common=False)
+    assert "do not report that there were no failures" in prompt

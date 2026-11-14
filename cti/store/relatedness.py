@@ -48,7 +48,7 @@ that sat on it in 2019.
 
 ## Demotions
 
-Two shapes of value look like identity and are not:
+Three shapes of value look like identity and are not:
 
 * a default certificate - a stock self-signed subject. Its digest is shared
   by every unconfigured install, so a certificate artefact on a holder that
@@ -59,6 +59,12 @@ Two shapes of value look like identity and are not:
   collapse onto one address, the value is a statement about that address,
   and is scored as one behavioural fact. Address selectors themselves are
   exempt: every holder of an IP is on that IP by definition.
+* a default page - the page a web server or hosting panel serves before
+  anyone has put a site on it. Its body digest and its favicon are the
+  software's, shared by every fresh install, so a page digest or favicon
+  that was observed under a stock default-page title is capped at
+  behavioural. Two DragonForce hosts were reported as sharing "page" and
+  "favicon" identity on 2026-11-14 on the strength of Plesk's placeholder.
 
 And one shape of holder: a CDN edge. Everything measured on a Cloudflare
 address - its JARM, its TCP stack, its open ports - is Cloudflare's, so a
@@ -254,6 +260,47 @@ def _is_cdn_edge(indicator: str) -> bool:
     return entities.entity_type(indicator).startswith("ipv") and cdn.is_cdn(indicator)
 
 
+# Titles of pages that ship with the software. Matched as lower-case
+# prefixes, because several carry a version or a distribution after them.
+# Short on purpose: a title missing from here leaves a default page counted
+# as it was before; a real site's title added here would hide a real link.
+DEFAULT_PAGE_TITLES = (
+    "web server's default page",            # Plesk
+    "welcome to nginx",
+    "welcome to openresty",
+    "test page for the nginx http server",
+    "apache2 ubuntu default page",
+    "apache2 debian default page",
+    "test page for the apache http server",
+    "apache http server test page",
+    "iis windows server",
+    "this is the default server vhost",
+    "default web site page",                # cPanel
+    "welcome to centos",
+)
+_PAGE_COLUMNS = {"http.body_sha256": "body_sha256", "http.favicon_mmh3": "favicon_mmh3"}
+
+
+def _from_a_default_page(con, selector_type: str, value: str) -> bool:
+    """Whether this page digest or favicon was served under a stock
+    default-page title.
+
+    Read from the scan snapshots, where the digest, the favicon and the
+    title of one response sit in one row. The selectors alone cannot say:
+    a host that shows nginx's welcome page on port 80 and an operator's
+    panel on 8443 carries both titles, and only the snapshot knows which
+    favicon came with which. A value never seen in a snapshot is left as it
+    is.
+    """
+    column = _PAGE_COLUMNS.get(selector_type)
+    if column is None:
+        return False
+    titles = " OR ".join("lower(http_title) LIKE ?" for _ in DEFAULT_PAGE_TITLES)
+    return con.execute(
+        f"SELECT 1 FROM service_snapshots WHERE {column} = ? AND ({titles}) LIMIT 1",
+        [str(value), *(t + "%" for t in DEFAULT_PAGE_TITLES)]).fetchone() is not None
+
+
 def _has_default_cert(con, indicator: str) -> bool:
     return con.execute(
         "SELECT 1 FROM selectors WHERE indicator_value = ? "
@@ -297,6 +344,9 @@ def score_against(con: duckdb.DuckDBPyConnection, entity: str,
         elif group == "certificate" and cls in ("identity", "structural"):
             if entity_default_cert or any(_has_default_cert(con, s) for s in sharers):
                 cls, note = "behavioural", "default certificate"
+        elif cls in ("identity", "structural") and _from_a_default_page(
+                con, selector_type, value):
+            cls, note = "behavioural", "default page"
         rare = rarity_factor(verdict)
         if rare == 0.0:
             note = verdict.get("why_not") or "provider-scale value"
