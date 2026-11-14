@@ -297,3 +297,128 @@ def test_a_specialist_out_of_turns_answers_without_tools(monkeypatch):
     assert [f.headline for f in out["findings"]] == ["cert rotated"]
     assert "6-turn limit" in out["errors"][0]
     assert calls[1]["allowed_tools"] == [] and calls[1]["max_turns"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# The timeline's rows reach a specialist
+# --------------------------------------------------------------------------- #
+
+def _timeline_digest(**timeline):
+    return {"digest_json": _digest(day="2026-11-13", timeline=timeline)}
+
+
+def _port_row(target, **kw):
+    row = {"target": target, "actor": "A", "memberships": ["a:seed"], "opened": [],
+           "closed": [], "flapped": [], "open_now": [], "at": "2026-11-13T06:03:00"}
+    row.update(kw)
+    return row
+
+
+def test_port_changes_from_the_scheduled_scans_reach_a_specialist():
+    """72 closures were recorded on 2026-11-13 and no specialist was shown
+    one: only an on-demand rescan produced a `ports` row."""
+    out = rank(_timeline_digest(port_changes=[
+        _port_row("pulled.example", closed=[8080], open_now=[22, 443]),
+        _port_row("dark.example", closed=[80, 443]),
+        _port_row("listener.example", opened=[4444], open_now=[22, 4444])]))
+
+    items = out["ranked"]["infra_change"]
+    kinds = {i.indicator: i.change_type for i in items}
+    assert kinds == {"pulled.example": "service_ports_closed",
+                     "dark.example": "service_went_dark",
+                     "listener.example": "service_ports_opened"}
+    assert all(i.attribute == "service_ports" and i.actor == "A" for i in items)
+    # One service pulled among several is the weakest of the three.
+    assert items[-1].indicator == "pulled.example"
+    assert items[0].new_value["open_now"] is not None
+
+
+def test_a_dormant_host_that_opens_a_port_is_not_suppressed():
+    digest = _digest(day="2026-11-13",
+                     lifecycle={"inactive": {"woke.example": "dormant",
+                                             "asleep.example": "dormant"}},
+                     timeline={"port_changes": [
+                         _port_row("woke.example", opened=[8443], open_now=[8443]),
+                         _port_row("asleep.example", closed=[80])]})
+    ranked = rank({"digest_json": digest})["ranked"]["infra_change"]
+    assert [i.indicator for i in ranked] == ["woke.example"]
+
+
+def test_fingerprint_changes_and_divergences_go_to_the_presentation_specialist():
+    out = rank(_timeline_digest(
+        value_changes=[
+            {"indicator": "c2.example", "actor": "A", "selector_type": "tls.spki_sha256",
+             "class": "identity", "old_value": "a" * 64, "new_value": "b" * 64,
+             "at": "2026-11-13T05:00:00", "vantage": "probe"},
+            {"indicator": "c2.example", "actor": "A", "selector_type": "http.header_order",
+             "class": "behavioural", "old_value": "a,b", "new_value": "b,a",
+             "at": "2026-11-13T05:00:00", "vantage": "probe"}],
+        client_divergences=[{"target": "kit.example", "actor": "A", "port": 443,
+                             "diverged": "status:404>200", "at": "2026-11-13T05:00:00"}]))
+
+    items = out["ranked"]["cert_tls"]
+    # Two fingerprints changing on one host are two items, not one.
+    assert [(i.indicator, i.attribute) for i in items] == [
+        ("kit.example", "client_divergence"),
+        ("c2.example", "fingerprint"), ("c2.example", "fingerprint")]
+    key, order = items[1], items[2]
+    assert key.new_value["selector_type"] == "tls.spki_sha256" and key.score > order.score
+    assert key.old_value["value"] == "a" * 64
+
+
+def test_a_candidate_band_move_is_read_even_on_a_day_full_of_links():
+    from graph.nodes.rank import ATTRIBUTE_CAP
+
+    links = [{"seed": f"a{n}.example", "linked_to": f"b{n}.example", "actor": "A",
+              "score": 0.9, "band": "strong", "reason": "r", "identity": [],
+              "structural": [], "corroborating": []} for n in range(30)]
+    digest = _digest(day="2026-11-13",
+                     infrastructure_links={"promoted": links, "held_back_total": 0},
+                     timeline={"band_moves": [
+                         {"cluster": "a", "entity": "rising.example", "actor": "A",
+                          "from_band": "weak", "to_band": "strong", "from_score": 0.3,
+                          "to_score": 0.86, "direction": "up"}]})
+
+    items = rank({"digest_json": digest})["ranked"]["infrastructure"]
+
+    assert sum(i.attribute == "selector_link" for i in items) == ATTRIBUTE_CAP["selector_link"]
+    (move,) = [i for i in items if i.attribute == "candidate_band"]
+    assert move.change_type == "candidate_band_up" and move.indicator == "rising.example"
+    assert move.old_value == {"band": "weak", "score": 0.3}
+    assert move.new_value == {"cluster": "a", "band": "strong", "score": 0.86}
+
+
+def test_a_block_of_hosts_going_dark_does_not_crowd_out_the_address_that_moved():
+    """On 2026-11-13, 31 tracked hosts had nothing left open."""
+    from graph.nodes.rank import ATTRIBUTE_CAP
+
+    dark = [_port_row(f"h{n:02d}.example", closed=[80]) for n in range(31)]
+    digest = _digest(day="2026-11-13",
+                     attribute_changes=[_change("moved.example", "resolved_ip",
+                                                "resolved_ip_changed")],
+                     timeline={"port_changes": dark + [
+                         _port_row("z-listener.example", opened=[4444], open_now=[4444])]})
+
+    items = rank({"digest_json": digest})["ranked"]["infra_change"]
+
+    assert sum(i.attribute == "service_ports" for i in items) == ATTRIBUTE_CAP["service_ports"]
+    assert items[0].indicator == "z-listener.example", "the new listener is shown first"
+    assert "moved.example" in [i.indicator for i in items]
+
+
+def test_an_intermediate_rotation_already_on_record_is_not_shown():
+    le = "CN={}, O=Let's Encrypt, C=US"
+    digest = _digest(attribute_changes=[
+        _change("rotated.example", "cert", "cert_issuer_changed", confidence="high",
+                old_value={"issuer": le.format("YR2"), "sans": ["rotated.example"]},
+                new_value={"issuer": le.format("YR1"), "sans": ["rotated.example"]}),
+        _change("rebuilt.example", "cert", "cert_issuer_changed", confidence="high",
+                old_value={"issuer": le.format("YR2"), "sans": ["rebuilt.example"]},
+                new_value={"issuer": "CN=Abcde, O=Fghijklm, C=ZZ",
+                           "sans": ["rebuilt.example"]})])
+
+    out = rank({"digest_json": digest})
+
+    assert [i.indicator for i in out["ranked"]["cert_tls"]] == ["rebuilt.example"]
+    (dropped,) = [i for i in out["items"] if i.suppressed]
+    assert "intermediate rotation" in dropped.suppressed

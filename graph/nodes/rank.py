@@ -26,6 +26,7 @@ import json
 from typing import Any
 
 from cti.sources.pivot import is_shared_hosting_hostname
+from cti.store.changes import same_issuer
 from cti.store.hosting import is_shared_asn
 from cti.util import asn_int
 
@@ -45,8 +46,10 @@ from ..state import ATTRIBUTE_FAMILY, FAMILY_ATTRIBUTES, CTIState, Item
 # are individual files, not indicators: ten files in one directory is one
 # event described ten ways, and the interesting one is rarely the first.
 ITEMS_PER_FAMILY = {
-    "infra_change": 4,
-    "cert_tls": 3,
+    # One more each than before the timeline's rows were routed here: a
+    # family that reads another kind of change needs room to be shown it.
+    "infra_change": 5,
+    "cert_tls": 4,
     "hosting": 4,
     "opendir": 8,
     # Links are already filtered by the corroboration rule, so the ones
@@ -54,8 +57,19 @@ ITEMS_PER_FAMILY = {
     # clear. Six because a real campaign surfaces as a handful of linked
     # pairs at once - the source reporting's certificate was on 8 hosts -
     # and showing two of them would describe a cluster as a coincidence.
-    "infrastructure": 6,
+    # Two more for candidates whose band moved (see ATTRIBUTE_CAP).
+    "infrastructure": 8,
 }
+
+# The most items of one attribute a family is shown. A link outranks a band
+# move by construction, and there are dozens of links on an ordinary day, so
+# without a ceiling the moves would be routed here and never read.
+#
+# Scheduled-scan port changes are capped for the same reason from the other
+# side: on a day a provider drops a block of hosts, thirty of them go dark
+# at once and would take every place the family has, ahead of the one
+# address that moved.
+ATTRIBUTE_CAP = {"selector_link": 6, "service_ports": 3}
 DEFAULT_ITEM_BUDGET = 3
 
 CONFIDENCE_WEIGHT = {"high": 3.0, "medium": 2.0, "low": 1.0}
@@ -85,6 +99,17 @@ CHANGE_WEIGHT = {
     "ip_hostnames_changed": 0.5,
     "subdomains_changed": 0.5,
     "opendir_files": 3.0,
+    # The timeline's rows. A new listener is the rarest and is shown first; a host with nothing left open is the takedown or the move. One
+    # service closing among several is the weakest of the three.
+    "service_ports_opened": 3.0,
+    "service_went_dark": 2.5,
+    "service_ports_closed": 1.0,
+    # The host answers a Windows client differently from a scanner.
+    "client_divergence": 2.5,
+    "fingerprint_changed": 2.0,
+    "candidate_band_up": 3.0,
+    "candidate_band_new": 2.0,
+    "candidate_band_down": 1.0,
 }
 
 
@@ -294,6 +319,73 @@ def _sample(slot: str, pairs: list) -> dict[str, Any]:
     return out
 
 
+def _items_from_timeline(digest: dict[str, Any]) -> list[Item]:
+    """The timeline's rows, as items.
+
+    The timeline (cti/store/timeline.py) was written for the digest's
+    reader and no specialist saw it: ports the scheduled scans found opened
+    or closed, a fingerprint that changed on a tracked host, a host that
+    answers a Windows client differently, a candidate whose relatedness
+    band moved. Each is a change on a tracked host like any other, and goes
+    to the specialist whose remit it is.
+    """
+    timeline = digest.get("timeline") or {}
+    out = []
+
+    for row in timeline.get("port_changes") or []:
+        opened, closed = row.get("opened") or [], row.get("closed") or []
+        if opened:
+            change_type = "service_ports_opened"
+        elif not row.get("open_now"):
+            change_type = "service_went_dark"
+        else:
+            change_type = "service_ports_closed"
+        out.append(Item(
+            family="infra_change", attribute="service_ports", actor=row.get("actor"),
+            indicator=row.get("target") or "", change_type=change_type,
+            confidence="medium", detected_at=str(row.get("at") or "") or None,
+            new_value={"opened": opened, "closed": closed,
+                       "flapped": row.get("flapped") or [],
+                       "open_now": row.get("open_now") or []},
+            source_section="timeline"))
+
+    for row in timeline.get("value_changes") or []:
+        # A behavioural or contextual value moves for routine reasons - a
+        # package upgrade changes a header order - so it is weighed lower.
+        strong = row.get("class") in ("identity", "structural")
+        out.append(Item(
+            family="cert_tls", attribute="fingerprint", actor=row.get("actor"),
+            indicator=row.get("indicator") or "", change_type="fingerprint_changed",
+            confidence="medium" if strong else "low",
+            detected_at=str(row.get("at") or "") or None,
+            old_value={"selector_type": row.get("selector_type"),
+                       "value": row.get("old_value")},
+            new_value={"selector_type": row.get("selector_type"),
+                       "value": row.get("new_value"), "class": row.get("class"),
+                       "vantage": row.get("vantage")},
+            source_section="timeline"))
+
+    for row in timeline.get("client_divergences") or []:
+        out.append(Item(
+            family="cert_tls", attribute="client_divergence", actor=row.get("actor"),
+            indicator=row.get("target") or "", change_type="client_divergence",
+            confidence="high", detected_at=str(row.get("at") or "") or None,
+            new_value={"port": row.get("port"), "diverged": row.get("diverged")},
+            source_section="timeline"))
+
+    for row in timeline.get("band_moves") or []:
+        out.append(Item(
+            family="infrastructure", attribute="candidate_band", actor=row.get("actor"),
+            indicator=row.get("entity") or "",
+            change_type=f"candidate_band_{row.get('direction')}",
+            confidence="medium", detected_at=str(digest.get("day") or "") or None,
+            old_value={"band": row.get("from_band"), "score": row.get("from_score")},
+            new_value={"cluster": row.get("cluster"), "band": row.get("to_band"),
+                       "score": row.get("to_score")},
+            source_section="timeline"))
+    return out
+
+
 def score(item: Item, asn_by_indicator: dict[str, int],
           lifecycle: dict[str, str] | None = None) -> Item:
     base = CHANGE_WEIGHT.get(item.change_type, 1.0)
@@ -305,7 +397,10 @@ def score(item: Item, asn_by_indicator: dict[str, int],
             "routine renewal: same issuer and SANs, new sha256 - the "
             "provider's ACME client, not the actor")
         item.score = 0.0
-    elif state in ("dormant", "retired") and item.family != "infrastructure":
+    elif (state in ("dormant", "retired") and item.family != "infrastructure"
+          # A dormant host that opens a port has stopped being dormant; that
+          # is the change the scan exists to catch.
+          and item.change_type != "service_ports_opened"):
         item.suppressed = (
             f"{state} indicator: no live evidence for weeks, so a change on "
             "it is most likely the provider recycling the address or name")
@@ -314,6 +409,15 @@ def score(item: Item, asn_by_indicator: dict[str, int],
         item.suppressed = (
             "shared hosting: a change on a CDN or big-cloud address says "
             "something about the provider's tenants, not about this actor")
+        item.score = 0.0
+    elif (item.change_type == "cert_issuer_changed"
+          and isinstance(item.old_value, dict) and isinstance(item.new_value, dict)
+          and same_issuer(item.old_value.get("issuer"), item.new_value.get("issuer"))):
+        # No longer recorded as a change at all (changes.same_issuer); this
+        # catches the rows recorded before that, while the window holds them.
+        item.suppressed = (
+            "intermediate rotation: the same public authority issuing from "
+            "another of its own intermediates, as routine as a renewal")
         item.score = 0.0
     elif item.change_type == "first_seen":
         item.suppressed = (
@@ -329,7 +433,8 @@ def rank(state: CTIState) -> dict:
     items = (_items_from_attribute_changes(digest)
              + _items_from_asn_pivots(digest)
              + _items_from_open_directories(digest)
-             + _items_from_infrastructure_links(digest))
+             + _items_from_infrastructure_links(digest)
+             + _items_from_timeline(digest))
     asn_by_indicator = _asn_index(digest, [i.indicator for i in items])
     # Written by collect (enrich_and_write) after the sweep, so a host that
     # came back today is already active here and keeps its changes.
@@ -342,7 +447,7 @@ def rank(state: CTIState) -> dict:
         candidates.sort(key=lambda i: (-i.score, i.detected_at or "", i.indicator),
                         reverse=False)
         budget = ITEMS_PER_FAMILY.get(family, DEFAULT_ITEM_BUDGET)
-        ranked[family] = _latest_per_indicator(candidates)[:budget]
+        ranked[family] = _within_caps(_latest_per_indicator(candidates))[:budget]
 
     return {"items": items, "ranked": ranked}
 
@@ -364,6 +469,19 @@ def _latest_per_indicator(items: list[Item]) -> list[Item]:
     return sorted(best.values(), key=lambda i: (-i.score, i.indicator))
 
 
+def _within_caps(items: list[Item]) -> list[Item]:
+    """Drop what exceeds ATTRIBUTE_CAP, keeping the order."""
+    taken: dict[str, int] = {}
+    out = []
+    for item in items:
+        cap = ATTRIBUTE_CAP.get(item.attribute)
+        if cap is not None and taken.get(item.attribute, 0) >= cap:
+            continue
+        taken[item.attribute] = taken.get(item.attribute, 0) + 1
+        out.append(item)
+    return out
+
+
 def _discriminator(item: Item) -> str:
     """What makes two rows for the same indicator genuinely different.
 
@@ -375,6 +493,11 @@ def _discriminator(item: Item) -> str:
     """
     if item.attribute == "opendir_files" and isinstance(item.new_value, dict):
         return str(item.new_value.get("path") or "")
+    # One host can change two fingerprints in a day, or diverge on two ports.
+    if item.attribute == "fingerprint" and isinstance(item.new_value, dict):
+        return str(item.new_value.get("selector_type") or "")
+    if item.attribute == "client_divergence" and isinstance(item.new_value, dict):
+        return str(item.new_value.get("port") or "")
     return ""
 
 

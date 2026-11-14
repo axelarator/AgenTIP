@@ -191,8 +191,10 @@ the MCP server.
 
 Every day the collect stage re-scores each cluster's candidates against its
 current members (the score history grows a row per candidate per day), then
-`cti/store/timeline.py` reports what moved since the last run, as three
-digest sections:
+`cti/store/timeline.py` reports what moved since the last run, as four
+digest sections. Each row also goes to a specialist: band moves to
+`infrastructure`, fingerprints and divergences to `cert_tls`, ports to
+`infra_change`.
 
 - **Candidate relatedness moved** - a band change since the last score
   (`up` wakes the analysis; a new candidate is listed from `weak` up).
@@ -202,6 +204,10 @@ digest sections:
   left to them, and nothing behind a CDN counts - its TLS is the CDN's.
 - **Served Windows clients something different** - the first time a host
   shows a given `http.client_divergence`.
+- **Ports opened or closed on tracked hosts** - the net of what the hourly
+  and daily scans saw move on each host: opened, closed, flapped (closed
+  and open again, which is not a change), and what is still open. A host
+  with nothing left open is listed first.
 
 ### Hunting
 

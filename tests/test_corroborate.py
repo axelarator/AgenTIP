@@ -482,3 +482,25 @@ def test_the_same_question_gets_the_same_answer_in_the_same_order():
             assert link[key] == sorted(link[key])
     keys = [(not c["promoted"], -(c["score"] or 0.0), c["indicator"]) for c in first]
     assert keys == sorted(keys)
+
+
+def test_the_digest_lists_the_strongest_links_first(monkeypatch):
+    """They were ordered by how many identity values a pair shared, so two
+    load balancers sharing dozens of certificates held the top of the list
+    every day. A pair's score is what says how strong it is."""
+    from cti.store import expand
+
+    def candidates(con, indicator):
+        if indicator != "seed.example":
+            return []
+        return [expand.Candidate(indicator="many.example", actor="A", promoted=True,
+                                 reason="r", score=0.86, band="strong",
+                                 identity=[("tls.cert_sha256", f"{n:064x}") for n in range(9)]),
+                expand.Candidate(indicator="strong.example", actor="A", promoted=True,
+                                 reason="r", score=0.97, band="strong",
+                                 identity=[("tls.cert_sha256", "f" * 64)])]
+
+    _seed([("seed.example", "tls.jarm", "1" * 62, "A")])
+    monkeypatch.setattr(expand, "candidates_for", candidates)
+
+    assert [r["linked_to"] for r in _run()["promoted"]] == ["strong.example", "many.example"]

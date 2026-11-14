@@ -340,3 +340,55 @@ def test_no_spec_writes_to_tls_live_any_more():
     from cti.store.changes import CERT_SOURCES
     assert CERT_SOURCES[0] == "observe_tls"
     assert "tls_live" in CERT_SOURCES[1:]
+
+
+# --------------------------------------------------------------------------- #
+# A public authority rotating its own intermediates
+# --------------------------------------------------------------------------- #
+
+LE_YR1 = "CN=YR1, O=Let's Encrypt, C=US"
+LE_YR2 = "CN=YR2, O=Let's Encrypt, C=US"
+
+
+def test_a_public_ca_changing_intermediate_is_a_renewal_not_an_issuer_change(con):
+    """16 of the 17 issuer changes on record on 2026-11-14 were Let's Encrypt
+    and Microsoft moving a name between their own intermediates."""
+    seed(con, "observe_tls", "x.com", tls_sha256="h1", tls_issuer=LE_YR2,
+         tls_sans=["x.com"])
+    rotated = {"issuer": LE_YR1, "sans": ["x.com"], "sha256": "h2"}
+    assert detect(con, "cert", indicator_value="x.com", actor="A",
+                  observed_at=DAY2, new=rotated) is None
+    assert detect(con, "cert_hash", indicator_value="x.com", actor="A",
+                  observed_at=DAY2, new=rotated) == "cert_renewed"
+
+
+def test_the_two_spellings_of_one_authority_are_still_one(con):
+    seed(con, "tls_live", "x.com", tls_sha256="h1",
+         tls_issuer="C = US, O = Microsoft Corporation, CN = Microsoft TLS G2 RSA CA OCSP 04",
+         tls_sans=["x.com"])
+    assert detect(con, "cert", indicator_value="x.com", actor="A", observed_at=DAY2,
+                  new={"issuer": "CN=Microsoft TLS G2 RSA CA OCSP 16, "
+                                 "O=Microsoft Corporation, C=US",
+                       "sans": ["x.com"], "sha256": "h2"}) is None
+
+
+def test_a_move_to_another_authority_is_still_an_issuer_change(con):
+    seed(con, "observe_tls", "x.com", tls_sha256="h1", tls_issuer=LE_YR2,
+         tls_sans=["x.com"])
+    moved = {"issuer": "CN=Sectigo RSA DV CA, O=Sectigo Limited, C=GB",
+             "sans": ["x.com"], "sha256": "h2"}
+    assert detect(con, "cert", indicator_value="x.com", actor="A",
+                  observed_at=DAY2, new=moved) == "cert_issuer_changed"
+    assert detect(con, "cert_hash", indicator_value="x.com", actor="A",
+                  observed_at=DAY2, new=moved) == "cert_new"
+
+
+def test_a_made_up_organisation_is_not_trusted_as_an_authority(con):
+    """Anyone can write an O into a certificate they sign. Two self-signed
+    certificates sharing one and differing in CN are a rebuild - and so is
+    a public certificate replaced by one that only borrows the name."""
+    seed(con, "observe_tls", "x.com", tls_sha256="h1",
+         tls_issuer="CN=Abcde, O=Fghijklm, C=ZZ", tls_sans=["x.com"])
+    assert detect(con, "cert", indicator_value="x.com", actor="A", observed_at=DAY2,
+                  new={"issuer": "CN=Zzyx, O=Fghijklm, C=ZZ", "sans": ["x.com"],
+                       "sha256": "h2"}) == "cert_issuer_changed"

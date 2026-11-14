@@ -32,7 +32,7 @@ from typing import Any, Callable
 import duckdb
 
 from ..util import is_stale, json_text
-from .selectors import canonical_dn
+from .selectors import canonical_dn, split_dn
 
 # A baseline this old is re-checked for the first time in months; a
 # change against it shouldn't read as a confident "changed since
@@ -147,17 +147,58 @@ def _sorted_list_changed(old: Any, new: Any, change_type: str) -> str | None:
     return None if sorted(old or []) == sorted(new or []) else change_type
 
 
+# Certificate authorities that issue from several intermediates at once and
+# rotate between them on their own schedule, by the organisation name their
+# intermediates carry. Let's Encrypt moves a name between YR1 and YR2 at any
+# renewal, and Microsoft's edge alternates "TLS G2 RSA CA OCSP" numbers from
+# one handshake to the next. Recorded as issuer changes, those were 16 of the
+# 17 on record on 2026-11-14 and took the certificate specialist's first
+# slots at the highest confidence there is.
+#
+# A list, and a short one, because the organisation is a string anyone can
+# put in a certificate they sign themselves: two self-signed certificates
+# with the same made-up O and different CNs are a rebuild, and must still
+# say so. An authority missing from here costs a routine row in the digest;
+# a made-up name treated as an authority would cost a finding.
+PUBLIC_CA_ORGS = frozenset({
+    "let's encrypt", "google trust services", "google trust services llc",
+    "microsoft corporation", "digicert inc", "digicert, inc.",
+    "sectigo limited", "globalsign nv-sa", "zerossl", "amazon",
+    "cloudflare, inc.", "godaddy.com, inc.", "buypass as-983163327",
+    "identrust", "ssl corporation", "entrust, inc.", "certainly",
+})
+
+
+def _issuer_org(issuer: str) -> str | None:
+    for key, value in split_dn(issuer or ""):
+        if key.upper() == "O":
+            return value.replace("\\,", ",").strip().lower()
+    return None
+
+
+def same_issuer(old: str | None, new: str | None) -> bool:
+    """Whether two issuer names are the same issuer for the purpose of
+    telling a renewal from a rebuild: the same name, or two intermediates
+    of one public authority."""
+    if not old or not new:
+        return False
+    if canonical_dn(old) == canonical_dn(new):
+        return True
+    org = _issuer_org(old)
+    return org is not None and org == _issuer_org(new) and org in PUBLIC_CA_ORGS
+
+
 def _classify_cert(old: dict, new: dict) -> str | None:
     """A same-issuer, same-SANs renewal is routine and deliberately not
     recorded - the sha256 rotation it produces is tracked separately by
-    the cert_hash spec, on its own timeline."""
+    the cert_hash spec, on its own timeline. A public authority moving
+    between its own intermediates is the same issuer (`same_issuer`)."""
     # Compared as canonical DNs. The baseline may be an openssl row ("C = US,
     # O = Let's Encrypt, CN = YE1") and the new value tlsx's ("CN=YE1, O=Let's
     # Encrypt, C=US"): the same issuer, spelled two ways. Compared as strings
     # the first observation after the switch would report a certificate
     # issuer change for every domain that has one.
-    if (new["issuer"] and old["issuer"]
-            and canonical_dn(new["issuer"]) != canonical_dn(old["issuer"])):
+    if new["issuer"] and old["issuer"] and not same_issuer(old["issuer"], new["issuer"]):
         return "cert_issuer_changed"
     if set(new["sans"] or []) != set(old["sans"] or []):
         return "cert_sans_changed"
@@ -180,7 +221,7 @@ def _classify_cert_hash(old: dict, new: dict) -> str | None:
     if old["sha256"] == new["sha256"]:
         return None
     if (old.get("issuer") and new.get("issuer") and old.get("sans") and new.get("sans")
-            and canonical_dn(old["issuer"]) == canonical_dn(new["issuer"])
+            and same_issuer(old["issuer"], new["issuer"])
             and set(old["sans"]) == set(new["sans"])):
         return "cert_renewed"
     return "cert_new"

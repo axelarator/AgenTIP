@@ -604,6 +604,13 @@ def _split_dn(text: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def split_dn(text: str) -> list[tuple[str, str]]:
+    """The (attribute, value) pairs of a distinguished name, in the order
+    written; empty when the text is not one."""
+    pairs = _split_dn(text)
+    return pairs if pairs and all(k for k, _ in pairs) else []
+
+
 def canonical_dn(text: str) -> str:
     """One form for a distinguished name, whichever tool produced it.
 

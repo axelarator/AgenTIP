@@ -175,7 +175,10 @@ identity fact, or two independent structural ones.
 reading, in code, before any token is spent; five specialists run in
 parallel, one per family (`infra_change`, `cert_tls`, `hosting`,
 `opendir`, `infrastructure`); `persist` stores their findings; `narrate`
-writes the day's narrative. A quiet day skips the specialists.
+writes the day's narrative. A quiet day skips the specialists. Besides the
+attribute changes, links and open-directory files, the specialists are
+given the timeline's rows (`cti/store/timeline.py`): scheduled-scan port
+changes, fingerprint changes, client divergences and candidate band moves.
 
 The model calls run on the operator's subscription. A call refused for a
 usage limit waits until the reset time the refusal names and tries again,

@@ -109,10 +109,14 @@ at the infrastructure, not it appearing in our network.
   on-demand `active_scan` runs. change_type is `first_seen` (baseline,
   not an event) or one of the per-attribute values below:
   - `ports` - `ports_changed`. Written only by `active_scan`'s nmap
-    run now (no passive port source remains).
+    run. Ports the hourly and daily scans see open or close are in
+    `service_changes` (`field = 'open'`) and in the digest's "Ports
+    opened or closed on tracked hosts" section.
   - `cert` - live-TLS issuer/SAN diff; `cert_issuer_changed` or
     `cert_sans_changed`. A same-issuer renewal with unchanged SANs is
-    not recorded at all (routine, not a signal).
+    not recorded at all (routine, not a signal). A public CA moving a
+    name between its own intermediates (Let's Encrypt `YR1`/`YR2`) counts
+    as the same issuer.
   - `cert_hash` - a tracked domain's live certificate SHA256; `cert_new`
     (a genuinely new cert - every renewal mints one). The hash is
     recorded as a dated `tls.cert_sha256` selector on the domain, not

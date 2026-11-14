@@ -18,6 +18,8 @@ Three kinds of movement, all read from what the store already keeps:
   them, and body hashes are left out - dynamic pages change on every load.
 * **Client divergences** - the first time a host served the Windows client
   something different from the scanner, per divergence value.
+* **Port changes** - ports the scheduled scans found opened or closed on a
+  tracked host, net over the window.
 """
 from __future__ import annotations
 
@@ -62,6 +64,21 @@ def _tracked(con, clusters: list[str] | None) -> dict[str, list[str]]:
     return out
 
 
+def _actors(con) -> dict[str, str]:
+    """cluster slug -> actor name. The store files a correlation under the
+    actor's name, and memberships know only the slug."""
+    return {slug: name for name, slug in con.execute(
+        "SELECT actor_name, cluster_slug FROM actors WHERE cluster_slug IS NOT NULL"
+    ).fetchall()}
+
+
+def _actor_of(memberships: list[str], actors: dict[str, str]) -> str | None:
+    """The one actor these memberships point at, or None when they point
+    at two: a host in two clusters belongs to neither for filing."""
+    clusters = {m.split(":", 1)[0] for m in memberships}
+    return actors.get(next(iter(clusters))) if len(clusters) == 1 else None
+
+
 def band_moves(con: duckdb.DuckDBPyConnection, *, since: datetime, until: datetime,
                clusters: list[str] | None = None) -> list[dict[str, Any]]:
     params: list[Any] = [since, until]
@@ -75,6 +92,7 @@ def band_moves(con: duckdb.DuckDBPyConnection, *, since: datetime, until: dateti
         FROM relatedness_scores WHERE scored_at >= ? AND scored_at <= ? {scope}
         GROUP BY 1, 2""", params)
     out = []
+    actors = _actors(con)
     for row in current:
         prior = con.execute(
             "SELECT score, band FROM relatedness_scores WHERE cluster = ? AND entity = ? "
@@ -93,6 +111,7 @@ def band_moves(con: duckdb.DuckDBPyConnection, *, since: datetime, until: dateti
         direction = ("new" if before is None else
                      "up" if BAND_ORDER.index(row["band"]) > BAND_ORDER.index(before) else "down")
         out.append({"cluster": row["cluster"], "entity": row["entity"],
+                    "actor": actors.get(row["cluster"]),
                     "from_band": before, "to_band": row["band"],
                     "from_score": round(prior[0], 3) if prior else None,
                     "to_score": round(row["score"], 3), "direction": direction})
@@ -159,6 +178,7 @@ def value_changes(con: duckdb.DuckDBPyConnection, *, since: datetime, until: dat
                             AND r.start_at < n.start_at)""",
         [since, until, *TIMELINE_TYPES, *sorted(PASSIVE_SOURCES)])
     out = []
+    actors = _actors(con)
     fronted: dict[str, bool] = {}
     for row in opened:
         if row["previous"] is None or row["indicator_value"] not in tracked:
@@ -170,6 +190,7 @@ def value_changes(con: duckdb.DuckDBPyConnection, *, since: datetime, until: dat
             if fronted[host]:
                 continue
         out.append({"indicator": row["indicator_value"],
+                    "actor": _actor_of(tracked[row["indicator_value"]], actors),
                     "memberships": tracked[row["indicator_value"]],
                     "selector_type": row["selector_type"],
                     "class": selector_class(row["selector_type"]),
@@ -191,6 +212,7 @@ def divergences(con: duckdb.DuckDBPyConnection, *, since: datetime, until: datet
                             AND p.new_value = c.new_value AND p.detected_at < ?)
         ORDER BY c.target, c.port""", [since, until, since])
     out = []
+    actors = _actors(con)
     for row in found:
         if row["target"] not in tracked:
             continue
@@ -198,7 +220,67 @@ def divergences(con: duckdb.DuckDBPyConnection, *, since: datetime, until: datet
         if isinstance(value, str) and value.startswith('"'):
             value = value.strip('"')
         out.append({"target": row["target"], "port": row["port"], "diverged": value,
+                    "actor": _actor_of(tracked[row["target"]], actors),
                     "memberships": tracked[row["target"]], "at": row["detected_at"]})
+    return out
+
+
+def port_changes(con: duckdb.DuckDBPyConnection, *, since: datetime, until: datetime,
+                 clusters: list[str] | None = None) -> list[dict[str, Any]]:
+    """Ports the scheduled scans found opened or closed on tracked hosts.
+
+    One row per host, and the net of the window, not its events: a port
+    that closed at noon and was open again an hour later did not close. It
+    is listed as `flapped`, and a host with nothing but flaps is left out.
+
+    `open_now` is every port the latest scans still found open, so a
+    reader can tell a service being pulled from a host going dark.
+
+    These are the changes netwatch records hourly and daily. They sat in
+    `service_changes` and reached neither the digest nor a specialist: the
+    `ports` attribute change is fed by on-demand nmap alone.
+    """
+    tracked = _tracked(con, clusters)
+    if not tracked:
+        return []
+    events = rows(con, """
+        SELECT target, port, change_type, detected_at
+        FROM service_changes
+        WHERE field = 'open' AND detected_at >= ? AND detected_at <= ? AND port > 0
+        ORDER BY target, port, detected_at, id""", [since, until])
+    per_host: dict[str, dict[int, list[dict]]] = {}
+    for event in events:
+        if event["target"] in tracked:
+            per_host.setdefault(event["target"], {}).setdefault(
+                event["port"], []).append(event)
+
+    actors = _actors(con)
+    out = []
+    for target, ports in per_host.items():
+        opened, closed, flapped = [], [], []
+        for port, seen in sorted(ports.items()):
+            # What the port was before the window is the opposite of the
+            # first thing that happened to it; what it is now is the last.
+            was_open = seen[0]["change_type"] == "port_closed"
+            is_open = seen[-1]["change_type"] == "port_opened"
+            (flapped if was_open == is_open else opened if is_open else closed).append(port)
+        if not opened and not closed:
+            continue
+        open_now = [r[0] for r in con.execute(
+            """SELECT port FROM (
+                   SELECT port, arg_max(open, scanned_at) AS open
+                   FROM service_snapshots
+                   WHERE target = ? AND port > 0 AND scanned_at <= ?
+                   GROUP BY port)
+               WHERE open ORDER BY port""", [target, until]).fetchall()]
+        out.append({"target": target, "actor": _actor_of(tracked[target], actors),
+                    "memberships": tracked[target],
+                    "opened": opened, "closed": closed, "flapped": flapped,
+                    "open_now": open_now,
+                    "at": max(e["detected_at"] for seen in ports.values() for e in seen)})
+    # Hosts that went dark first, then new listeners, then partial closures.
+    out.sort(key=lambda c: (0 if not c["open_now"] else 1 if c["opened"] else 2,
+                            c["target"]))
     return out
 
 
@@ -212,4 +294,6 @@ def changes(con: duckdb.DuckDBPyConnection, *, since: datetime, until: datetime,
             "value_changes": plain(value_changes(con, since=since, until=until,
                                                  clusters=clusters)),
             "client_divergences": plain(divergences(con, since=since, until=until,
-                                                    clusters=clusters))}
+                                                    clusters=clusters)),
+            "port_changes": plain(port_changes(con, since=since, until=until,
+                                               clusters=clusters))}

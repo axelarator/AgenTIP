@@ -114,6 +114,7 @@ def _has_signals(sections: dict[str, Any]) -> bool:
                for m in (sections.get("timeline") or {}).get("band_moves") or [])
         or (sections.get("timeline") or {}).get("value_changes")
         or (sections.get("timeline") or {}).get("client_divergences")
+        or (sections.get("timeline") or {}).get("port_changes")
     )
 
 
@@ -192,6 +193,22 @@ def _timeline_lines(timeline: dict[str, Any]) -> list[str]:
         for d in diverged:
             lines.append(f"- **{d['target']}**:{d['port']} ({', '.join(d['memberships'])}): "
                          f"`{d['diverged']}` — the probe and win116 got different answers")
+        lines.append("")
+    ports = timeline.get("port_changes") or []
+    if ports:
+        lines += ["## Ports opened or closed on tracked hosts (scheduled scans)", ""]
+
+        def listed(label, values):
+            return f"{label} {', '.join(str(v) for v in values)}" if values else ""
+
+        for p in ports:
+            moved = "; ".join(filter(None, [listed("opened", p.get("opened")),
+                                            listed("closed", p.get("closed")),
+                                            listed("flapped", p.get("flapped"))]))
+            now = (listed("still open:", p.get("open_now"))
+                   or "**nothing left open**")
+            lines.append(f"- **{p['target']}** ({', '.join(p['memberships'])}): "
+                         f"{moved} — {now}")
         lines.append("")
     return lines
 

@@ -11,14 +11,17 @@ import operator
 from dataclasses import asdict, dataclass, field
 from typing import Annotated, Any, Literal, TypedDict
 
-# The specialist families. The first four own a disjoint set of the digest's
-# attribute vocabulary, so a change row is routed to exactly one of them.
+# The specialist families. Each owns a disjoint set of attributes, so a row
+# is routed to exactly one of them. Most attributes are the digest's
+# attribute-change vocabulary; `service_ports`, `fingerprint`,
+# `client_divergence` and `candidate_band` are rows of its timeline section
+# (cti/store/timeline.py), given names here so they can be routed too.
 Family = Literal["infra_change", "cert_tls", "hosting", "opendir",
                  "infrastructure"]
 
 FAMILY_ATTRIBUTES: dict[Family, tuple[str, ...]] = {
-    "infra_change": ("asn", "ports", "ptr", "resolved_ip"),
-    "cert_tls": ("cert", "cert_hash", "http"),
+    "infra_change": ("asn", "ports", "ptr", "resolved_ip", "service_ports"),
+    "cert_tls": ("cert", "cert_hash", "http", "fingerprint", "client_divergence"),
     "hosting": ("ip_hostnames", "subdomains", "webamon_fingerprint",
                 "infostealer_hits"),
     "opendir": ("opendir_files",),
@@ -27,7 +30,9 @@ FAMILY_ATTRIBUTES: dict[Family, tuple[str, ...]] = {
     # one answers "who else has this?", which is a different question and
     # needs a different reader. Its attribute is not a digest column - it
     # is a candidate link produced by the corroboration rule.
-    "infrastructure": ("selector_link",),
+    # A candidate's relatedness band moving is the same question asked of a
+    # host and a whole cluster, so it is read by the same specialist.
+    "infrastructure": ("selector_link", "candidate_band"),
 }
 
 ATTRIBUTE_FAMILY: dict[str, Family] = {

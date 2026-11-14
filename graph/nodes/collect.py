@@ -365,7 +365,11 @@ def corroborate(state: dict) -> dict:
                            "linked_to": evidence.pop("indicator"), **evidence}
                     (promoted if candidate.promoted else held).append(row)
 
-        promoted.sort(key=lambda r: (-len(r["identity"]), -len(r["structural"])))
+        # Strongest first, by the score that promoted them. They used to be
+        # ordered by how many identity values a pair shared, which is not
+        # strength: two load balancers of one cloud provider share dozens of
+        # certificates, so those pairs took the digest's places every day.
+        promoted.sort(key=lambda r: (-(r.get("score") or 0.0), r["seed"], r["linked_to"]))
         return {
             "stats": stats, "priced": priced,
             "promoted": promoted[:MAX_DIGEST_LINKS],

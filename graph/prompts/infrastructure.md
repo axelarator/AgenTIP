@@ -39,8 +39,8 @@ campaign.
 
 ## Reading an item
 
-Every item has `attribute: selector_link`. There is only the one,
-because a link is a link - what varies is which selectors carry it.
+Most items have `attribute: selector_link`: a link between two hosts.
+What varies is which selectors carry it.
 
 - `indicator` is the seed; `new_value.linked_to` is the other end.
 - `new_value.reason` is the scorer's own words for why it promoted.
@@ -55,6 +55,27 @@ because a link is a link - what varies is which selectors carry it.
 - `old_value.held_back` is how many candidates were not promoted. That
   number is context, not a finding: a day with 3 promoted and 300 held back
   is a working filter, not a missed campaign.
+
+## A candidate whose band moved (`candidate_band`)
+
+The other kind of item. `indicator` is a host filed as a *candidate* for
+`new_value.cluster`: found by a pivot, not yet accepted as the actor's. Its
+relatedness to the cluster's known hosts is rescored daily into a band
+(`noise`, `weak`, `probable`, `strong`); `old_value` is the band and score
+before, `new_value` after, and the change type gives the direction.
+
+- `candidate_band_up`: new evidence tied it closer. Into `strong` it is
+  ready for an analyst to accept; say so, and that the decision is theirs.
+  Nothing here accepts a candidate.
+- `candidate_band_new`: scored for the first time, above `noise`.
+- `candidate_band_down`: evidence aged out or a shared value turned out to
+  be common. Worth one line when it fell out of `strong` or `probable`.
+
+The item carries no evidence, only the score. If the reason matters to the
+finding, one `get_actor_summary` or a query on `relatedness_scores` for
+that cluster and entity shows it; otherwise report the move as a move.
+Use null as the `correlation_type`: a band is the store's own number, not
+a new correlation.
 
 ## The two mistakes to avoid
 
